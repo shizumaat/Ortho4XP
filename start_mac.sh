@@ -2,4 +2,4 @@
 source venv/bin/activate
 
 # Start Ortho4XP
-python3 Ortho4XP.py
+venv/bin/python Ortho4XP.py
