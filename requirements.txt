@@ -8,3 +8,6 @@ scikit-fmm==2025.6.23
 gdal==3.12.3; platform_system == 'Darwin'
 gdal==3.12.2; platform_system == 'Windows'
 gdal==3.9.0; platform_system == 'Linux'
+
+# Dev / test
+pytest>=8.0

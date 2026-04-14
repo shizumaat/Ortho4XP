@@ -42,27 +42,46 @@ only way to guarantee smooth joins *and* meet FAA/EASA slope limits
 everywhere is to solve the elevation field for the whole airport
 first.
 
-1. **CIFP runway threshold elevations are authoritative and immutable.**
-   Everything else bends to them.
-2. **Sample the DEM to determine centroid elevations for buildings and
-   terminals.**  Initial estimates only — may be adjusted in step 5.
-3. **Build taxiways that meet slope requirements** (1.5 % longitudinal,
-   FAA vertical-curve rate-of-change rule).  Taxiway elevations are
-   constrained by CIFP anchors at runway crossings and by DEM-sampled
-   building centroids where the taxiway enters a terminal area.
-4. **Join buildings and terminals to their nearest taxiways following
-   apron slope rules** (1.0 % any direction).  The apron is the
-   connective tissue: it must plane-fit (or triangulate) between the
-   terminal edge and the taxiway crossing point with grade ≤ 1.0 %.
-5. **If an apron still cannot meet 1.0 % with the current
-   building/terminal elevation, adjust the building or terminal
-   elevation** to produce the smoothest achievable slope.  This is the
-   only situation in which building elevations move from their
-   DEM-sampled values.
+**Critical principle: CIFP runway elevations are authoritative for the
+runway alone.  They are NOT used as anchors for any other feature.**
+Propagating CIFP across the airport flattens everything to the runway
+slope, which is wrong — taxiways, aprons, and buildings have their own
+elevations driven by the local DEM, with the runway being just one of
+several boundaries they negotiate against.
 
-The legacy `generate_airport_surface_patches` already implements a
-version of this ordering in its Phase A5 elevation pipeline — see
-`src/O4_Auto_Patch.py:2238`.
+1. **Runways:** CIFP threshold elevations are authoritative.  The
+   runway emits at those elevations, plus DEM-driven undulations
+   between them constrained to ≤ 1.5 % grade.  CIFP elevations stop
+   at the runway boundary.
+2. **Buildings/terminals:** flat pads at DEM centroid elevation.
+   Independent of the runway.  May be adjusted in step 5.
+3. **Aprons (1.0 % grade limit):** connect to building edges using
+   the building's pad elevation as a hard anchor.  Interior follows
+   DEM, smoothed to ≤ 1.0 % in any direction.  Aprons do NOT use
+   CIFP runway elevations for any vertex (only at the rare case where
+   an apron polygon literally touches a runway boundary).
+4. **Taxiways (1.5 % grade limit):** connect smoothly between aprons
+   and runways.  Anchored at apron-touch points (using the apron's
+   local elevation at that point) and at runway-touch points (using
+   the runway segment elevation at that point — only where the
+   centerline crosses the runway boundary).  Interior follows DEM,
+   smoothed to ≤ 1.5 %.  Taxiways have their own slopes which may
+   differ from runway slopes.
+5. **Reconciliation:** if step 3 (apron) or step 4 (taxiway) cannot
+   meet its grade limit with the current building elevations, adjust
+   the contributing building/terminal pad elevation toward the
+   constraint.  Buildings yield, the runway never does.
+
+This reflects the user-confirmed priority and supersedes the earlier
+"CIFP-everywhere" formulation in commit 1's STATUS.md, which was
+misread by the previous session.
+
+**Implementation status:** the legacy Phase A5 still uses CIFP as a
+global anchor for building validation and taxiway elevations.
+Migrating away from that is in progress.  Apron triangulation (Phase
+C2) is the first step — it now uses DEM + building edges only, no
+CIFP queries.  Phase D (junctions) will follow.  The full Phase A5
+rewrite is a later commit.
 
 ## Why we reverted
 
@@ -116,30 +135,43 @@ fundamentally wrong for the active invariants.
 
 ## Plan
 
-Working in commits so each step has a roll-back point.
+Working in commits so each step has a roll-back point.  The plan
+shifted between commits 3 and 4: rather than fixing all the legacy
+bugs in place and then doing a single big refactor, we now
+**refactor as we touch** — every commit that touches a section of
+the legacy first extracts the affected helper into its own
+single-purpose module with unit tests.  Future fixes land in the
+small modules, not the monolith.
 
-1. **Commit 1 — revert flag, restore legacy.**  Done in the same
-   commit as this STATUS.md update.
-2. **Commit 2 — fix the six known bugs in the legacy** (listed under
-   "Bugs to fix in the legacy" below).  Each bug is a small targeted
-   change; bugs land as separate commits where it makes sense.
-3. **Commit 3 — refactor for PR quality.**  Split the 2 700-line
-   monolithic `generate_airport_surface_patches` into named
-   module-level helpers, one per phase.  Either (a) keep everything in
-   `O4_Auto_Patch.py`, or (b) move the surface mesh builder to its own
-   file with a name that actually distinguishes it (current candidate:
-   `O4_Surface_Mesh.py`).  This decision is open — see the question
-   asked in the conversation.
-4. **Commit 4 — apply learnings from the experiment.**  Specifically:
-   airport-centered projection for plane fits (numerical stability),
-   `patch_feature` tags on every emitted way (for analyzer + JOSM
-   debugging), `min_coverage`-based recursive v-subdivision for any
-   apron strip emission paths.
-5. **Commit 5+ — Phase E (boundary band, tunnel portals) and Phase F
-   (drainage) refinement.**  These were producing useful output but
-   were never finished; left in place and marked as such.
-6. **Commit N — re-run the test plan** in `docs/TEST_PLAN_SPJC.md`,
-   verify all 11+ checks plus the four new invariant checks (12-15).
+1. **Commit 1 — revert flag, restore legacy.**  Done.
+2. **Commit 2 — fix A4b building merge bug (no convex_hull).**  Done.
+3. **Commit 3 — add FAA vertical-curve rule + correct STATUS.md.**
+   Done.
+4. **Commit 4 — extract `O4_Surface_Mesh.py` + adopt pytest.**
+   Pure refactor: introduce a new module containing
+   ``adaptive_triangulate``, ``fit_plane``, ``plane_grade``, and the
+   per-vertex bag, with unit tests in ``tests/test_surface_mesh.py``.
+   No behaviour change in the legacy yet — Phases C2/D still call
+   their inline triangulators.  This commit just gives us a tested
+   helper to call in commit 5.
+5. **Commit 5 — wire `adaptive_triangulate` into Phase C2** (apron
+   complex path).  Replace the 200-line inline Delaunay-with-densified-
+   grid with a small call site that uses the new module.  Expected:
+   apron triangle count drops dramatically.
+6. **Commit 6 — wire `adaptive_triangulate` into Phase D** (junction
+   zones).  Same pattern.
+7. **Commit 7+** — extract more helpers into single-purpose modules
+   as we touch them:
+   * ``_compute_taxiway_elevations`` → ``O4_Taxiway_Elevations.py``
+   * runway elevation interpolation → ``O4_Runway_Elevations.py``
+   * Phase A geometry preparation → ``O4_Surface_Inputs.py``
+   * Phase emit helpers → ``O4_Surface_Emit.py``
+8. **Phase E (boundary band, tunnel portals) and Phase F (drainage)**
+   refinement.  These were producing useful output but were never
+   finished; left in place and marked as such.  Will be cleaned up
+   in their own commits after the core (A-D) phases are clean.
+9. **Re-run the test plan** in ``docs/TEST_PLAN_SPJC.md`` — verify
+   all 11+ checks plus the four new invariant checks (12-15).
 
 ## Bugs to fix in the legacy
 

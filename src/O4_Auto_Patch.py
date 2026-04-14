@@ -13,6 +13,9 @@ import os
 import re
 from math import cos, sin, pi, sqrt, floor, atan2, acos
 
+from shapely import geometry as shp_geom
+from shapely import ops as shp_ops
+
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
 
@@ -390,6 +393,13 @@ def extend_point(lat_from, lon_from, lat_to, lon_to, distance_m):
     ext_dlon = (ux * distance_m) / (cos_lat * DEG_TO_M)
     ext_dlat = (uy * distance_m) / DEG_TO_M
     return (lat_to + ext_dlat, lon_to + ext_dlon)
+
+
+# Adaptive triangulation lives in O4_Surface_Mesh as
+# ``adaptive_triangulate`` and is exercised by tests/test_surface_mesh.py.
+# Phases C2 (apron) and D (junction) will be wired to call it in
+# commits 5 and 6.  The deleted inline definition below this comment
+# was a transitional copy.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
