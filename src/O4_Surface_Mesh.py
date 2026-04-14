@@ -222,20 +222,26 @@ def _delaunay_clipped(bag: _VertexBag,
                       polygon: shp_geom.Polygon
                       ) -> List[shp_geom.Polygon]:
     """Delaunay-triangulate the vertex bag and keep only triangles
-    whose centroid lies inside `polygon` (with a small buffer).
+    whose centroid lies strictly inside `polygon`.
+
+    The "strictly inside" test (``polygon.contains``) ensures
+    triangle vertices stay within (or on) the polygon boundary, so
+    the triangulation can't bleed into adjacent emitted shapes.
+    A boundary-tolerant test would let edge triangles drift
+    outside, causing cross-category overlap with neighbour features
+    (the bug found in commit 6 Phase D rewrite).
     """
     try:
         mp = shp_geom.MultiPoint([(p[0], p[1]) for p in bag])
         raw = shp_ops.triangulate(mp)
     except Exception:
         return []
-    poly_for_test = polygon.buffer(0.5)
     out = []
     for t in raw:
         if t.is_empty or not t.is_valid:
             continue
         try:
-            if poly_for_test.contains(t.centroid):
+            if polygon.contains(t.centroid):
                 out.append(t)
         except Exception:
             pass

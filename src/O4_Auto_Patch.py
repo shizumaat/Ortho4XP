@@ -3527,21 +3527,38 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # includes all aprons, both flat and complex.
 
     # ════════════════════════════════════════════════════════════════
-    # PHASE D: Triangulate junction zones + complex surfaces
+    # PHASE D: Triangulate junction zones + sloping taxiway curves
     # ════════════════════════════════════════════════════════════════
-    # Combine all areas that need triangles:
-    #   - Junction zones (taxiway–runway + taxiway–taxiway overlaps)
-    #     minus the runway area (runway rects already cover that)
-    #   - Sloping taxiway buffers (avoid rectangle fan overlap on curves)
-    #   - Complex building transition zones
-    #   - Complex apron zones (spanning significant elevation range)
-    #   - Transition strips between adjacent flat shapes
-    # Then Delaunay-triangulate the combined zone.
-
+    # Junctions are areas where two paved features physically overlap:
+    #   * taxiway buffer ∩ runway polygon
+    #   * taxiway buffer ∩ another taxiway buffer
+    # Sloped taxiway curves (sent from Phase C1) are added too — their
+    # per-segment rectangle emission would fan and overlap on curves,
+    # so they get triangulated instead.
+    #
+    # Each connected component of the combined triangle zone is fed
+    # through O4_Surface_Mesh.adaptive_triangulate, which produces the
+    # smallest set of grade-compliant DEM-faithful triangles for that
+    # component.  The legacy code Delaunay-triangulated a single
+    # densified point cloud across the entire zone (1394 triangles at
+    # SPJC); the new per-component approach typically yields 5-30
+    # triangles per junction.
+    #
+    # Anchors come from:
+    #   * taxiway centerline crossings → twy_centerlines elevations
+    #   * runway-touch boundary points → linear CIFP interpolation
+    #     along the touched runway centerline (this is the ONE place
+    #     non-runway features legitimately read CIFP elevations: at
+    #     the actual runway boundary, where the junction must meet
+    #     the runway exactly)
+    #   * adjacent emitted-flat-shape edges (taxiways, aprons,
+    #     buildings already emitted) — anchors them to the
+    #     surrounding mesh
+    # Per STATUS.md elevation rule, NO global CIFP surface model
+    # queries (no _cifp_surface_elevation) are used for non-touch
+    # vertices.
     triangle_zone_parts = []
 
-    # D1: Junction zones (clipped: subtract runways — those are
-    # already covered by runway rectangles from generate_patch_osm)
     if not junction_zone_m.is_empty:
         jz_clipped = junction_zone_m
         if not rwy_union_m.is_empty:
@@ -3552,289 +3569,241 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         if not jz_clipped.is_empty:
             triangle_zone_parts.append(jz_clipped)
 
-    # D1b: Sloping taxiway buffers — sent here from Phase C1 because
-    # per-segment rectangles cause fan-shaped overlaps on curves.
-    # Already clipped against runways + junctions in Phase C1.
+    # Sloping taxiway buffers from Phase C1 (curves where the
+    # per-segment rectangle emission would fan and overlap).
     for part in sloped_twy_parts_m:
         if not part.is_empty:
             triangle_zone_parts.append(part)
-
-    # D2–D4: SIMPLIFIED — Complex building transitions, complex aprons,
-    # and transition strips no longer triangulated.  Ortho4XP smooths
-    # transitions between adjacent flat/sloped shapes automatically.
-    # Only junction zones (D1) and sloped taxiway curves (D1b) need
-    # triangles because they involve compound angles.
 
     UI.vprint(2, "    {}: {} complex apron parts, {} transition strips"
               " → triangle zone".format(
                   icao, len(complex_apron_parts_m),
                   len(transition_strip_parts)))
 
-    triangle_zone = shp_geom.Polygon()  # may remain empty
-    if not triangle_zone_parts:
-        UI.vprint(2, "    {}: no triangle zones needed".format(icao))
-    else:
+    triangle_zone = shp_geom.Polygon()
+    if triangle_zone_parts:
         try:
             triangle_zone = shp_ops.unary_union(triangle_zone_parts)
         except Exception:
             triangle_zone = shp_geom.Polygon()
 
-    # Continue to Phase E/F even if no triangles are needed
+    # Junction polygons are NOT simplified.  Their boundaries are
+    # SHARED edges with adjacent flat shapes (taxiway flats, apron
+    # pieces, building pads) and ANY vertex shift moves the
+    # triangulation off the shared edge, causing cross-category
+    # overlap.  The polygon's vertex count is a small constant per
+    # junction (most junctions have 4-12 vertices anyway), so
+    # passing them all through to adaptive_triangulate is fine.
+    JUNCTION_ANCHOR_GAP_M = 30.0
 
-    # ── Phase D triangulation (only when junction/sloped zones exist) ──
-    total_tri = 0
-    if not triangle_zone.is_empty:
-        triangle_zone = triangle_zone.simplify(
-            0.5, preserve_topology=True)
-
-        # Subtract emitted flat shapes so triangles don't overlap
+    def _runway_touch_elev(x_m, y_m):
+        """Return the CIFP-interpolated runway elevation at (x, y)
+        if the point lies on or near a runway boundary.  Used only
+        for anchors at the actual runway touch line — never as a
+        global query.
+        """
         try:
-            all_flat_polys = [s[0] for s in emitted_flat_shapes
-                              if not s[0].is_empty]
-            if all_flat_polys:
-                flat_all_union = shp_ops.unary_union(all_flat_polys)
-                if not flat_all_union.is_empty:
-                    triangle_zone = triangle_zone.difference(
-                        flat_all_union)
-            if emitted_twy_quads_m:
-                quad_union = shp_ops.unary_union(emitted_twy_quads_m)
-                if not quad_union.is_empty:
-                    triangle_zone = triangle_zone.difference(quad_union)
+            lon, lat = to_ll(x_m, y_m)
+            return _project_point_onto_runway(
+                lat, lon, runway_pairs, max_dist=10.0)
+        except Exception:
+            return None
+
+    def _junction_anchors(zone_poly):
+        """Collect (x, y, z) anchors for a single junction zone
+        component.  Sources (in priority order):
+          1. Taxiway centerlines that pass through or stub into it
+          2. Runway touch points along the zone's intersection with
+             a runway boundary
+          3. Edges of already-emitted flat shapes (taxiway flats,
+             apron pieces, building pads) within ~2 m of the zone
+        """
+        raw = []
+        # 1. Taxiway crossings.
+        TWY_REACH = TAXIWAY_BUFFER_WIDTH * 2
+        zone_buf = zone_poly.buffer(TWY_REACH)
+        for ti2, cl_m2 in enumerate(twy_centerlines_m):
+            if cl_m2 is None:
+                continue
+            entry2 = twy_centerlines[ti2]
+            if entry2 is None:
+                continue
+            cl_elevs = entry2[1]
+            if not cl_elevs or len(cl_elevs) != len(cl_m2):
+                continue
+            try:
+                ls2 = shp_geom.LineString(cl_m2)
+                if ls2.distance(zone_poly) > TWY_REACH:
+                    continue
+                inside = ls2.intersection(zone_buf)
+            except Exception:
+                continue
+            if inside.is_empty:
+                continue
+            comps = (list(inside.geoms)
+                     if hasattr(inside, "geoms") else [inside])
+            for comp in comps:
+                if not hasattr(comp, "coords"):
+                    continue
+                coords = list(comp.coords)
+                if not coords:
+                    continue
+                # Use both endpoints of each crossing segment so
+                # adaptive_triangulate sees the full taxiway profile
+                # through the junction.
+                for c in (coords[0], coords[-1]):
+                    px, py = c[0], c[1]
+                    ie = _interpolate_elevation_along_centerline(
+                        (px, py), cl_m2, cl_elevs)
+                    raw.append((px, py, float(ie)))
+        # 2. Runway touch points: sample along the zone's boundary
+        # wherever it lies inside a runway polygon.
+        if not rwy_union_m.is_empty:
+            try:
+                touch = zone_poly.boundary.intersection(rwy_union_m)
+            except Exception:
+                touch = None
+            if touch is not None and not touch.is_empty:
+                comps = (list(touch.geoms)
+                         if hasattr(touch, "geoms") else [touch])
+                for comp in comps:
+                    if not hasattr(comp, "coords"):
+                        continue
+                    length = comp.length if hasattr(comp, "length") else 0.0
+                    if length < 1.0:
+                        for c in comp.coords:
+                            elev = _runway_touch_elev(c[0], c[1])
+                            if elev is not None:
+                                raw.append((c[0], c[1], float(elev)))
+                        continue
+                    n = max(2, int(length / 30.0) + 1)
+                    for k in range(n):
+                        t = k / (n - 1) if n > 1 else 0.5
+                        try:
+                            p = comp.interpolate(t, normalized=True)
+                            elev = _runway_touch_elev(p.x, p.y)
+                            if elev is not None:
+                                raw.append((p.x, p.y, float(elev)))
+                        except Exception:
+                            pass
+        # 3. Adjacent emitted flat shape edges.  Dense anchors along
+        # the shared boundary pin junction vertices to neighbour
+        # elevations and prevent the triangulation from drifting
+        # over the boundary into the flat shape.
+        if emitted_flat_shapes:
+            for sp, se in emitted_flat_shapes:
+                if sp.is_empty:
+                    continue
+                try:
+                    if sp.distance(zone_poly) > 2.0:
+                        continue
+                    shared = sp.boundary.intersection(zone_poly.buffer(2.0))
+                except Exception:
+                    continue
+                if shared is None or shared.is_empty:
+                    continue
+                lines = []
+                if hasattr(shared, "geoms"):
+                    for g in shared.geoms:
+                        if hasattr(g, "coords"):
+                            lines.append(g)
+                elif hasattr(shared, "coords"):
+                    lines.append(shared)
+                for ln in lines:
+                    length = ln.length
+                    if length < 1.0:
+                        p = ln.interpolate(0.5, normalized=True)
+                        raw.append((p.x, p.y, float(se)))
+                        continue
+                    for t in (0.0, 0.5, 1.0):
+                        p = ln.interpolate(t, normalized=True)
+                        raw.append((p.x, p.y, float(se)))
+        return _sparsify_anchors(raw, JUNCTION_ANCHOR_GAP_M)
+
+    total_tri = 0
+    # Pre-compute the unions that will be subtracted from each
+    # component (also re-subtracted after per-component simplify so
+    # the simplified outline can't drift over an adjacent painted
+    # shape).
+    all_flat_polys = [s[0] for s in emitted_flat_shapes
+                      if not s[0].is_empty]
+    flat_all_union = shp_geom.Polygon()
+    quad_union = shp_geom.Polygon()
+    try:
+        if all_flat_polys:
+            flat_all_union = shp_ops.unary_union(all_flat_polys)
+        if emitted_twy_quads_m:
+            quad_union = shp_ops.unary_union(emitted_twy_quads_m)
+    except Exception:
+        pass
+
+    if not triangle_zone.is_empty:
+        # Subtract emitted flat shapes so triangles don't overlap
+        # what's already painted by Phase C.
+        try:
+            if not flat_all_union.is_empty:
+                triangle_zone = triangle_zone.difference(flat_all_union)
+            if not quad_union.is_empty:
+                triangle_zone = triangle_zone.difference(quad_union)
         except Exception:
             pass
 
         if not triangle_zone.is_empty:
-            ROUND_PREC = 2
-
-            def _densify_ring(ring):
-                dense = ring.segmentize(BOUNDARY_SEG_LENGTH)
-                return [(round(c[0], ROUND_PREC),
-                         round(c[1], ROUND_PREC))
-                        for c in dense.coords]
-
-            def _collect_pts(poly, pt_set):
-                if poly.is_empty or not hasattr(poly, "exterior"):
-                    return []
-                pts = []
-                for c in _densify_ring(poly.exterior):
-                    pt_set.add(c)
-                    pts.append(c)
-                for hole in poly.interiors:
-                    for c in _densify_ring(hole):
-                        pt_set.add(c)
-                        pts.append(c)
-                return pts
-
-            vert_set = set()
-            vert_zone_tag = {}
-
-            # Triangle zone boundary vertices
-            if triangle_zone.geom_type == "MultiPolygon":
-                for g in triangle_zone.geoms:
-                    pts = _collect_pts(g, vert_set)
-                    for pt in pts:
-                        if pt not in vert_zone_tag:
-                            vert_zone_tag[pt] = (ZONE_SURFACE, -1)
-            else:
-                pts = _collect_pts(triangle_zone, vert_set)
-                for pt in pts:
-                    if pt not in vert_zone_tag:
-                        vert_zone_tag[pt] = (ZONE_SURFACE, -1)
-
-            if len(vert_set) >= 3:
-                all_pts = shp_geom.MultiPoint(list(vert_set))
-                raw_tris = shp_ops.triangulate(all_pts)
-
-                tris = []
-                for t in raw_tris:
-                    if t.is_empty or not t.is_valid:
+            zone_components = (list(triangle_zone.geoms)
+                               if hasattr(triangle_zone, "geoms")
+                               else [triangle_zone])
+            for comp in zone_components:
+                if (comp.is_empty or not hasattr(comp, "exterior")
+                        or comp.area < 5.0):
+                    continue
+                seed_comp = comp
+                # Re-subtraction can split the component into a
+                # MultiPolygon.  Iterate over each sub-piece.
+                sub_pieces = (list(seed_comp.geoms)
+                              if hasattr(seed_comp, "geoms")
+                              else [seed_comp])
+                for sub in sub_pieces:
+                    if (sub.is_empty
+                            or not hasattr(sub, "exterior")
+                            or sub.area < 5.0):
                         continue
-                    c = t.centroid
-                    if (triangle_zone.contains(c)
-                            or triangle_zone.boundary.distance(c) < 1.0):
-                        tris.append(t)
-
-                if tris:
-                    UI.vprint(2, "    {}: {} junction triangles".format(
-                        icao, len(tris)))
-
-                    vert_map = {}
-                    vert_coords = []
-                    for t in tris:
-                        for c in t.exterior.coords[:-1]:
-                            key = (round(c[0], ROUND_PREC),
-                                   round(c[1], ROUND_PREC))
-                            if key not in vert_map:
-                                vert_map[key] = len(vert_coords)
-                                vert_coords.append(key)
-
-                    nv = len(vert_coords)
-                    vert_elev = [None] * nv
-                    vert_dem = [None] * nv
-                    vert_anchored = [False] * nv
-
-                    for vi, (mx, my) in enumerate(vert_coords):
-                        vlon, vlat = to_ll(mx, my)
-                        try:
-                            dem_val = tile.dem.alt(
-                                (vlon - tile.lon, vlat - tile.lat))
-                        except Exception:
-                            dem_val = 0.0
-                        vert_dem[vi] = dem_val
-
-                        # Try taxiway centerline interpolation first
-                        elev = None
-                        if twy_centerlines_m:
-                            best_dist = float("inf")
-                            for ti2, cl_m2 in enumerate(
-                                    twy_centerlines_m):
-                                if cl_m2 is None:
-                                    continue
-                                entry2 = twy_centerlines[ti2]
-                                if entry2 is None:
-                                    continue
-                                cl2_elevs = entry2[1]
-                                ie = _interpolate_elevation_along_centerline(
-                                    (mx, my), cl_m2, cl2_elevs)
-                                try:
-                                    ls2 = shp_geom.LineString(cl_m2)
-                                    d2 = shp_geom.Point(
-                                        mx, my).distance(ls2)
-                                except Exception:
-                                    d2 = float("inf")
-                                if d2 < best_dist:
-                                    best_dist = d2
-                                    elev = ie
-                            if best_dist > TAXIWAY_BUFFER_WIDTH * 3:
-                                elev = None
-
-                        if elev is None:
-                            elev = _cifp_surface_elevation(
-                                mx, my, max_search=500.0)
-                        if elev is not None:
-                            vert_elev[vi] = elev
-                            vert_anchored[vi] = True
-                        else:
-                            vert_elev[vi] = dem_val
-
-                    # Lock vertices near emitted flat shapes
-                    if emitted_flat_shapes:
-                        from shapely.strtree import STRtree
-                        fs_polys_d = [s[0] for s in emitted_flat_shapes]
-                        fs_elevs_d = [s[1] for s in emitted_flat_shapes]
-                        fs_tree = STRtree(fs_polys_d)
-                        for vi in range(nv):
-                            if vert_anchored[vi]:
-                                continue
-                            mx, my = vert_coords[vi]
-                            pt = shp_geom.Point(mx, my)
-                            try:
-                                candidates = fs_tree.query(
-                                    pt.buffer(2.0))
-                            except Exception:
-                                continue
-                            best_dist = float("inf")
-                            best_elev = None
-                            for ci in candidates:
-                                idx = int(ci)
-                                sp = fs_polys_d[idx]
-                                try:
-                                    d = sp.boundary.distance(pt)
-                                except Exception:
-                                    continue
-                                if d < best_dist:
-                                    best_dist = d
-                                    best_elev = fs_elevs_d[idx]
-                            if best_dist < 2.0 and best_elev is not None:
-                                vert_elev[vi] = best_elev
-                                vert_anchored[vi] = True
-
-                    # Grade-constrained relaxation (simplified —
-                    # junctions only, no apron/building zone logic)
-                    vert_neighbors = [[] for _ in range(nv)]
-                    for t in tris:
-                        coords = t.exterior.coords[:-1]
-                        idxs = []
-                        for c in coords:
-                            key = (round(c[0], ROUND_PREC),
-                                   round(c[1], ROUND_PREC))
-                            idxs.append(vert_map[key])
-                        for a_pos in range(len(idxs)):
-                            b_pos = (a_pos + 1) % len(idxs)
-                            ai, bi2 = idxs[a_pos], idxs[b_pos]
-                            ax, ay = vert_coords[ai]
-                            bx, by = vert_coords[bi2]
-                            dist = sqrt(
-                                (bx - ax) ** 2 + (by - ay) ** 2)
-                            if dist < 0.01:
-                                continue
-                            vert_neighbors[ai].append((bi2, dist))
-                            vert_neighbors[bi2].append((ai, dist))
-
-                    for iteration in range(GRADE_RELAX_ITERATIONS):
-                        changed = False
-                        for vi in range(nv):
-                            if (vert_anchored[vi]
-                                    or vert_elev[vi] is None):
-                                continue
-                            if not vert_neighbors[vi]:
-                                continue
-                            cur = vert_elev[vi]
-                            new_elev = cur
-                            for (ni, dist) in vert_neighbors[vi]:
-                                if vert_elev[ni] is None:
-                                    continue
-                                max_rise = dist * MAX_SURFACE_GRADE
-                                nelev = vert_elev[ni]
-                                if cur > nelev + max_rise:
-                                    new_elev = min(
-                                        new_elev, nelev + max_rise)
-                                elif cur < nelev - max_rise:
-                                    new_elev = max(
-                                        new_elev, nelev - max_rise)
-                            if abs(new_elev - cur) > 0.001:
-                                vert_elev[vi] = new_elev
-                                changed = True
-                        if not changed:
-                            break
-
-                    # Emit triangles — only where elevation differs
-                    # from DEM (avoid unnecessary shapes)
-                    for t in tris:
-                        coords = t.exterior.coords[:-1]
-                        idxs = []
-                        for c in coords:
-                            key = (round(c[0], ROUND_PREC),
-                                   round(c[1], ROUND_PREC))
-                            idxs.append(vert_map[key])
-                        if len(idxs) != 3:
-                            continue
+                    anchors = _junction_anchors(sub)
+                    try:
+                        tris = SM.adaptive_triangulate(
+                            sub, anchors, _dem_at,
+                            max_grade=MAX_SURFACE_GRADE,
+                            fidelity_tol=1.0,
+                            max_extra_points=50)
+                    except Exception:
+                        tris = []
+                    for (v0, v1, v2) in tris:
+                        # Skip triangles whose elevations all match
+                        # DEM within DEM_VARIANCE_THRESHOLD — those
+                        # are "flat" pieces where the underlying
+                        # DEM is already correct, no patch needed.
+                        # Matches the legacy's variance filter and
+                        # cuts the triangle count dramatically.
                         has_variance = False
-                        for vi in idxs:
-                            if (vert_dem[vi] is not None
-                                    and vert_elev[vi] is not None
-                                    and abs(vert_elev[vi] - vert_dem[vi])
+                        for v in (v0, v1, v2):
+                            dem_z = _dem_at(v[0], v[1])
+                            if (dem_z is not None
+                                    and abs(v[2] - dem_z)
                                     > DEM_VARIANCE_THRESHOLD):
                                 has_variance = True
                                 break
                         if not has_variance:
                             continue
-
-                        elevs = []
-                        latlons = []
-                        for vi in idxs:
-                            mx, my = vert_coords[vi]
-                            tlon, tlat = to_ll(mx, my)
-                            latlons.append((tlat, tlon))
-                            elevs.append(
-                                vert_elev[vi]
-                                if vert_elev[vi] is not None else 0.0)
+                        lon0, lat0 = to_ll(v0[0], v0[1])
+                        lon1, lat1 = to_ll(v1[0], v1[1])
+                        lon2, lat2 = to_ll(v2[0], v2[1])
                         _emit_triangle(
-                            latlons[0][0], latlons[0][1], elevs[0],
-                            latlons[1][0], latlons[1][1], elevs[1],
-                            latlons[2][0], latlons[2][1], elevs[2],
-                        )
+                            lat0, lon0, round(v0[2], 1),
+                            lat1, lon1, round(v1[2], 1),
+                            lat2, lon2, round(v2[2], 1))
                         total_tri += 1
+            if total_tri:
+                UI.vprint(2, "    {}: {} junction triangles "
+                          "(adaptive mesh)".format(icao, total_tri))
 
     n_twy_shapes = n_twy_flat + n_twy_sloped
 
