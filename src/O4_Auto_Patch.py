@@ -3064,13 +3064,167 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     UI.vprint(2, "    {}: {} flat taxiway polys, {} sloped quads".format(
         icao, n_twy_flat, n_twy_sloped))
 
-    # C2: Apron shapes — adaptive: flat when uniform, triangulated when
-    # spanning significant elevation range (FAA: max 1.0% apron grade).
-    # An apron near buildings or taxiways at very different elevations
-    # needs to slope, not be a flat slab at the centroid elevation.
-    n_apron_flat = 0
-    n_apron_complex = 0
-    complex_apron_parts_m = []   # (clipped_poly_m,) for Phase D
+    # ── C2: Apron shapes ────────────────────────────────────────────
+    # New apron emission strategy (commit 5):
+    #
+    #   1. Each OSM apron polygon is clipped against runways,
+    #      taxiways, junction zones, and buildings (so it never
+    #      overlaps any of those features).
+    #   2. Anchor elevations are collected from neighbouring features
+    #      using the elevation priority documented in STATUS.md:
+    #        * building edges that touch the apron → bldg_elevations
+    #        * taxiway centerline crossings        → twy_centerlines
+    #      CIFP runway elevations are NOT used as apron anchors —
+    #      they belong to the runways alone.
+    #   3. The apron is triangulated by O4_Surface_Mesh.adaptive_-
+    #      triangulate, which produces the smallest set of
+    #      grade-compliant DEM-faithful triangles (typically 2-15
+    #      per apron, vs the legacy's ~50).
+    #   4. Triangles are emitted via _emit_triangle (node_altitudes
+    #      tag, allowed for 3-vertex shapes only).
+    #
+    # The "complex vs flat" branch is gone: adaptive_triangulate
+    # naturally yields just 2 triangles for a flat apron and adds
+    # interior detail only where DEM departs from the plane.
+    import O4_Surface_Mesh as SM
+
+    def _dem_at(x_m, y_m):
+        """DEM sampler closure for the current `to_ll`/tile."""
+        try:
+            lon, lat = to_ll(x_m, y_m)
+            return float(tile.dem.alt((lon - tile.lon, lat - tile.lat)))
+        except Exception:
+            return None
+
+    APRON_SIMPLIFY_M = 10.0      # input polygon simplification
+                                 # tolerance — strips OSM vertex
+                                 # noise so adaptive_triangulate
+                                 # starts with a small seed set.
+                                 # 10 m is well below the 1.0 %
+                                 # apron grade rule's resolution
+                                 # (a 10 m horizontal step at 1 %
+                                 # is 10 cm vertical) so simplifying
+                                 # at this scale loses no real
+                                 # geometry that the grade rule cares
+                                 # about.
+    APRON_ANCHOR_GAP_M = 50.0    # minimum spacing between anchors
+                                 # of the same kind, to keep the
+                                 # triangulation seed sparse
+
+    def _sparsify_anchors(anchors, min_gap):
+        """Return a subset of `anchors` with no two within `min_gap`
+        of each other.  Greedy: walk the input order, skip any
+        candidate that's already covered.
+        """
+        kept = []
+        gap2 = min_gap * min_gap
+        for ax, ay, az in anchors:
+            covered = False
+            for kx, ky, _kz in kept:
+                if (ax - kx) ** 2 + (ay - ky) ** 2 < gap2:
+                    covered = True
+                    break
+            if not covered:
+                kept.append((ax, ay, az))
+        return kept
+
+    def _apron_anchors(apron_poly):
+        """Collect (x, y, z) anchor elevations from neighbouring
+        features that touch this apron.  Building edges contribute
+        a small number of sample points along each shared boundary
+        at the building's pad elevation; taxiway centerlines
+        contribute one point per crossing into the apron at the
+        interpolated taxiway elevation.
+
+        Per STATUS.md elevation rule, CIFP runway elevations are
+        NOT used here.
+
+        The result is sparsified to a minimum APRON_ANCHOR_GAP_M
+        spacing so adaptive_triangulate starts with the smallest
+        useful seed set — the user's "minimum shape count" goal.
+        """
+        raw = []
+        # Building edge anchors.  A building "touches" the apron if
+        # its padded footprint comes within 6 m of the apron polygon
+        # (the legacy A4b padding + simplification can leave a small
+        # gap between the two outlines even when they share an edge
+        # in the source data).
+        TOUCH_M = 6.0
+        for bi, bp in enumerate(building_polys_m):
+            if bp.is_empty or bi not in bldg_elevations:
+                continue
+            try:
+                if bp.distance(apron_poly) > TOUCH_M:
+                    continue
+            except Exception:
+                continue
+            elev = float(bldg_elevations[bi])
+            try:
+                shared = bp.boundary.intersection(
+                    apron_poly.buffer(TOUCH_M))
+            except Exception:
+                shared = None
+            if shared is None or shared.is_empty:
+                raw.append((bp.centroid.x, bp.centroid.y, elev))
+                continue
+            lines = []
+            if hasattr(shared, "geoms"):
+                for g in shared.geoms:
+                    if hasattr(g, "coords"):
+                        lines.append(g)
+            elif hasattr(shared, "coords"):
+                lines.append(shared)
+            for ln in lines:
+                length = ln.length
+                if length < 1.0:
+                    p = ln.interpolate(0.5, normalized=True)
+                    raw.append((p.x, p.y, elev))
+                    continue
+                # Two endpoints + midpoint.  Sparsifier will trim
+                # further if the building is very small.
+                for t in (0.0, 0.5, 1.0):
+                    p = ln.interpolate(t, normalized=True)
+                    raw.append((p.x, p.y, elev))
+        # Taxiway crossing anchors.  Use a slightly buffered apron
+        # so taxiways that stub into the edge also contribute.
+        TWY_TOUCH_M = 5.0
+        zone = apron_poly.buffer(TWY_TOUCH_M)
+        for ti2, cl_m2 in enumerate(twy_centerlines_m):
+            if cl_m2 is None:
+                continue
+            entry2 = twy_centerlines[ti2]
+            if entry2 is None:
+                continue
+            cl_elevs = entry2[1]
+            if not cl_elevs or len(cl_elevs) != len(cl_m2):
+                continue
+            try:
+                ls2 = shp_geom.LineString(cl_m2)
+                crossing = ls2.intersection(zone)
+            except Exception:
+                continue
+            if crossing.is_empty:
+                continue
+            # One representative point per crossing component.
+            comps = (list(crossing.geoms)
+                     if hasattr(crossing, "geoms") else [crossing])
+            for comp in comps:
+                if not hasattr(comp, "coords"):
+                    continue
+                coords = list(comp.coords)
+                if not coords:
+                    continue
+                # Use the midpoint of the crossing
+                mid = coords[len(coords) // 2]
+                px, py = mid[0], mid[1]
+                ie = _interpolate_elevation_along_centerline(
+                    (px, py), cl_m2, cl_elevs)
+                raw.append((px, py, float(ie)))
+        return _sparsify_anchors(raw, APRON_ANCHOR_GAP_M)
+
+    n_apron = 0
+    n_apron_tris = 0
+    complex_apron_parts_m = []   # left in scope for Phase D / coverage
 
     for ai, p_m in enumerate(apron_polys_m):
         clipped = p_m
@@ -3084,320 +3238,81 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         if clipped.is_empty:
             continue
 
-        # Sample elevations across the apron using the CIFP surface
-        # model, which incorporates runway thresholds, building
-        # platforms, and taxiway projections.  Aprons are transitional
-        # surfaces — their elevation is dictated by adjacent elements.
-        sample_elevs = []
-
-        # Centroid elevation from surface model
-        cx_m, cy_m = p_m.centroid.x, p_m.centroid.y
-        clon, clat = to_ll(cx_m, cy_m)
-        centroid_elev = _cifp_surface_elevation(cx_m, cy_m, max_search=500.0)
-        if centroid_elev is None:
-            try:
-                centroid_elev = tile.dem.alt(
-                    (clon - tile.lon, clat - tile.lat))
-            except Exception:
-                centroid_elev = 0.0
-        sample_elevs.append(centroid_elev)
-
-        # Boundary samples (every Nth vertex) from surface model
-        boundary_coords = list(p_m.exterior.coords)
-        step = max(1, len(boundary_coords) // 8)
-        for i in range(0, len(boundary_coords) - 1, step):
-            bx, by = boundary_coords[i]
-            be = _cifp_surface_elevation(bx, by, max_search=500.0)
-            if be is None:
-                blon, blat = to_ll(bx, by)
-                try:
-                    be = tile.dem.alt(
-                        (blon - tile.lon, blat - tile.lat))
-                except Exception:
-                    be = centroid_elev
-            sample_elevs.append(be)
-
-        # Check nearby buildings for elevation mismatch
-        for bi, bp in enumerate(building_polys_m):
-            if bp.is_empty or bi not in bldg_elevations:
+        pieces = ([clipped] if clipped.geom_type == "Polygon"
+                  else list(clipped.geoms)
+                  if hasattr(clipped, "geoms") else [])
+        for piece in pieces:
+            if (piece.is_empty or not hasattr(piece, "exterior")
+                    or piece.area < 10.0):
                 continue
+
+            # Simplify the piece's outline before triangulation so
+            # adaptive_triangulate starts with a small seed set.
+            # OSM apron polygons commonly have 50-200 contour
+            # vertices that don't carry meaningful shape information
+            # at the patch-mesh scale.  5 m tolerance trims those
+            # without losing the apron's recognisable outline.
             try:
-                if p_m.distance(bp) < 10.0:
-                    sample_elevs.append(bldg_elevations[bi])
+                seed_poly = piece.simplify(
+                    APRON_SIMPLIFY_M, preserve_topology=True)
+                if (seed_poly.is_empty
+                        or not hasattr(seed_poly, "exterior")):
+                    seed_poly = piece
             except Exception:
-                pass
+                seed_poly = piece
 
-        # Check nearby taxiway edges for elevation mismatch
-        for ti2, cl_m2 in enumerate(twy_centerlines_m):
-            if cl_m2 is None:
-                continue
-            entry2 = twy_centerlines[ti2]
-            if entry2 is None:
-                continue
+            anchors = _apron_anchors(seed_poly)
             try:
-                ls2 = shp_geom.LineString(cl_m2)
-                if p_m.distance(ls2) < TAXIWAY_BUFFER_WIDTH * 2:
-                    # Sample taxiway elevation at closest point to apron
-                    nearest_pt = p_m.boundary.interpolate(
-                        p_m.boundary.project(
-                            shp_geom.Point(ls2.interpolate(
-                                ls2.project(p_m.centroid)).coords[0])))
-                    ie = _interpolate_elevation_along_centerline(
-                        (nearest_pt.x, nearest_pt.y),
-                        cl_m2, entry2[1])
-                    sample_elevs.append(ie)
+                tris = SM.adaptive_triangulate(
+                    seed_poly, anchors, _dem_at,
+                    max_grade=MAX_APRON_GRADE,
+                    fidelity_tol=1.0,
+                    max_extra_points=50)
             except Exception:
-                pass
+                tris = []
 
-        elev_range = (max(sample_elevs) - min(sample_elevs)
-                      if len(sample_elevs) >= 2 else 0.0)
-
-        if elev_range > COMPLEX_APRON_ELEV_RANGE:
-            # Complex apron: spans significant elevation range.
-            # Aprons are allowed 1% slope (FAA) and must smoothly
-            # transition from building pads to taxiway joins.
-            #
-            # Strategy: triangulate the apron polygon itself and
-            # assign per-vertex elevations from the CIFP surface
-            # model, adjacent buildings, and taxiway centerlines.
-            # Grade-constrained relaxation enforces the 1% limit.
-            # This uses only as many triangles as the apron needs
-            # (no surrounding buffer zones).
-            polys = ([clipped] if clipped.geom_type == "Polygon"
-                     else list(clipped.geoms)
-                     if hasattr(clipped, "geoms") else [])
-            for piece in polys:
-                if piece.is_empty or piece.area < 10.0:
-                    continue
-                if not hasattr(piece, "exterior"):
-                    continue
-                complex_apron_parts_m.append(piece)
-
-                # Triangulate this apron piece
-                try:
-                    ap_simple = piece.simplify(
-                        1.0, preserve_topology=True)
-                    if (ap_simple.is_empty
-                            or not hasattr(ap_simple, "exterior")):
-                        ap_simple = piece
-
-                    # Collect boundary vertices
-                    ap_dense = ap_simple.exterior.segmentize(
-                        BOUNDARY_SEG_LENGTH)
-                    ap_verts = set()
-                    for c in ap_dense.coords:
-                        ap_verts.add(
-                            (round(c[0], 2), round(c[1], 2)))
-                    # Add interior holes if any
-                    for hole in ap_simple.interiors:
-                        hd = hole.segmentize(BOUNDARY_SEG_LENGTH)
-                        for c in hd.coords:
-                            ap_verts.add(
-                                (round(c[0], 2), round(c[1], 2)))
-                    # Add centroid as interior point
-                    cx_a, cy_a = ap_simple.centroid.x, ap_simple.centroid.y
-                    ap_verts.add((round(cx_a, 2), round(cy_a, 2)))
-
-                    if len(ap_verts) < 3:
-                        # Fallback: emit flat at average
-                        avg_e = (sum(sample_elevs) / len(sample_elevs)
-                                 if sample_elevs else centroid_elev)
-                        ring_ll = [to_ll(mx, my)
-                                   for mx, my in piece.exterior.coords]
-                        _emit_flat_poly(ring_ll, round(avg_e, 1))
-                        emitted_flat_shapes.append(
-                            (piece, round(avg_e, 1)))
-                        continue
-
-                    # Delaunay triangulate
-                    ap_pts = shp_geom.MultiPoint(list(ap_verts))
-                    ap_tris = shp_ops.triangulate(ap_pts)
-                    # Filter to inside the apron polygon
-                    ap_tris = [t for t in ap_tris
-                               if not t.is_empty and t.is_valid
-                               and ap_simple.buffer(0.5).contains(t)]
-
-                    if not ap_tris:
-                        avg_e = (sum(sample_elevs) / len(sample_elevs)
-                                 if sample_elevs else centroid_elev)
-                        ring_ll = [to_ll(mx, my)
-                                   for mx, my in piece.exterior.coords]
-                        _emit_flat_poly(ring_ll, round(avg_e, 1))
-                        emitted_flat_shapes.append(
-                            (piece, round(avg_e, 1)))
-                        continue
-
-                    # Build vertex list and assign elevations
-                    ap_vmap = {}
-                    ap_vcoords = []
-                    for t in ap_tris:
-                        for c in t.exterior.coords[:-1]:
-                            key = (round(c[0], 2), round(c[1], 2))
-                            if key not in ap_vmap:
-                                ap_vmap[key] = len(ap_vcoords)
-                                ap_vcoords.append(key)
-
-                    ap_nv = len(ap_vcoords)
-                    ap_elev = [None] * ap_nv
-                    ap_anchored = [False] * ap_nv
-
-                    for vi, (mx, my) in enumerate(ap_vcoords):
-                        # Try nearby building elevation
-                        elev = None
-                        for bi, bp in enumerate(building_polys_m):
-                            if (bp.is_empty
-                                    or bi not in bldg_elevations):
-                                continue
-                            try:
-                                d = bp.boundary.distance(
-                                    shp_geom.Point(mx, my))
-                                if d < 3.0:
-                                    elev = bldg_elevations[bi]
-                                    break
-                            except Exception:
-                                pass
-                        # Try taxiway centerline
-                        if elev is None and twy_centerlines_m:
-                            best_d = float("inf")
-                            for ti2, cl_m2 in enumerate(
-                                    twy_centerlines_m):
-                                if cl_m2 is None:
-                                    continue
-                                entry2 = twy_centerlines[ti2]
-                                if entry2 is None:
-                                    continue
-                                try:
-                                    ls2 = shp_geom.LineString(cl_m2)
-                                    d2 = shp_geom.Point(
-                                        mx, my).distance(ls2)
-                                    if d2 < best_d:
-                                        best_d = d2
-                                        elev = _interpolate_elevation_along_centerline(
-                                            (mx, my), cl_m2,
-                                            entry2[1])
-                                except Exception:
-                                    pass
-                            if best_d > TAXIWAY_BUFFER_WIDTH * 3:
-                                elev = None
-                        # Fall back to CIFP surface model
-                        if elev is None:
-                            elev = _cifp_surface_elevation(
-                                mx, my, max_search=500.0)
-                        if elev is None:
-                            vlon, vlat = to_ll(mx, my)
-                            try:
-                                elev = tile.dem.alt(
-                                    (vlon - tile.lon,
-                                     vlat - tile.lat))
-                            except Exception:
-                                elev = centroid_elev
-                        ap_elev[vi] = elev
-                        ap_anchored[vi] = True
-
-                    # Grade-constrained relaxation (apron max 1%)
-                    ap_neighbors = [[] for _ in range(ap_nv)]
-                    for t in ap_tris:
-                        idxs = []
-                        for c in t.exterior.coords[:-1]:
-                            key = (round(c[0], 2), round(c[1], 2))
-                            idxs.append(ap_vmap[key])
-                        for a_pos in range(len(idxs)):
-                            b_pos = (a_pos + 1) % len(idxs)
-                            ai, bi2 = idxs[a_pos], idxs[b_pos]
-                            ax, ay = ap_vcoords[ai]
-                            bx, by = ap_vcoords[bi2]
-                            dist = sqrt(
-                                (bx - ax) ** 2 + (by - ay) ** 2)
-                            if dist > 0.01:
-                                ap_neighbors[ai].append(
-                                    (bi2, dist))
-                                ap_neighbors[bi2].append(
-                                    (ai, dist))
-
-                    for _iter in range(GRADE_RELAX_ITERATIONS):
-                        changed = False
-                        for vi in range(ap_nv):
-                            if ap_elev[vi] is None:
-                                continue
-                            if not ap_neighbors[vi]:
-                                continue
-                            cur = ap_elev[vi]
-                            new_e = cur
-                            for (ni, dist) in ap_neighbors[vi]:
-                                if ap_elev[ni] is None:
-                                    continue
-                                max_rise = dist * MAX_APRON_GRADE
-                                ne = ap_elev[ni]
-                                if cur > ne + max_rise:
-                                    new_e = min(new_e, ne + max_rise)
-                                elif cur < ne - max_rise:
-                                    new_e = max(new_e, ne - max_rise)
-                            if abs(new_e - cur) > 0.001:
-                                ap_elev[vi] = new_e
-                                changed = True
-                        if not changed:
-                            break
-
-                    # Emit triangles
-                    for t in ap_tris:
-                        coords = t.exterior.coords[:-1]
-                        if len(coords) != 3:
-                            continue
-                        t_elevs = []
-                        t_lls = []
-                        for c in coords:
-                            key = (round(c[0], 2), round(c[1], 2))
-                            vi = ap_vmap[key]
-                            e = (ap_elev[vi]
-                                 if ap_elev[vi] is not None
-                                 else centroid_elev)
-                            t_elevs.append(round(e, 1))
-                            tlon, tlat = to_ll(c[0], c[1])
-                            t_lls.append((tlat, tlon))
-                        _emit_triangle(
-                            t_lls[0][0], t_lls[0][1], t_elevs[0],
-                            t_lls[1][0], t_lls[1][1], t_elevs[1],
-                            t_lls[2][0], t_lls[2][1], t_elevs[2],
-                        )
-                    # Record the apron polygon as emitted (at average
-                    # elevation for overlap tracking purposes)
-                    avg_e = (sum(sample_elevs) / len(sample_elevs)
-                             if sample_elevs else centroid_elev)
-                    emitted_flat_shapes.append(
-                        (piece, round(avg_e, 1)))
-                except Exception:
-                    # Fallback: emit flat at average elevation
-                    avg_e = (sum(sample_elevs) / len(sample_elevs)
-                             if sample_elevs else centroid_elev)
-                    try:
-                        ring_ll = [to_ll(mx, my)
-                                   for mx, my in piece.exterior.coords]
-                        _emit_flat_poly(ring_ll, round(avg_e, 1))
-                        emitted_flat_shapes.append(
-                            (piece, round(avg_e, 1)))
-                    except Exception:
-                        pass
-            n_apron_complex += 1
-        else:
-            # Simple apron: emit flat at centroid elevation
-            polys = ([clipped] if clipped.geom_type == "Polygon"
-                     else list(clipped.geoms)
-                     if hasattr(clipped, "geoms") else [])
-            for piece in polys:
-                if piece.is_empty or not hasattr(piece, "exterior"):
-                    continue
-                if piece.area < 10.0:
-                    continue
+            if not tris:
+                # Degenerate fallback: emit the piece as a flat
+                # polygon at the average anchor elevation (or DEM
+                # centroid if no anchors).
+                if anchors:
+                    avg_e = sum(a[2] for a in anchors) / len(anchors)
+                else:
+                    cx_m, cy_m = piece.centroid.x, piece.centroid.y
+                    avg_e = _dem_at(cx_m, cy_m) or 0.0
                 ring_ll = [to_ll(mx, my)
                            for mx, my in piece.exterior.coords]
-                e = round(centroid_elev, 1)
-                _emit_flat_poly(ring_ll, e)
-                emitted_flat_shapes.append((piece, e))
-                n_apron_flat += 1
+                _emit_flat_poly(ring_ll, round(avg_e, 1))
+                emitted_flat_shapes.append((piece, round(avg_e, 1)))
+                n_apron += 1
+                continue
 
-    UI.vprint(2, "    {}: {} flat apron polys, {} complex aprons "
-              "(→ triangulation)".format(
-                  icao, n_apron_flat, n_apron_complex))
+            # Emit each triangle from the adaptive mesh.
+            avg_e = (sum(v[2] for t in tris for v in t)
+                     / (3.0 * len(tris)))
+            for (v0, v1, v2) in tris:
+                lon0, lat0 = to_ll(v0[0], v0[1])
+                lon1, lat1 = to_ll(v1[0], v1[1])
+                lon2, lat2 = to_ll(v2[0], v2[1])
+                _emit_triangle(
+                    lat0, lon0, round(v0[2], 1),
+                    lat1, lon1, round(v1[2], 1),
+                    lat2, lon2, round(v2[2], 1))
+                n_apron_tris += 1
+            # Record the apron piece for emitted_flat_shapes overlap
+            # tracking — the actual emission was a triangle set, but
+            # the overlap accumulator only needs a footprint and a
+            # representative elevation.
+            emitted_flat_shapes.append((piece, round(avg_e, 1)))
+            complex_apron_parts_m.append(piece)
+            n_apron += 1
+
+    UI.vprint(2, "    {}: {} apron pieces emitted as {} triangles"
+              " (adaptive mesh, no CIFP anchors)".format(
+                  icao, n_apron, n_apron_tris))
+    # Legacy variables that downstream code still reads:
+    n_apron_flat = 0          # all aprons go through the unified
+    n_apron_complex = n_apron #   adaptive path now
 
     # C3: Building flat pads — clip against runways + taxiways so pads
     # don't overlap pavement shapes.  Buildings CAN nest inside aprons
