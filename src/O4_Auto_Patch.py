@@ -2159,11 +2159,25 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     if building_polys_m else shp_geom.Polygon())
 
     # A4b: Merge nearby buildings — absorb gate protuberances into
-    # the main terminal shape. At SPJC and similar airports, the
+    # the main terminal shape.  At SPJC and similar airports, the
     # terminal has small protuberances for gates that create tiny
-    # shapes overlapping the surrounding apron area. By merging
-    # them, we get one clean terminal shape.
-    BLDG_MERGE_DIST = 15.0  # meters — merge buildings within this distance
+    # shapes overlapping the surrounding apron area.  By merging
+    # them into the parent terminal, the result is one clean shape
+    # with real concavities preserved.
+    #
+    # Critical invariants (do NOT regress):
+    #   * Merge zone is measured from the *original* terminal footprint
+    #     (term_buf is computed once before the inner loop) — never from
+    #     the growing union, otherwise each absorption expands reach and
+    #     the merge snowballs across the airfield.
+    #   * The merged result is the *unary union* (concavities and all),
+    #     NEVER the convex hull, which produces a giant blob that
+    #     swallows aprons and unrelated buildings inside the hull.
+    BLDG_MERGE_DIST = 8.0   # meters — gate protuberances within this
+                            # radius of the ORIGINAL terminal footprint
+                            # are absorbed.  Tuned for SPJC; smaller
+                            # than the legacy 15 m default to prevent
+                            # over-aggressive merging.
     if len(building_polys_m) > 1:
         bldg_areas = [(bp.area, i) for i, bp in enumerate(building_polys_m)
                        if not bp.is_empty]
@@ -2172,25 +2186,49 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         for _, term_idx in bldg_areas:
             if term_idx in absorbed:
                 continue
-            terminal = building_polys_m[term_idx]
-            if terminal.area < 500.0:
+            original_terminal = building_polys_m[term_idx]
+            if original_terminal.area < 500.0:
                 continue
-            term_buf = terminal.buffer(BLDG_MERGE_DIST)
-            merged_any = False
+            # Reach measured from the ORIGINAL footprint, never the
+            # growing union — single-pass, no snowball.
+            term_buf = original_terminal.buffer(BLDG_MERGE_DIST)
+            to_merge = [original_terminal]
             for _, other_idx in bldg_areas:
                 if other_idx == term_idx or other_idx in absorbed:
                     continue
                 other = building_polys_m[other_idx]
                 if term_buf.intersects(other):
-                    terminal = terminal.union(other)
+                    to_merge.append(other)
                     absorbed.add(other_idx)
-                    merged_any = True
-            if merged_any:
-                terminal = terminal.convex_hull
-                terminal = terminal.simplify(
+            if len(to_merge) > 1:
+                # unary_union keeps the actual outline (concavities
+                # intact); simplify trims OSM micro-jitter.  No convex
+                # hull anywhere — that would swallow apron area.
+                merged = shp_ops.unary_union(to_merge)
+                # Buildings within BLDG_MERGE_DIST of the original
+                # terminal may not touch each other directly — the
+                # union is then a MultiPolygon.  Bridge those sub-
+                # BLDG_MERGE_DIST gaps with a morphological closing so
+                # the result is one connected outline.  Buffer/unbuffer
+                # by half the merge distance + small epsilon: any gap
+                # of ≤ BLDG_MERGE_DIST gets filled, outer boundary
+                # returns to its original shape (within shapely
+                # precision).
+                if hasattr(merged, "geoms"):
+                    eps = BLDG_MERGE_DIST / 2.0 + 0.5
+                    merged = merged.buffer(
+                        eps, join_style=2, mitre_limit=2.0).buffer(
+                        -eps, join_style=2, mitre_limit=2.0)
+                # If still multi (very wide separation), take the
+                # largest component containing the original terminal.
+                if hasattr(merged, "geoms"):
+                    merged = max(
+                        merged.geoms, key=lambda g: g.area)
+                merged = merged.simplify(
                     BLDG_SIMPLIFY, preserve_topology=True)
-                if terminal.is_valid and not terminal.is_empty:
-                    building_polys_m[term_idx] = terminal
+                if (merged.is_valid and not merged.is_empty
+                        and hasattr(merged, "exterior")):
+                    building_polys_m[term_idx] = merged
 
         if absorbed:
             new_polys = []
