@@ -155,21 +155,23 @@ Snowballs into 394 000 m² polygons at SPJC that swallow the airfield.
 with `unary_union().simplify(BLDG_SIMPLIFY)` so the terminal keeps its
 real concavities.
 
-### 2. `generate_patch_osm()` emits one rect per runway
-The runway-only entry point used as the baseline by Phase 0 emits a
-single sloped rectangle from physical end to physical end, losing all
-DEM-driven undulation and ignoring displaced thresholds.
-**Fix:** port the segmented runway sample chain from the experimental
-`O4_Surface_Patch._build_runway_segments` — DEM samples every
-`RUNWAY_SEGMENT_LENGTH` (100 m), CIFP anchors at displaced thresholds
-+ physical ends, two-pass relaxation (hard 1.5 % cap + FAA
-vertical-curve rate-of-change `L ≥ 30 m per 1 % of grade change`,
-then re-cap).
+### ~~2. `generate_patch_osm()` emits one rect per runway~~ (already fixed)
+**Verified incorrect.**  The legacy `generate_patch_osm()` already
+samples DEM at `RUNWAY_SEGMENT_LENGTH` (100 m) intervals, anchors
+CIFP elevations at displaced thresholds + physical ends, applies
+per-segment grade relaxation, and emits per-segment rectangles plus
+flat overruns.  At SPJC it produces 73 segmented runway ways (66
+sloped, 7 flat overruns) with elevations covering 5.9–32.2 m and
+49 unique values.  The previous-session note claiming "one rect per
+runway" was looking at an even-older version, or confused this
+function with something else.  No fix needed.
 
-### 3. No FAA vertical-curve rule
-Same as #2 — the legacy doesn't apply
-`MAX_GRADE_CHANGE_PER_M = 1/3000` between adjacent runway segments.
-Lands together with the runway segment fix.
+### 3. ~~No FAA vertical-curve rule~~ (added in commit 3)
+The legacy didn't apply `MAX_GRADE_CHANGE_PER_M = 1/3000` between
+adjacent runway segments.  At the legacy's 100 m segment length and
+1.5 % grade cap the rule is auto-satisfied, so this pass is mostly
+defensive — but it's now in place so any future tightening of segment
+length or grade cap stays compliant.  **Done in commit 3.**
 
 ### 4. IDW elevation falloff returns 0 m beyond radius
 The legacy `_idw_elev` (or its inline equivalent in the CIFP surface
@@ -177,10 +179,11 @@ model) zeros out vertices beyond `IDW_RADIUS`, causing runaway-low
 drainage shapes.  **Fix:** add a nearest-anchor fallback that returns
 the closest anchor's elevation when no anchor falls within radius.
 
-### 5. Displaced threshold positions not anchored as samples
-The runway segment builder needs to insert the displaced-threshold
-fraction (`displaced_m / phys_dist`) into its sample list and mark
-those samples as anchored at the CIFP elevation.  Lands with #2.
+### ~~5. Displaced threshold positions not anchored as samples~~ (already fixed)
+**Verified incorrect.**  `generate_patch_osm()` already inserts the
+displaced-threshold fraction into the sample chain (lines ~558-566)
+and seeds it with the CIFP elevation in the anchor branch (lines
+~575-601).  No fix needed.
 
 ### 6. Plane fit / centroid math uses absolute meter coordinates
 At tropical latitudes `|x| ≈ 8 × 10⁶`, which blows the condition

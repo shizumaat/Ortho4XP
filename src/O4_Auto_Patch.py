@@ -610,35 +610,97 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None):
                     sample_pts.append((s_lat, s_lon, interp, False))
 
             # ── Grade-limited smoothing ──────────────────────────────────
-            # Ensure no segment exceeds 1.75% grade while preserving
-            # the DEM's natural contour (dips, rises) and anchoring
-            # CIFP threshold elevations.
+            # Two passes:
+            #   1. Hard cap on per-segment longitudinal grade
+            #      (MAX_RUNWAY_GRADE = 1.5 % per FAA AC 150/5300-13B
+            #      and EASA CS-ADR-DSN for Code 3-4 / Cat C-E runways).
+            #   2. Vertical-curve rate-of-change cap
+            #      (MAX_GRADE_CHANGE_PER_M = 1/3000): the FAA rule
+            #      "L_min ≥ 30 m per 1 % of grade change" means the
+            #      change in grade between adjacent segments must be
+            #      ≤ MAX_GRADE_CHANGE_PER_M × average_segment_length.
+            #   3. Re-cap pass — the rate-of-change pass can push some
+            #      segments past the absolute cap; tidy it up.
+            #
+            # CIFP-anchored samples (displaced thresholds + physical
+            # ends) are immutable — they never move during relaxation.
             elevs = [s[2] for s in sample_pts]
             anchored = [s[3] for s in sample_pts]
 
-            for _iteration in range(GRADE_RELAX_ITERATIONS):
+            def _pass_hard_cap():
+                for _it in range(GRADE_RELAX_ITERATIONS):
+                    changed = False
+                    for idx in range(len(elevs)):
+                        if anchored[idx]:
+                            continue
+                        for nidx in (idx - 1, idx + 1):
+                            if nidx < 0 or nidx >= len(elevs):
+                                continue
+                            seg_dist = (
+                                abs(fractions[nidx] - fractions[idx])
+                                * phys_dist)
+                            if seg_dist < 0.1:
+                                continue
+                            max_rise = seg_dist * MAX_RUNWAY_GRADE
+                            if elevs[idx] > elevs[nidx] + max_rise:
+                                elevs[idx] = elevs[nidx] + max_rise
+                                changed = True
+                            elif elevs[idx] < elevs[nidx] - max_rise:
+                                elevs[idx] = elevs[nidx] - max_rise
+                                changed = True
+                    if not changed:
+                        return
+
+            _pass_hard_cap()
+
+            # FAA vertical-curve rate-of-change pass.  For each
+            # interior sample i (1..n-2):
+            #   g_left  = (e[i]   - e[i-1]) / L_left
+            #   g_right = (e[i+1] - e[i])   / L_right
+            #   |g_right - g_left| must be
+            #     ≤ MAX_GRADE_CHANGE_PER_M × ((L_left + L_right) / 2)
+            # If violated, push e[i] toward the value that exactly
+            # meets the constraint.  Anchored samples cannot move.
+            #
+            # At the default 100 m segment length and 1.5 % grade cap,
+            # this rule is automatically satisfied (max possible
+            # |Δgrade| is 3 % × 100 m / 100 m = 0.03, vs allowed
+            # 1/3000 × 100 = 0.0333), so this pass usually no-ops.
+            # It exists so that any future tightening of the segment
+            # length or grade cap stays compliant without code changes.
+            def _seg_len(i):
+                return abs(fractions[i + 1] - fractions[i]) * phys_dist
+
+            for _it in range(GRADE_RELAX_ITERATIONS):
                 changed = False
-                for idx in range(len(elevs)):
-                    if anchored[idx]:
+                for i in range(1, len(elevs) - 1):
+                    if anchored[i]:
                         continue
-                    for nidx in [idx - 1, idx + 1]:
-                        if nidx < 0 or nidx >= len(elevs):
-                            continue
-                        # Distance between this point and neighbor
-                        f1 = fractions[idx]
-                        f2 = fractions[nidx]
-                        seg_dist = abs(f2 - f1) * phys_dist
-                        if seg_dist < 0.1:
-                            continue
-                        max_rise = seg_dist * MAX_RUNWAY_GRADE
-                        if elevs[idx] > elevs[nidx] + max_rise:
-                            elevs[idx] = elevs[nidx] + max_rise
-                            changed = True
-                        elif elevs[idx] < elevs[nidx] - max_rise:
-                            elevs[idx] = elevs[nidx] - max_rise
-                            changed = True
+                    ll = _seg_len(i - 1)
+                    lr = _seg_len(i)
+                    if ll < 0.1 or lr < 0.1:
+                        continue
+                    g_left = (elevs[i] - elevs[i - 1]) / ll
+                    g_right = (elevs[i + 1] - elevs[i]) / lr
+                    max_dg = MAX_GRADE_CHANGE_PER_M * ((ll + lr) / 2.0)
+                    dg = g_right - g_left
+                    if abs(dg) <= max_dg:
+                        continue
+                    # Solve elevs[i] s.t. dg = ±max_dg
+                    target_dg = max_dg if dg > 0 else -max_dg
+                    denom = 1.0 / lr + 1.0 / ll
+                    new_e = (elevs[i + 1] / lr
+                             + elevs[i - 1] / ll
+                             - target_dg) / denom
+                    if abs(new_e - elevs[i]) > 0.001:
+                        elevs[i] = new_e
+                        changed = True
                 if not changed:
                     break
+
+            # Re-apply the hard cap in case the rate-of-change pass
+            # pushed any segment past the absolute grade limit.
+            _pass_hard_cap()
 
             # ── Emit segmented rectangles ────────────────────────────────
             for idx in range(len(sample_pts) - 1):
@@ -1641,6 +1703,15 @@ MAX_TAXIWAY_GRADE = 0.015     # 1.5% max longitudinal grade for taxiways
 MAX_APRON_GRADE = 0.010       # 1.0% max grade in any direction for aprons
 MAX_SURFACE_GRADE = 0.015     # 1.5% general transition grade limit
 MAX_RUNWAY_GRADE = 0.015      # 1.5% max longitudinal grade for runways (Cat C-E)
+
+# FAA AC 150/5300-13B vertical-curve rule for runways and taxiways:
+#   L_min = 30 m × (Δgrade as % per 1%) = (Δgrade × 100) × 30 m
+# i.e. a 1.0% grade change requires at least 30 m of vertical curve, so
+# the maximum allowable change in grade per metre of pavement is 1/3000.
+# Used as a second relaxation pass after the hard MAX_RUNWAY_GRADE cap
+# (see generate_patch_osm).
+MAX_GRADE_CHANGE_PER_M = 1.0 / 3000.0  # ≈ 0.0333% per metre
+
 GRADE_RELAX_ITERATIONS = 80   # iterations for the elevation solver (increased)
 TAXIWAY_BUFFER_WIDTH = 12.0   # meters half-width for taxiway surface area
 APRON_BUFFER = 5.0            # meters extra buffer around aprons
