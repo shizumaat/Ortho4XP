@@ -2027,13 +2027,52 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     all_emitted_parts_m = []  # list of Shapely geoms
 
     def _emitted_union():
-        """Return the union of all emitted shapes so far."""
+        """Return the union of all emitted shapes so far.
+
+        Defensively handles invalid geometries: if a straight
+        unary_union fails (TopologicalError on a self-intersecting
+        polygon, etc.), we run buffer(0) on each part to clean it
+        up and retry.  Returning an empty Polygon on failure means
+        Phase E and Phase F downstream would emit *everywhere* in
+        the airport footprint, defeating the no-overlap invariant.
+        """
         if not all_emitted_parts_m:
             return shp_geom.Polygon()
         try:
             return shp_ops.unary_union(all_emitted_parts_m)
         except Exception:
+            pass
+        # Retry with cleaned polygons.
+        cleaned = []
+        for p in all_emitted_parts_m:
+            try:
+                if p.is_empty:
+                    continue
+                if p.is_valid:
+                    cleaned.append(p)
+                else:
+                    fixed = p.buffer(0)
+                    if fixed.is_valid and not fixed.is_empty:
+                        cleaned.append(fixed)
+            except Exception:
+                pass
+        if not cleaned:
             return shp_geom.Polygon()
+        try:
+            return shp_ops.unary_union(cleaned)
+        except Exception:
+            # As a last resort, return a unary_union of just the
+            # bounds of every part.  Coarse but never empty.
+            try:
+                from shapely.geometry import box
+                bboxes = []
+                for p in cleaned:
+                    if not p.is_empty:
+                        b = p.bounds
+                        bboxes.append(box(*b))
+                return shp_ops.unary_union(bboxes)
+            except Exception:
+                return shp_geom.Polygon()
 
     # ── Road geometry for terrain anchoring ───────────────────────
     road_lines_m = []    # [(LineString_m, highway_type, tunnel, bridge), ...]
@@ -3721,6 +3760,13 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         return _sparsify_anchors(raw, JUNCTION_ANCHOR_GAP_M)
 
     total_tri = 0
+    emitted_triangle_polys_m = []   # actual triangle polygons in
+                                    # meter space, fed into
+                                    # all_emitted_parts_m so Phase
+                                    # E/F's _emitted_union() sees
+                                    # the precise triangulated
+                                    # geometry (not the abstract
+                                    # triangle_zone, which can drift)
     # Pre-compute the unions that will be subtracted from each
     # component (also re-subtracted after per-component simplify so
     # the simplified outline can't drift over an adjacent painted
@@ -3801,6 +3847,18 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                             lat1, lon1, round(v1[2], 1),
                             lat2, lon2, round(v2[2], 1))
                         total_tri += 1
+                        # Record the actual triangle for the
+                        # downstream emit accumulator.
+                        try:
+                            tri_poly = shp_geom.Polygon(
+                                [(v0[0], v0[1]),
+                                 (v1[0], v1[1]),
+                                 (v2[0], v2[1])])
+                            if (tri_poly.is_valid
+                                    and not tri_poly.is_empty):
+                                emitted_triangle_polys_m.append(tri_poly)
+                        except Exception:
+                            pass
             if total_tri:
                 UI.vprint(2, "    {}: {} junction triangles "
                           "(adaptive mesh)".format(icao, total_tri))
@@ -3808,14 +3866,21 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     n_twy_shapes = n_twy_flat + n_twy_sloped
 
     # ── Accumulate ALL emitted shapes so far (Phases C + D) ──────
+    # Phase E (boundary band) and Phase F (drainage) call
+    # _emitted_union() to subtract everything that's already been
+    # painted.  We feed it the actual triangle polygons (not the
+    # abstract triangle_zone) so the union is precise: drainage and
+    # boundary bands can't accidentally land on top of a Phase D
+    # triangle just because the zone calculation drifted.
     for s_poly, _ in emitted_flat_shapes:
         if not s_poly.is_empty:
             all_emitted_parts_m.append(s_poly)
     for q in emitted_twy_quads_m:
         if not q.is_empty:
             all_emitted_parts_m.append(q)
-    if not triangle_zone.is_empty:
-        all_emitted_parts_m.append(triangle_zone)
+    for tri_poly in emitted_triangle_polys_m:
+        if not tri_poly.is_empty:
+            all_emitted_parts_m.append(tri_poly)
     if not rwy_union_m.is_empty:
         all_emitted_parts_m.append(rwy_union_m)
 

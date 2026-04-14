@@ -192,9 +192,21 @@ def _find_anchor_at(x: float, y: float, anchors: Sequence[Anchor],
 def _seed_vertices(polygon: shp_geom.Polygon,
                    anchors: Sequence[Anchor],
                    sample_dem: DemSampler) -> _VertexBag:
-    """Build the initial vertex bag: polygon exterior vertices + any
-    interior anchor points.  Polygon vertices that coincide with an
-    anchor adopt that anchor's elevation; otherwise they sample DEM.
+    """Build the initial vertex bag: polygon exterior + interior
+    ring (hole) vertices + any interior anchor points.
+
+    Polygon vertices that coincide with an anchor adopt that
+    anchor's elevation; otherwise they sample DEM.
+
+    INTERIOR RING vertices are critical: a polygon with holes (e.g.
+    a junction zone with building-shaped holes carved by
+    ``difference``) needs hole vertices in the triangulation seed,
+    or Delaunay produces large triangles that span across the holes.
+    The centroid-based clip in :func:`_delaunay_clipped` only rejects
+    triangles whose centroid lands inside a hole — large triangles
+    whose centroid is elsewhere still cover the hole geometry.
+    Adding hole vertices forces Delaunay to wrap the hole tightly so
+    the centroid check works.
     """
     bag = _VertexBag()
     for x, y in polygon.exterior.coords[:-1]:
@@ -205,6 +217,16 @@ def _seed_vertices(polygon: shp_geom.Polygon,
             dem_z = sample_dem(x, y)
             bag.add(x, y, dem_z if dem_z is not None else 0.0,
                     anchored=False)
+    # Interior ring (hole) vertices.
+    for hole in polygon.interiors:
+        for x, y in hole.coords[:-1]:
+            anc_z = _find_anchor_at(x, y, anchors, EPS_DUP_M)
+            if anc_z is not None:
+                bag.add(x, y, anc_z, anchored=True)
+            else:
+                dem_z = sample_dem(x, y)
+                bag.add(x, y, dem_z if dem_z is not None else 0.0,
+                        anchored=False)
     # Interior anchor points (e.g. a taxiway centerline crossing an
     # apron's middle).
     for ax, ay, az in anchors:
