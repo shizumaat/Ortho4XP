@@ -19,3 +19,6 @@ venv*/
 **/*.swp
 .last_gui_params.txt
 .DS_Store
+Ortho4XP.cfg
+Patches/
+mnt/

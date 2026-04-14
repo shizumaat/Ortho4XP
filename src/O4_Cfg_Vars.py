@@ -105,9 +105,20 @@ cfg_app_vars = {
         "default": "",
         "hint": "If sceneries with overlays are not found in custom_overlay_src, set an alternate directory to search.",
     },
+    "cifp_data_path": {
+        "type": str,
+        "default": "",
+        "hint": "Path to CIFP/AIRAC aeronautical data directory (contains .dat files per airport). If empty, Ortho4XP will look in your X-Plane installation under 'Custom Data/CIFP/'. Set this to use a different data source such as Navigraph.",
+    },
 }
 
 cfg_tile_vars = {
+    # Auto-patch
+    "auto_patch": {
+        "type": bool,
+        "default": True,
+        "hint": "When enabled, Ortho4XP auto-generates runway slope patches from CIFP/AIRAC data for airports with available data. Auto-patches provide accurate threshold-anchored elevation profiles and are overridden by any manual patches.",
+    },
     # Vector
     "apt_smoothing_pix": {
         "type": int,
@@ -369,13 +380,15 @@ list_app_vars = [
     "custom_scenery_dir",
     "custom_overlay_src",
     "custom_overlay_src_alternate",
+    "cifp_data_path",
 ]
 
-gui_app_vars_short = list_app_vars[:-3]
+gui_app_vars_short = list_app_vars[:-4]
 
-gui_app_vars_long = list_app_vars[-3:]
+gui_app_vars_long = list_app_vars[-4:]
 
 list_vector_vars = [
+    "auto_patch",
     "apt_smoothing_pix",
     "road_level",
     "road_banking_limit",

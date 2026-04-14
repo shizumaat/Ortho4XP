@@ -1047,11 +1047,11 @@ def encode_runways_taxiways_and_aprons(
         apt = dico_airports[airport]
         total_rwy += len(apt["runway"][1] + apt["runway"][2])
         total_taxi += len(apt["taxiway"][1])
-        # First build the altitude generator function : that is a number of 
-        # least square polynomial approximations of altitudes along ways 
-        # (runways, taxiways, etc). These will be used later approriately 
-        # weighted all together in order to give altitudes to any node in a 
-        # runway or taxiway (this weighting is highly important to avoid 
+        # First build the altitude generator function : that is a number of
+        # least square polynomial approximations of altitudes along ways
+        # (runways, taxiways, etc). These will be used later approriately
+        # weighted all together in order to give altitudes to any node in a
+        # runway or taxiway (this weighting is highly important to avoid
         # steppint effects close to intersections)
         alt_idx = index.Index()
         alt_dico = {}
@@ -1090,7 +1090,7 @@ def encode_runways_taxiways_and_aprons(
         # Now that alt_gen is filled, we may proceed to encoding
         pols = (
             []
-        )  
+        )
         # Keep track of encoded pols to later plant seeds inside crossings etc
         ## First runways
         # First runways as lines
@@ -1281,8 +1281,8 @@ def encode_runways_taxiways_and_aprons(
                     numpy.hstack([way, alti_way]), "TAXIWAY", check=True
                 )
             seeds["TAXIWAY"].append(numpy.array(pol.representative_point().coords[0]))
-        ## Try to bring some aprons with, we are looking for the small ones 
-        # along runways, you just need to add the 'include' tag to that apron 
+        ## Try to bring some aprons with, we are looking for the small ones
+        # along runways, you just need to add the 'include' tag to that apron
         # in JOSM (local copy)
         for wayid in apt["apron"][1]:
             if (

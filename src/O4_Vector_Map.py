@@ -12,6 +12,8 @@ import O4_Vector_Utils as VECT
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Airport_Utils as APT
+import O4_Auto_Patch as AUTOPATCH
+import O4_Config_Utils as CFG
 
 good_imagery_list = ()
 
@@ -212,6 +214,84 @@ def include_airports(vector_map, tile):
         info_only=False,
     )
     APT.smooth_raster_over_airports(tile, dico_airports)
+    # Auto-generate runway, taxiway, and building patches from CIFP data +
+    # OSM geometry (before loading patches so include_patches() picks them up)
+    if tile.auto_patch:
+        cifp_path = CFG.cifp_data_path
+        if not cifp_path and CFG.custom_scenery_dir:
+            # Try X-Plane's default CIFP location relative to Custom Scenery
+            xplane_root = os.path.dirname(
+                os.path.normpath(CFG.custom_scenery_dir)
+            )
+            candidate = os.path.join(xplane_root, "Custom Data", "CIFP")
+            if os.path.isdir(candidate):
+                cifp_path = candidate
+        if cifp_path:
+            # Extract taxiway centerlines from OSM data for patch generation
+            taxiway_data = AUTOPATCH.extract_taxiway_info(
+                airport_layer, dico_airports, tile
+            )
+            # Download building data within 1km of each airport boundary
+            # (per-airport bbox so distant airports don't fill gaps)
+            building_layer = OSM.OSM_layer()
+            cached_bldg = FNAMES.osm_cached(
+                tile.lat, tile.lon, "apt_bldg_local"
+            )
+            if os.path.isfile(cached_bldg):
+                UI.vprint(
+                    1,
+                    "    * Recycling building data from", cached_bldg,
+                )
+                building_layer.update_dicosm(
+                    cached_bldg,
+                    {"n": [], "w": [("building", "")], "r": []},
+                    {"n": [], "w": [("building", "")], "r": []},
+                )
+            else:
+                apt_bboxes = AUTOPATCH.compute_airport_bboxes(
+                    dico_airports, tile, buffer_m=1000.0
+                )
+                for apt_key, apt_bbox in apt_bboxes:
+                    UI.vprint(
+                        1,
+                        "   Auto-patch: Building query for {}:"
+                        " S={:.4f} W={:.4f} N={:.4f} E={:.4f}".format(
+                            apt_key, *apt_bbox
+                        ),
+                    )
+                    OSM.OSM_query_to_OSM_layer(
+                        'way["building"]',
+                        apt_bbox,
+                        building_layer,
+                        tags_of_interest=["building"],
+                    )
+                if apt_bboxes:
+                    building_layer.write_to_file(cached_bldg)
+            building_data = AUTOPATCH.extract_building_info(
+                airport_layer, dico_airports, tile,
+                building_layer=building_layer,
+            )
+            # Load cached big roads for tunnel/road-aware terrain modeling
+            road_data = None
+            cached_roads = FNAMES.osm_cached(tile.lat, tile.lon, "big_roads")
+            if os.path.isfile(cached_roads):
+                road_osm_layer = OSM.OSM_layer()
+                road_osm_layer.update_dicosm(
+                    cached_roads,
+                    {"n": [], "w": [("highway", ""), ("tunnel", ""),
+                                    ("bridge", "")], "r": []},
+                    {"n": [], "w": [("highway", ""), ("tunnel", ""),
+                                    ("bridge", "")], "r": []},
+                )
+                road_data = AUTOPATCH.extract_road_info(
+                    dico_airports, tile, road_layer=road_osm_layer)
+            AUTOPATCH.generate_auto_patches(
+                tile, cifp_path,
+                taxiway_data=taxiway_data,
+                building_data=building_data,
+                dico_airports=dico_airports,
+                road_data=road_data,
+            )
     (patches_area, patches_list) = include_patches(vector_map, tile)
     runway_taxiway_apron_area = APT.encode_runways_taxiways_and_aprons(
         tile, airport_layer, dico_airports, vector_map, patches_list
@@ -651,9 +731,35 @@ def include_patches(vector_map, tile):
     patch_dir = FNAMES.patch_dir(tile.lat, tile.lon)
     if not os.path.exists(patch_dir):
         return (patches_area, patches_list)
-    for pfile_name in os.listdir(patch_dir):
-        if pfile_name[-10:] != ".patch.osm":
-            continue
+    # Sort patch files so manual patches are processed before auto patches.
+    # This ensures manual patches take priority: if a manual patch covers an
+    # airport, the corresponding _auto patch is skipped.
+    all_patch_files = [
+        f for f in os.listdir(patch_dir) if f[-10:] == ".patch.osm"
+    ]
+    manual_patches = [f for f in all_patch_files if "_auto.patch.osm" not in f]
+    auto_patches = [f for f in all_patch_files if "_auto.patch.osm" in f]
+    # Track which ICAO codes are covered by manual patches
+    manual_icao_codes = set()
+    for f in manual_patches:
+        base = f[:-10]  # strip .patch.osm
+        icao_prefix = base.split("_")[0].upper()
+        manual_icao_codes.add(icao_prefix)
+    # Process manual patches first, then auto patches
+    ordered_patch_files = manual_patches + auto_patches
+    for pfile_name in ordered_patch_files:
+        # Skip auto-patches for airports that have a manual patch
+        is_auto = "_auto.patch.osm" in pfile_name
+        if is_auto:
+            auto_icao = pfile_name.replace("_auto.patch.osm", "").upper()
+            if auto_icao in manual_icao_codes:
+                UI.vprint(
+                    1,
+                    "   Skipping auto-patch",
+                    pfile_name,
+                    "(manual patch exists).",
+                )
+                continue
         UI.vprint(1, "   Patching", pfile_name)
         patch_layer = OSM.OSM_layer()
         try:
@@ -665,6 +771,13 @@ def include_patches(vector_map, tile):
         except:
             UI.vprint(1, "     Error in treating", pfile_name, ", skipped.")
         patches_list.append(pfile_name[:-10])
+        # For auto-patches, also add the bare ICAO code so that
+        # encode_runways_taxiways_and_aprons() skips this airport.
+        # The auto-patch must handle the full airport surface because
+        # building flattening can create large DEM variances that the
+        # normal pipeline's DEM-based polynomial fitting can't account for.
+        if is_auto:
+            patches_list.append(auto_icao)
         dw = patch_layer.dicosmw
         dn = patch_layer.dicosmn
         df = patch_layer.dicosmfirst
@@ -708,6 +821,28 @@ def include_patches(vector_map, tile):
                         alti_way = numpy.ones((len(way), 1)) * numpy.mean(
                             tile.dem.alt_vec(way)
                         )
+                elif "node_altitudes" in wtags:
+                    # Per-node altitude: comma-separated elevation values,
+                    # one per node. Supports arbitrary polygon shapes with
+                    # individually specified elevations at each vertex.
+                    try:
+                        alts = [
+                            float(x)
+                            for x in wtags["node_altitudes"].split(",")
+                        ]
+                        if len(alts) == len(way):
+                            alti_way = numpy.array(alts).reshape(-1, 1)
+                        else:
+                            UI.vprint(
+                                1,
+                                "    node_altitudes count ({}) != node"
+                                " count ({}), using DEM.".format(
+                                    len(alts), len(way)
+                                ),
+                            )
+                            alti_way = alti_way_orig
+                    except Exception:
+                        alti_way = alti_way_orig
                 elif "altitude_high" in wtags:
                     cplx_way = True
                     if len(way) != 5 or (way[0] != way[-1]).all():
