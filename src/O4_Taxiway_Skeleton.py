@@ -64,7 +64,13 @@ from shapely.ops import linemerge, voronoi_diagram
 # Tunables
 DEFAULT_DENSIFY_STEP_M = 5.0
 DEFAULT_MIN_PATH_LENGTH_M = 50.0
-DEFAULT_SIMPLIFY_TOL_M = 3.0
+DEFAULT_SIMPLIFY_TOL_M = 5.0  # Aggressive centerline simplification
+                              # so a nearly-straight skeleton path
+                              # becomes a single long segment instead
+                              # of many short ones.  A 5 m centerline
+                              # deviation on a 30 m-wide taxiway is
+                              # 17 % of the width, still well inside
+                              # the polygon.
 _INTERIOR_SHRINK_M = 0.05
 
 

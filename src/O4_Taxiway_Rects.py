@@ -66,8 +66,13 @@ from shapely.geometry import Polygon
 DEFAULT_SAMPLE_SPACING_M = 20.0
 
 # RDP tolerance for collapsing adjacent samples into a single sloping
-# segment.  0.3 m ~ a gentle rise/fall below visual pixel threshold.
-DEFAULT_FIDELITY_TOL_M = 0.3
+# segment.  Per user direction: "unless there's more than 1 m
+# elevation change over a 30 m distance, simplify and combine".  A
+# 1 m RDP tolerance means a linear fit between two break-points is
+# kept as long as every interior sample is within 1 m of the fit,
+# so a 300 m straight taxiway with gentle DEM variation collapses
+# to ONE rect.  This is the primary lever for "minimum shapes".
+DEFAULT_FIDELITY_TOL_M = 1.0
 
 # Fit-ratio threshold below which the polygon is too irregular to
 # approximate with an MRR-aligned rect chain.  0.80 handles simple

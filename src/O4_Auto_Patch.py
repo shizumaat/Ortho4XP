@@ -2894,7 +2894,9 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     try:
                         rc = _TR.build_rects_along_centerline(
                             ln, poly, _dem_at,
-                            max_grade=MAX_TAXIWAY_GRADE)
+                            max_grade=MAX_TAXIWAY_GRADE,
+                            seg_length=50.0,
+                            fidelity_tol=1.0)
                     except Exception:
                         rc = None
                     if not rc:
