@@ -3012,7 +3012,16 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                             ln, poly, _dem_at,
                             max_grade=MAX_TAXIWAY_GRADE,
                             seg_length=50.0,
-                            fidelity_tol=1.0,
+                            # Loose elevation fidelity: user
+                            # directive is "25-30 rects for all
+                            # taxiways at SPJC", so a single
+                            # straight skeleton segment should
+                            # usually emit ONE rect even with
+                            # typical DEM noise.  3 m tolerance
+                            # is still well inside the 1.5 %
+                            # grade budget at the 200 m+ segment
+                            # lengths we now produce.
+                            fidelity_tol=3.0,
                             runway_polygon=rwy_union_raw_m,
                             runway_elev_lookup=_runway_elev_lookup)
                     except Exception:

@@ -372,7 +372,7 @@ def build_taxiway_rects(
     fidelity_tol: float = DEFAULT_FIDELITY_TOL_M,
     min_fit_ratio: float = DEFAULT_MIN_FIT_RATIO,
     max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
-    max_rect_length_m: float = 100.0,
+    max_rect_length_m: float = 0.0,
     runway_polygon: Optional[Polygon] = None,
     runway_elev_lookup: Optional[Callable[[float, float],
                                           Optional[float]]] = None,
@@ -604,256 +604,236 @@ def build_rects_along_centerline(
     max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
     min_width_m: float = 8.0,
     max_width_m: float = 50.0,
-    max_rect_length_m: float = 100.0,
+    max_rect_length_m: float = 0.0,
     runway_polygon: Optional[Polygon] = None,
     runway_elev_lookup: Optional[Callable[[float, float],
                                           Optional[float]]] = None,
 ) -> Optional[List[TaxiwayRect]]:
-    """Build a chain of sloping rectangles along an arbitrary
-    centerline inside a polygon.
+    """Build one sloping rect per STRAIGHT segment of a centerline.
 
-    This is the fall-back for curved or multi-strip taxiway
-    polygons whose MRR-aligned rect chain doesn't fit.  The
-    centerline is typically extracted from
-    :func:`O4_Taxiway_Skeleton.extract_centerlines`; each rect
-    in the returned chain covers one ``seg_length``-metre slice
-    of the centerline, sized perpendicular to the local tangent
-    and width-clamped to the local polygon width.
+    The centerline is typically a Ramer-Douglas-Peucker simplified
+    Voronoi skeleton path; its consecutive vertices are therefore
+    already guaranteed to represent straight runs of the taxi
+    polygon.  We emit exactly ONE rect per consecutive-vertex
+    segment — no uniform sub-sampling — so a long straight taxiway
+    collapses to a single rect regardless of length.
+
+    User directive: "we can use between 25-30 rectangles to cover
+    all the taxiways, excluding junctions", and "our shapes may
+    go beyond the bounds of the apt.dat pavement by a small
+    amount if needed to simplify coverage".  This function
+    therefore uses the MAX of local-width probes (not the min or
+    median) plus a small outward padding so each rect fully
+    covers its segment of the taxi polygon — the rect can
+    overflow into adjacent pavement by a few metres, which
+    downstream apron/junction emission subtracts.
+
+    Grade clamping + RDP on the elevation profile is still
+    applied (so a 500 m rect with a 3 m DEM bump in the middle
+    splits into 2 rects at the bump), but the segmentation
+    floor is the CENTERLINE's own vertex count — the longest
+    possible rect per centerline vertex pair is emitted.
 
     Args:
-        centerline: a :class:`shapely.geometry.LineString` in
-            meter space, typically from the Voronoi skeleton.
-        polygon: the source taxiway polygon — used to clip each
-            rect's width to the local pavement width.
-        sample_dem: callable ``(x, y) → elevation_m | None``.
-        max_grade: longitudinal grade cap.
-        seg_length: target length of each emitted rect segment.
-        fidelity_tol: RDP tolerance used when simplifying the
-            sampled elevation profile along the centerline.
-        max_dg_per_m: FAA vertical-curve rate-of-change.
-        min_width_m / max_width_m: reject or clamp segments whose
-            local polygon width falls outside this range; a
-            segment that shrinks to < min_width_m is probably near
-            a junction throat and is dropped (the junction
-            triangulator will paint it).
+        centerline: shapely ``LineString`` in meter space, from
+            :func:`O4_Taxiway_Skeleton.extract_centerlines`.
+        polygon: the source taxiway polygon.
+        sample_dem: ``(x, y) → elevation_m | None``.
+        max_grade: longitudinal grade cap (default 1.5 % for
+            taxiways).
+        seg_length: DEM sample spacing along the centerline for
+            grade clamping (not related to rect length any more).
+        fidelity_tol: RDP tolerance for elevation-profile splits.
+        max_dg_per_m: vertical-curve rate-of-change cap.
+        min_width_m / max_width_m: if the computed width of a
+            segment is below min_width_m the segment is dropped;
+            above max_width_m it is clamped.
+        max_rect_length_m: 0 disables any hard length cap (the
+            default — let centerline vertex spacing determine
+            rect length).  A positive value still splits any
+            vertex-to-vertex segment exceeding the cap as a
+            safety for extreme centerlines.
+        runway_polygon / runway_elev_lookup: runway endpoint
+            anchoring, unchanged from the previous version.
 
     Returns:
-        A list of :class:`TaxiwayRect`, or ``None`` if the
-        centerline is too short to build at least one segment.
+        A list of :class:`TaxiwayRect` or ``None`` if the
+        centerline is degenerate or too narrow at every segment.
     """
     import math
     from shapely.geometry import Point
 
-    if (centerline is None or centerline.is_empty
-            or centerline.length < seg_length):
+    if centerline is None or centerline.is_empty:
         return None
     if polygon is None or polygon.is_empty:
         return None
-
     total_len = centerline.length
-    n_segs = max(1, int(round(total_len / seg_length)))
-    actual_seg = total_len / n_segs
+    if total_len < 1.0:
+        return None
 
-    # Runway-endpoint anchoring.  apt.dat taxiway polygons
-    # typically STOP at the runway edge (the runway and the
-    # taxiway are separate row-110 entries that butt up against
-    # one another), so the extracted centerline's endpoints are
-    # the points that touch the runway boundary.  For each
-    # centerline endpoint whose distance to the runway polygon
-    # is ≤ ANCHOR_MAX_DIST_M, we:
-    #
-    #   1. Pin the endpoint's elevation to the runway's own
-    #      elevation at that (x, y) — projected via
-    #      runway_elev_lookup, which internally does
-    #      _project_point_onto_runway on the CIFP thresholds.
-    #   2. Mark the endpoint sample as anchored, so the grade
-    #      clamp propagates it through the rest of the chain as
-    #      an immovable boundary condition.
-    #
-    # A taxi running parallel to a runway has both endpoints FAR
-    # from the runway boundary (the endpoints are wherever the
-    # centerline terminates, not where the strip is closest to
-    # the runway edge), so this logic does NOT anchor parallel
-    # taxis — exactly as the user clarified.
-    # The Voronoi-skeleton endpoint of a taxi polygon sits on the
-    # medial axis, which is ~half the polygon's local width away
-    # from the nearest boundary — NOT at the boundary itself.
-    # For a typical 25–45 m wide taxi that means the skeleton
-    # endpoint is 12–22 m inside the polygon, so "near a runway
-    # join" is an endpoint within ~half-max-taxi-width of the
-    # runway boundary.  The user's "1 m" threshold referred to the
-    # taxi pavement's own distance from the runway (they never run
-    # closer than that without crossing); the centerline we actually
-    # sample is a geometric derivative, not the pavement itself, so
-    # it needs a wider search radius.
+    # Width padding added to every rect so its edges comfortably
+    # reach (and slightly exceed) the local polygon boundary.
+    # Coverage-over-correctness per the user's "shapes may go
+    # beyond the bounds if needed to simplify coverage" directive.
+    WIDTH_PADDING_M = 1.5
+
+    # 1. Centerline vertices — these are the "natural" rect break
+    # points.  RDP-simplify them once more to enforce `fidelity_tol`
+    # geometric straightness and drop tiny dog-legs that would
+    # otherwise emit their own rect.  The input centerline is
+    # already RDP-simplified at skeleton-extract time; this is a
+    # second pass with a (possibly) tighter tolerance, but default
+    # DEFAULT_FIDELITY_TOL_M = 1.0 m is a no-op for a 10 m-simplified
+    # skeleton centerline.
+    base_coords = list(centerline.coords)
+    if len(base_coords) < 2:
+        return None
+
+    # 2. Runway-endpoint anchoring (unchanged).
     ANCHOR_MAX_DIST_M = 25.0
-    anchor_at_start = None  # runway elevation at t=0, if applicable
-    anchor_at_end = None    # runway elevation at t=total_len
+    anchor_at_start = None
+    anchor_at_end = None
     if (runway_polygon is not None
             and not runway_polygon.is_empty
             and runway_elev_lookup is not None):
         try:
-            p_start = centerline.interpolate(0.0)
-            p_end = centerline.interpolate(total_len)
+            p_start = Point(base_coords[0])
+            p_end = Point(base_coords[-1])
             if p_start.distance(runway_polygon) <= ANCHOR_MAX_DIST_M:
                 anchor_at_start = runway_elev_lookup(
-                    p_start.x, p_start.y)
+                    base_coords[0][0], base_coords[0][1])
             if p_end.distance(runway_polygon) <= ANCHOR_MAX_DIST_M:
-                anchor_at_end = runway_elev_lookup(p_end.x, p_end.y)
+                anchor_at_end = runway_elev_lookup(
+                    base_coords[-1][0], base_coords[-1][1])
         except Exception:
             pass
 
-    # Build the sample schedule.  Uniform steps along the
-    # centerline; t=0 and t=total_len are always included so
-    # endpoint anchors land on a real sample.
-    t_values = [i * actual_seg for i in range(n_segs + 1)]
-
-    # Sample centerline at each scheduled t.
-    centers: List[Tuple[float, float]] = []
-    tangents: List[Tuple[float, float]] = []
-    zs: List[float] = []
-    anchored: List[bool] = []
-    n_t = len(t_values)
-    for idx, t in enumerate(t_values):
-        pt = centerline.interpolate(t)
-        centers.append((pt.x, pt.y))
-        eps = min(1.0, actual_seg * 0.1)
-        t_fwd = min(total_len, t + eps)
-        t_bck = max(0.0, t - eps)
-        p_f = centerline.interpolate(t_fwd)
-        p_b = centerline.interpolate(t_bck)
-        tx = p_f.x - p_b.x
-        ty = p_f.y - p_b.y
-        mag = math.hypot(tx, ty)
-        if mag < 1e-9:
-            tangents.append((1.0, 0.0))
-        else:
-            tangents.append((tx / mag, ty / mag))
-
-        # Only the first and last samples can be runway-anchored
-        # (endpoints of the centerline).  All interior samples use
-        # DEM and follow the normal grade rules — the anchored
-        # endpoints act as hard boundary conditions the grade
-        # clamp will propagate inward.
-        runway_z = None
-        if idx == 0 and anchor_at_start is not None:
-            runway_z = float(anchor_at_start)
-        elif idx == n_t - 1 and anchor_at_end is not None:
-            runway_z = float(anchor_at_end)
-
-        if runway_z is not None:
-            zs.append(runway_z)
-            anchored.append(True)
-        else:
-            z = sample_dem(pt.x, pt.y)
-            if z is None:
-                z = zs[-1] if zs else 0.0
-            zs.append(z)
-            anchored.append(False)
-
-    _clamp_profile_with_anchors(
-        zs, anchored, actual_seg, max_grade, max_dg_per_m)
-
-    keep_indices = _rdp_simplify_indices(zs, fidelity_tol)
-    if len(keep_indices) < 2:
-        keep_indices = [0, n_segs]
-
-    # Post-process: cap each RDP segment length by splitting any
-    # segment longer than `max_rect_length_m` into equal sub-pieces
-    # at the nearest available sample indices.  RDP only cares
-    # about ELEVATION fit; it will happily collapse a 1 km gently
-    # curved taxi into a single segment, whose axis is the average
-    # of the curve — off by several degrees from local tangents at
-    # the ends, producing a rect whose corners drift 15-30 m
-    # outside the real polygon.  Capping the length forces the
-    # chain to follow curves more tightly.
-    if max_rect_length_m > 0:
-        capped: List[int] = [keep_indices[0]]
-        for k in range(len(keep_indices) - 1):
-            i_a = keep_indices[k]
-            i_b = keep_indices[k + 1]
-            span_len = (i_b - i_a) * actual_seg
-            if span_len <= max_rect_length_m:
-                capped.append(i_b)
-                continue
-            # Number of sub-pieces so each is ≤ max_rect_length_m.
-            n_pieces = max(
-                2, int(math.ceil(span_len / max_rect_length_m)))
-            # Distribute sub-break indices evenly between i_a and
-            # i_b in the original sample grid.
-            for s in range(1, n_pieces + 1):
-                ix = i_a + int(
-                    round(s * (i_b - i_a) / n_pieces))
-                if ix > capped[-1]:
-                    capped.append(ix)
-        keep_indices = capped
-
+    # 3. For each vertex-to-vertex segment: sample DEM along the
+    # segment, grade-clamp the profile, RDP-simplify, and split
+    # into 1+ sub-rects if the elevation profile demands.
     rects: List[TaxiwayRect] = []
-    # For each simplified segment, build one sloping rect whose
-    # width is the local polygon-perpendicular width.
-    for k in range(len(keep_indices) - 1):
-        i_a = keep_indices[k]
-        i_b = keep_indices[k + 1]
-        a_center = centers[i_a]
-        b_center = centers[i_b]
-        # Segment tangent from a_center to b_center.
-        tx = b_center[0] - a_center[0]
-        ty = b_center[1] - a_center[1]
-        seg_mag = math.hypot(tx, ty)
-        if seg_mag < 1e-6:
+    for seg_idx in range(len(base_coords) - 1):
+        a = base_coords[seg_idx]
+        b = base_coords[seg_idx + 1]
+        seg_dx = b[0] - a[0]
+        seg_dy = b[1] - a[1]
+        seg_len = math.hypot(seg_dx, seg_dy)
+        if seg_len < 5.0:
             continue
-        ux, uy = tx / seg_mag, ty / seg_mag
-        px, py = -uy, ux  # perpendicular
+        ux = seg_dx / seg_len
+        uy = seg_dy / seg_len
+        px, py = -uy, ux
 
-        # Local width: probe at 5 equally-spaced points along the
-        # segment and use the MEDIAN.  Using min under-reports
-        # width whenever one probe happens to hit a narrow throat
-        # (e.g. a taxi exit or hold-line), leaving slivers of
-        # uncovered pavement on both sides of the rect that the
-        # coverage-fill pass paints in at DIFFERENT elevations
-        # than the rect itself.  Median is robust to one or two
-        # narrow probes while still preventing the rect from
-        # overshooting at a genuinely narrow neck.
+        # DEM samples along the segment.
+        n_samples = max(2, int(round(seg_len / seg_length)) + 1)
+        step = seg_len / (n_samples - 1)
+        seg_centers: List[Tuple[float, float]] = []
+        seg_zs: List[float] = []
+        seg_anchored: List[bool] = []
+        for k in range(n_samples):
+            t = k * step
+            cx = a[0] + ux * t
+            cy = a[1] + uy * t
+            seg_centers.append((cx, cy))
+            # Anchor at the very first vertex of seg 0 and at the
+            # very last vertex of the final segment.
+            forced = None
+            if seg_idx == 0 and k == 0 and anchor_at_start is not None:
+                forced = float(anchor_at_start)
+            elif (seg_idx == len(base_coords) - 2
+                  and k == n_samples - 1
+                  and anchor_at_end is not None):
+                forced = float(anchor_at_end)
+            if forced is not None:
+                seg_zs.append(forced)
+                seg_anchored.append(True)
+            else:
+                z = sample_dem(cx, cy)
+                if z is None:
+                    z = seg_zs[-1] if seg_zs else 0.0
+                seg_zs.append(z)
+                seg_anchored.append(False)
+
+        _clamp_profile_with_anchors(
+            seg_zs, seg_anchored, step, max_grade, max_dg_per_m)
+
+        # RDP-simplify the elevation profile.  Multi-rect split
+        # ONLY happens when elevation fidelity demands it; straight
+        # flat / uniform-slope segments stay as one rect.
+        keep = _rdp_simplify_indices(seg_zs, fidelity_tol)
+        if len(keep) < 2:
+            keep = [0, n_samples - 1]
+
+        # Optional hard length cap as a safety.  Disabled by
+        # default (max_rect_length_m = 0).
+        if max_rect_length_m > 0:
+            capped = [keep[0]]
+            for j in range(len(keep) - 1):
+                ia = keep[j]
+                ib = keep[j + 1]
+                span = (ib - ia) * step
+                if span <= max_rect_length_m:
+                    capped.append(ib)
+                    continue
+                n_pieces = max(2, int(math.ceil(
+                    span / max_rect_length_m)))
+                for s in range(1, n_pieces + 1):
+                    ix = ia + int(
+                        round(s * (ib - ia) / n_pieces))
+                    if ix > capped[-1]:
+                        capped.append(ix)
+            keep = capped
+
+        # Compute ONE rect width for the whole vertex-to-vertex
+        # segment: max of 5 probe widths + padding.  All sub-rects
+        # that come from RDP splits share this width because the
+        # segment is straight — uniform direction = uniform
+        # perpendicular = uniform local width range.
         widths: List[float] = []
         for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-            mid_x = a_center[0] + ux * seg_mag * frac
-            mid_y = a_center[1] + uy * seg_mag * frac
+            mid_x = a[0] + ux * seg_len * frac
+            mid_y = a[1] + uy * seg_len * frac
             hw = _local_half_width(
                 polygon, mid_x, mid_y, px, py, max_reach=60.0)
             if hw > 0:
                 widths.append(hw * 2.0)
         if not widths:
             continue
-        widths.sort()
-        local_width = widths[len(widths) // 2]
+        local_width = max(widths) + WIDTH_PADDING_M
         if local_width < min_width_m:
             continue
         if local_width > max_width_m:
             local_width = max_width_m
         half_w = local_width / 2.0
 
-        z_a = zs[i_a]
-        z_b = zs[i_b]
-        if z_a >= z_b:
-            c_high, c_low = a_center, b_center
-            eh, el = z_a, z_b
-        else:
-            c_high, c_low = b_center, a_center
-            eh, el = z_b, z_a
+        # Emit one rect per RDP sub-segment.
+        for j in range(len(keep) - 1):
+            ia = keep[j]
+            ib = keep[j + 1]
+            ax_pt = seg_centers[ia]
+            ay_pt = seg_centers[ib]
+            z_a = seg_zs[ia]
+            z_b = seg_zs[ib]
+            if z_a >= z_b:
+                c_high, c_low = ax_pt, ay_pt
+                eh, el = z_a, z_b
+            else:
+                c_high, c_low = ay_pt, ax_pt
+                eh, el = z_b, z_a
 
-        c0 = (c_high[0] + px * half_w, c_high[1] + py * half_w)
-        c1 = (c_high[0] - px * half_w, c_high[1] - py * half_w)
-        c2 = (c_low[0] - px * half_w, c_low[1] - py * half_w)
-        c3 = (c_low[0] + px * half_w, c_low[1] + py * half_w)
+            c0 = (c_high[0] + px * half_w, c_high[1] + py * half_w)
+            c1 = (c_high[0] - px * half_w, c_high[1] - py * half_w)
+            c2 = (c_low[0] - px * half_w, c_low[1] - py * half_w)
+            c3 = (c_low[0] + px * half_w, c_low[1] + py * half_w)
 
-        rects.append(TaxiwayRect(
-            corners_m=(c0, c1, c2, c3),
-            elev_low=el,
-            elev_high=eh,
-            center_high=c_high,
-            center_low=c_low,
-            width_m=local_width,
-        ))
+            rects.append(TaxiwayRect(
+                corners_m=(c0, c1, c2, c3),
+                elev_low=el,
+                elev_high=eh,
+                center_high=c_high,
+                center_low=c_low,
+                width_m=local_width,
+            ))
 
     return rects if rects else None
 

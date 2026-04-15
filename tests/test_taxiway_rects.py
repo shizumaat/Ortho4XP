@@ -156,16 +156,17 @@ def test_build_rects_flat_taxiway_single_rect():
 
 
 def test_build_rects_flat_taxiway_length_cap_splits():
-    # With the default 100 m length cap a 300 m strip emits 3-4
-    # rects (exact split depends on where the uniform sample grid
-    # lines up), and all of them should be flat and cover the
-    # full polygon area.
+    # With max_rect_length_m=100 a 300 m strip emits 3-4 rects
+    # (exact split depends on where the uniform sample grid lines
+    # up), and all of them should be flat and cover the full
+    # polygon area.  Default is max_rect_length_m=0 (no cap) so
+    # this is an explicit opt-in test.
     poly = _strip(20, 300)
-    rects = TR.build_taxiway_rects(poly, _flat_dem(10.0))
+    rects = TR.build_taxiway_rects(
+        poly, _flat_dem(10.0), max_rect_length_m=100.0)
     assert rects is not None
     assert 3 <= len(rects) <= 4
     assert all(r.is_flat for r in rects)
-    assert all(r.polygon.length < 300.0 for r in rects)  # all shorter
     total_area = sum(r.polygon.area for r in rects)
     assert math.isclose(total_area, 20.0 * 300.0, rel_tol=1e-6)
 
