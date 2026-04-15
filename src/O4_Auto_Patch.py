@@ -2734,13 +2734,46 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         # decision.  The raw per-pavement list lives in
         # dico_apt_entry["_apt_pavements"] (stashed by
         # _dico_from_apt_dat).
+        #
+        # apt.dat pavements are NOT disjoint in general: custom
+        # scenery packs commonly layer a giant "Base Ramp" underlay
+        # beneath named sub-ramps, and taxiway mega-polygons that
+        # concatenate many real taxiways into one row-110 entry
+        # routinely overlap those ramps.  To guarantee both
+        # (a) complete pavement coverage and (b) no cross-feature
+        # overlap, we run this two-pass pipeline:
+        #
+        #   Pass 1 — classify + probe: every polygon is classified
+        #   apron/taxiway.  Each TAXIWAY-classified polygon is
+        #   then probed by O4_Taxiway_Rects.build_taxiway_rects
+        #   with the same tunables Phase C0 will use.  If the
+        #   probe succeeds (fit ratio ≥ 0.80, strip-like shape),
+        #   the polygon is a "rectifiable taxiway" and is held
+        #   for C0 emission as sloping rects.  If it fails, it is
+        #   demoted to the apron pool — mega multi-taxiway blobs
+        #   and chunky non-strip shapes land here.
+        #
+        #   Pass 2 — union-and-diff: everything in the apron pool
+        #   is unioned to eliminate self-overlap ("Base Ramp" ∪
+        #   "Main Ramp" etc. collapse into one disjoint geometry).
+        #   The successful taxiway regions are subtracted from the
+        #   apron union so the Phase C0 rects and the C2
+        #   triangulation cover complementary ground with no
+        #   overlap.  Fallback taxiways never participate in the
+        #   subtract so their full area stays in the apron.
         try:
             import O4_Pavement_Classifier as _PC
+            import O4_Taxiway_Rects as _TR
         except Exception:
             _PC = None
+            _TR = None
         apt_pavements = dico_apt_entry.get("_apt_pavements") or []
         classify_counts = {"taxiway": 0, "apron": 0}
         classify_reasons = {}
+        rectifiable_twy_m = []    # survived build_taxiway_rects probe
+        rectifiable_twy_rects = []  # cached rect chains so C0 does
+                                    # not re-run the probe
+        pool_apron_m = []         # apron-classified OR fallback twy
         for (poly_tr, pav_name) in apt_pavements:
             if poly_tr is None or poly_tr.is_empty or not poly_tr.is_valid:
                 continue
@@ -2748,25 +2781,92 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             if p_m is None:
                 continue
             if _PC is None:
-                apron_polys_m.append(p_m)
+                pool_apron_m.append(p_m)
                 continue
             kind = _PC.classify_pavement_m(p_m, pav_name or "")
             classify_counts[kind.kind] = classify_counts.get(
                 kind.kind, 0) + 1
             classify_reasons[kind.reason] = classify_reasons.get(
                 kind.reason, 0) + 1
-            if kind.kind == "taxiway":
-                apt_twy_polys_m.append(p_m)
-            else:
-                apron_polys_m.append(p_m)
+            if kind.kind == "taxiway" and _TR is not None:
+                rects = _TR.build_taxiway_rects(
+                    p_m, _dem_at, max_grade=MAX_TAXIWAY_GRADE)
+                if rects:
+                    rectifiable_twy_m.append(p_m)
+                    rectifiable_twy_rects.append(rects)
+                    continue
+            pool_apron_m.append(p_m)
         UI.vprint(2,
             "    apt.dat pavement classification: "
-            "{} taxiway, {} apron  (reasons: {})".format(
+            "{} taxiway (of which {} rectifiable), {} apron  "
+            "(reasons: {})".format(
                 classify_counts.get("taxiway", 0),
+                len(rectifiable_twy_m),
                 classify_counts.get("apron", 0),
                 ", ".join("{}={}".format(k, v)
                           for k, v in sorted(classify_reasons.items()))))
+
+        # Union the rectifiable twy polygons and the apron pool
+        # separately.  Subtract the twy union from the apron union
+        # so the two sets are disjoint.  Break each union into its
+        # component polygons.
+        def _union_components(polys):
+            if not polys:
+                return []
+            try:
+                u = shp_ops.unary_union(polys)
+            except Exception:
+                return polys
+            if u.is_empty:
+                return []
+            if hasattr(u, "geoms"):
+                return [g for g in u.geoms
+                        if hasattr(g, "exterior") and not g.is_empty]
+            return [u] if hasattr(u, "exterior") else []
+
+        twy_union_all = (shp_ops.unary_union(rectifiable_twy_m)
+                         if rectifiable_twy_m else shp_geom.Polygon())
+
+        apron_union_all = (shp_ops.unary_union(pool_apron_m)
+                           if pool_apron_m else shp_geom.Polygon())
+        if not twy_union_all.is_empty and not apron_union_all.is_empty:
+            try:
+                apron_union_all = apron_union_all.difference(
+                    twy_union_all)
+            except Exception:
+                pass
+        if apron_union_all.is_empty:
+            apron_components = []
+        elif hasattr(apron_union_all, "geoms"):
+            apron_components = [g for g in apron_union_all.geoms
+                                if hasattr(g, "exterior")
+                                and not g.is_empty]
+        else:
+            apron_components = ([apron_union_all]
+                                if hasattr(apron_union_all, "exterior")
+                                else [])
+
+        # apt_twy_polys_m holds the rectifiable polygons (each
+        # associated with a pre-computed rect chain kept in a
+        # parallel list of lists).  Phase C0 iterates these in
+        # step and just emits the cached rects — no re-probe.
+        apt_twy_polys_m = rectifiable_twy_m
+        apt_twy_rect_chains = rectifiable_twy_rects
+        apron_polys_m = apron_components
+
+        UI.vprint(2,
+            "    apt.dat pavement deduplication: "
+            "rectifiable taxiway {:.0f} m² in {} components, "
+            "apron {:.0f} m² in {} components, "
+            "total {:.0f} m² (no self-overlap)".format(
+                sum(p.area for p in apt_twy_polys_m),
+                len(apt_twy_polys_m),
+                sum(p.area for p in apron_polys_m),
+                len(apron_polys_m),
+                sum(p.area for p in apt_twy_polys_m)
+                + sum(p.area for p in apron_polys_m)))
     else:
+        apt_twy_rect_chains = []
         # Legacy OSM path: one unified apron MultiPolygon, 5 m buffer.
         apron_data = dico_apt_entry.get("apron")
         if apron_data is not None:
@@ -2788,47 +2888,21 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # Phase C0: emit classified taxiway polygons as chains of
     # sloping rectangles.
     #
-    # Each apt_twy_polys_m entry is a strip-like pavement polygon
-    # (aspect ≥ 4, 9–45 m wide) whose surface is well approximated
-    # by an MRR-aligned rectangle.  O4_Taxiway_Rects.build_taxiway_rects
-    # slices the polygon's long axis into grade-clamped, DEM-
-    # faithful sloping rect segments; each segment is emitted here
-    # using _emit_sloped_rect (altitude_high/altitude_low tags, same
-    # format as runway segments).  Rects are tracked in
-    # emitted_taxi_rects_m so downstream phases (C2 apron, D
-    # junctions, E boundary band) subtract them cleanly.
-    #
-    # A polygon that fails build_taxiway_rects's fit-ratio gate
-    # (≥ 0.80) is considered too irregular and flows back through
-    # the apron triangulation path.
+    # Each apt_twy_polys_m entry is a rectifiable strip pavement
+    # polygon that already passed the build_taxiway_rects fit-
+    # ratio gate during Phase A3's probe pass.  The pre-computed
+    # rect chain is in apt_twy_rect_chains at the matching index,
+    # so we just emit each segment via _emit_sloped_rect and track
+    # the 4 meter-space corners in emitted_taxi_rects_m for
+    # downstream subtraction.
     emitted_taxi_rects_m = []
-    if apt_twy_polys_m:
-        try:
-            import O4_Taxiway_Rects as TR
-        except Exception:
-            TR = None
+    if apt_twy_polys_m and apt_twy_rect_chains:
         twy_rect_count = 0
         twy_flat_count = 0
-        twy_fallback_count = 0
-        for twy_poly in apt_twy_polys_m:
-            rects = (TR.build_taxiway_rects(
-                twy_poly, _dem_at,
-                max_grade=MAX_TAXIWAY_GRADE,
-            ) if TR is not None else None)
-            if rects is None:
-                # Polygon failed the strip-fit check — fall back
-                # to triangulation by pushing it into the apron
-                # pool.  This will be handled by the existing C2
-                # apron path.
-                apron_polys_m.append(twy_poly)
-                twy_fallback_count += 1
+        for twy_poly, rects in zip(apt_twy_polys_m, apt_twy_rect_chains):
+            if not rects:
                 continue
             for r in rects:
-                # Convert the 4 meter-space corners to lat/lon and
-                # emit via _emit_sloped_rect.  The rect is axis-
-                # aligned with the MRR long axis, so the high-end
-                # centerline endpoint and low-end centerline
-                # endpoint are the "a" and "b" of _emit_sloped_rect.
                 lon_hi, lat_hi = to_ll(r.center_high[0],
                                        r.center_high[1])
                 lon_lo, lat_lo = to_ll(r.center_low[0],
@@ -2840,17 +2914,13 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 twy_rect_count += 1
                 if r.is_flat:
                     twy_flat_count += 1
-                # Track in meter space for the emitted-parts
-                # accumulator.  Build a shapely polygon from the 4
-                # corners (the same ones _emit_sloped_rect built in
-                # lat/lon via runway_corners — close enough for
-                # subtraction).
                 try:
                     rp = shp_geom.Polygon(r.corners_m)
                     if rp.is_valid and not rp.is_empty:
                         emitted_taxi_rects_m.append(rp)
                 except Exception:
                     pass
+        twy_fallback_count = 0  # dedup pass already reclassified them
         if emitted_taxi_rects_m:
             all_emitted_parts_m.extend(emitted_taxi_rects_m)
             # Feed the rects into emitted_twy_quads_m so the later
@@ -2875,9 +2945,9 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             except Exception:
                 pass
         UI.vprint(2,
-            "    apt.dat taxiway rect-chain: {} rects ({} flat), "
-            "{} polygons fell back to triangulation".format(
-                twy_rect_count, twy_flat_count, twy_fallback_count))
+            "    apt.dat taxiway rect-chain: {} rects ({} flat) "
+            "over {} rectifiable polygons".format(
+                twy_rect_count, twy_flat_count, len(apt_twy_polys_m)))
 
     try:
         apron_union_m = shp_ops.unary_union(apron_polys_m) if apron_polys_m \
@@ -4070,13 +4140,11 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     seed_poly = piece
 
             anchors = _apron_anchors(seed_poly)
-            # apt.dat pavements lump taxiways, aprons, and ramps into
-            # one "pavement" category.  Per user direction we treat
-            # them all as taxiway for now (1.5 % grade) rather than
-            # the stricter 1.0 % apron grade — a finer name-based
-            # classification is a follow-up commit.
-            pavement_grade = (MAX_TAXIWAY_GRADE if apt_dat_used
-                              else MAX_APRON_GRADE)
+            # Taxiway-classified pavement is already handled by the
+            # Phase C0 rect-chain emission — anything reaching this
+            # apron triangulation loop is apron-classified and must
+            # respect the stricter 1.0 % apron grade rule.
+            pavement_grade = MAX_APRON_GRADE
             try:
                 tris = SM.adaptive_triangulate(
                     seed_poly, anchors, _dem_at,
@@ -4146,6 +4214,53 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     lat2, lon2, round(v2[2], 1))
                 n_apron_tris += 1
                 emitted_apron_triangles_m.append(tri_poly)
+
+            # Per-piece coverage sweep: adaptive_triangulate's
+            # centroid-in-polygon clip rejects triangles whose
+            # centroid lies just outside a concave bay even when
+            # 90 %+ of the triangle is inside, leaving bay slivers
+            # uncovered.  Compute the residue (piece minus emitted
+            # triangles for THIS piece) right here and emit it as
+            # one or more flat polygons at the piece's average
+            # triangle elevation.  This guarantees per-piece
+            # coverage without affecting zero-overlap (triangles
+            # and fills are complementary by construction).
+            try:
+                piece_tris_union = shp_ops.unary_union(
+                    [tp for tp in emitted_apron_triangles_m[-len(tris):]
+                     if not tp.is_empty])
+                residue = piece.difference(piece_tris_union)
+                if not residue.is_empty:
+                    res_polys = (list(residue.geoms)
+                                 if hasattr(residue, "geoms")
+                                 else [residue])
+                    for rp in res_polys:
+                        if (rp.is_empty
+                                or not hasattr(rp, "exterior")
+                                or rp.area < 5.0):
+                            continue
+                        # Avoid creating a fill that overlaps a
+                        # building pad (the subtract at 4030-4033
+                        # already removed bldg_union_m from piece,
+                        # but tiny slivers can survive).
+                        if not bldg_union_m.is_empty:
+                            rp = rp.difference(bldg_union_m)
+                            if (rp.is_empty
+                                    or not hasattr(rp, "exterior")
+                                    or rp.area < 5.0):
+                                continue
+                        ring_ll = [to_ll(mx, my)
+                                   for mx, my in rp.exterior.coords]
+                        _emit_flat_poly(ring_ll, round(avg_e, 1))
+                        emitted_flat_shapes.append(
+                            (rp, round(avg_e, 1)))
+                        # Track in the apron-triangles list so the
+                        # global coverage-fill pass sees this fill
+                        # as "covered".
+                        emitted_apron_triangles_m.append(rp)
+            except Exception:
+                pass
+
             # Record the apron piece for emitted_flat_shapes overlap
             # tracking — the actual emission was a triangle set, but
             # the overlap accumulator only needs a footprint and a
@@ -4224,15 +4339,35 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             paved_area = shp_ops.unary_union(paved_parts)
 
         if not paved_area.is_empty:
-            # Compute what's already covered (or will be by Phase D)
+            # Compute what's already covered (or will be by Phase D).
+            # IMPORTANT: we track the ACTUAL emitted apron triangles
+            # (emitted_apron_triangles_m), not the apron piece
+            # outlines in emitted_flat_shapes.  adaptive_triangulate
+            # can leave tiny concave-bay gaps that the piece outline
+            # papers over; using the triangle geometry directly lets
+            # the coverage-fill pass detect and patch those gaps.
+            # terminal_zone_m is a classification mask (used by the
+            # legacy taxiway path to identify "terminal-adjacent"
+            # aprons); it is NOT emitted as a shape and must NOT be
+            # treated as covered, or the coverage-fill pass blindly
+            # skips 1 M+ m² of pavement.
             covered_parts = [rwy_union_m]  # runways always covered
-            if not terminal_zone_m.is_empty:
-                covered_parts.append(terminal_zone_m)
             if not junction_zone_m.is_empty:
                 covered_parts.append(junction_zone_m)
+            # Non-apron emitted flats (flat taxiway polys, transition
+            # strip substitutes, etc.) still track via piece outlines.
+            # Apron pieces are skipped here and accounted for via
+            # emitted_apron_triangles_m below so concave-bay gaps
+            # become candidate coverage fills.
+            apron_piece_set = {id(p) for p in complex_apron_parts_m}
             for s_poly, _ in emitted_flat_shapes:
-                if not s_poly.is_empty:
-                    covered_parts.append(s_poly)
+                if s_poly.is_empty:
+                    continue
+                if id(s_poly) in apron_piece_set:
+                    continue
+                covered_parts.append(s_poly)
+            if emitted_apron_triangles_m:
+                covered_parts.extend(emitted_apron_triangles_m)
             for q in emitted_twy_quads_m:
                 if not q.is_empty:
                     covered_parts.append(q)
