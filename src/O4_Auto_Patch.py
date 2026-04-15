@@ -2381,6 +2381,53 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 except Exception:
                     pass
 
+    # Also build rectangles from CIFP runway_pairs — these are what
+    # generate_patch_osm uses to emit runway segments.  apt.dat and
+    # CIFP thresholds can differ by a few meters (different rotation
+    # or displaced-threshold handling), and the apt.dat rectangle
+    # alone does not cover every pixel the CIFP rectangle will
+    # emit.  Union both so aprons get clipped against the full
+    # emitted runway footprint.
+    for rp in (runway_pairs or []):
+        da, db = rp.get("data_a"), rp.get("data_b")
+        if not (da and db):
+            continue
+        try:
+            # Match generate_patch_osm: physical ends (extended back
+            # from the opposite threshold by displaced_m) plus a
+            # 30 m flat overrun on each side.
+            lat_a, lon_a = da["lat"], da["lon"]
+            lat_b, lon_b = db["lat"], db["lon"]
+            disp_a = da.get("displaced_m", 0.0) or 0.0
+            disp_b = db.get("displaced_m", 0.0) or 0.0
+            if disp_a > 0:
+                phys_a = extend_point(lat_b, lon_b, lat_a, lon_a, disp_a)
+            else:
+                phys_a = (lat_a, lon_a)
+            if disp_b > 0:
+                phys_b = extend_point(lat_a, lon_a, lat_b, lon_b, disp_b)
+            else:
+                phys_b = (lat_b, lon_b)
+            end_a = extend_point(
+                phys_b[0], phys_b[1], phys_a[0], phys_a[1],
+                OVERRUN_EXTENSION)
+            end_b = extend_point(
+                phys_a[0], phys_a[1], phys_b[0], phys_b[1],
+                OVERRUN_EXTENSION)
+            patch_width = DEFAULT_RUNWAY_WIDTH + 2 * RUNWAY_MARGIN
+            corners = runway_corners(
+                end_a[0], end_a[1], end_b[0], end_b[1], patch_width)
+            if corners is None:
+                continue
+            coords_m = [to_m(lon, lat) for (lat, lon) in corners]
+            p = shp_geom.Polygon(coords_m)
+            if p.is_valid and not p.is_empty:
+                # 2 m outward safety buffer to absorb sub-meter
+                # threshold/width drift between CIFP and apt.dat.
+                runway_polys_m.append(p.buffer(2.0))
+        except Exception:
+            pass
+
     rwy_union_m = (shp_ops.unary_union(runway_polys_m)
                    if runway_polys_m else shp_geom.Polygon())
 
@@ -2485,6 +2532,29 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             else shp_geom.Polygon()
     except Exception:
         apron_union_m = shp_geom.Polygon()
+
+    # Subtract the runway footprint from the apron union so aprons
+    # do not overlap the per-segment runway patches emitted by
+    # generate_patch_osm.  The runway rectangle includes overrun
+    # extensions that extend past the apt.dat pavement, and the
+    # overlap this causes must be removed before Phase C2
+    # triangulates the apron.
+    if not rwy_union_m.is_empty and not apron_union_m.is_empty:
+        try:
+            apron_union_m = apron_union_m.difference(rwy_union_m)
+            if not apron_union_m.is_valid:
+                apron_union_m = apron_union_m.buffer(0)
+        except Exception:
+            pass
+        # Rebuild apron_polys_m from the clipped union so Phase C2
+        # triangulation sees the clipped shape.
+        if apron_union_m.is_empty:
+            apron_polys_m = []
+        elif hasattr(apron_union_m, "geoms"):
+            apron_polys_m = [g for g in apron_union_m.geoms
+                             if not g.is_empty and hasattr(g, "exterior")]
+        elif hasattr(apron_union_m, "exterior"):
+            apron_polys_m = [apron_union_m]
 
     # A4: Building pads
     # Commit 10: BLDG_PAD is 0 — use the EXACT footprint.  The

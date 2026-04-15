@@ -263,7 +263,19 @@ def _delaunay_clipped(bag: _VertexBag,
         if t.is_empty or not t.is_valid:
             continue
         try:
-            if polygon.contains(t.centroid):
+            # Centroid-inside is not enough: when `polygon` is
+            # concave (e.g. an apron with a runway rectangle cut
+            # out of it), Delaunay can produce triangles whose
+            # centroid sits in the concavity's interior while the
+            # triangle itself spans the bay and pokes into the
+            # subtracted region.  Require the triangle to be
+            # (almost) fully contained — the 1% tolerance absorbs
+            # boundary-touching floating-point slivers without
+            # letting a triangle bleed across a concavity.
+            if not polygon.contains(t.centroid):
+                continue
+            inter = polygon.intersection(t).area
+            if inter >= 0.99 * t.area:
                 out.append(t)
         except Exception:
             pass
