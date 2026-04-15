@@ -140,9 +140,11 @@ def test_rdp_empty_and_tiny():
 # build_taxiway_rects — integration
 # ──────────────────────────────────────────────────────────────────────
 def test_build_rects_flat_taxiway_single_rect():
-    # 20 m × 300 m, flat DEM at 10 m.  Expect exactly one rect.
+    # 20 m × 300 m, flat DEM at 10 m.  With max_rect_length_m
+    # disabled, the whole strip should collapse to ONE rect.
     poly = _strip(20, 300)
-    rects = TR.build_taxiway_rects(poly, _flat_dem(10.0))
+    rects = TR.build_taxiway_rects(
+        poly, _flat_dem(10.0), max_rect_length_m=0)
     assert rects is not None
     assert len(rects) == 1
     r = rects[0]
@@ -150,18 +152,31 @@ def test_build_rects_flat_taxiway_single_rect():
     assert math.isclose(r.elev_high, 10.0, abs_tol=1e-6)
     assert math.isclose(r.elev_low, 10.0, abs_tol=1e-6)
     assert math.isclose(r.width_m, 20.0, abs_tol=1e-6)
-    # Polygon area approximately matches the strip.
     assert math.isclose(r.polygon.area, 20.0 * 300.0, rel_tol=1e-6)
+
+
+def test_build_rects_flat_taxiway_length_cap_splits():
+    # With the default 100 m length cap a 300 m strip emits 3-4
+    # rects (exact split depends on where the uniform sample grid
+    # lines up), and all of them should be flat and cover the
+    # full polygon area.
+    poly = _strip(20, 300)
+    rects = TR.build_taxiway_rects(poly, _flat_dem(10.0))
+    assert rects is not None
+    assert 3 <= len(rects) <= 4
+    assert all(r.is_flat for r in rects)
+    assert all(r.polygon.length < 300.0 for r in rects)  # all shorter
+    total_area = sum(r.polygon.area for r in rects)
+    assert math.isclose(total_area, 20.0 * 300.0, rel_tol=1e-6)
 
 
 def test_build_rects_uniform_slope_single_rect():
     # 20 m × 300 m, DEM slope 1% (below max_grade 1.5%).
-    poly = _strip(20, 300)
-    # Shift polygon to start at x=0 so DEM z = slope*x works cleanly.
+    # Disable length cap so RDP can collapse to one rect.
     poly = Polygon([(0, -10), (300, -10), (300, 10), (0, 10)])
-    rects = TR.build_taxiway_rects(poly, _linear_x_dem(5.0, 0.01))
+    rects = TR.build_taxiway_rects(
+        poly, _linear_x_dem(5.0, 0.01), max_rect_length_m=0)
     assert rects is not None
-    # A linear DEM should collapse to ONE rect under RDP.
     assert len(rects) == 1
     r = rects[0]
     assert not r.is_flat
@@ -200,16 +215,17 @@ def test_build_rects_empty_polygon():
 
 
 def test_build_rects_corners_have_high_end_first():
-    # High end to the right (elevation 10), low end to the left (elev 0).
+    # High end to the right (elevation 3 at x=300), low end to
+    # the left (elev 0 at x=0).  Disable length cap so we get
+    # ONE rect and can assert on its corners.
     poly = Polygon([(0, -10), (300, -10), (300, 10), (0, 10)])
     rects = TR.build_taxiway_rects(
-        poly, _linear_x_dem(0.0, 0.01), max_grade=0.015)
+        poly, _linear_x_dem(0.0, 0.01), max_grade=0.015,
+        max_rect_length_m=0)
     assert rects is not None
     r = rects[0]
-    # elev_high end is at x=300 (the right side).
     assert math.isclose(r.center_high[0], 300.0, abs_tol=1.0)
     assert math.isclose(r.center_low[0], 0.0, abs_tol=1.0)
-    # Corners 0-1 are at the high end, so their x is ≈ 300.
     assert math.isclose(r.corners_m[0][0], 300.0, abs_tol=1.0)
     assert math.isclose(r.corners_m[1][0], 300.0, abs_tol=1.0)
     assert math.isclose(r.corners_m[2][0], 0.0, abs_tol=1.0)
@@ -217,10 +233,11 @@ def test_build_rects_corners_have_high_end_first():
 
 
 def test_build_rects_rotated_polygon():
-    # Rotated 45°, same taxiway.
+    # Rotated 45°, same taxiway.  Disable length cap to get 1 rect.
     poly = rotate(Polygon([(0, -10), (300, -10), (300, 10), (0, 10)]),
                   45.0, origin=(150, 0))
-    rects = TR.build_taxiway_rects(poly, _flat_dem(10.0))
+    rects = TR.build_taxiway_rects(
+        poly, _flat_dem(10.0), max_rect_length_m=0)
     assert rects is not None
     assert len(rects) == 1
     r = rects[0]

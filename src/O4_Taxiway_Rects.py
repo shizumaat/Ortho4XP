@@ -372,6 +372,7 @@ def build_taxiway_rects(
     fidelity_tol: float = DEFAULT_FIDELITY_TOL_M,
     min_fit_ratio: float = DEFAULT_MIN_FIT_RATIO,
     max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
+    max_rect_length_m: float = 100.0,
     runway_polygon: Optional[Polygon] = None,
     runway_elev_lookup: Optional[Callable[[float, float],
                                           Optional[float]]] = None,
@@ -531,6 +532,28 @@ def build_taxiway_rects(
     if len(keep_indices) < 2:
         keep_indices = [0, n_samples - 1]
 
+    # Same length cap as build_rects_along_centerline — split any
+    # segment longer than max_rect_length_m so a gently curved
+    # taxi emits a chain of rects that follows the curve rather
+    # than one giant rect whose axis drifts off the polygon.
+    if max_rect_length_m > 0:
+        capped: List[int] = [keep_indices[0]]
+        for k in range(len(keep_indices) - 1):
+            i_a = keep_indices[k]
+            i_b = keep_indices[k + 1]
+            span_len = (i_b - i_a) * seg_len
+            if span_len <= max_rect_length_m:
+                capped.append(i_b)
+                continue
+            n_pieces = max(
+                2, int(round(span_len / max_rect_length_m + 0.5)))
+            for s in range(1, n_pieces + 1):
+                ix = i_a + int(
+                    round(s * (i_b - i_a) / n_pieces))
+                if ix > capped[-1]:
+                    capped.append(ix)
+        keep_indices = capped
+
     half_w = short_len / 2.0
 
     rects: List[TaxiwayRect] = []
@@ -581,6 +604,7 @@ def build_rects_along_centerline(
     max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
     min_width_m: float = 8.0,
     max_width_m: float = 50.0,
+    max_rect_length_m: float = 100.0,
     runway_polygon: Optional[Polygon] = None,
     runway_elev_lookup: Optional[Callable[[float, float],
                                           Optional[float]]] = None,
@@ -734,10 +758,39 @@ def build_rects_along_centerline(
     if len(keep_indices) < 2:
         keep_indices = [0, n_segs]
 
+    # Post-process: cap each RDP segment length by splitting any
+    # segment longer than `max_rect_length_m` into equal sub-pieces
+    # at the nearest available sample indices.  RDP only cares
+    # about ELEVATION fit; it will happily collapse a 1 km gently
+    # curved taxi into a single segment, whose axis is the average
+    # of the curve — off by several degrees from local tangents at
+    # the ends, producing a rect whose corners drift 15-30 m
+    # outside the real polygon.  Capping the length forces the
+    # chain to follow curves more tightly.
+    if max_rect_length_m > 0:
+        capped: List[int] = [keep_indices[0]]
+        for k in range(len(keep_indices) - 1):
+            i_a = keep_indices[k]
+            i_b = keep_indices[k + 1]
+            span_len = (i_b - i_a) * actual_seg
+            if span_len <= max_rect_length_m:
+                capped.append(i_b)
+                continue
+            # Number of sub-pieces so each is ≤ max_rect_length_m.
+            n_pieces = max(
+                2, int(math.ceil(span_len / max_rect_length_m)))
+            # Distribute sub-break indices evenly between i_a and
+            # i_b in the original sample grid.
+            for s in range(1, n_pieces + 1):
+                ix = i_a + int(
+                    round(s * (i_b - i_a) / n_pieces))
+                if ix > capped[-1]:
+                    capped.append(ix)
+        keep_indices = capped
+
     rects: List[TaxiwayRect] = []
     # For each simplified segment, build one sloping rect whose
-    # width is the local polygon-perpendicular width at the
-    # segment midpoint (averaged between its two endpoints).
+    # width is the local polygon-perpendicular width.
     for k in range(len(keep_indices) - 1):
         i_a = keep_indices[k]
         i_b = keep_indices[k + 1]
@@ -752,10 +805,17 @@ def build_rects_along_centerline(
         ux, uy = tx / seg_mag, ty / seg_mag
         px, py = -uy, ux  # perpendicular
 
-        # Local width: take the min of a few probe points along
-        # the segment (segment midpoint and the two endpoints).
+        # Local width: probe at 5 equally-spaced points along the
+        # segment and use the MEDIAN.  Using min under-reports
+        # width whenever one probe happens to hit a narrow throat
+        # (e.g. a taxi exit or hold-line), leaving slivers of
+        # uncovered pavement on both sides of the rect that the
+        # coverage-fill pass paints in at DIFFERENT elevations
+        # than the rect itself.  Median is robust to one or two
+        # narrow probes while still preventing the rect from
+        # overshooting at a genuinely narrow neck.
         widths: List[float] = []
-        for frac in (0.0, 0.5, 1.0):
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
             mid_x = a_center[0] + ux * seg_mag * frac
             mid_y = a_center[1] + uy * seg_mag * frac
             hw = _local_half_width(
@@ -764,7 +824,8 @@ def build_rects_along_centerline(
                 widths.append(hw * 2.0)
         if not widths:
             continue
-        local_width = min(widths)
+        widths.sort()
+        local_width = widths[len(widths) // 2]
         if local_width < min_width_m:
             continue
         if local_width > max_width_m:
