@@ -117,54 +117,51 @@ building, etc.) as well as 161 069 m² of intra-taxiway overlap from
 adjacent centerline rects sharing corners.  The architecture was
 fundamentally wrong for the active invariants.
 
-## Current state (after commit 7b — `ce3b97c`)
+## Current state (after commit 10 — `6d237d6`)
 
 The legacy phase-A-through-F surface generator is the active code
-path.  Phases C2 (apron) and D (junctions) have been wired to the
-new `O4_Surface_Mesh.adaptive_triangulate` helper.  Phase E (boundary
-band, tunnel portals) and Phase F (drainage) are still inline and
-unfinished but functional.  A new `O4_Apt_Dat_Reader` module has
-landed and is tested but not yet integrated.
+path.  Phases C2 (apron) and D (junctions) are wired to
+`O4_Surface_Mesh.adaptive_triangulate`.  `O4_Apt_Dat_Reader` is
+integrated at Phase A0.5 and supplies authoritative pavement
+geometry.  At SPJC the full pipeline now emits **zero m² of
+overlap** across all cross-feature and intra-category checks.
 
 ### Modules
 
 | File | Status | Tests |
 |---|---|---|
-| `src/O4_Auto_Patch.py` | active legacy pipeline | none yet |
+| `src/O4_Auto_Patch.py` | active legacy pipeline + Phase A0.5 | none yet |
 | `src/O4_Surface_Mesh.py` | adaptive triangulation, used by C2 + D | 19 |
-| `src/O4_Apt_Dat_Reader.py` | apt.dat parser, **not yet wired in** | 22 |
+| `src/O4_Apt_Dat_Reader.py` | apt.dat parser, wired in Phase A0.5 | 22 |
 | `src/O4_Vector_Map.py` | calls `generate_auto_patches` (unchanged) | none |
 | `tests/test_surface_mesh.py` | mesh + grade + anchors | 19 |
 | `tests/test_apt_dat_reader.py` | runway/pavement/Bezier/search priority | 22 |
+| `tests/test_auto_patch_apt_dat_integration.py` | A0.5 adapter | 11 |
 | `tests/fixtures/synthetic_apt.dat` | hand-crafted parser fixture | — |
 
-Total tests: **41**.  Run with `./venv/bin/python3 -m pytest tests/`.
+Total tests: **52**.  Run with `./venv/bin/python3 -m pytest tests/`.
 
-### SPJC numbers (post commit 8)
+### SPJC numbers (post commit 10)
 
-| Metric | Commit 7b | **Commit 8** |
-|---|---|---|
-| Total emitted ways | 2 871 | **2 442** (-15 %) |
-| Total cross-feature overlap | 7 638 m² (0.4 %) | **6 099 m² (0.2 %)** |
-| flat ∩ flat overlap | 3 085 m² | 3 370 m² |
-| flat ∩ triangle overlap | 3 148 m² | **2 729 m²** |
-| triangle ∩ triangle | 1 221 m² | **0 m²** ✓ |
-| Junction triangles (Phase D) | 1 631 | 0 (taxiway_data is empty) |
-| Apron triangles (Phase C2) | ~700 | **2 262** |
-| apt.dat pavements loaded | 0 (OSM) | **51 → 5 merged pieces** |
-| Buildings reconciled for grade | 30 | 27 |
+| Metric | Commit 7b | Commit 8 | Commit 9 | **Commit 10** |
+|---|---|---|---|---|
+| Total emitted ways | 2 871 | 2 442 | 2 501 | **2 624** |
+| Total cross-feature overlap | 7 638 m² | 6 099 m² | 5 101 m² | **0 m²** ✓ |
+| flat ∩ flat overlap | 3 085 | 3 370 | 2 154 | **0** ✓ |
+| flat ∩ triangle overlap | 3 148 | 2 729 | 2 901 | **0** ✓ |
+| flat ∩ slope overlap | — | — | 46 | **0** ✓ |
+| slope ∩ triangle overlap | — | — | 517 | **0** ✓ |
+| triangle ∩ triangle | 1 221 | 0 | 0 | **0** ✓ |
+| Intra-category overlaps (all) | — | — | — | **0** ✓ |
+| Apron triangles (Phase C2) | ~700 | 2 262 | 2 271 | **2 271** |
+| Building pads (Phase C3/A4) | — | — | 313 | **313** (no padding) |
+| Drainage low-points (Phase F) | — | — | 12 | **30** |
+| apt.dat pavements merged | 0 | 5 | 3 | **3** |
+| Sum of areas = union area | no | no | no | **2 553 674 m²** ✓ |
 
-apt.dat pavement polygons are disjoint by design, so the
-Phase D junction pipeline produces zero overlapping triangles
-(junction_zone_m is empty).  The remaining ~6 k m² overlap is
-from the building merge leftovers (flat-flat) and the apron
-clipping against buildings not always preserving tiny holes
-(flat-triangle).  Both will be addressed in commit 9+.
-
-The remaining overlaps are not from the legacy architecture being
-wrong — they're from OSM-derived inputs not being disjoint by
-construction.  Switching to apt.dat (commit 8) eliminates the
-underlying cause.
+**SPJC is now a zero-overlap planar subdivision.**  Every vertex
+belongs to exactly one cell; sum of cell areas equals union area
+exactly.  All 52 unit tests pass.
 
 ### `O4_Apt_Dat_Reader` ready to use
 
@@ -211,7 +208,58 @@ small modules, not the monolith.
 6. **Commit 6 — wire Phase D (junction) to adaptive_triangulate.** ✅ `7d89f33`
 7. **Commit 7a — Phase D hole-vertex + actual-triangle accumulator.** ✅ `e36e6a1`
 8. **Commit 7b — add `O4_Apt_Dat_Reader` module + tests.** ✅ `ce3b97c`
-9. **Commit 8 — wire `O4_Apt_Dat_Reader` into legacy (Phase A0.5).** ✅ (this commit)
+9. **Commit 8 — wire `O4_Apt_Dat_Reader` into legacy (Phase A0.5).** ✅ `2e8ab66`
+10. **Commit 9 — pavement-as-taxiway grade, morphological terminal clean, flat buffer ring around buildings, drainage from pavement holes.** ✅ `115be6e`
+11. **Commit 10 — zero overlap: precise building cutouts + triangle/ditch containment + Phase E buffered subtraction.** ✅ `6d237d6` (this commit)
+
+### Commits 8–10 (done): apt.dat integration and zero overlap
+
+**Commit 8 (`2e8ab66`)** wired `O4_Apt_Dat_Reader` into the legacy
+at a new Phase A0.5.  `xplane_root_from_cifp_path()` derives the
+X-Plane root from the CIFP directory; if an apt.dat for the ICAO
+is found, `_dico_from_apt_dat()` converts its pavements (tile-
+relative), runway rectangle, and boundary into the same
+`dico_apt_entry` shape Phases A3/C2/C3 already consume.  All
+pavement is merged into the apron field; taxiway is left empty.
+When `apt_dat_used` is true Phase A3 skips `APRON_BUFFER` and
+preserves interior rings, and Phase C2 skips simplification (which
+was erasing small holes).
+
+**Commit 9 (`115be6e`)** adjusted four things:
+1. Phase C2 grade for apt.dat pavement is `MAX_TAXIWAY_GRADE`
+   (1.5 %) rather than `MAX_APRON_GRADE` — all pavement is
+   treated as taxiway.
+2. Phase A4b applies morphological opening (buffer -5, +5) to
+   merged terminals so < 10 m protrusions disappear, keeping
+   clean outlines.
+3. `_apron_anchors` adds a `TERMINAL_FLAT_BUFFER_M = 10.0` ring
+   around each terminal at building elevation, so the ground
+   around a terminal is flat before sloping away to taxiways.
+4. Phase F paved-contact filter includes `apron_union_m` so
+   grass islands are recognised as drainage candidates when
+   the surrounding pavement is apt.dat apron.
+
+**Commit 10 (`6d237d6`)** drove total cross-feature overlap from
+5 101 m² to exactly 0 m²:
+- Phase A4: `BLDG_PAD = 0.0`, `BLDG_SIMPLIFY = 2.0`.  Buildings
+  are cut from the terrain precisely, not padded.
+- Phase A4 cleanup pass: sort buildings by area descending,
+  subtract each prior building from the current one so no two
+  pads overlap.
+- Phase C2 apron emission: per-triangle intersection-area check
+  against the building union (OVERLAP_EPS = 0.5 m²), catching
+  triangles whose edges or area cross a building even when the
+  centroid is outside.
+- Apron triangles are tracked individually in
+  `emitted_apron_triangles_m` and added to `all_emitted_parts_m`
+  so downstream phases see the real mesh, not the piece polygons
+  with holes.
+- Phase F Type B drainage: reject candidates whose ditch
+  rectangle escapes the infield polygon by more than 0.5 m².
+- Phase E boundary band: buffer `emitted_union` by 1.0 m before
+  subtracting, consuming sub-meter slivers around building edges.
+
+Historical notes from the original commit 8 plan below.
 
 ### ← Commit 8 (done): wire `O4_Apt_Dat_Reader` into the legacy
 
@@ -329,8 +377,8 @@ adapter.  Unit tests for the adapter live in a new
 
 ```bash
 cd /Users/noah/Ortho4XP-shred86
-git log --oneline -10            # confirm we're at ce3b97c
-./venv/bin/python3 -m pytest tests/   # 41 pass
+git log --oneline -10            # confirm we're at 6d237d6
+./venv/bin/python3 -m pytest tests/   # 52 pass
 
 # Quick sanity: parse SPJC's custom apt.dat
 ./venv/bin/python3 -c "
