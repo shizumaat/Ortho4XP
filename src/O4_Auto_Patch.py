@@ -2577,6 +2577,39 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 if hasattr(merged, "geoms"):
                     merged = max(
                         merged.geoms, key=lambda g: g.area)
+                # Smooth out small-scale features (< 10 m wide) via
+                # a morphological opening: shrink by 5 m, grow by
+                # 5 m.  The opening removes anything narrower than
+                # 10 m — gate protuberances, service jetty bumps,
+                # OSM tracing noise — and leaves the real terminal
+                # outline.  Preserves concavities larger than 10 m
+                # wide (real cut-outs stay intact).
+                TERMINAL_OPEN_R = 5.0   # half of "feature size" 10 m
+                try:
+                    opened = merged.buffer(
+                        -TERMINAL_OPEN_R,
+                        join_style=2, mitre_limit=2.0)
+                    if opened.is_empty:
+                        # Building is so thin that the shrink fully
+                        # consumed it — keep the original merged.
+                        pass
+                    else:
+                        opened = opened.buffer(
+                            TERMINAL_OPEN_R,
+                            join_style=2, mitre_limit=2.0)
+                        if hasattr(opened, "geoms"):
+                            opened = max(
+                                opened.geoms, key=lambda g: g.area)
+                        if (not opened.is_empty
+                                and hasattr(opened, "exterior")
+                                and opened.area > 0.5 * merged.area):
+                            # Accept the opened outline only if it
+                            # kept at least half the original area
+                            # (otherwise the building was mostly
+                            # thin fingers and we'd lose it).
+                            merged = opened
+                except Exception:
+                    pass
                 merged = merged.simplify(
                     BLDG_SIMPLIFY, preserve_topology=True)
                 if (merged.is_valid and not merged.is_empty
@@ -3402,18 +3435,30 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
     def _apron_anchors(apron_poly):
         """Collect (x, y, z) anchor elevations from neighbouring
-        features that touch this apron.  Building edges contribute
-        a small number of sample points along each shared boundary
-        at the building's pad elevation; taxiway centerlines
-        contribute one point per crossing into the apron at the
-        interpolated taxiway elevation.
+        features that touch this apron.  Three anchor sources:
+
+        1. Building edges: sample points along the shared boundary
+           between each touching building and the apron, at the
+           building's pad elevation.
+
+        2. **Flat terminal buffer** (new in commit 9): for each
+           touching building, also sample points along an OUTWARD
+           offset ring at TERMINAL_FLAT_BUFFER_M metres from the
+           building's footprint, all at the building's elevation.
+           This creates a band of "flat" anchors around each
+           terminal so the apron triangulation is forced to stay at
+           the terminal's elevation for ~10 m around the building
+           before sloping away to the nearest taxiway.  Result: the
+           ground around terminals is flat, then slopes gently
+           (≤ 1.5 %) to the taxiway, matching how real airports are
+           graded.
+
+        3. Taxiway centerline crossings at the apron boundary,
+           elev interpolated from the taxiway's routed elevation.
 
         Per STATUS.md elevation rule, CIFP runway elevations are
-        NOT used here.
-
-        The result is sparsified to a minimum APRON_ANCHOR_GAP_M
-        spacing so adaptive_triangulate starts with the smallest
-        useful seed set — the user's "minimum shape count" goal.
+        NOT used here.  The result is sparsified to
+        APRON_ANCHOR_GAP_M minimum spacing.
         """
         raw = []
         # Building edge anchors.  A building "touches" the apron if
@@ -3422,6 +3467,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         # gap between the two outlines even when they share an edge
         # in the source data).
         TOUCH_M = 6.0
+        TERMINAL_FLAT_BUFFER_M = 10.0   # flat zone half-width
         for bi, bp in enumerate(building_polys_m):
             if bp.is_empty or bi not in bldg_elevations:
                 continue
@@ -3438,25 +3484,54 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 shared = None
             if shared is None or shared.is_empty:
                 raw.append((bp.centroid.x, bp.centroid.y, elev))
-                continue
-            lines = []
-            if hasattr(shared, "geoms"):
-                for g in shared.geoms:
-                    if hasattr(g, "coords"):
-                        lines.append(g)
-            elif hasattr(shared, "coords"):
-                lines.append(shared)
-            for ln in lines:
-                length = ln.length
-                if length < 1.0:
-                    p = ln.interpolate(0.5, normalized=True)
-                    raw.append((p.x, p.y, elev))
-                    continue
-                # Two endpoints + midpoint.  Sparsifier will trim
-                # further if the building is very small.
-                for t in (0.0, 0.5, 1.0):
-                    p = ln.interpolate(t, normalized=True)
-                    raw.append((p.x, p.y, elev))
+            else:
+                lines = []
+                if hasattr(shared, "geoms"):
+                    for g in shared.geoms:
+                        if hasattr(g, "coords"):
+                            lines.append(g)
+                elif hasattr(shared, "coords"):
+                    lines.append(shared)
+                for ln in lines:
+                    length = ln.length
+                    if length < 1.0:
+                        p = ln.interpolate(0.5, normalized=True)
+                        raw.append((p.x, p.y, elev))
+                        continue
+                    # Two endpoints + midpoint.  Sparsifier will
+                    # trim further if the building is very small.
+                    for t in (0.0, 0.5, 1.0):
+                        p = ln.interpolate(t, normalized=True)
+                        raw.append((p.x, p.y, elev))
+            # Flat terminal buffer ring: sample an outward offset
+            # of the building's boundary every ~20 m, clipped to
+            # the apron polygon.  These anchors force the apron
+            # triangulation to be flat at the terminal elevation
+            # for TERMINAL_FLAT_BUFFER_M around the building.
+            try:
+                ring_geom = bp.buffer(TERMINAL_FLAT_BUFFER_M).boundary
+                clipped_ring = ring_geom.intersection(apron_poly)
+            except Exception:
+                clipped_ring = None
+            if clipped_ring is not None and not clipped_ring.is_empty:
+                ring_lines = []
+                if hasattr(clipped_ring, "geoms"):
+                    for g in clipped_ring.geoms:
+                        if hasattr(g, "coords"):
+                            ring_lines.append(g)
+                elif hasattr(clipped_ring, "coords"):
+                    ring_lines.append(clipped_ring)
+                for rl in ring_lines:
+                    total = rl.length
+                    if total < 1.0:
+                        p = rl.interpolate(0.5, normalized=True)
+                        raw.append((p.x, p.y, elev))
+                        continue
+                    n = max(2, int(total / 20.0) + 1)
+                    for k in range(n):
+                        t = k / (n - 1) if n > 1 else 0.5
+                        p = rl.interpolate(t, normalized=True)
+                        raw.append((p.x, p.y, elev))
         # Taxiway crossing anchors.  Use a slightly buffered apron
         # so taxiways that stub into the edge also contribute.
         TWY_TOUCH_M = 5.0
@@ -3544,10 +3619,17 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     seed_poly = piece
 
             anchors = _apron_anchors(seed_poly)
+            # apt.dat pavements lump taxiways, aprons, and ramps into
+            # one "pavement" category.  Per user direction we treat
+            # them all as taxiway for now (1.5 % grade) rather than
+            # the stricter 1.0 % apron grade — a finer name-based
+            # classification is a follow-up commit.
+            pavement_grade = (MAX_TAXIWAY_GRADE if apt_dat_used
+                              else MAX_APRON_GRADE)
             try:
                 tris = SM.adaptive_triangulate(
                     seed_poly, anchors, _dem_at,
-                    max_grade=MAX_APRON_GRADE,
+                    max_grade=pavement_grade,
                     fidelity_tol=1.0,
                     max_extra_points=50)
             except Exception:
@@ -4479,28 +4561,35 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     ip_boundary_len = ip_boundary.length
                     if ip_boundary_len < 10.0:
                         continue
-                    # Drainage must be between runways and/or taxiways
-                    # specifically — not in apron/terminal areas.
+                    # Drainage must be enclosed by any kind of
+                    # pavement.  The legacy only counted runway and
+                    # taxiway contact, which ruled out the interior
+                    # grass islands of apron-rich airports (the
+                    # usual drainage candidates).  With apt.dat as
+                    # the source, taxiway_union is empty — all
+                    # pavement is in the apron union — so we have
+                    # to include apron contact too.
                     paved_contact = 0.0
                     try:
-                        rwy_twy_union = shp_geom.Polygon()
-                        rwy_twy_parts = []
+                        paved_parts = []
                         if not rwy_union_m.is_empty:
-                            rwy_twy_parts.append(rwy_union_m)
+                            paved_parts.append(rwy_union_m)
                         if not twy_union_m.is_empty:
-                            rwy_twy_parts.append(twy_union_m)
-                        if rwy_twy_parts:
-                            rwy_twy_union = shp_ops.unary_union(
-                                rwy_twy_parts)
-                        rwy_twy_buf = rwy_twy_union.buffer(
-                            DRAINAGE_EDGE_BUFFER + 5.0)
-                        contact = ip_boundary.intersection(rwy_twy_buf)
-                        if not contact.is_empty:
-                            paved_contact = contact.length / ip_boundary_len
+                            paved_parts.append(twy_union_m)
+                        if not apron_union_m.is_empty:
+                            paved_parts.append(apron_union_m)
+                        if paved_parts:
+                            paved_union = shp_ops.unary_union(paved_parts)
+                            paved_buf = paved_union.buffer(
+                                DRAINAGE_EDGE_BUFFER + 5.0)
+                            contact = ip_boundary.intersection(paved_buf)
+                            if not contact.is_empty:
+                                paved_contact = (
+                                    contact.length / ip_boundary_len)
                     except Exception:
                         pass
                     if paved_contact < 0.80:
-                        continue  # not enclosed by runways/taxiways
+                        continue  # not enclosed by pavement
                     # Also skip if touching buildings/terminals
                     try:
                         if not bldg_union_m.is_empty:
