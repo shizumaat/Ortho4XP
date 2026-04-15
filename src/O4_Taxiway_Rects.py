@@ -372,6 +372,9 @@ def build_taxiway_rects(
     fidelity_tol: float = DEFAULT_FIDELITY_TOL_M,
     min_fit_ratio: float = DEFAULT_MIN_FIT_RATIO,
     max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
+    runway_polygon: Optional[Polygon] = None,
+    runway_elev_lookup: Optional[Callable[[float, float],
+                                          Optional[float]]] = None,
 ) -> Optional[List[TaxiwayRect]]:
     """Build the rect chain for one taxiway polygon.
 
@@ -455,6 +458,7 @@ def build_taxiway_rects(
 
     zs: List[float] = []
     xs_center: List[Tuple[float, float]] = []
+    anchored: List[bool] = []
     for i in range(n_samples):
         t = i * seg_len
         cx = m_a[0] + ux * t
@@ -467,8 +471,61 @@ def build_taxiway_rects(
             z = zs[-1] if zs else 0.0
         zs.append(z)
         xs_center.append((cx, cy))
+        anchored.append(False)
 
-    _clamp_profile(zs, seg_len, max_grade, max_dg_per_m)
+    # Runway-endpoint anchoring.  Same rule as
+    # build_rects_along_centerline: if the polygon's long-axis
+    # endpoint (i.e. the strip's short edge) comes within 1 m of a
+    # runway, pin that end to the runway's elevation at the
+    # touch point and mark it anchored so the grade clamp
+    # propagates it through the chain as an immovable boundary.
+    #
+    # A taxi running parallel to a runway has both endpoints far
+    # from the runway, so no anchoring occurs — exactly as the
+    # user clarified.
+    from shapely.geometry import Point as _Pt
+    # The Voronoi-skeleton endpoint of a taxi polygon sits on the
+    # medial axis, which is ~half the polygon's local width away
+    # from the nearest boundary — NOT at the boundary itself.
+    # For a typical 25–45 m wide taxi that means the skeleton
+    # endpoint is 12–22 m inside the polygon, so "near a runway
+    # join" is an endpoint within ~half-max-taxi-width of the
+    # runway boundary.  The user's "1 m" threshold referred to the
+    # taxi pavement's own distance from the runway (they never run
+    # closer than that without crossing); the centerline we actually
+    # sample is a geometric derivative, not the pavement itself, so
+    # it needs a wider search radius.
+    ANCHOR_MAX_DIST_M = 25.0
+    if (runway_polygon is not None and not runway_polygon.is_empty
+            and runway_elev_lookup is not None):
+        # Near-start endpoint
+        try:
+            p_start = _Pt(xs_center[0][0], xs_center[0][1])
+            if p_start.distance(runway_polygon) <= ANCHOR_MAX_DIST_M:
+                rz = runway_elev_lookup(
+                    xs_center[0][0], xs_center[0][1])
+                if rz is not None:
+                    zs[0] = float(rz)
+                    anchored[0] = True
+        except Exception:
+            pass
+        try:
+            last = n_samples - 1
+            p_end = _Pt(xs_center[last][0], xs_center[last][1])
+            if p_end.distance(runway_polygon) <= ANCHOR_MAX_DIST_M:
+                rz = runway_elev_lookup(
+                    xs_center[last][0], xs_center[last][1])
+                if rz is not None:
+                    zs[last] = float(rz)
+                    anchored[last] = True
+        except Exception:
+            pass
+
+    if any(anchored):
+        _clamp_profile_with_anchors(
+            zs, anchored, seg_len, max_grade, max_dg_per_m)
+    else:
+        _clamp_profile(zs, seg_len, max_grade, max_dg_per_m)
 
     keep_indices = _rdp_simplify_indices(zs, fidelity_tol)
     if len(keep_indices) < 2:
@@ -524,8 +581,9 @@ def build_rects_along_centerline(
     max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
     min_width_m: float = 8.0,
     max_width_m: float = 50.0,
-    runway_anchor: Optional[Callable[[float, float],
-                                     Optional[float]]] = None,
+    runway_polygon: Optional[Polygon] = None,
+    runway_elev_lookup: Optional[Callable[[float, float],
+                                          Optional[float]]] = None,
 ) -> Optional[List[TaxiwayRect]]:
     """Build a chain of sloping rectangles along an arbitrary
     centerline inside a polygon.
@@ -572,19 +630,69 @@ def build_rects_along_centerline(
     n_segs = max(1, int(round(total_len / seg_length)))
     actual_seg = total_len / n_segs
 
-    # Sample centerline at each split point.  A sample within 1 m
-    # of a runway boundary (detected via the optional runway_anchor
-    # callback) is pinned to the runway's elevation and marked
-    # anchored; the grade clamp won't move those.
+    # Runway-endpoint anchoring.  apt.dat taxiway polygons
+    # typically STOP at the runway edge (the runway and the
+    # taxiway are separate row-110 entries that butt up against
+    # one another), so the extracted centerline's endpoints are
+    # the points that touch the runway boundary.  For each
+    # centerline endpoint whose distance to the runway polygon
+    # is ≤ ANCHOR_MAX_DIST_M, we:
+    #
+    #   1. Pin the endpoint's elevation to the runway's own
+    #      elevation at that (x, y) — projected via
+    #      runway_elev_lookup, which internally does
+    #      _project_point_onto_runway on the CIFP thresholds.
+    #   2. Mark the endpoint sample as anchored, so the grade
+    #      clamp propagates it through the rest of the chain as
+    #      an immovable boundary condition.
+    #
+    # A taxi running parallel to a runway has both endpoints FAR
+    # from the runway boundary (the endpoints are wherever the
+    # centerline terminates, not where the strip is closest to
+    # the runway edge), so this logic does NOT anchor parallel
+    # taxis — exactly as the user clarified.
+    # The Voronoi-skeleton endpoint of a taxi polygon sits on the
+    # medial axis, which is ~half the polygon's local width away
+    # from the nearest boundary — NOT at the boundary itself.
+    # For a typical 25–45 m wide taxi that means the skeleton
+    # endpoint is 12–22 m inside the polygon, so "near a runway
+    # join" is an endpoint within ~half-max-taxi-width of the
+    # runway boundary.  The user's "1 m" threshold referred to the
+    # taxi pavement's own distance from the runway (they never run
+    # closer than that without crossing); the centerline we actually
+    # sample is a geometric derivative, not the pavement itself, so
+    # it needs a wider search radius.
+    ANCHOR_MAX_DIST_M = 25.0
+    anchor_at_start = None  # runway elevation at t=0, if applicable
+    anchor_at_end = None    # runway elevation at t=total_len
+    if (runway_polygon is not None
+            and not runway_polygon.is_empty
+            and runway_elev_lookup is not None):
+        try:
+            p_start = centerline.interpolate(0.0)
+            p_end = centerline.interpolate(total_len)
+            if p_start.distance(runway_polygon) <= ANCHOR_MAX_DIST_M:
+                anchor_at_start = runway_elev_lookup(
+                    p_start.x, p_start.y)
+            if p_end.distance(runway_polygon) <= ANCHOR_MAX_DIST_M:
+                anchor_at_end = runway_elev_lookup(p_end.x, p_end.y)
+        except Exception:
+            pass
+
+    # Build the sample schedule.  Uniform steps along the
+    # centerline; t=0 and t=total_len are always included so
+    # endpoint anchors land on a real sample.
+    t_values = [i * actual_seg for i in range(n_segs + 1)]
+
+    # Sample centerline at each scheduled t.
     centers: List[Tuple[float, float]] = []
     tangents: List[Tuple[float, float]] = []
     zs: List[float] = []
     anchored: List[bool] = []
-    for i in range(n_segs + 1):
-        t = i * actual_seg
+    n_t = len(t_values)
+    for idx, t in enumerate(t_values):
         pt = centerline.interpolate(t)
         centers.append((pt.x, pt.y))
-        # Local tangent: central difference using a small epsilon.
         eps = min(1.0, actual_seg * 0.1)
         t_fwd = min(total_len, t + eps)
         t_bck = max(0.0, t - eps)
@@ -598,14 +706,19 @@ def build_rects_along_centerline(
         else:
             tangents.append((tx / mag, ty / mag))
 
+        # Only the first and last samples can be runway-anchored
+        # (endpoints of the centerline).  All interior samples use
+        # DEM and follow the normal grade rules — the anchored
+        # endpoints act as hard boundary conditions the grade
+        # clamp will propagate inward.
         runway_z = None
-        if runway_anchor is not None:
-            try:
-                runway_z = runway_anchor(pt.x, pt.y)
-            except Exception:
-                runway_z = None
+        if idx == 0 and anchor_at_start is not None:
+            runway_z = float(anchor_at_start)
+        elif idx == n_t - 1 and anchor_at_end is not None:
+            runway_z = float(anchor_at_end)
+
         if runway_z is not None:
-            zs.append(float(runway_z))
+            zs.append(runway_z)
             anchored.append(True)
         else:
             z = sample_dem(pt.x, pt.y)

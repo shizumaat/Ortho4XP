@@ -18,6 +18,8 @@ from shapely import ops as shp_ops
 
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
+import O4_OSM_Utils as OSM
+import O4_Boundary_Model as BND
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -626,6 +628,14 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
     way_id = -1
     nodes = []  # list of (id, lat, lon)
     ways = []  # list of (id, [node_ids], {tags})
+    # Chain of emitted runway segments, captured for downstream
+    # consumers that need the authoritative runway elevation at an
+    # arbitrary (lat, lon).  Each entry:
+    #   (lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m)
+    # — exactly the same 7 values add_rect_patch receives when
+    # emitting a runway segment, so the elevation model any caller
+    # queries from this list matches the patch output byte-for-byte.
+    runway_chain = []
 
     def add_node(lat, lon):
         nonlocal node_id
@@ -1057,6 +1067,11 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     s_b[0], s_b[1], elevs[idx + 1],
                     patch_width,
                 )
+                runway_chain.append((
+                    s_a[0], s_a[1], elevs[idx],
+                    s_b[0], s_b[1], elevs[idx + 1],
+                    patch_width,
+                ))
 
             # ── Flat blast-pad / overrun rectangles beyond ends ─────────
             # Length comes from apt.dat row-100 blast_a/blast_b when
@@ -1074,6 +1089,11 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     phys_end_a[0], phys_end_a[1], elevs[0],
                     patch_width,
                 )
+                runway_chain.append((
+                    ext_a[0], ext_a[1], elevs[0],
+                    phys_end_a[0], phys_end_a[1], elevs[0],
+                    patch_width,
+                ))
             if blast_b > 0.1:
                 ext_b = extend_point(
                     phys_end_a[0], phys_end_a[1],
@@ -1085,6 +1105,11 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     ext_b[0], ext_b[1], elevs[-1],
                     patch_width,
                 )
+                runway_chain.append((
+                    phys_end_b[0], phys_end_b[1], elevs[-1],
+                    ext_b[0], ext_b[1], elevs[-1],
+                    patch_width,
+                ))
 
         else:
             # ── Unpaired runway: flat patch at known elevation ───────────
@@ -1101,6 +1126,11 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 ext2[0], ext2[1], elev_a,
                 patch_width,
             )
+            runway_chain.append((
+                ext[0], ext[1], elev_a,
+                ext2[0], ext2[1], elev_a,
+                patch_width,
+            ))
 
     # ── Assemble OSM XML ─────────────────────────────────────────────────────
     lines = [
@@ -1125,7 +1155,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             lines.append("    <tag k='{}' v='{}' />".format(k, v))
         lines.append("  </way>")
     lines.append("</osm>")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", runway_chain
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1340,7 +1370,7 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
             UI.vprint(
                 2, "   Auto-patch: apt.dat runway geometry lookup "
                 "failed ({}); falling back to CIFP".format(_e))
-        osm_content = generate_patch_osm(
+        osm_content, runway_segment_chain = generate_patch_osm(
             icao, pairs, runway_widths=runway_widths, tile=tile,
             apt_runways=apt_runway_geom,
         )
@@ -1365,6 +1395,7 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                 start_node_id=-10000,
                 road_data=airport_roads,
                 xplane_root=xplane_root_from_cifp_path(cifp_path),
+                runway_segment_chain=runway_segment_chain,
             )
             if surface_lines:
                 num_surface_patches = sum(
@@ -2210,7 +2241,8 @@ def extract_road_info(dico_airports, tile, road_layer=None):
 def generate_airport_surface_patches(icao, taxiway_data, building_data,
                                       runway_pairs, tile, dico_apt_entry,
                                       start_node_id=-10000, road_data=None,
-                                      xplane_root=None):
+                                      xplane_root=None,
+                                      runway_segment_chain=None):
     """Generate efficient airport surface patches using JOSM-friendly shapes.
 
     Uses the simplest shape that achieves smooth, grade-limited slopes.
@@ -2623,6 +2655,14 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
     rwy_union_m = (shp_ops.unary_union(runway_polys_m)
                    if runway_polys_m else shp_geom.Polygon())
+    # Keep a pristine copy BEFORE the 0.5 m safety inflate below.
+    # The unbuffered version is used by Phase A3's runway-taxiway
+    # intersection detection: we only want to anchor taxi
+    # centerlines at points that ACTUALLY CROSS into the runway
+    # rectangle, not at points merely within 0.5 m of the edge
+    # (which would wrongly anchor a taxi running parallel to a
+    # runway).
+    rwy_union_raw_m = rwy_union_m
     # Sub-meter safety inflate: generate_patch_osm emits per-segment
     # rectangles whose corners may drift from the whole-rectangle
     # corners by a fraction of a meter due to float precision in the
@@ -2802,62 +2842,92 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         pool_apron_m = []         # apron-classified OR fallback twy
 
         # ────────────────────────────────────────────────────────────
-        # Runway edge-anchor closure.
+        # Runway elevation lookup closure.
         #
-        # User rule: "the goal is a perfectly smooth transition from
-        # runway to taxiway.  If the runway has any slope, then a
-        # taxiway joining it has to match that slope when it's close
-        # to the runway — anything < 1 m.  Once we're more than 1 m
-        # from the runway, the taxiway can follow its normal slope
-        # rules."
+        # User rule: "the goal is a perfectly smooth transition
+        # from runway to taxiway".  "Perfectly smooth" requires
+        # using the EXACT same elevations as the runway segments
+        # emitted by generate_patch_osm — NOT the raw CIFP linear
+        # interpolation, which can differ by up to ~1 m on curved
+        # runways because generate_patch_osm applies wide-window
+        # DEM smoothing and a FAA vertical-curve solver to its
+        # profile.
         #
-        # Implementation: a centerline sample at meter-space point
-        # (x, y) is "near a runway" if the point lies inside
-        # `rwy_union_m.buffer(1.0)` — the runway rectangles inflated
-        # 1 m outward.  Such samples are anchored to the runway's
-        # own elevation, obtained by projecting the lat/lon onto the
-        # nearest CIFP runway centerline.  Non-near samples fall
-        # back to DEM and the normal grade rule.
+        # We get byte-identical matching by accepting the emitted
+        # runway chain (from generate_patch_osm) as a parameter
+        # and projecting each taxi endpoint onto the nearest
+        # segment of that chain.
         #
-        # Note rwy_union_m is computed BEFORE Phase A3 in Phase A1;
-        # at this point it's already a valid meter-space geometry.
-        def _runway_edge_anchor_m(x_m, y_m):
-            try:
-                if rwy_union_m.is_empty:
-                    return None
-                pt = shp_geom.Point(x_m, y_m)
-                # Fast reject: more than 1 m outside every runway?
-                # distance > 1.0 means the point is outside buffered
-                # runways — normal DEM applies.
+        # The chain format: a list of
+        #   (lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m)
+        # tuples — one per emitted runway rectangle.  We convert
+        # each to meter space here and build a spatial index once
+        # per airport.
+        _runway_segs_m = []   # list of (a_pt, b_pt, elev_a, elev_b,
+                              #          length, unit_x, unit_y, width)
+        if runway_segment_chain:
+            for (la, lo_a, ea, lb, lob, eb, w) in runway_segment_chain:
                 try:
-                    if pt.distance(rwy_union_m) > 1.0:
-                        return None
+                    ax, ay = to_m(lo_a, la)
+                    bx, by = to_m(lob, lb)
                 except Exception:
-                    return None
-                lon, lat = to_ll(x_m, y_m)
-                # Project onto the nearest runway centerline; use a
-                # max_dist that comfortably covers the widest runway
-                # (SPJC: 45 m), so a point 22 m inside a 45-m runway
-                # still matches.  Returns the CIFP-interpolated
-                # elevation at the projection.
-                elev = _project_point_onto_runway(
-                    lat, lon, runway_pairs, max_dist=60.0)
-                return elev
-            except Exception:
+                    continue
+                dx = bx - ax
+                dy = by - ay
+                L = sqrt(dx * dx + dy * dy)
+                if L < 1e-3:
+                    continue
+                ux = dx / L
+                uy = dy / L
+                _runway_segs_m.append((
+                    (ax, ay), (bx, by), float(ea), float(eb),
+                    L, ux, uy, float(w)))
+
+        def _runway_elev_lookup(x_m, y_m):
+            """Return the elevation of the nearest point on the
+            emitted runway chain to (x_m, y_m).  None if the chain
+            is empty or every runway segment is beyond RADIUS_M.
+            The caller is responsible for deciding WHETHER to ask
+            (e.g. "is this taxi endpoint near a runway?") — this
+            function just interpolates once the decision is made.
+            """
+            RADIUS_M = 100.0
+            if not _runway_segs_m:
                 return None
+            best_elev = None
+            best_dist = 1e18
+            for (pa, pb, ea, eb, L, ux, uy, w) in _runway_segs_m:
+                # Project onto the runway segment's centerline.
+                px = x_m - pa[0]
+                py = y_m - pa[1]
+                t = px * ux + py * uy
+                t_clamped = max(0.0, min(L, t))
+                cx = pa[0] + ux * t_clamped
+                cy = pa[1] + uy * t_clamped
+                d = sqrt((x_m - cx) ** 2 + (y_m - cy) ** 2)
+                if d > RADIUS_M:
+                    continue
+                if d < best_dist:
+                    best_dist = d
+                    frac = t_clamped / L if L > 0 else 0.0
+                    best_elev = ea + frac * (eb - ea)
+            return best_elev
 
         def _try_rectify(strip_poly):
             """Return a rect chain if the strip is rectifiable, else
             None.  Factored so the decomposition branch can re-test
-            each branch after morphological splitting.  build_taxiway_
-            rects (MRR-aligned) does NOT receive the runway anchor
-            because its sampling is long-axis-only; runway joins are
-            handled by the centerline builder fallback instead."""
+            each branch after morphological splitting.  The MRR-
+            aligned builder gets the same runway_polygon +
+            runway_elev_lookup as the centerline builder so its
+            endpoints are anchored to the runway the same way."""
             if _TR is None:
                 return None
             try:
                 return _TR.build_taxiway_rects(
-                    strip_poly, _dem_at, max_grade=MAX_TAXIWAY_GRADE)
+                    strip_poly, _dem_at,
+                    max_grade=MAX_TAXIWAY_GRADE,
+                    runway_polygon=rwy_union_raw_m,
+                    runway_elev_lookup=_runway_elev_lookup)
             except Exception:
                 return None
 
@@ -2945,7 +3015,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                             max_grade=MAX_TAXIWAY_GRADE,
                             seg_length=50.0,
                             fidelity_tol=1.0,
-                            runway_anchor=_runway_edge_anchor_m)
+                            runway_polygon=rwy_union_raw_m,
+                            runway_elev_lookup=_runway_elev_lookup)
                     except Exception:
                         rc = None
                     if not rc:
@@ -5150,6 +5221,29 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         if not airport_footprint.is_empty and airport_footprint.area > 100:
             emitted_union = _emitted_union()
 
+            # ── Boundary environment (commits A+B scaffolding) ────────
+            # Load (or download + cache) OSM landuse / natural /
+            # waterway / barrier features that the classifier in
+            # ``O4_Boundary_Model`` will consume once commit C+ lands.
+            # For this commit the features are only used to prove the
+            # load path works — ``classify_segment`` always returns
+            # ``Archetype.FLUSH`` so behaviour is unchanged.
+            try:
+                _bnd_osm_layer = BND.load_boundary_environment(
+                    tile.lat, tile.lon, OSM)
+                _bnd_ext_features = BND.extract_features(
+                    _bnd_osm_layer, to_m)
+                UI.vprint(
+                    2,
+                    "    {}: boundary env loaded — {} exterior features"
+                    .format(icao, len(_bnd_ext_features)))
+            except Exception as _bnd_err:
+                UI.vprint(
+                    2,
+                    "    {}: boundary env load skipped ({})"
+                    .format(icao, _bnd_err))
+                _bnd_ext_features = []
+
             # ── Portal exclusion zones ────────────────────────────────
             # Pre-scan tunnel roads to find portal points so Phase E1
             # can carve a gap in the boundary band around each portal,
@@ -5263,6 +5357,25 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                         if not airport_footprint.contains(probe_pt):
                             perp_b = (-perp_b[0], -perp_b[1])
 
+                        # ── Classifier dispatch (A+B scaffolding) ──
+                        # Ask the boundary model which archetype
+                        # this segment wants.  The context builder
+                        # in commit C will populate exterior DEM
+                        # profile + constraint set; for now only the
+                        # segment endpoints are populated and the
+                        # stub classifier always returns FLUSH.
+                        # Future commits insert
+                        #   if _arch == Archetype.EMBANKMENT:
+                        #       _emit_embankment(...)
+                        #       continue
+                        # above the FLUSH body below, one branch per
+                        # archetype, without reshaping the walk.
+                        _bnd_ctx = BND.BoundaryContext(
+                            seg_start_m=(sx_b, sy_b),
+                            seg_end_m=(ex_b, ey_b))
+                        _arch = BND.classify_segment(_bnd_ctx)
+
+                        # ── FLUSH emitter body ────────────────────
                         # Centerline offset inward by band_width/2
                         # so the runway_corners-built rect spans
                         # [boundary, boundary + band_width inward].
