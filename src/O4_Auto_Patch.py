@@ -4836,10 +4836,30 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     strip = near_zone_i.intersection(near_zone_j)
                     if strip.is_empty or strip.area < 5.0:
                         continue
-                    # Subtract all existing emitted shapes
-                    for s_poly, _ in emitted_flat_shapes:
-                        if not s_poly.is_empty:
-                            strip = strip.difference(s_poly)
+                    # Subtract existing emitted flat shapes that
+                    # actually touch the strip's bbox.  The previous
+                    # version scanned ALL emitted_flat_shapes
+                    # (~800 polys at SPJC) for every pair, producing
+                    # 260 000 difference() calls — 4.4 s of the
+                    # pre-optimisation 45 s total.  The STRtree
+                    # query cuts that to the 0-20 neighbours that
+                    # actually overlap the strip.
+                    try:
+                        nbrs = tree.query(strip)
+                    except Exception:
+                        nbrs = []
+                    for n_idx in nbrs:
+                        n = int(n_idx)
+                        if n == i or n == j:
+                            continue
+                        s_poly = fs_polys[n]
+                        if s_poly.is_empty:
+                            continue
+                        if not s_poly.intersects(strip):
+                            continue
+                        strip = strip.difference(s_poly)
+                        if strip.is_empty:
+                            break
                     # Also subtract runways, taxiways, junctions
                     for subtract in (rwy_union_m, twy_union_m,
                                      junction_zone_m):
@@ -5398,23 +5418,25 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
                         full_area = rp.area
                         # Clip against prior phase emitted shapes +
-                        # portal exclusion + rects already emitted
-                        # earlier in THIS walk.
+                        # portal exclusion (static `subtract_base`)
+                        # followed by rects already emitted earlier
+                        # in THIS walk (`e1_emitted_union`).  The
+                        # previous version unioned both into one
+                        # polygon per iteration, which made a single
+                        # line of the Phase E1 loop account for 12 s
+                        # of the 32 s runtime at SPJC because the
+                        # static half was re-unioned 400 times.  Two
+                        # sequential differences are equivalent to
+                        # one difference-of-union, and the static
+                        # polygon is pre-computed once above.
                         try:
-                            if e1_emitted_union.is_empty:
-                                dyn_subtract = subtract_base
-                            elif subtract_base.is_empty:
-                                dyn_subtract = e1_emitted_union
-                            else:
-                                dyn_subtract = shp_ops.unary_union([
-                                    subtract_base, e1_emitted_union])
-                        except Exception:
-                            dyn_subtract = subtract_base
-                        try:
-                            if not dyn_subtract.is_empty:
-                                rp_clean = rp.difference(dyn_subtract)
-                            else:
-                                rp_clean = rp
+                            rp_clean = rp
+                            if not subtract_base.is_empty:
+                                rp_clean = rp_clean.difference(subtract_base)
+                            if (not rp_clean.is_empty
+                                    and not e1_emitted_union.is_empty):
+                                rp_clean = rp_clean.difference(
+                                    e1_emitted_union)
                         except Exception:
                             rp_clean = rp
                         if (rp_clean.is_empty

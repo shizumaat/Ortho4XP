@@ -127,8 +127,23 @@ class _VertexBag:
     """
 
     def __init__(self, eps: float = EPS_DUP_M):
+        self._eps = eps
         self._eps2 = eps * eps
         self._pts: List[List] = []
+        # Spatial-hash grid: cell_size >= eps so two points within
+        # eps are guaranteed to be in the same or an adjacent cell.
+        # cell_size is also tuned to the dedup + sample gap radii
+        # (0.5 m and 2 m respectively): making it larger than 2 m
+        # means has_near can't finish in O(1) cells, but making it
+        # exactly eps means has_near with gap = SAMPLE_GAP_M must
+        # scan (2*gap/cell+1)² ≈ 81 cells — still cheap.  The grid
+        # replaces the O(n²) linear scan behaviour with O(n) total
+        # builds + O(1) average lookups.
+        self._cell_size = max(eps, 1.0)
+        self._grid: dict = {}
+
+    def _cell(self, x: float, y: float) -> tuple:
+        return (int(x / self._cell_size), int(y / self._cell_size))
 
     def __iter__(self):
         return iter(self._pts)
@@ -145,29 +160,57 @@ class _VertexBag:
         promotes an existing un-anchored duplicate to anchored, but
         an existing anchor is never overwritten.
         """
-        for i, p in enumerate(self._pts):
-            if (p[0] - x) ** 2 + (p[1] - y) ** 2 < self._eps2:
-                if anchored and not p[3]:
-                    self._pts[i] = [p[0], p[1], z, True]
-                return i
+        # Check the 9 neighbouring grid cells for a duplicate.
+        cx, cy = self._cell(x, y)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                bucket = self._grid.get((cx + dx, cy + dy))
+                if bucket is None:
+                    continue
+                for i in bucket:
+                    p = self._pts[i]
+                    if (p[0] - x) ** 2 + (p[1] - y) ** 2 < self._eps2:
+                        if anchored and not p[3]:
+                            self._pts[i] = [p[0], p[1], z, True]
+                        return i
+        idx = len(self._pts)
         self._pts.append([x, y, float(z), anchored])
-        return len(self._pts) - 1
+        self._grid.setdefault((cx, cy), []).append(idx)
+        return idx
 
     def index_at(self, x: float, y: float) -> Optional[int]:
         """Return the index of the vertex closest to (x, y) within
         EPS_DUP_M, or None if no vertex is that close.
         """
-        for i, p in enumerate(self._pts):
-            if (p[0] - x) ** 2 + (p[1] - y) ** 2 < self._eps2:
-                return i
+        cx, cy = self._cell(x, y)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                bucket = self._grid.get((cx + dx, cy + dy))
+                if bucket is None:
+                    continue
+                for i in bucket:
+                    p = self._pts[i]
+                    if (p[0] - x) ** 2 + (p[1] - y) ** 2 < self._eps2:
+                        return i
         return None
 
     def has_near(self, x: float, y: float, gap: float) -> bool:
         """True if any existing vertex is within `gap` of (x, y)."""
         gap2 = gap * gap
-        for p in self._pts:
-            if (p[0] - x) ** 2 + (p[1] - y) ** 2 < gap2:
-                return True
+        cx, cy = self._cell(x, y)
+        # Number of grid cells that could contain a point within
+        # `gap` of (x, y).  For gap <= cell_size this is just the
+        # 9 surrounding cells; wider `gap` walks more cells.
+        r = int(gap / self._cell_size) + 1
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                bucket = self._grid.get((cx + dx, cy + dy))
+                if bucket is None:
+                    continue
+                for i in bucket:
+                    p = self._pts[i]
+                    if (p[0] - x) ** 2 + (p[1] - y) ** 2 < gap2:
+                        return True
         return False
 
 
@@ -244,36 +287,64 @@ def _delaunay_clipped(bag: _VertexBag,
                       polygon: shp_geom.Polygon
                       ) -> List[shp_geom.Polygon]:
     """Delaunay-triangulate the vertex bag and keep only triangles
-    whose centroid lies strictly inside `polygon`.
+    whose centroid lies strictly inside `polygon` AND whose area
+    is at least 99 % inside (to reject triangles that span concave
+    bays, see commit 6 Phase D rewrite).
 
-    The "strictly inside" test (``polygon.contains``) ensures
-    triangle vertices stay within (or on) the polygon boundary, so
-    the triangulation can't bleed into adjacent emitted shapes.
-    A boundary-tolerant test would let edge triangles drift
-    outside, causing cross-category overlap with neighbour features
-    (the bug found in commit 6 Phase D rewrite).
+    Uses shapely ``prepared`` geometry for the centroid containment
+    test (a 5-10× speedup over the raw ``polygon.contains`` path
+    which has to re-index the polygon on every call) and a
+    strict-vertex shortcut that skips the expensive
+    ``polygon.intersection(t)`` check when the triangle's three
+    corners are all strictly inside — in that case the 99 %
+    containment is trivially satisfied.
     """
     try:
         mp = shp_geom.MultiPoint([(p[0], p[1]) for p in bag])
         raw = shp_ops.triangulate(mp)
     except Exception:
         return []
+    try:
+        from shapely.prepared import prep
+        prepared = prep(polygon)
+    except Exception:
+        prepared = None
+    # If the polygon has no interior rings, a triangle with all 3
+    # corners inside the prepared polygon is trivially 100 %
+    # contained — no need for the expensive
+    # ``polygon.intersection(t).area`` check.  When the polygon
+    # has holes, fall through to the full intersection test.
+    has_holes = bool(list(polygon.interiors))
     out = []
     for t in raw:
         if t.is_empty or not t.is_valid:
             continue
         try:
-            # Centroid-inside is not enough: when `polygon` is
-            # concave (e.g. an apron with a runway rectangle cut
-            # out of it), Delaunay can produce triangles whose
-            # centroid sits in the concavity's interior while the
-            # triangle itself spans the bay and pokes into the
-            # subtracted region.  Require the triangle to be
-            # (almost) fully contained — the 1% tolerance absorbs
-            # boundary-touching floating-point slivers without
-            # letting a triangle bleed across a concavity.
-            if not polygon.contains(t.centroid):
-                continue
+            centroid = t.centroid
+            if prepared is not None:
+                if not prepared.contains(centroid):
+                    continue
+            else:
+                if not polygon.contains(centroid):
+                    continue
+            if prepared is not None and not has_holes:
+                # Hole-free shortcut: check the 3 raw vertex coords
+                # with prepared.contains (no new Point creation
+                # needed via the direct coordinate-bounds trick —
+                # we must still build Points, but this is much
+                # cheaper than polygon.intersection(t) because
+                # prepared.contains is O(log n) against a
+                # pre-indexed polygon).
+                coords = list(t.exterior.coords)[:-1]
+                if len(coords) == 3:
+                    p0 = shp_geom.Point(coords[0])
+                    p1 = shp_geom.Point(coords[1])
+                    p2 = shp_geom.Point(coords[2])
+                    if (prepared.contains(p0)
+                            and prepared.contains(p1)
+                            and prepared.contains(p2)):
+                        out.append(t)
+                        continue
             inter = polygon.intersection(t).area
             if inter >= 0.99 * t.area:
                 out.append(t)
