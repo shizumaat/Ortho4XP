@@ -4021,35 +4021,21 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     for t in (0.0, 0.5, 1.0):
                         p = ln.interpolate(t, normalized=True)
                         raw.append((p.x, p.y, elev))
-            # Flat terminal buffer ring: sample an outward offset
-            # of the building's boundary every ~20 m, clipped to
-            # the apron polygon.  These anchors force the apron
-            # triangulation to be flat at the terminal elevation
-            # for TERMINAL_FLAT_BUFFER_M around the building.
-            try:
-                ring_geom = bp.buffer(TERMINAL_FLAT_BUFFER_M).boundary
-                clipped_ring = ring_geom.intersection(apron_poly)
-            except Exception:
-                clipped_ring = None
-            if clipped_ring is not None and not clipped_ring.is_empty:
-                ring_lines = []
-                if hasattr(clipped_ring, "geoms"):
-                    for g in clipped_ring.geoms:
-                        if hasattr(g, "coords"):
-                            ring_lines.append(g)
-                elif hasattr(clipped_ring, "coords"):
-                    ring_lines.append(clipped_ring)
-                for rl in ring_lines:
-                    total = rl.length
-                    if total < 1.0:
-                        p = rl.interpolate(0.5, normalized=True)
-                        raw.append((p.x, p.y, elev))
-                        continue
-                    n = max(2, int(total / 20.0) + 1)
-                    for k in range(n):
-                        t = k / (n - 1) if n > 1 else 0.5
-                        p = rl.interpolate(t, normalized=True)
-                        raw.append((p.x, p.y, elev))
+            # NOTE: commit 9 added a TERMINAL_FLAT_BUFFER_M flat ring
+            # around each building at the pad elevation, to keep the
+            # ground flat for ~10 m around each terminal.  At airports
+            # with densely-packed buildings at varying pad elevations
+            # (SPJC has 313 buildings spanning ~40 m of pad elevation
+            # across ~2 km of pavement) the overlapping flat rings
+            # create incompatible anchor constraints — two adjacent
+            # buildings' flat rings demand two different elevations
+            # at the same apron point, and the grade clamp cannot
+            # resolve it.  Per the user's rule "aprons share an edge
+            # with the building pad, THEN slope gently to taxiways",
+            # the flat ring is unnecessary: vertex coincidence at the
+            # actual building edge (handled by the shared-boundary
+            # block above) is enough, and the apron can slope freely
+            # from there at ≤ MAX_APRON_GRADE.  Ring code removed.
         # Taxiway crossing anchors.  Use a slightly buffered apron
         # so taxiways that stub into the edge also contribute.
         TWY_TOUCH_M = 5.0
@@ -4188,7 +4174,34 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             # drainage could land inside).
             avg_e = (sum(v[2] for t in tris for v in t)
                      / (3.0 * len(tris)))
+            piece_tris_start = len(emitted_apron_triangles_m)
             OVERLAP_EPS = 0.5   # m² — ignore vanishing boundary slop
+            # Sliver filters: Delaunay on complex polygons routinely
+            # produces a handful of near-colinear "sliver" triangles
+            # whose shortest edge is 1-3 m.  adaptive_triangulate's
+            # fit_plane returns None for colinear triples so the
+            # grade clamp silently skips them, and the sliver is
+            # emitted with raw DEM/anchor elevations — which then
+            # look like 50-100 % grade in the final patch because
+            # the sliver's short edge amplifies any ΔZ into an
+            # absurd edge gradient.  Drop sliver triangles here and
+            # rely on the per-piece coverage-fill below to paint
+            # their area as flat residue at the piece's average
+            # elevation.
+            SLIVER_MIN_AREA_M2 = 5.0
+            SLIVER_MIN_EDGE_M = 2.0
+            # Plane gradient filter: drop any triangle whose plane
+            # slope exceeds 2× MAX_APRON_GRADE.  These are slivers
+            # whose plane fit is dominated by a short edge with a
+            # large Δz — the grade clamp cannot fix them because
+            # pulling corners toward the centroid just produces a
+            # different degenerate plane.  Dropped triangles become
+            # holes in the triangulation that the per-piece coverage
+            # fill below paints as flat residue at the piece's
+            # average elevation, which preserves coverage and is a
+            # much better approximation than a sliver with a 300 %
+            # plane gradient.
+            MAX_PLANE_GRADIENT = 2.0 * MAX_APRON_GRADE
             for (v0, v1, v2) in tris:
                 tri_poly = None
                 try:
@@ -4199,6 +4212,30 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     if (not tri_poly.is_valid
                             or tri_poly.is_empty):
                         continue
+                    if tri_poly.area < SLIVER_MIN_AREA_M2:
+                        continue
+                    # Min edge length check — catches long-thin
+                    # slivers whose area is just above threshold.
+                    e01 = sqrt((v0[0] - v1[0]) ** 2
+                               + (v0[1] - v1[1]) ** 2)
+                    e12 = sqrt((v1[0] - v2[0]) ** 2
+                               + (v1[1] - v2[1]) ** 2)
+                    e20 = sqrt((v2[0] - v0[0]) ** 2
+                               + (v2[1] - v0[1]) ** 2)
+                    if min(e01, e12, e20) < SLIVER_MIN_EDGE_M:
+                        continue
+                    # Plane gradient check via inline fit_plane.
+                    v1x = v1[0] - v0[0]; v1y = v1[1] - v0[1]
+                    v1z = v1[2] - v0[2]
+                    v2x = v2[0] - v0[0]; v2y = v2[1] - v0[1]
+                    v2z = v2[2] - v0[2]
+                    nz = v1x * v2y - v1y * v2x
+                    if abs(nz) > 1e-9:
+                        nx = v1y * v2z - v1z * v2y
+                        ny = v1z * v2x - v1x * v2z
+                        grad = sqrt((nx * nx + ny * ny)) / abs(nz)
+                        if grad > MAX_PLANE_GRADIENT:
+                            continue
                     if (not bldg_union_m.is_empty
                             and tri_poly.intersection(
                                 bldg_union_m).area > OVERLAP_EPS):
@@ -4226,10 +4263,17 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             # coverage without affecting zero-overlap (triangles
             # and fills are complementary by construction).
             try:
+                # Use only the triangles emitted for THIS piece
+                # (slivers and plane-gradient outliers have already
+                # been dropped by the loop above).  Buffer the
+                # union by 0.1 m before subtracting so the residue
+                # sits slightly inside the gap and sub-meter
+                # floating-point precision can't create a
+                # flat∩triangle edge overlap.
+                this_piece_tris = emitted_apron_triangles_m[piece_tris_start:]
                 piece_tris_union = shp_ops.unary_union(
-                    [tp for tp in emitted_apron_triangles_m[-len(tris):]
-                     if not tp.is_empty])
-                residue = piece.difference(piece_tris_union)
+                    [tp for tp in this_piece_tris if not tp.is_empty])
+                residue = piece.difference(piece_tris_union.buffer(0.1))
                 if not residue.is_empty:
                     res_polys = (list(residue.geoms)
                                  if hasattr(residue, "geoms")
