@@ -2445,6 +2445,17 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     def to_ll(mx, my):
         return (mx / (cos_lat * DEG_TO_M), my / DEG_TO_M)
 
+    def _dem_at(x_m, y_m):
+        """DEM sampler closure for the current ``to_ll`` / tile.
+        Returns ``None`` on lookup failure so callers can fall back
+        to a nearest-anchor or interpolated estimate.
+        """
+        try:
+            lon, lat = to_ll(x_m, y_m)
+            return float(tile.dem.alt((lon - tile.lon, lat - tile.lat)))
+        except Exception:
+            return None
+
     # Full taxiway width (both sides of centerline)
     TWY_FULL_WIDTH = TAXIWAY_BUFFER_WIDTH * 2.0
 
@@ -2454,6 +2465,12 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # Updated incrementally — after each batch of emissions, new
     # shapes are appended and union recomputed.
     all_emitted_parts_m = []  # list of Shapely geoms
+
+    # Taxiway sloped-quad accumulator — hoisted to the top because
+    # Phase C0 (apt.dat taxiway rect-chain, runs from A3) writes to
+    # it and the coverage-fill pass (Phase C2 tail) reads from it to
+    # avoid re-emitting flat patches over already-emitted taxi rects.
+    emitted_twy_quads_m = []
 
     def _emitted_union():
         """Return the union of all emitted shapes so far.
@@ -2768,11 +2785,99 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     continue
                 apron_polys_m.append(p_m.buffer(APRON_BUFFER))
 
-    # For task 1 the classified taxiway polygons still flow through
-    # the apron emission path so output stays bit-identical.  Task 2
-    # will short-circuit this by emitting apt_twy_polys_m via the
-    # rect-chain path and clearing it before the apron union runs.
-    apron_polys_m.extend(apt_twy_polys_m)
+    # Phase C0: emit classified taxiway polygons as chains of
+    # sloping rectangles.
+    #
+    # Each apt_twy_polys_m entry is a strip-like pavement polygon
+    # (aspect ≥ 4, 9–45 m wide) whose surface is well approximated
+    # by an MRR-aligned rectangle.  O4_Taxiway_Rects.build_taxiway_rects
+    # slices the polygon's long axis into grade-clamped, DEM-
+    # faithful sloping rect segments; each segment is emitted here
+    # using _emit_sloped_rect (altitude_high/altitude_low tags, same
+    # format as runway segments).  Rects are tracked in
+    # emitted_taxi_rects_m so downstream phases (C2 apron, D
+    # junctions, E boundary band) subtract them cleanly.
+    #
+    # A polygon that fails build_taxiway_rects's fit-ratio gate
+    # (≥ 0.80) is considered too irregular and flows back through
+    # the apron triangulation path.
+    emitted_taxi_rects_m = []
+    if apt_twy_polys_m:
+        try:
+            import O4_Taxiway_Rects as TR
+        except Exception:
+            TR = None
+        twy_rect_count = 0
+        twy_flat_count = 0
+        twy_fallback_count = 0
+        for twy_poly in apt_twy_polys_m:
+            rects = (TR.build_taxiway_rects(
+                twy_poly, _dem_at,
+                max_grade=MAX_TAXIWAY_GRADE,
+            ) if TR is not None else None)
+            if rects is None:
+                # Polygon failed the strip-fit check — fall back
+                # to triangulation by pushing it into the apron
+                # pool.  This will be handled by the existing C2
+                # apron path.
+                apron_polys_m.append(twy_poly)
+                twy_fallback_count += 1
+                continue
+            for r in rects:
+                # Convert the 4 meter-space corners to lat/lon and
+                # emit via _emit_sloped_rect.  The rect is axis-
+                # aligned with the MRR long axis, so the high-end
+                # centerline endpoint and low-end centerline
+                # endpoint are the "a" and "b" of _emit_sloped_rect.
+                lon_hi, lat_hi = to_ll(r.center_high[0],
+                                       r.center_high[1])
+                lon_lo, lat_lo = to_ll(r.center_low[0],
+                                       r.center_low[1])
+                _emit_sloped_rect(
+                    lat_hi, lon_hi, r.elev_high,
+                    lat_lo, lon_lo, r.elev_low,
+                    r.width_m)
+                twy_rect_count += 1
+                if r.is_flat:
+                    twy_flat_count += 1
+                # Track in meter space for the emitted-parts
+                # accumulator.  Build a shapely polygon from the 4
+                # corners (the same ones _emit_sloped_rect built in
+                # lat/lon via runway_corners — close enough for
+                # subtraction).
+                try:
+                    rp = shp_geom.Polygon(r.corners_m)
+                    if rp.is_valid and not rp.is_empty:
+                        emitted_taxi_rects_m.append(rp)
+                except Exception:
+                    pass
+        if emitted_taxi_rects_m:
+            all_emitted_parts_m.extend(emitted_taxi_rects_m)
+            # Feed the rects into emitted_twy_quads_m so the later
+            # coverage-fill pass sees them as "already covered" and
+            # skips re-emitting flat patches for the same area.
+            emitted_twy_quads_m.extend(emitted_taxi_rects_m)
+            # Union the emitted taxi rects into twy_union_m so the
+            # existing C2 apron subtraction (`clipped = clipped.
+            # difference(twy_union_m)` at line ~4005) carves them
+            # out cleanly.  Without this the apron triangulation
+            # would produce triangles overlapping the rect chain.
+            # Buffer by 0.5 m to swallow sub-meter slivers from
+            # corner rounding in runway_corners precision.
+            try:
+                taxi_union = shp_ops.unary_union(emitted_taxi_rects_m)
+                if not taxi_union.is_empty:
+                    if twy_union_m.is_empty:
+                        twy_union_m = taxi_union.buffer(0.5)
+                    else:
+                        twy_union_m = shp_ops.unary_union(
+                            [twy_union_m, taxi_union.buffer(0.5)])
+            except Exception:
+                pass
+        UI.vprint(2,
+            "    apt.dat taxiway rect-chain: {} rects ({} flat), "
+            "{} polygons fell back to triangulation".format(
+                twy_rect_count, twy_flat_count, twy_fallback_count))
 
     try:
         apron_union_m = shp_ops.unary_union(apron_polys_m) if apron_polys_m \
@@ -3400,7 +3505,6 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     n_twy_flat = 0
     n_twy_sloped = 0
     sloped_twy_parts_m = []   # curve areas sent to Phase D for triangulation
-    emitted_twy_quads_m = []  # meter-space footprints of emitted sloped quads
     emitted_flat_twy_m = []   # meter-space footprints of emitted flat twy polys
 
     # Merge parallel taxiways within 15m into single surfaces
@@ -3744,14 +3848,6 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # naturally yields just 2 triangles for a flat apron and adds
     # interior detail only where DEM departs from the plane.
     import O4_Surface_Mesh as SM
-
-    def _dem_at(x_m, y_m):
-        """DEM sampler closure for the current `to_ll`/tile."""
-        try:
-            lon, lat = to_ll(x_m, y_m)
-            return float(tile.dem.alt((lon - tile.lon, lat - tile.lat)))
-        except Exception:
-            return None
 
     APRON_SIMPLIFY_M = 10.0      # input polygon simplification
                                  # tolerance — strips OSM vertex
