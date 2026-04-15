@@ -563,7 +563,8 @@ def extend_point(lat_from, lon_from, lat_to, lon_to, distance_m):
 RUNWAY_SEGMENT_LENGTH = 100.0  # meters — length of each runway segment
 
 
-def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None):
+def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
+                       apt_runways=None):
     """Generate OSM XML content for segmented runway auto-patches.
 
     For each paired runway, samples the DEM along the centerline at
@@ -581,12 +582,21 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None):
         runway_pairs: List from pair_runways()
         runway_widths: Dict of {designator: width_m} from apt.dat, or None.
         tile: Optional Tile object with .dem, .lat, .lon for DEM sampling.
+        apt_runways: Optional dict of {designator: (lat, lon, width_m)}
+            parsed from apt.dat row-100 records.  When provided,
+            threshold lat/lon and width for each matching designator
+            are taken from apt.dat instead of CIFP, so the emitted
+            runway rectangles align with what X-Plane renders as
+            the runway texture.  CIFP is still the authoritative
+            source for elevations and displaced-threshold distances.
 
     Returns:
         str: Complete OSM XML content for the patch file.
     """
     if runway_widths is None:
         runway_widths = {}
+    if apt_runways is None:
+        apt_runways = {}
     node_id = -1
     way_id = -1
     nodes = []  # list of (id, lat, lon)
@@ -659,6 +669,15 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None):
     for desig_a, data_a, desig_b, data_b in runway_pairs:
         if desig_b is not None and data_b is not None:
             # ── Paired runway ────────────────────────────────────────────
+            # CIFP provides the DISPLACED threshold lat/lon and
+            # elevation at that threshold; apt.dat row-100 provides
+            # the PHYSICAL runway-end lat/lon (the same point when
+            # displaced_m == 0) plus the true width.
+            #
+            # Grade is computed from CIFP displaced-threshold
+            # elevations and the CIFP threshold-to-threshold
+            # distance.  apt.dat is used only for the footprint
+            # rectangle positions and width.
             lat_a, lon_a = data_a["lat"], data_a["lon"]
             lat_b, lon_b = data_b["lat"], data_b["lon"]
             elev_a = data_a["elevation_m"]
@@ -666,11 +685,20 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None):
             displaced_a = data_a["displaced_m"]
             displaced_b = data_b["displaced_m"]
 
-            # Determine runway width for this pair (apt.dat → default)
-            rwy_width = runway_widths.get(
-                desig_a,
-                runway_widths.get(desig_b, DEFAULT_RUNWAY_WIDTH),
-            )
+            apt_a = apt_runways.get(desig_a)
+            apt_b = apt_runways.get(desig_b)
+            have_apt_geom = apt_a is not None and apt_b is not None
+
+            # Determine runway width for this pair.  Prefer apt.dat
+            # row-100 width (exact), then the runway_widths dict, then
+            # the default.
+            if have_apt_geom:
+                rwy_width = apt_a[2]
+            else:
+                rwy_width = runway_widths.get(
+                    desig_a,
+                    runway_widths.get(desig_b, DEFAULT_RUNWAY_WIDTH),
+                )
             patch_width = rwy_width + 2 * RUNWAY_MARGIN
 
             # Compute threshold-to-threshold distance for grade calculation
@@ -687,23 +715,39 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None):
             grade = (elev_b - elev_a) / thresh_dist
 
             # ── Physical runway ends ─────────────────────────────────────
-            if displaced_a > 0:
-                phys_end_a = extend_point(
-                    lat_b, lon_b, lat_a, lon_a, displaced_a
-                )
+            # When apt.dat row-100 geometry is available, use its
+            # lat/lon as the physical runway ends directly — apt.dat
+            # row-100 coordinates are the physical ends (displaced
+            # distance is stored separately).  Elevations at those
+            # physical ends come from CIFP threshold elevations
+            # shifted along the runway by ±displaced_m × grade.
+            #
+            # Without apt.dat, fall back to the legacy behaviour:
+            # extend the CIFP threshold outward by displaced_m to
+            # approximate the physical end.
+            if have_apt_geom:
+                phys_end_a = (apt_a[0], apt_a[1])
+                phys_end_b = (apt_b[0], apt_b[1])
                 elev_phys_a = elev_a - grade * displaced_a
-            else:
-                phys_end_a = (lat_a, lon_a)
-                elev_phys_a = elev_a
-
-            if displaced_b > 0:
-                phys_end_b = extend_point(
-                    lat_a, lon_a, lat_b, lon_b, displaced_b
-                )
                 elev_phys_b = elev_b + grade * displaced_b
             else:
-                phys_end_b = (lat_b, lon_b)
-                elev_phys_b = elev_b
+                if displaced_a > 0:
+                    phys_end_a = extend_point(
+                        lat_b, lon_b, lat_a, lon_a, displaced_a
+                    )
+                    elev_phys_a = elev_a - grade * displaced_a
+                else:
+                    phys_end_a = (lat_a, lon_a)
+                    elev_phys_a = elev_a
+
+                if displaced_b > 0:
+                    phys_end_b = extend_point(
+                        lat_a, lon_a, lat_b, lon_b, displaced_b
+                    )
+                    elev_phys_b = elev_b + grade * displaced_b
+                else:
+                    phys_end_b = (lat_b, lon_b)
+                    elev_phys_b = elev_b
 
             # Full physical runway length
             dx_phys = (phys_end_b[1] - phys_end_a[1]) * cos_lat_v * DEG_TO_M
@@ -878,27 +922,32 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None):
                 )
 
             # ── Flat overrun extensions beyond physical ends ─────────────
-            ext_a = extend_point(
-                phys_end_b[0], phys_end_b[1],
-                phys_end_a[0], phys_end_a[1],
-                OVERRUN_EXTENSION,
-            )
-            add_rect_patch(
-                ext_a[0], ext_a[1], elevs[0],
-                phys_end_a[0], phys_end_a[1], elevs[0],
-                patch_width,
-            )
+            # Skip when apt.dat geometry is authoritative — the
+            # apt.dat row-100 rectangle already represents the full
+            # runway surface, and adding a 30 m extension would push
+            # the emitted patch past the rendered runway edge.
+            if not have_apt_geom:
+                ext_a = extend_point(
+                    phys_end_b[0], phys_end_b[1],
+                    phys_end_a[0], phys_end_a[1],
+                    OVERRUN_EXTENSION,
+                )
+                add_rect_patch(
+                    ext_a[0], ext_a[1], elevs[0],
+                    phys_end_a[0], phys_end_a[1], elevs[0],
+                    patch_width,
+                )
 
-            ext_b = extend_point(
-                phys_end_a[0], phys_end_a[1],
-                phys_end_b[0], phys_end_b[1],
-                OVERRUN_EXTENSION,
-            )
-            add_rect_patch(
-                phys_end_b[0], phys_end_b[1], elevs[-1],
-                ext_b[0], ext_b[1], elevs[-1],
-                patch_width,
-            )
+                ext_b = extend_point(
+                    phys_end_a[0], phys_end_a[1],
+                    phys_end_b[0], phys_end_b[1],
+                    OVERRUN_EXTENSION,
+                )
+                add_rect_patch(
+                    phys_end_b[0], phys_end_b[1], elevs[-1],
+                    ext_b[0], ext_b[1], elevs[-1],
+                    patch_width,
+                )
 
         else:
             # ── Unpaired runway: flat patch at known elevation ───────────
@@ -1127,8 +1176,34 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
         # Start from the legacy per-segment runway patch; the surface
         # generator (Phase A-F) appends buildings, taxiways, aprons,
         # triangle wedges, and boundary band on top.
+        #
+        # Load apt.dat row-100 runway geometry so per-segment rectangles
+        # align with the X-Plane rendered runway.  CIFP is still the
+        # sole elevation source (thresholds + displaced distances);
+        # apt.dat is used only for footprint lat/lon and width.
+        apt_runway_geom = {}
+        try:
+            xp_root = xplane_root_from_cifp_path(cifp_path)
+            if xp_root:
+                import O4_Apt_Dat_Reader as _APR
+                _apt_path = _APR.find_airport_apt_dat(xp_root, icao)
+                if _apt_path:
+                    _apt = _APR.load_airport(_apt_path, icao)
+                    if _apt is not None:
+                        for _r in _apt.runways:
+                            def _norm(d):
+                                return d if d.startswith("RW") else "RW" + d
+                            apt_runway_geom[_norm(_r.desig_a)] = (
+                                _r.lat_a, _r.lon_a, _r.width_m)
+                            apt_runway_geom[_norm(_r.desig_b)] = (
+                                _r.lat_b, _r.lon_b, _r.width_m)
+        except Exception as _e:
+            UI.vprint(
+                2, "   Auto-patch: apt.dat runway geometry lookup "
+                "failed ({}); falling back to CIFP".format(_e))
         osm_content = generate_patch_osm(
-            icao, pairs, runway_widths=runway_widths, tile=tile
+            icao, pairs, runway_widths=runway_widths, tile=tile,
+            apt_runways=apt_runway_geom,
         )
         num_surface_patches = 0
 
@@ -2381,55 +2456,17 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 except Exception:
                     pass
 
-    # Also build rectangles from CIFP runway_pairs — these are what
-    # generate_patch_osm uses to emit runway segments.  apt.dat and
-    # CIFP thresholds can differ by a few meters (different rotation
-    # or displaced-threshold handling), and the apt.dat rectangle
-    # alone does not cover every pixel the CIFP rectangle will
-    # emit.  Union both so aprons get clipped against the full
-    # emitted runway footprint.
-    for rp in (runway_pairs or []):
-        da, db = rp.get("data_a"), rp.get("data_b")
-        if not (da and db):
-            continue
-        try:
-            # Match generate_patch_osm: physical ends (extended back
-            # from the opposite threshold by displaced_m) plus a
-            # 30 m flat overrun on each side.
-            lat_a, lon_a = da["lat"], da["lon"]
-            lat_b, lon_b = db["lat"], db["lon"]
-            disp_a = da.get("displaced_m", 0.0) or 0.0
-            disp_b = db.get("displaced_m", 0.0) or 0.0
-            if disp_a > 0:
-                phys_a = extend_point(lat_b, lon_b, lat_a, lon_a, disp_a)
-            else:
-                phys_a = (lat_a, lon_a)
-            if disp_b > 0:
-                phys_b = extend_point(lat_a, lon_a, lat_b, lon_b, disp_b)
-            else:
-                phys_b = (lat_b, lon_b)
-            end_a = extend_point(
-                phys_b[0], phys_b[1], phys_a[0], phys_a[1],
-                OVERRUN_EXTENSION)
-            end_b = extend_point(
-                phys_a[0], phys_a[1], phys_b[0], phys_b[1],
-                OVERRUN_EXTENSION)
-            patch_width = DEFAULT_RUNWAY_WIDTH + 2 * RUNWAY_MARGIN
-            corners = runway_corners(
-                end_a[0], end_a[1], end_b[0], end_b[1], patch_width)
-            if corners is None:
-                continue
-            coords_m = [to_m(lon, lat) for (lat, lon) in corners]
-            p = shp_geom.Polygon(coords_m)
-            if p.is_valid and not p.is_empty:
-                # 2 m outward safety buffer to absorb sub-meter
-                # threshold/width drift between CIFP and apt.dat.
-                runway_polys_m.append(p.buffer(2.0))
-        except Exception:
-            pass
-
     rwy_union_m = (shp_ops.unary_union(runway_polys_m)
                    if runway_polys_m else shp_geom.Polygon())
+    # Sub-meter safety inflate: generate_patch_osm emits per-segment
+    # rectangles whose corners may drift from the whole-rectangle
+    # corners by a fraction of a meter due to float precision in the
+    # runway_corners perpendicular offset.  A 0.5 m outward buffer on
+    # rwy_union_m (used only for subtraction from aprons, never
+    # emitted) absorbs those slivers without visibly affecting any
+    # apron edge.
+    if not rwy_union_m.is_empty:
+        rwy_union_m = rwy_union_m.buffer(0.5)
 
     # A2: Taxiway geometry — build buffer polygons and meter-space
     # centerlines.  Elevations are computed AFTER building platforms
@@ -2532,29 +2569,6 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             else shp_geom.Polygon()
     except Exception:
         apron_union_m = shp_geom.Polygon()
-
-    # Subtract the runway footprint from the apron union so aprons
-    # do not overlap the per-segment runway patches emitted by
-    # generate_patch_osm.  The runway rectangle includes overrun
-    # extensions that extend past the apt.dat pavement, and the
-    # overlap this causes must be removed before Phase C2
-    # triangulates the apron.
-    if not rwy_union_m.is_empty and not apron_union_m.is_empty:
-        try:
-            apron_union_m = apron_union_m.difference(rwy_union_m)
-            if not apron_union_m.is_valid:
-                apron_union_m = apron_union_m.buffer(0)
-        except Exception:
-            pass
-        # Rebuild apron_polys_m from the clipped union so Phase C2
-        # triangulation sees the clipped shape.
-        if apron_union_m.is_empty:
-            apron_polys_m = []
-        elif hasattr(apron_union_m, "geoms"):
-            apron_polys_m = [g for g in apron_union_m.geoms
-                             if not g.is_empty and hasattr(g, "exterior")]
-        elif hasattr(apron_union_m, "exterior"):
-            apron_polys_m = [apron_union_m]
 
     # A4: Building pads
     # Commit 10: BLDG_PAD is 0 — use the EXACT footprint.  The
