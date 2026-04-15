@@ -2764,9 +2764,11 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         try:
             import O4_Pavement_Classifier as _PC
             import O4_Taxiway_Rects as _TR
+            import O4_Taxiway_Decompose as _TD
         except Exception:
             _PC = None
             _TR = None
+            _TD = None
         apt_pavements = dico_apt_entry.get("_apt_pavements") or []
         classify_counts = {"taxiway": 0, "apron": 0}
         classify_reasons = {}
@@ -2774,6 +2776,21 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         rectifiable_twy_rects = []  # cached rect chains so C0 does
                                     # not re-run the probe
         pool_apron_m = []         # apron-classified OR fallback twy
+
+        def _try_rectify(strip_poly):
+            """Return a rect chain if the strip is rectifiable, else
+            None.  Factored so the decomposition branch can re-test
+            each branch after morphological splitting."""
+            if _TR is None:
+                return None
+            try:
+                return _TR.build_taxiway_rects(
+                    strip_poly, _dem_at, max_grade=MAX_TAXIWAY_GRADE)
+            except Exception:
+                return None
+
+        n_twy_decomposed = 0      # mega-polys that needed decomposition
+        n_twy_strip_branches = 0  # branches emitted as rects after decomp
         for (poly_tr, pav_name) in apt_pavements:
             if poly_tr is None or poly_tr.is_empty or not poly_tr.is_valid:
                 continue
@@ -2788,20 +2805,74 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 kind.kind, 0) + 1
             classify_reasons[kind.reason] = classify_reasons.get(
                 kind.reason, 0) + 1
-            if kind.kind == "taxiway" and _TR is not None:
-                rects = _TR.build_taxiway_rects(
-                    p_m, _dem_at, max_grade=MAX_TAXIWAY_GRADE)
+            if kind.kind != "taxiway" or _TR is None:
+                pool_apron_m.append(p_m)
+                continue
+
+            # Fast path: try the polygon whole.
+            rects = _try_rectify(p_m)
+            if rects:
+                rectifiable_twy_m.append(p_m)
+                rectifiable_twy_rects.append(rects)
+                continue
+
+            # Fast path failed.  Attempt recursive morphological
+            # decomposition — a "Taxiway V / U / Q / R / L / M"-style
+            # mega-polygon splits into strip branches per taxiway
+            # plus junction hubs at the letters' crossings.  Each
+            # branch that still fails the rect probe (e.g. an L-bend
+            # within one taxiway) is re-decomposed, and so on, until
+            # everything is either rectifiable, too small to bother
+            # with, or recursion-depth exhausted.
+            if _TD is None:
+                pool_apron_m.append(p_m)
+                continue
+
+            def _recursive_rectify(poly, depth):
+                """Walk decomposition recursively.  Appends
+                rectifiable branches to rectifiable_twy_m /
+                rectifiable_twy_rects and non-rectifiable residue
+                to pool_apron_m.  Returns (rect_count, hub_count).
+                """
+                nonlocal n_twy_strip_branches
+                if poly is None or poly.is_empty or poly.area < 50.0:
+                    if not poly.is_empty:
+                        pool_apron_m.append(poly)
+                    return
+                # Try rectifying the whole thing.
+                rects = _try_rectify(poly)
                 if rects:
-                    rectifiable_twy_m.append(p_m)
+                    rectifiable_twy_m.append(poly)
                     rectifiable_twy_rects.append(rects)
-                    continue
-            pool_apron_m.append(p_m)
+                    n_twy_strip_branches += 1
+                    return
+                if depth <= 0:
+                    pool_apron_m.append(poly)
+                    return
+                sub = _TD.decompose_multi_taxiway(poly)
+                if not sub.used_decomposition:
+                    # Single strip but rectify failed — no further
+                    # split is possible (a concave bend within one
+                    # strip is NOT a multi-strip junction).  Send
+                    # to the apron path.
+                    pool_apron_m.append(poly)
+                    return
+                for s in sub.strip_polygons:
+                    _recursive_rectify(s, depth - 1)
+                for h in sub.junction_polygons:
+                    # Hubs always triangulate.
+                    pool_apron_m.append(h)
+
+            n_twy_decomposed += 1
+            _recursive_rectify(p_m, depth=4)
         UI.vprint(2,
             "    apt.dat pavement classification: "
-            "{} taxiway (of which {} rectifiable), {} apron  "
-            "(reasons: {})".format(
+            "{} taxiway ({} rectifiable; {} mega-polys decomposed "
+            "into {} strip branches), {} apron  (reasons: {})".format(
                 classify_counts.get("taxiway", 0),
                 len(rectifiable_twy_m),
+                n_twy_decomposed,
+                n_twy_strip_branches,
                 classify_counts.get("apron", 0),
                 ", ".join("{}={}".format(k, v)
                           for k, v in sorted(classify_reasons.items()))))
@@ -4180,7 +4251,6 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             # drainage could land inside).
             avg_e = (sum(v[2] for t in tris for v in t)
                      / (3.0 * len(tris)))
-            piece_tris_start = len(emitted_apron_triangles_m)
             OVERLAP_EPS = 0.5   # m² — ignore vanishing boundary slop
             # Sliver filters: Delaunay on complex polygons routinely
             # produces a handful of near-colinear "sliver" triangles
@@ -4258,58 +4328,16 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 n_apron_tris += 1
                 emitted_apron_triangles_m.append(tri_poly)
 
-            # Per-piece coverage sweep: adaptive_triangulate's
-            # centroid-in-polygon clip rejects triangles whose
-            # centroid lies just outside a concave bay even when
-            # 90 %+ of the triangle is inside, leaving bay slivers
-            # uncovered.  Compute the residue (piece minus emitted
-            # triangles for THIS piece) right here and emit it as
-            # one or more flat polygons at the piece's average
-            # triangle elevation.  This guarantees per-piece
-            # coverage without affecting zero-overlap (triangles
-            # and fills are complementary by construction).
-            try:
-                # Use only the triangles emitted for THIS piece
-                # (slivers and plane-gradient outliers have already
-                # been dropped by the loop above).  Buffer the
-                # union by 0.1 m before subtracting so the residue
-                # sits slightly inside the gap and sub-meter
-                # floating-point precision can't create a
-                # flat∩triangle edge overlap.
-                this_piece_tris = emitted_apron_triangles_m[piece_tris_start:]
-                piece_tris_union = shp_ops.unary_union(
-                    [tp for tp in this_piece_tris if not tp.is_empty])
-                residue = piece.difference(piece_tris_union.buffer(0.1))
-                if not residue.is_empty:
-                    res_polys = (list(residue.geoms)
-                                 if hasattr(residue, "geoms")
-                                 else [residue])
-                    for rp in res_polys:
-                        if (rp.is_empty
-                                or not hasattr(rp, "exterior")
-                                or rp.area < 5.0):
-                            continue
-                        # Avoid creating a fill that overlaps a
-                        # building pad (the subtract at 4030-4033
-                        # already removed bldg_union_m from piece,
-                        # but tiny slivers can survive).
-                        if not bldg_union_m.is_empty:
-                            rp = rp.difference(bldg_union_m)
-                            if (rp.is_empty
-                                    or not hasattr(rp, "exterior")
-                                    or rp.area < 5.0):
-                                continue
-                        ring_ll = [to_ll(mx, my)
-                                   for mx, my in rp.exterior.coords]
-                        _emit_flat_poly(ring_ll, round(avg_e, 1))
-                        emitted_flat_shapes.append(
-                            (rp, round(avg_e, 1)))
-                        # Track in the apron-triangles list so the
-                        # global coverage-fill pass sees this fill
-                        # as "covered".
-                        emitted_apron_triangles_m.append(rp)
-            except Exception:
-                pass
+            # (The per-piece flat-residue coverage fill that lived
+            # here was a bandaid: it emitted flat polygons at the
+            # piece MEAN elevation over concave bays that Delaunay
+            # missed, producing visible multi-metre elevation steps
+            # at the flat-to-triangle edges.  The correct fix is
+            # upstream — decompose multi-taxiway mega-polygons so
+            # they go through the rect-chain path, and let the
+            # global coverage-fill pass at the end of C2 paint any
+            # genuinely missing slivers at a locally-sampled
+            # elevation.  See commit log for details.)
 
             # Record the apron piece for emitted_flat_shapes overlap
             # tracking — the actual emission was a triangle set, but

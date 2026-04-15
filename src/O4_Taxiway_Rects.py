@@ -333,13 +333,46 @@ def build_taxiway_rects(
         fit_ratio = (polygon.area / mrr.area) if mrr.area > 0 else 0.0
     except Exception:
         fit_ratio = 0.0
-    if fit_ratio < min_fit_ratio:
-        return None
 
     ax = _long_axis(polygon)
     if ax is None:
         return None
     m_a, m_b, ux, uy, long_len, short_len = ax
+
+    # Strip-shape gate.  A polygon is "strip-like enough" to model
+    # as an MRR-aligned rect chain when:
+    #
+    #   * its MRR short side lies within the taxiway width envelope
+    #     (9 – 45 m), AND
+    #   * its aspect ratio is ≥ 3.5, AND
+    #   * it fills at least a scaled fraction of its MRR.
+    #
+    # Scaled fit threshold: a true rectangle has fit = 1.0; real
+    # taxiways have gentle curves, splays at runway touch points,
+    # and chamfered corners that depress fit to 0.55 – 0.85 even
+    # when the underlying shape is clearly a single strip.
+    # High-aspect curved strips get a lenient threshold; short
+    # near-square "taxiway pads" get the strict one.
+    #
+    # L-shapes and C-shapes — the dangerous false-positives where
+    # an MRR-aligned rect would massively overshoot the polygon —
+    # have bbox aspect ≤ ~1.5 because the bounding rectangle wraps
+    # both arms of the bend.  The aspect gate rejects them.
+    aspect = (long_len / short_len) if short_len > 0 else 0.0
+    if short_len < 9.0 or short_len > 45.0:
+        return None
+    if aspect < 3.5:
+        return None
+    if aspect >= 15.0:
+        adaptive_min = 0.40
+    elif aspect >= 8.0:
+        adaptive_min = 0.50
+    elif aspect >= 5.0:
+        adaptive_min = 0.60
+    else:
+        adaptive_min = 0.70
+    if fit_ratio < adaptive_min:
+        return None
     # Perpendicular (90° CCW rotation of the long axis).
     px, py = -uy, ux
 
