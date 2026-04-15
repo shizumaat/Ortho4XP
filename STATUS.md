@@ -1,11 +1,19 @@
 # Auto-Patch Refactor — Status
 
-**Current direction (as of the latest commit):** we are returning to
-the legacy `generate_airport_surface_patches()` in
-`src/O4_Auto_Patch.py` as the foundation, fixing its known bugs, and
-refactoring it into a clean PR-ready module.  The "new pipeline"
-experiment in `src/O4_Surface_Patch.py` is being retired — read the
-"Why we reverted" section below for the reasoning.
+**Current direction (head = `693c4f0`):** the legacy
+`generate_airport_surface_patches()` in `src/O4_Auto_Patch.py`
+remains the active code path, now with a dedicated Phase C0 for
+apt.dat-sourced taxiways.  Taxiway polygons are classified and
+emitted as chains of sloping rectangles via a four-strategy
+pipeline (MRR fast path → Voronoi skeleton → morphological
+decomposition → apron triangulation fallback), with runway-edge
+anchoring tied to the runway chain actually emitted by
+`generate_patch_osm`.  The "new pipeline" experiment in
+`src/O4_Surface_Patch.py` is retired — read the "Why we reverted"
+section below.  **Most recent session (head = `693c4f0`)
+delivered Tasks A + B on the user's four-item taxiway refinement
+list; Task 2 (apron-prefer-flat) and Task 4 (building-pad
+reconciliation) are the next priorities.**
 
 ## Active surface invariants (apply to all emitted geometry)
 
@@ -117,7 +125,7 @@ building, etc.) as well as 161 069 m² of intra-taxiway overlap from
 adjacent centerline rects sharing corners.  The architecture was
 fundamentally wrong for the active invariants.
 
-## Current state (after commit 16 — `53a3d53`)
+## Current state (after commit `693c4f0`)
 
 The legacy phase-A-through-F surface generator is the active code
 path.  Phases C2 (apron) and D (junctions) are wired to
@@ -133,49 +141,113 @@ with envelope pre-clamp, joint hard-cap / rate-of-change solver,
 and the correct FAA runway vertical-curve rule
 (305 m per 1 % ΔG).
 
-At SPJC the full pipeline (surface patches + runway segments)
-emits **zero m² of overlap** across all cross-feature and
-intra-category checks.
+**Taxiway emission is the major change since commit 16.**  Every
+apt.dat pavement polygon is classified apron / taxiway by
+O4_Pavement_Classifier, and taxiway polygons flow through a new
+Phase C0 that emits them as chains of sloping rectangles via
+one of four strategies tried in order:
+
+1. **Fast path:** MRR-aligned rect chain if the polygon is a
+   clean strip (aspect ≥ 3.5, width 9–45 m, aspect-scaled fit
+   ratio).
+2. **Voronoi skeleton:** centerline extraction via
+   `shapely.ops.voronoi_diagram`, linemerge, drop < 50 m spurs,
+   RDP 5 m simplification.  Each centerline is walked in 50 m
+   steps and emitted as a local-width rect chain.  Handles
+   curved taxiways and multi-taxi mega-polygons.
+3. **Morphological decomposition:** buffer(-15).buffer(+15)
+   isolates wide junction hubs from strip branches; each branch
+   is re-probed with the fast path.  Handles polygons with
+   dramatically wider junction hubs.
+4. **Apron triangulation:** last-resort fall-through.
+
+A running global rect-union (`global_twy_rect_union`) deduplicates
+emissions across all source polygons so sibling branches at a
+Y-junction can't overlap.  Chain elevations are RDP-simplified
+with a 1 m tolerance so long straight stretches collapse to one
+rect (user directive: "unless there's more than 1 m elevation
+change over 30 m, simplify and combine").
+
+Runway-taxi joins are anchored to the runway's own emitted
+elevation: `generate_patch_osm` now returns its runway segment
+chain alongside the OSM string, and Phase A3 builds a meter-space
+lookup (`_runway_elev_lookup`) that interpolates the nearest
+runway segment.  Taxi-centerline endpoints within 25 m of a
+runway polygon (a distance sized for the fact that a Voronoi-
+skeleton leaf sits ≈ half-width inside the polygon boundary) are
+pinned to the runway's own elevation and propagated through the
+grade clamp via `_clamp_profile_with_anchors`.
+
+apt.dat pavement polygons are simplified to 1 m tolerance at
+ingest (user directive: "we can simplify taxiway shapes, anything
+less than a meter — too many shapes hurts performance").
+
+At SPJC the full pipeline emits **1 006 m² of intra-sloped
+overlap** (0.03 % of total area, where adjacent rects in one
+chain meet at curve joins) and **zero cross-category overlap**.
+Two of the three close taxi-runway joins at SPJC match the
+runway elevation exactly; one has a 0.7 m residual to be fixed.
 
 ### Modules
 
 | File | Status | Tests |
 |---|---|---|
-| `src/O4_Auto_Patch.py` | active legacy pipeline + Phase A0.5 | none yet |
+| `src/O4_Auto_Patch.py` | active legacy pipeline + Phase A0.5 + Phase C0 | none yet |
 | `src/O4_Surface_Mesh.py` | adaptive triangulation, used by C2 + D | 19 |
 | `src/O4_Apt_Dat_Reader.py` | apt.dat parser, wired in Phase A0.5 | 22 |
+| `src/O4_Pavement_Classifier.py` | name + shape based apron/taxiway split | 21 |
+| `src/O4_Taxiway_Rects.py` | MRR + centerline rect-chain builders; grade clamp with anchor support | 18 |
+| `src/O4_Taxiway_Decompose.py` | morphological open-minus decomposition | 8 |
+| `src/O4_Taxiway_Skeleton.py` | Voronoi medial-axis centerline extraction | none yet |
 | `src/O4_Vector_Map.py` | calls `generate_auto_patches` (unchanged) | none |
 | `tests/test_surface_mesh.py` | mesh + grade + anchors | 19 |
 | `tests/test_apt_dat_reader.py` | runway/pavement/Bezier/search priority | 22 |
 | `tests/test_auto_patch_apt_dat_integration.py` | A0.5 adapter | 11 |
+| `tests/test_pavement_classifier.py` | name hints, MRR, classification rules | 21 |
+| `tests/test_taxiway_rects.py` | long axis, clamp, RDP, rect chain build | 18 |
+| `tests/test_taxiway_decompose.py` | simple strip, T/cross/plus junctions, blob | 8 |
 | `tests/fixtures/synthetic_apt.dat` | hand-crafted parser fixture | — |
 
-Total tests: **52**.  Run with `./venv/bin/python3 -m pytest tests/`.
+Total tests: **99** (plus 35 tests from `test_boundary_model.py`
+contributed by the parallel boundary-model agent, for 134 collected).
+Run with `./venv/bin/python3 -m pytest tests/`.
 
-### SPJC numbers (post commit 16)
+### SPJC numbers (post commit `693c4f0`)
 
 Combined surface + runway-segment patch (`SPJC_auto.patch.osm`):
 
-| Metric | Commit 10 | **Commit 16** |
+| Metric | Commit 16 | **Commit `693c4f0`** |
 |---|---|---|
-| Total emitted ways | 2 624 | **3 009** |
-| Total cross-feature overlap | 0 m² ✓ | **0 m²** ✓ |
-| All intra-category overlaps | 0 m² ✓ | **0 m²** ✓ |
-| Sum of areas = union area | yes | **yes** (2 753 043 m²) |
-| Runway segments (Phase `generate_patch_osm`) | 73 | **77** |
-| Apron triangles (Phase C2) | 2 271 | **2 170** |
-| Flat polys (buildings + boundary band + apron pieces) | 333 | **545** |
-| Sloped rects (runway + boundary + tunnel ramps) | 20 | **294** |
-| Drainage low-points (Phase F) | 30 | **29** |
-| Boundary / road shapes (Phase E) | 10 | **424** |
-| Tunnel portals (Phase E2) | — | **2** (SPJC NE + SW) |
-| apt.dat pavements merged | 3 | **3** |
+| Total emitted ways | 3 009 → 5 184 | **2 117** |
+| Flat polygons | 545 → 546 | **824** |
+| Sloped rectangles (runway + boundary + **taxiway**) | 294 → 293 | **364** |
+| Triangles (apron + transition strips) | 2 170 → 4 345 | **929** |
+| apt.dat taxiway classifications | — | **9 classified** (7 decomposed) |
+| apt.dat taxiway rectifiable polygons | — | **52** |
+| apt.dat taxiway rect segments emitted | — | **76** (4 flat, 72 sloped) |
+| Cross-category overlap | 0 m² ✓ | **0 m²** ✓ |
+| Intra-sloped overlap | 0 m² ✓ | **1 006 m²** (0.03 %) |
+| Intra-triangle overlap | 0 m² claimed | **0 m²** ✓ |
 | Max runway longitudinal grade | 1.50 % | **1.50 %** ✓ |
-| Max runway grade change per VPI | — | **≤ 0.78 %** at boundaries, ≈ 0.4 % interior |
+| Max taxiway longitudinal grade | 1.50 % | **1.50 %** ✓ |
+| Max apron longitudinal grade | (apt.dat path was 1.5 %) | **1.00 %** ✓ |
+| Taxi-runway close joins matching exactly | n/a | **2 of 3** |
+| Residual join mismatch (worst case) | n/a | **0.70 m** (1 rect) |
 
-**SPJC is a zero-overlap planar subdivision.**  Every vertex
-belongs to exactly one cell; sum of cell areas equals union area
-exactly.  All 52 unit tests pass.
+**Note on the commit-16 numbers:** the "0 m² overlap" reported at
+commit 16 was a cross-feature check that did not catch the
+intra-triangle overlap caused by apt.dat's overlapping
+"Base Ramp" + named sub-ramps.  At the start of the 693c4f0
+session the audit script showed **928 004 m² intra-triangle
+overlap** from that layering — ~35 % of the triangle sum.  Task 3
+(commit `239efa9`) deduplicated by unioning the apt.dat pool
+before emission, which dropped the intra-triangle overlap to
+exactly **0 m²**.
+
+Run `./venv/bin/python3 /tmp/run_legacy.py` then
+`./venv/bin/python3 /tmp/audit_legacy.py` to reproduce.  All 99
+auto-patch tests pass (134 total counting the boundary agent's
+test module, if present).
 
 ### `O4_Apt_Dat_Reader` ready to use
 
@@ -231,7 +303,17 @@ small modules, not the monolith.
 15. **Commit 14 — Phase E2 tunnel portals: fix missing SW portal (road-direction probe instead of centroid heuristic), dedupe divided-highway carriageways, portal exclusion disc carved from boundary band.** ✅ `b8a096c`
 16. **Commit 15 — Phase E2 tunnel portal rewrite: ramp from OSM tunnel node to airport boundary with inverted slope (depth at portal, surface at node), combined carriageway width, U-shaped retaining wall with 0.5 m gap, four to_ll lat/lon unpacking bugs fixed.** ✅ `148d17b`
 17. **Commit 16a — Phase E1 segmented sloped boundary band: walk boundary in 40 m steps, sample CIFP surface model at each endpoint, emit sloped rect per segment with flat corner polys where clipping is needed.** ✅ `b2a931b`
-18. **Commit 16b — Runway grading: FAA runway vertical-curve rule (305 m per 1 % ΔG), wide-window DEM smoothing, envelope pre-clamp from all anchors, joint hard-cap + rate-of-change solver, blast-pad boundary condition.** ✅ `53a3d53` (this commit)
+18. **Commit 16b — Runway grading: FAA runway vertical-curve rule (305 m per 1 % ΔG), wide-window DEM smoothing, envelope pre-clamp from all anchors, joint hard-cap + rate-of-change solver, blast-pad boundary condition.** ✅ `53a3d53`
+19. **Task 1 — pavement classifier (O4_Pavement_Classifier) with name + shape rules; Phase A3 uses it to split apt.dat pavements into apron / taxiway lists.** ✅ `5e5c3dc`
+20. **Task 2 — Phase C0 taxiway rect-chain emission (O4_Taxiway_Rects) with MRR long-axis sampling, combined grade + rate-of-change clamp, and RDP profile simplification.** ✅ `b488350`
+21. **Task 3 — apron cleanup: union/difference dedup of overlapping apt.dat pavements (Base Ramp + sub-ramps), MAX_APRON_GRADE = 1.0 %, coverage-fill uses emitted triangles rather than piece outlines, terminal_zone_m removed from "covered" set.** ✅ `239efa9`
+22. **Task 4 — apron grade-violation filters: sliver triangle drop (< 5 m², min edge < 2 m) and plane-gradient cap at 2 × MAX_APRON_GRADE.** ✅ `603aa1a`
+23. **Progress-line fix — include C0 taxi rects in the final "N taxiway (…)" summary.** ✅ `836d492`
+24. **Taxiway decomposition + remove per-piece flat-residue fill — recursive morphological splitting of multi-strip mega-polygons, deletion of the piece-mean elevation bandaid that caused visible multi-metre flat/triangle steps.** ✅ `cd128b1`
+25. **Voronoi-skeleton rect chains (O4_Taxiway_Skeleton) — medial-axis extraction via shapely.ops.voronoi_diagram, linemerge to paths, per-path rect-chain emission with local-width sizing.  Global rect-union dedup across all taxi source polygons.  Raised SPJC from 17 → 125 taxi rects.** ✅ `df7aaf6`
+26. **Task A — rect consolidation: RDP tolerance 0.3 m → 1.0 m, centerline skeleton simplification 3 m → 5 m, seg length 30 m → 50 m.  Long straight taxiways now collapse to one rect.  SPJC 125 → 59 taxi rects, ratio 1.18 rects per rectifiable polygon.** ✅ `c3e98c1`
+27. **Task B initial — within-1-m-of-runway elevation anchoring in build_rects_along_centerline via a runway_anchor callback and `_clamp_profile_with_anchors` helper.** ✅ `fa4bb55`
+28. **Task B refined — (a) endpoint-based crossing detection replaces the per-sample distance check, and (b) generate_patch_osm returns its emitted runway-segment chain so the taxi-runway elevation lookup uses the SAME per-segment elevation the runway actually emitted (not raw CIFP linear interpolation).** ✅ `693c4f0` (this commit)
 
 ### Commits 11–16 (done): runway footprint, tunnels, boundary band, runway grading
 
@@ -504,97 +586,93 @@ adapter.  Unit tests for the adapter live in a new
 
 ### Next task queue
 
-In priority order, per user direction at end of commit 16:
+User's four-item list from the session that produced
+`693c4f0`, in priority order:
 
-1. **Aprons (Phase C2 refinement + optimization)**.  The
-   adaptive-triangulation path from commit 5 works and produces
-   a zero-overlap mesh, but the per-triangle behavior could be
-   tightened:
-   - Triangle count (2 170 at SPJC) is dominated by Delaunay on
-     the simplified apt.dat polygon plus a very small number of
-     apron anchors.  Investigate whether the mesh density is
-     actually driven by the polygon outline vertex count, and
-     whether the `APRON_SIMPLIFY_M` tolerance (currently 10 m,
-     skipped when apt.dat is the source because simplification
-     was erasing small interior rings) can be re-enabled with a
-     smaller value (e.g. 2 m) to reduce vertex count without
-     losing holes.
-   - Grade compliance: apron is currently emitted with
-     `MAX_TAXIWAY_GRADE = 1.5 %` rather than the stricter
-     `MAX_APRON_GRADE = 1.0 %`.  Revisit the name-based
-     taxiway-vs-apron classification from the commit 8 plan so
-     true aprons get 1.0 % and taxiway-style pavements get 1.5 %.
-   - Apron interior elevation field: currently uses DEM
-     sampling on the simplified polygon interior.  Consider
-     tying it to the CIFP surface model for better agreement
-     with the runway slope projected over the apron.
-   - Runtime / output-size: 2 170 triangles per airport is a
-     lot.  If most of them sit at a single flat elevation, a
-     polygonal flat emission would be cheaper.  Profile this.
+1. **Rect consolidation** ✅ *done in task A (commit `c3e98c1`)* —
+   RDP tolerance raised to 1 m; long straight taxi stretches
+   between junctions now emit as one rect.
+2. **Apron prefers flat; slope minimally to meet taxiways.**
+   Not yet implemented.  The plan (from user direction):
+   - For each apron component, first try a single flat poly
+     at the dominant DEM elevation.
+   - If taxiway-touch points at the component's boundary
+     exceed the grade budget from that flat value, split the
+     component into the minimum number of sloped rects /
+     triangles that respect the 1.0 % rule AND match the
+     taxi-entry anchor elevations.
+   - Use the already-emitted taxi rects as fixed-point
+     anchors (they're in `emitted_twy_quads_m` by the time
+     Phase C2 runs).
+3. **Taxi-runway smooth transition** ✅ *mostly done in tasks
+   B initial + refined (commits `fa4bb55`, `693c4f0`).*
+   Centerline endpoints within 25 m of a runway polygon are
+   pinned to the emitted runway chain's interpolated
+   elevation.  2 of 3 close taxi-runway pairs at SPJC match
+   exactly; **1 of 3 has a 0.7 m residual** on taxi -10025
+   which is rect[1] of a multi-rect chain where the clamp at
+   rect[0] didn't fully propagate.  To finish:
+   - Either (a) every rect-corner near a runway gets its own
+     anchor check (not just centerline endpoints), or
+     (b) shorten the chain around anchored endpoints so the
+     anchor dominates the nearest rect's corners directly.
+4. **Building-pad reconciliation for smooth apron joins.**
+   Not yet started.  Depends on task 2 (apron path) being
+   done so building-pad edges can be reconciled against the
+   apron grade budget.  Per the STATUS.md elevation build
+   order: "Reconciliation: if step 3 (apron) or step 4
+   (taxiway) cannot meet its grade limit with the current
+   building elevations, adjust the contributing
+   building/terminal pad elevation toward the constraint."
 
-2. **Taxiways (Phase C1 revisit)**.  With `apt_dat_used=True`
-   the legacy taxiway pipeline is bypassed entirely — all
-   pavement goes through the apron path at 1.5 % grade.  That
-   was commit 8's simplification.  Real taxiways deserve their
-   own treatment:
-   - Re-enable the name-based classification (see apron item
-     above): `"TWY *"`, `"TAXIWAY *"`, `"Apron N"` + heuristics
-     on aspect ratio of the polygon.
-   - Taxiway centerline elevations: the legacy
-     `_compute_taxiway_elevations` was computing CIFP-anchored
-     elevations along the OSM taxiway polylines, and grade-
-     clamping them against building platforms + runway anchors.
-     With apt.dat pavement this logic is unused — revive it for
-     the apt.dat-classified taxiways, sampling along a derived
-     centerline of the pavement polygon (medial axis or
-     polygon-major-axis simplification).
-   - Junction zones: Phase B/D for the apt.dat case currently
-     sees `junction_zone_area = 0` because there are no taxiway
-     buffers to intersect with the runway.  Once taxiways are
-     classified separately, junctions can be computed as
-     `apron_polys ∩ rwy_union_m` and triangulated the same way.
+Other pending refinements not in the user's top-4:
 
-3. **Drainage (Phase F refinement)**.  See Phase F status
-   section above.  Work items:
-   - Fix Type A flat infield depths so they sit at a realistic
-     0.5 – 1.5 m below surrounding pavement, not wildly deeper.
-   - Improve the Type A / Type B classifier.
-   - Split multi-basin pavement holes into per-natural-low-point
-     sub-basins and emit one ditch per sub-basin.
-
-4. **Helper extraction (ongoing, do alongside 1–3)**.  As we
-   touch each area, pull the logic out of the monolith into its
-   own module with unit tests:
-   - `O4_Apron_Mesh.py` — apron triangulation + grade logic
-   - `O4_Taxiway_Elevations.py` — centerline sampling + clamp
-   - `O4_Drainage.py` — Type A / Type B basin detection + emit
-
-5. **Re-run `docs/TEST_PLAN_SPJC.md`** — verify all 11 numeric
-   checks plus the four new invariant checks (12-15).
+5. **Intra-sloped taxi overlap (1 006 m² at SPJC).**  Two
+   adjacent rects in a single centerline chain overlap at a
+   curved join by a few m² each.  Fix candidates:
+   (a) clip each rect's tracking polygon to its source branch
+   before emission, (b) emit a single longer-than-2-rect chain
+   segment at curved joins and forgo the corner overlap, or
+   (c) drop the clamp on adjacent-rect perpendicular widths
+   so the transition is always angular, not parallelogrammic.
+6. **Drainage (Phase F refinement).**  Unchanged from the
+   pre-task-1 queue — see "Phase F status" section below.
+7. **Helper extraction: `O4_Apron_Mesh.py`, `O4_Drainage.py`.**
+   Taxi work has already extracted `O4_Pavement_Classifier`,
+   `O4_Taxiway_Rects`, `O4_Taxiway_Decompose`, and
+   `O4_Taxiway_Skeleton`.  Aprons and drainage still live in
+   the `O4_Auto_Patch` monolith.
 
 ## How to resume next session
 
 ```bash
 cd /Users/noah/Ortho4XP-shred86
-git log --oneline -10            # confirm we're at 53a3d53
-./venv/bin/python3 -m pytest tests/   # 52 pass
+git log --oneline -15            # confirm we're at 693c4f0
+./venv/bin/python3 -m pytest tests/   # 99 local, 134 with boundary-model
 
 # Full pipeline sanity run + audit (driver at /tmp/run_legacy.py):
 ./venv/bin/python3 /tmp/run_legacy.py      # writes /tmp/SPJC_legacy.patch.osm
-./venv/bin/python3 /tmp/audit_legacy.py    # should report overlap: 0 m²
+./venv/bin/python3 /tmp/audit_legacy.py    # see the SPJC numbers table above
 ```
 
-Next task: **refine and optimize aprons** — see the Next Task
-Queue section above.  Key files and entry points:
+Next task: **aprons — prefer flat, slope minimally.**  See
+item 2 of the Next Task Queue.  Key files and entry points:
 
-- Phase C2 apron emission: `src/O4_Auto_Patch.py:3700`-ish
-  (search for `complex_apron_parts_m`).
-- Apron polygon preparation / runway-clipping: Phase A3 around
-  `src/O4_Auto_Patch.py:2470`.
-- Adaptive triangulation helper:
-  `src/O4_Surface_Mesh.py:adaptive_triangulate`.
-- `_apron_anchors` helper for terminal flat-ring and
-  building-edge anchors.
+- Phase C2 apron emission: `src/O4_Auto_Patch.py` around line
+  4010, search for `for ai, p_m in enumerate(apron_polys_m)`.
+- Taxi rects that the apron path should treat as anchors:
+  `emitted_twy_quads_m` at Phase C0 (line ~2900).
+- Runway segment chain available via `runway_segment_chain`
+  parameter / `_runway_segs_m` meter-space index.
+- Apron anchor collection: `_apron_anchors` helper at line
+  ~3790 already merges building edges + taxi crossings +
+  terminal flat rings.  Extend it to also read from
+  `emitted_twy_quads_m` so apron triangles see the C0 rects
+  as immovable boundary conditions.
+- Building pad elevations live in `bldg_elevations` (Phase
+  A5) and are currently fixed at DEM-sampled centroid; task 4
+  will move them within `±BLDG_ADJUST_MAX` to satisfy the
+  apron grade budget.
 
 ## Bugs to fix in the legacy
 
