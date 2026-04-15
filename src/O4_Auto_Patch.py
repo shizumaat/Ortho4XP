@@ -2487,8 +2487,24 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         apron_union_m = shp_geom.Polygon()
 
     # A4: Building pads
-    BLDG_PAD = 5.0
-    BLDG_SIMPLIFY = 8.0
+    # Commit 10: BLDG_PAD is 0 — use the EXACT footprint.  The
+    # legacy's 5 m outward buffer was a workaround for OSM tracing
+    # imprecision and to glue adjacent buildings together, but it
+    # directly caused both overlap classes:
+    #   * flat∩flat: adjacent building footprints padded by 5 m each
+    #     developed 10 m of overlap space.
+    #   * flat∩triangle: the apron hole was shaped to the padded
+    #     union, so apron triangles could extend up to 5 m into the
+    #     actual wall line.
+    # With precise cut-outs, the apron subtraction exactly equals
+    # the emitted pad and overlap drops to zero by construction.
+    # Adjacent-building merging is now handled by the morphological
+    # closing in Phase A4b, which bridges gaps up to BLDG_MERGE_DIST
+    # wide without inflating the outer boundary.
+    BLDG_PAD = 0.0
+    BLDG_SIMPLIFY = 2.0   # was 8 m — tighter now that we're not
+                          # hiding a 5 m pad.  2 m still kills OSM
+                          # cm-scale tracing jitter.
     building_polys_m = []
 
     for bldg in (building_data or []):
@@ -2498,15 +2514,57 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         coords_m = [to_m(lon, lat) for lon, lat in fp]
         try:
             p = shp_geom.Polygon(coords_m)
-            if p.is_valid and not p.is_empty and p.area > 20.0:
-                padded = p.buffer(BLDG_PAD, join_style=2, mitre_limit=2.0)
-                simple = padded.simplify(BLDG_SIMPLIFY, preserve_topology=True)
-                if simple.is_valid and not simple.is_empty:
-                    building_polys_m.append(simple)
-                else:
-                    building_polys_m.append(padded)
+            if not p.is_valid:
+                p = p.buffer(0)
+            if p.is_empty or p.area <= 20.0:
+                continue
+            # Simplify only (no outward buffer).
+            simple = p.simplify(BLDG_SIMPLIFY, preserve_topology=True)
+            if simple.is_valid and not simple.is_empty:
+                building_polys_m.append(simple)
+            else:
+                building_polys_m.append(p)
         except Exception:
             pass
+
+    # Source OSM data can include buildings whose footprints overlap
+    # each other (common when a terminal and a jetway are both tagged
+    # building=* in OSM and the jetway's outline clips into the
+    # terminal).  Without padding to hide it, this produces directly
+    # overlapping building pads.  Resolve by unioning overlapping
+    # pairs: sort largest-first, and subtract each already-processed
+    # building from the next.  Result: every pad is interior-disjoint
+    # from every other pad.
+    if len(building_polys_m) > 1:
+        building_polys_m.sort(key=lambda p: p.area, reverse=True)
+        cleaned = []
+        for bp in building_polys_m:
+            cur = bp
+            for prev in cleaned:
+                if prev.is_empty or cur.is_empty:
+                    continue
+                try:
+                    if prev.intersects(cur):
+                        cur = cur.difference(prev)
+                        if not cur.is_valid:
+                            cur = cur.buffer(0)
+                except Exception:
+                    pass
+                if cur.is_empty:
+                    break
+            if cur.is_empty or cur.area < 20.0:
+                continue
+            # Difference can produce a MultiPolygon — keep the
+            # largest piece (a building split in two by a larger
+            # neighbour is unusual; the smaller fragment is
+            # typically noise).
+            if hasattr(cur, "geoms"):
+                cur = max(cur.geoms, key=lambda g: g.area)
+            if (not cur.is_empty
+                    and hasattr(cur, "exterior")
+                    and cur.area >= 20.0):
+                cleaned.append(cur)
+        building_polys_m = cleaned
 
     bldg_union_m = (shp_ops.unary_union(building_polys_m)
                     if building_polys_m else shp_geom.Polygon())
@@ -3572,6 +3630,9 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     n_apron = 0
     n_apron_tris = 0
     complex_apron_parts_m = []   # left in scope for Phase D / coverage
+    emitted_apron_triangles_m = []   # actual Phase C2 triangles (for
+                                     # Phase F drainage detection to see
+                                     # via the emit accumulator)
 
     for ai, p_m in enumerate(apron_polys_m):
         clipped = p_m
@@ -3651,10 +3712,41 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 n_apron += 1
                 continue
 
-            # Emit each triangle from the adaptive mesh.
+            # Emit each triangle from the adaptive mesh.  Skip any
+            # triangle whose geometry actually overlaps a building
+            # pad (real intersection area, not just centroid — the
+            # user rightly pointed out that edge-crossing triangles
+            # can straddle a building while their centroid is
+            # outside it).  A triangle that merely shares an edge
+            # with a building boundary has zero intersection area
+            # and is kept; a triangle that reaches any interior
+            # slice of a building pad is dropped.
+            #
+            # Each surviving triangle is also added to
+            # emitted_apron_triangles_m so Phase F's drainage
+            # detection sees the precise triangulated shape via
+            # _emitted_union() instead of just the apron-piece
+            # outline (which has building-shaped holes that
+            # drainage could land inside).
             avg_e = (sum(v[2] for t in tris for v in t)
                      / (3.0 * len(tris)))
+            OVERLAP_EPS = 0.5   # m² — ignore vanishing boundary slop
             for (v0, v1, v2) in tris:
+                tri_poly = None
+                try:
+                    tri_poly = shp_geom.Polygon([
+                        (v0[0], v0[1]),
+                        (v1[0], v1[1]),
+                        (v2[0], v2[1])])
+                    if (not tri_poly.is_valid
+                            or tri_poly.is_empty):
+                        continue
+                    if (not bldg_union_m.is_empty
+                            and tri_poly.intersection(
+                                bldg_union_m).area > OVERLAP_EPS):
+                        continue
+                except Exception:
+                    continue
                 lon0, lat0 = to_ll(v0[0], v0[1])
                 lon1, lat1 = to_ll(v1[0], v1[1])
                 lon2, lat2 = to_ll(v2[0], v2[1])
@@ -3663,6 +3755,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     lat1, lon1, round(v1[2], 1),
                     lat2, lon2, round(v2[2], 1))
                 n_apron_tris += 1
+                emitted_apron_triangles_m.append(tri_poly)
             # Record the apron piece for emitted_flat_shapes overlap
             # tracking — the actual emission was a triangle set, but
             # the overlap accumulator only needs a footprint and a
@@ -4206,6 +4299,9 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     for tri_poly in emitted_triangle_polys_m:
         if not tri_poly.is_empty:
             all_emitted_parts_m.append(tri_poly)
+    for tri_poly in emitted_apron_triangles_m:
+        if not tri_poly.is_empty:
+            all_emitted_parts_m.append(tri_poly)
     if not rwy_union_m.is_empty:
         all_emitted_parts_m.append(rwy_union_m)
 
@@ -4263,9 +4359,13 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                     -BOUNDARY_BAND_WIDTH)
                 if not inner_ring.is_empty:
                     band = airport_footprint.difference(inner_ring)
-                    # Subtract already-emitted shapes to avoid overlaps
+                    # Subtract already-emitted shapes to avoid overlaps.
+                    # Buffer the union slightly so floating-point slivers
+                    # around building edges are consumed rather than left
+                    # as sub-meter overlaps.
                     if not emitted_union.is_empty:
-                        band = band.difference(emitted_union)
+                        band = band.difference(
+                            emitted_union.buffer(1.0))
                     if not band.is_empty:
                         # Simplify lightly to reduce vertex count
                         band = band.simplify(
@@ -4767,6 +4867,31 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                         ditch_mid = shp_geom.Point(ic_x, ic_y)
                         if not ip.contains(ditch_mid):
                             continue
+
+                        # Build the ditch rect polygon in meter
+                        # space and reject it if any part extends
+                        # past the infield (into adjacent pavement
+                        # triangles/pads).  Strict containment —
+                        # guarantees the ditch doesn't overlap any
+                        # already-emitted geometry.
+                        try:
+                            perp_x = -best_dir[1]
+                            perp_y = best_dir[0]
+                            hw = DRAIN_DITCH_WIDTH / 2.0
+                            ditch_poly = shp_geom.Polygon([
+                                (sx + perp_x * hw, sy + perp_y * hw),
+                                (ex + perp_x * hw, ey + perp_y * hw),
+                                (ex - perp_x * hw, ey - perp_y * hw),
+                                (sx - perp_x * hw, sy - perp_y * hw),
+                            ])
+                            # Allow 0.5 m² boundary slop; anything
+                            # larger means the ditch crosses the
+                            # infield boundary.
+                            outside = ditch_poly.difference(ip).area
+                            if outside > 0.5:
+                                continue
+                        except Exception:
+                            pass
 
                         # Elevations: depressed 2m below surrounding
                         high_e = round(high_e_val - DRAIN_FLAT_DEPTH, 1)
