@@ -1201,7 +1201,7 @@ def airport_in_tile(runways, tile_lat, tile_lon):
 # ──────────────────────────────────────────────────────────────────────────────
 def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                           building_data=None, dico_airports=None,
-                          road_data=None):
+                          road_data=None, mode="ICAO"):
     """Generate auto-patch files for all CIFP airports within a tile.
 
     Scans the CIFP directory for airport data files, parses runway threshold
@@ -1224,6 +1224,10 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
         building_data: Optional dict from extract_building_info().
         dico_airports: Optional dict with processed airport data (provides
                        apron geometry and boundaries).
+        mode: "ICAO" (default) only patches airports with a 4-letter ICAO
+              code; "All" patches every CIFP airport regardless of code
+              format. ("None" is handled at the call site by skipping this
+              function entirely.)
 
     Returns:
         list: ICAO codes of airports for which auto-patches were generated.
@@ -1265,6 +1269,16 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
     auto_patched = []
 
     for icao, filepath in sorted(cifp_airports.items()):
+        # In ICAO mode, only patch airports with a real 4-letter ICAO code
+        # (skip 3-letter FAA codes and alphanumeric local-use codes like "1A2")
+        if mode == "ICAO" and not (len(icao) == 4 and icao.isalpha()):
+            UI.vprint(
+                2,
+                "   Auto-patch: Skipping",
+                icao,
+                "(non-ICAO code, mode=ICAO).",
+            )
+            continue
         # Skip if a manual patch already covers this airport
         if icao in manual_patches:
             UI.vprint(

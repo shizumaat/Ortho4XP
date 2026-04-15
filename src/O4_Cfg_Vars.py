@@ -115,9 +115,10 @@ cfg_app_vars = {
 cfg_tile_vars = {
     # Auto-patch
     "auto_patch": {
-        "type": bool,
-        "default": True,
-        "hint": "When enabled, Ortho4XP auto-generates runway slope patches from CIFP/AIRAC data for airports with available data. Auto-patches provide accurate threshold-anchored elevation profiles and are overridden by any manual patches.",
+        "type": str,
+        "default": "ICAO",
+        "values": ("None", "ICAO", "All"),
+        "hint": 'Controls Ortho4XP auto-generation of runway slope patches from CIFP/AIRAC data. Auto-patches provide accurate threshold-anchored elevation profiles and are overridden by any manual patches. "ICAO" (default) only patches airports with a 4-letter ICAO code, "All" patches every airport found in CIFP, "None" disables auto-patching entirely.',
     },
     # Vector
     "apt_smoothing_pix": {
