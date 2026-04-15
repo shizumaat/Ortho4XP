@@ -2896,6 +2896,10 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # the 4 meter-space corners in emitted_taxi_rects_m for
     # downstream subtraction.
     emitted_taxi_rects_m = []
+    # Counts feed into the final progress line; initialised here so
+    # the summary works whether or not Phase C0 runs.
+    n_apt_twy_rects = 0        # sloped rect-chain segments (C0)
+    n_apt_twy_flat_rects = 0   # flat rect-chain segments (C0)
     if apt_twy_polys_m and apt_twy_rect_chains:
         twy_rect_count = 0
         twy_flat_count = 0
@@ -2921,6 +2925,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 except Exception:
                     pass
         twy_fallback_count = 0  # dedup pass already reclassified them
+        n_apt_twy_rects = twy_rect_count - twy_flat_count
+        n_apt_twy_flat_rects = twy_flat_count
         if emitted_taxi_rects_m:
             all_emitted_parts_m.extend(emitted_taxi_rects_m)
             # Feed the rects into emitted_twy_quads_m so the later
@@ -5765,12 +5771,18 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     except Exception:
         pass
 
+    # Final summary counts.  Phase C0 (apt.dat taxiway rect-chain)
+    # and Phase C1 (legacy OSM-centerline taxiway path) both feed
+    # the same two buckets: flat and sloped taxiway quads.
+    total_twy_flat = n_twy_flat + n_apt_twy_flat_rects
+    total_twy_sloped = n_twy_sloped + n_apt_twy_rects
+    total_twy_shapes = total_twy_flat + total_twy_sloped
     UI.vprint(1, "    {}: {} taxiway ({} flat, {} sloped)"
               " + {} apron ({} flat, {} complex)"
               " + {} building pads"
               " + {} junction triangles"
               " + {} boundary/road shapes + {} drainage low-points".format(
-                  icao, n_twy_shapes, n_twy_flat, n_twy_sloped,
+                  icao, total_twy_shapes, total_twy_flat, total_twy_sloped,
                   n_apron_flat + n_apron_complex,
                   n_apron_flat, n_apron_complex,
                   len(building_polys_m), total_tri,
