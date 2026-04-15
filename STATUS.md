@@ -117,14 +117,25 @@ building, etc.) as well as 161 069 m² of intra-taxiway overlap from
 adjacent centerline rects sharing corners.  The architecture was
 fundamentally wrong for the active invariants.
 
-## Current state (after commit 10 — `6d237d6`)
+## Current state (after commit 16 — `53a3d53`)
 
 The legacy phase-A-through-F surface generator is the active code
 path.  Phases C2 (apron) and D (junctions) are wired to
 `O4_Surface_Mesh.adaptive_triangulate`.  `O4_Apt_Dat_Reader` is
 integrated at Phase A0.5 and supplies authoritative pavement
-geometry.  At SPJC the full pipeline now emits **zero m² of
-overlap** across all cross-feature and intra-category checks.
+geometry; it is also the sole source of truth for runway
+FOOTPRINT (lat/lon, width, displaced threshold, blast pad) — CIFP
+contributes only threshold elevations.  Phase E (boundary band +
+tunnel portals) has been rewritten to emit a segmented sloped
+band and FAA-compliant tunnel ramps with U-shaped retaining
+walls.  Runway grading uses a wide-window-smoothed DEM profile
+with envelope pre-clamp, joint hard-cap / rate-of-change solver,
+and the correct FAA runway vertical-curve rule
+(305 m per 1 % ΔG).
+
+At SPJC the full pipeline (surface patches + runway segments)
+emits **zero m² of overlap** across all cross-feature and
+intra-category checks.
 
 ### Modules
 
@@ -141,25 +152,28 @@ overlap** across all cross-feature and intra-category checks.
 
 Total tests: **52**.  Run with `./venv/bin/python3 -m pytest tests/`.
 
-### SPJC numbers (post commit 10)
+### SPJC numbers (post commit 16)
 
-| Metric | Commit 7b | Commit 8 | Commit 9 | **Commit 10** |
-|---|---|---|---|---|
-| Total emitted ways | 2 871 | 2 442 | 2 501 | **2 624** |
-| Total cross-feature overlap | 7 638 m² | 6 099 m² | 5 101 m² | **0 m²** ✓ |
-| flat ∩ flat overlap | 3 085 | 3 370 | 2 154 | **0** ✓ |
-| flat ∩ triangle overlap | 3 148 | 2 729 | 2 901 | **0** ✓ |
-| flat ∩ slope overlap | — | — | 46 | **0** ✓ |
-| slope ∩ triangle overlap | — | — | 517 | **0** ✓ |
-| triangle ∩ triangle | 1 221 | 0 | 0 | **0** ✓ |
-| Intra-category overlaps (all) | — | — | — | **0** ✓ |
-| Apron triangles (Phase C2) | ~700 | 2 262 | 2 271 | **2 271** |
-| Building pads (Phase C3/A4) | — | — | 313 | **313** (no padding) |
-| Drainage low-points (Phase F) | — | — | 12 | **30** |
-| apt.dat pavements merged | 0 | 5 | 3 | **3** |
-| Sum of areas = union area | no | no | no | **2 553 674 m²** ✓ |
+Combined surface + runway-segment patch (`SPJC_auto.patch.osm`):
 
-**SPJC is now a zero-overlap planar subdivision.**  Every vertex
+| Metric | Commit 10 | **Commit 16** |
+|---|---|---|
+| Total emitted ways | 2 624 | **3 009** |
+| Total cross-feature overlap | 0 m² ✓ | **0 m²** ✓ |
+| All intra-category overlaps | 0 m² ✓ | **0 m²** ✓ |
+| Sum of areas = union area | yes | **yes** (2 753 043 m²) |
+| Runway segments (Phase `generate_patch_osm`) | 73 | **77** |
+| Apron triangles (Phase C2) | 2 271 | **2 170** |
+| Flat polys (buildings + boundary band + apron pieces) | 333 | **545** |
+| Sloped rects (runway + boundary + tunnel ramps) | 20 | **294** |
+| Drainage low-points (Phase F) | 30 | **29** |
+| Boundary / road shapes (Phase E) | 10 | **424** |
+| Tunnel portals (Phase E2) | — | **2** (SPJC NE + SW) |
+| apt.dat pavements merged | 3 | **3** |
+| Max runway longitudinal grade | 1.50 % | **1.50 %** ✓ |
+| Max runway grade change per VPI | — | **≤ 0.78 %** at boundaries, ≈ 0.4 % interior |
+
+**SPJC is a zero-overlap planar subdivision.**  Every vertex
 belongs to exactly one cell; sum of cell areas equals union area
 exactly.  All 52 unit tests pass.
 
@@ -210,7 +224,136 @@ small modules, not the monolith.
 8. **Commit 7b — add `O4_Apt_Dat_Reader` module + tests.** ✅ `ce3b97c`
 9. **Commit 8 — wire `O4_Apt_Dat_Reader` into legacy (Phase A0.5).** ✅ `2e8ab66`
 10. **Commit 9 — pavement-as-taxiway grade, morphological terminal clean, flat buffer ring around buildings, drainage from pavement holes.** ✅ `115be6e`
-11. **Commit 10 — zero overlap: precise building cutouts + triangle/ditch containment + Phase E buffered subtraction.** ✅ `6d237d6` (this commit)
+11. **Commit 10 — zero overlap: precise building cutouts + triangle/ditch containment + Phase E buffered subtraction.** ✅ `6d237d6`
+12. **Commit 11 — zero overlap with runway segments: include CIFP runway rect in Phase A1, strict 99 % triangle-in-polygon containment in Surface_Mesh.** ✅ `1bb3e4a`
+13. **Commit 12 — generate_patch_osm uses apt.dat row-100 for footprint (lat/lon + width), CIFP only for elevation anchors.** ✅ `d5a0ce4`
+14. **Commit 13 — apt.dat is sole source of truth for all runway footprint geometry including displaced thresholds and blast pads; `Runway` dataclass gains `blast_a_m` / `blast_b_m`.** ✅ `f46953f`
+15. **Commit 14 — Phase E2 tunnel portals: fix missing SW portal (road-direction probe instead of centroid heuristic), dedupe divided-highway carriageways, portal exclusion disc carved from boundary band.** ✅ `b8a096c`
+16. **Commit 15 — Phase E2 tunnel portal rewrite: ramp from OSM tunnel node to airport boundary with inverted slope (depth at portal, surface at node), combined carriageway width, U-shaped retaining wall with 0.5 m gap, four to_ll lat/lon unpacking bugs fixed.** ✅ `148d17b`
+17. **Commit 16a — Phase E1 segmented sloped boundary band: walk boundary in 40 m steps, sample CIFP surface model at each endpoint, emit sloped rect per segment with flat corner polys where clipping is needed.** ✅ `b2a931b`
+18. **Commit 16b — Runway grading: FAA runway vertical-curve rule (305 m per 1 % ΔG), wide-window DEM smoothing, envelope pre-clamp from all anchors, joint hard-cap + rate-of-change solver, blast-pad boundary condition.** ✅ `53a3d53` (this commit)
+
+### Commits 11–16 (done): runway footprint, tunnels, boundary band, runway grading
+
+**Commit 11 (`1bb3e4a`)** audited the COMBINED output (surface
+patches + runway segments from `generate_patch_osm`) for the
+first time and found 2 639 m² of cross-feature overlap that the
+surface-only audits had missed.  Two root causes: (1) Phase A1's
+`rwy_union_m` contained only the apt.dat runway rectangle, but
+`generate_patch_osm` emitted CIFP-threshold-based segments with
+a 30 m overrun that poked past the apt.dat rect; (2)
+`O4_Surface_Mesh._delaunay_clipped` used centroid-in-polygon
+which lets Delaunay triangles bridge concave bays (runway cut
+out of apron) and poke into subtracted regions.  Fixes: union
+a CIFP-derived rect into `rwy_union_m` as well, and require the
+triangle area to be ≥ 99 % inside the polygon rather than just
+its centroid.
+
+**Commit 12 (`d5a0ce4`)** made apt.dat row-100 the source of
+truth for runway footprint geometry in `generate_patch_osm`.
+CIFP still supplies threshold elevations, but runway rectangle
+lat/lon and width come from apt.dat.  New `apt_runways` dict
+parameter passes `{designator: (lat, lon, width_m)}` pre-loaded
+at the call site in `generate_auto_patches`.
+
+**Commit 13 (`f46953f`)** extended this to ALL footprint info:
+the `Runway` dataclass gained `blast_a_m` / `blast_b_m` fields
+parsed from row-100 field 4 of each end block, and the
+`apt_runways` tuple grew to
+`(lat, lon, width, displaced_m, blast_m)`.
+`generate_patch_osm` now uses apt.dat's displaced-threshold
+distances and blast-pad lengths instead of CIFP + the legacy
+30 m `OVERRUN_EXTENSION`.
+
+**Commit 14 (`b8a096c`)** fixed Phase E2 tunnel portal
+detection at SPJC.  Three bugs: (1) the outward-direction
+heuristic used dot(road_dir, centroid-vec), which for
+boundary-hugging tunnels is nearly perpendicular and flipped
+unpredictably; the SW portal's direction ended up pointing INTO
+the airport, so all six grade-down segments were filtered out
+and the portal was silently dropped.  Fix: probe 20 m along the
+road in each sign and pick whichever lands outside the airport
+footprint.  (2) Divided-highway tunnels produced two sets of
+overlapping portal rects, one per carriageway — now deduplicated
+within 40 m.  (3) The Phase E1 band overlapped the Phase E2
+rects at the portal corner; Phase E1 now subtracts a 35 m
+exclusion disc around each portal before emitting.
+
+**Commit 15 (`148d17b`)** rewrote Phase E2 entirely to match the
+user's mental model of tunnel ramps:
+- Ramp spans from the OSM tunnel way's outside endpoint to the
+  airport boundary (length = `r_ls.difference(airport_footprint)`
+  sub-line length), NOT a fixed 120 m.
+- Ramp width combines both divided-highway carriageways into
+  one wide rect covering the perpendicular span of all clustered
+  portals.
+- Slope is flipped: surface DEM elevation at the OSM tunnel
+  node (HIGH end), `apt_elev − TUNNEL_DEPTH_DEFAULT` at the
+  airport boundary (LOW end).  The ramp descends toward the
+  airport rather than away from it.
+- Retaining walls form a U-shape around the LOW end (two side
+  walls along the ramp plus a cap across the portal) with a
+  0.5 m `TUNNEL_WALL_GAP` to the ramp on every edge.  The cap
+  length is sized to fit BETWEEN the side walls without
+  overlapping them at the corners.
+- Also fixed four `to_ll(x, y)` lat/lon unpacking bugs (to_ll
+  returns `(lon, lat)`, not `(lat, lon)`) that were producing
+  degenerate ~1 m wide ramp rectangles.
+
+**Commit 16a (`b2a931b`)** replaced Phase E1's "one big flat
+polygon per band piece" with a segmented sloped band.  The old
+approach painted huge areas at a single centroid-sampled
+elevation, flattening any sloped airport.  New approach walks
+the airport boundary in `BAND_SEG_LENGTH = 40 m` steps; each
+step emits one rect `BOUNDARY_BAND_WIDTH` deep (inward from the
+boundary), with the two short-edge elevations sampled from
+`_cifp_surface_elevation` at the two boundary points.  The rect
+is emitted sloped when the endpoints differ, flat otherwise.
+Each new rect is clipped against a running subtract set
+containing `emitted_union`, `portal_exclusion`, AND all E1 rects
+emitted earlier in the walk (so adjacent segments at polygon
+corners don't overlap).  When the clipped area is < 99.9 % of
+the original, the clipped geometry is emitted as a flat polygon
+at the averaged elevation — these are the "small flat polygons
+for flat areas" connecting adjacent sloped rects.  SPJC goes
+from a handful of ~200 k m² flat pieces to 294 sloped rects +
+131 corner flats tracking elevation 5.9 – 45.1 m.
+
+**Commit 16b (`53a3d53`)** rebuilt runway grading in
+`generate_patch_osm` to match real FAA-compliant vertical
+curves.  Six stages:
+
+1. DEM sampling unchanged (every 100 m along centerline).
+2. Wide moving-average smoothing — window = runway length / 4
+   on each side — collapses local DEM bumps (hangars,
+   surface-model noise, vegetation) into the broad trend.
+3. Envelope pre-clamp: for each sample, compute the tightest
+   `[lower, upper]` band imposed by every CIFP anchor at
+   distance `d` using `|elev − anchor| ≤ d × max_grade`; clamp
+   smoothed DEM into that envelope.  Makes the profile
+   anchor-consistent in one pass.
+4. Joint hard-cap / rate-of-change solver: alternate the two
+   until both converge.  The hard cap uses a joint range clamp
+   (intersection of both neighbors' max-rise bands, midpoint
+   when infeasible).  The rate-of-change pass uses the new
+   **`MAX_RUNWAY_GRADE_CHANGE_PER_M = 1/30000`** constant — the
+   correct FAA runway rule (305 m per 1 % ΔG) instead of the
+   taxiway rule 1/3000 that was being mis-applied.
+5. Blast-pad boundary condition: at each end anchor the flat
+   blast pad implies `g_left = 0` from outside, so the first
+   interior segment is clamped explicitly by
+   `max_dg × seg_len`.  Without this, the first runway segment
+   spiked straight from 0 % to 1.5 % in 100 m, violating the
+   VPI rule by 4.5×.
+6. Grade separation.  `MAX_RUNWAY_GRADE_CHANGE_PER_M = 1/30000`
+   and `MAX_TAXIWAY_GRADE_CHANGE_PER_M = 1/3000` are now
+   separate constants.
+
+SPJC RWY B (16R-34L, 650 m displaced threshold) now emits a
+smooth vertical curve: blast pad 0 % → 0.78 % → 1.07 % → 1.17 %
+→ 0.88 % → 0.49 % → 0.29 % → ... rising from the flat blast pad
+to a peak of ~1.2 % and tapering back down over ~500 m.  Max
+absolute grade 1.50 % (at the cap).
 
 ### Commits 8–10 (done): apt.dat integration and zero overlap
 
@@ -359,44 +502,99 @@ pavement-name classification and the lat/lon → tile-relative
 adapter.  Unit tests for the adapter live in a new
 `tests/test_apt_dat_integration.py`.
 
-### After commit 8
+### Next task queue
 
-* **Commit 9+** — extract more helpers as we touch them:
-  * `_compute_taxiway_elevations` → `O4_Taxiway_Elevations.py`
-  * runway elevation interpolation → `O4_Runway_Elevations.py`
-  * Phase A geometry preparation → `O4_Surface_Inputs.py`
-  * Phase emit helpers → `O4_Surface_Emit.py`
-* **Phase E (boundary band, tunnel portals) and Phase F (drainage)**
-  refinement.  These were producing useful output but were never
-  finished; left in place and marked as such.  Will be cleaned up
-  after the core (A-D) phases are clean.
-* **Re-run `docs/TEST_PLAN_SPJC.md`** — verify all 11 numeric checks
-  plus the four new invariant checks (12-15).
+In priority order, per user direction at end of commit 16:
+
+1. **Aprons (Phase C2 refinement + optimization)**.  The
+   adaptive-triangulation path from commit 5 works and produces
+   a zero-overlap mesh, but the per-triangle behavior could be
+   tightened:
+   - Triangle count (2 170 at SPJC) is dominated by Delaunay on
+     the simplified apt.dat polygon plus a very small number of
+     apron anchors.  Investigate whether the mesh density is
+     actually driven by the polygon outline vertex count, and
+     whether the `APRON_SIMPLIFY_M` tolerance (currently 10 m,
+     skipped when apt.dat is the source because simplification
+     was erasing small interior rings) can be re-enabled with a
+     smaller value (e.g. 2 m) to reduce vertex count without
+     losing holes.
+   - Grade compliance: apron is currently emitted with
+     `MAX_TAXIWAY_GRADE = 1.5 %` rather than the stricter
+     `MAX_APRON_GRADE = 1.0 %`.  Revisit the name-based
+     taxiway-vs-apron classification from the commit 8 plan so
+     true aprons get 1.0 % and taxiway-style pavements get 1.5 %.
+   - Apron interior elevation field: currently uses DEM
+     sampling on the simplified polygon interior.  Consider
+     tying it to the CIFP surface model for better agreement
+     with the runway slope projected over the apron.
+   - Runtime / output-size: 2 170 triangles per airport is a
+     lot.  If most of them sit at a single flat elevation, a
+     polygonal flat emission would be cheaper.  Profile this.
+
+2. **Taxiways (Phase C1 revisit)**.  With `apt_dat_used=True`
+   the legacy taxiway pipeline is bypassed entirely — all
+   pavement goes through the apron path at 1.5 % grade.  That
+   was commit 8's simplification.  Real taxiways deserve their
+   own treatment:
+   - Re-enable the name-based classification (see apron item
+     above): `"TWY *"`, `"TAXIWAY *"`, `"Apron N"` + heuristics
+     on aspect ratio of the polygon.
+   - Taxiway centerline elevations: the legacy
+     `_compute_taxiway_elevations` was computing CIFP-anchored
+     elevations along the OSM taxiway polylines, and grade-
+     clamping them against building platforms + runway anchors.
+     With apt.dat pavement this logic is unused — revive it for
+     the apt.dat-classified taxiways, sampling along a derived
+     centerline of the pavement polygon (medial axis or
+     polygon-major-axis simplification).
+   - Junction zones: Phase B/D for the apt.dat case currently
+     sees `junction_zone_area = 0` because there are no taxiway
+     buffers to intersect with the runway.  Once taxiways are
+     classified separately, junctions can be computed as
+     `apron_polys ∩ rwy_union_m` and triangulated the same way.
+
+3. **Drainage (Phase F refinement)**.  See Phase F status
+   section above.  Work items:
+   - Fix Type A flat infield depths so they sit at a realistic
+     0.5 – 1.5 m below surrounding pavement, not wildly deeper.
+   - Improve the Type A / Type B classifier.
+   - Split multi-basin pavement holes into per-natural-low-point
+     sub-basins and emit one ditch per sub-basin.
+
+4. **Helper extraction (ongoing, do alongside 1–3)**.  As we
+   touch each area, pull the logic out of the monolith into its
+   own module with unit tests:
+   - `O4_Apron_Mesh.py` — apron triangulation + grade logic
+   - `O4_Taxiway_Elevations.py` — centerline sampling + clamp
+   - `O4_Drainage.py` — Type A / Type B basin detection + emit
+
+5. **Re-run `docs/TEST_PLAN_SPJC.md`** — verify all 11 numeric
+   checks plus the four new invariant checks (12-15).
 
 ## How to resume next session
 
 ```bash
 cd /Users/noah/Ortho4XP-shred86
-git log --oneline -10            # confirm we're at 6d237d6
+git log --oneline -10            # confirm we're at 53a3d53
 ./venv/bin/python3 -m pytest tests/   # 52 pass
 
-# Quick sanity: parse SPJC's custom apt.dat
-./venv/bin/python3 -c "
-import sys; sys.path.insert(0, 'src')
-import O4_Apt_Dat_Reader as APR
-path = APR.find_airport_apt_dat('/Users/noah/X-Plane 12', 'SPJC')
-apt  = APR.load_airport(path, 'SPJC')
-print(path); print(len(apt.pavements), 'pavements,',
-                   len(apt.runways), 'runways')
-"
-
-# Then start commit 8 work — see "Commit 8" section above.
+# Full pipeline sanity run + audit (driver at /tmp/run_legacy.py):
+./venv/bin/python3 /tmp/run_legacy.py      # writes /tmp/SPJC_legacy.patch.osm
+./venv/bin/python3 /tmp/audit_legacy.py    # should report overlap: 0 m²
 ```
 
-The unfinished bug from commits 5-7a (4 569 → 3 148 m² flat-tri
-overlap) is partially mitigated but not eliminated.  Commit 8
-should remove the underlying cause entirely by replacing the
-buffered OSM taxiways with the disjoint apt.dat polygons.
+Next task: **refine and optimize aprons** — see the Next Task
+Queue section above.  Key files and entry points:
+
+- Phase C2 apron emission: `src/O4_Auto_Patch.py:3700`-ish
+  (search for `complex_apron_parts_m`).
+- Apron polygon preparation / runway-clipping: Phase A3 around
+  `src/O4_Auto_Patch.py:2470`.
+- Adaptive triangulation helper:
+  `src/O4_Surface_Mesh.py:adaptive_triangulate`.
+- `_apron_anchors` helper for terminal flat-ring and
+  building-edge anchors.
 
 ## Bugs to fix in the legacy
 
@@ -449,25 +647,46 @@ with an airport-centered version (`(lon-mid_lon, lat-mid_lat)` × scale)
 so meter-space coordinates stay in the ±10 km range.  This was found
 during the experiment and is the right fix in the legacy too.
 
-## Phase E/F status (unfinished, kept in place)
+## Phase E status (rewritten in commits 14–16a, current)
 
-Phase E (boundary band + tunnel portals) and Phase F (drainage zones)
-are partially implemented and were producing useful output — the
-boundary band especially gives the airport a clean perimeter at its
-true elevation.  They have known rough edges:
+- **E1 boundary band**: segmented sloped rects along the boundary
+  (commit 16a).  Elevation per rect is sampled at both short-edge
+  endpoints from the CIFP surface model (IDW over all
+  runway / building / taxiway / road anchors).  Flat polys fill
+  the places where clipping against emitted shapes leaves a
+  non-rectangular residue.  Tracks the airport slope properly
+  at SPJC (5.9 – 45.1 m band elevation range).
+- **E2 tunnel portals**: full rewrite in commits 14 and 15.
+  Per-portal ramp from the OSM tunnel node to the airport
+  boundary with inverted slope (depth at boundary, surface at
+  node), combined carriageway width, U-shaped retaining walls
+  with a 0.5 m gap.  Probe-based outward-direction detection
+  handles the SW SPJC portal that the legacy centroid heuristic
+  dropped.
 
-- Phase E1 boundary band: per-piece centroid elevation sampling
-  occasionally picks the wrong CIFP anchor when the band crosses a
-  major elevation transition.
-- Phase E2 tunnel portals: the grade-down rect generator works for
-  simple road-under-airport cases but doesn't handle two-stage
-  retaining-wall geometry.
-- Phase F drainage: the infield triangulator runs but per-vertex
-  elevations still occasionally end up below the surrounding pavement
-  by more than a real drainage ditch would.
+Phase E is considered **functionally complete** for SPJC.
+Remaining refinements are grade-precision tuning if/when the
+visual output needs it.
 
-These will be revisited after the core (A-D) phases are clean.  For
-now they remain in the source as-is.
+## Phase F status (drainage zones, refinement pending)
+
+Partially implemented.  Type A (flat infield depression) and
+Type B (sloped drainage ditch) both emit shapes, and the
+containment check on Type B ditches (`ditch_poly.difference(ip)
+< 0.5 m²`) prevents the old class of overlap with surrounding
+pavement.  Known issues:
+
+- Type A flat infield elevations are sometimes more than a real
+  drainage ditch depth below the surrounding pavement.
+- Type A / Type B selection logic is driven by the elevation
+  variance of the surrounding pavement samples and mis-classifies
+  some flat islands as sloped-ditch candidates.
+- The per-pavement-hole classification lumps multi-feature
+  drainage basins together instead of producing one ditch per
+  natural sub-basin.
+
+Drainage refinement is the **third item** in the next-task
+queue below.
 
 ## Recently fixed regressions — DO NOT REVERT
 
