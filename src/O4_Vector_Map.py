@@ -216,7 +216,13 @@ def include_airports(vector_map, tile):
     APT.smooth_raster_over_airports(tile, dico_airports)
     # Auto-generate runway, taxiway, and building patches from CIFP data +
     # OSM geometry (before loading patches so include_patches() picks them up)
-    if tile.auto_patch:
+    # Backward compat: legacy bool True/False configs map to "All"/"None"
+    auto_patch_mode = tile.auto_patch
+    if auto_patch_mode is True:
+        auto_patch_mode = "All"
+    elif auto_patch_mode is False:
+        auto_patch_mode = "None"
+    if auto_patch_mode != "None":
         cifp_path = CFG.cifp_data_path
         if not cifp_path and CFG.custom_scenery_dir:
             # Try X-Plane's default CIFP location relative to Custom Scenery
@@ -291,6 +297,7 @@ def include_airports(vector_map, tile):
                 building_data=building_data,
                 dico_airports=dico_airports,
                 road_data=road_data,
+                mode=auto_patch_mode,
             )
     (patches_area, patches_list) = include_patches(vector_map, tile)
     runway_taxiway_apron_area = APT.encode_runways_taxiways_and_aprons(
