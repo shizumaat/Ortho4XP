@@ -80,6 +80,8 @@ class Runway:
     surface_code: int
     displaced_a_m: float
     displaced_b_m: float
+    blast_a_m: float = 0.0   # blast pad / overrun length beyond end a
+    blast_b_m: float = 0.0   # blast pad / overrun length beyond end b
 
 
 @dataclass
@@ -359,13 +361,14 @@ def _parse_runway(toks: List[str]) -> Optional[Runway]:
     """Parse an apt.dat row 100 into a Runway.  Format:
 
     ``100 width surface shoulder smoothness centerline edge_lights distance_signs
-         <end_a:5> <end_b:5>``
+         <end_a:9> <end_b:9>``
 
-    Each end-of-runway block is 5 tokens:
-    ``desig lat lon displaced overrun markings approach_lights tdz_lights reil``
+    Each end-of-runway block is 9 tokens:
+    ``desig lat lon displaced blastpad markings approach_lights tdz_lights reil``
 
-    We only care about width, surface, both designators, both lat/lon,
-    and both displaced thresholds (in metres).
+    ``blastpad`` (index 4 within the end block) is the length in
+    metres of the blast pad / stopway / overrun surface beyond the
+    threshold on that end.
     """
     if len(toks) < 25:
         return None
@@ -380,10 +383,12 @@ def _parse_runway(toks: List[str]) -> Optional[Runway]:
         lat_a = float(end_a[1])
         lon_a = float(end_a[2])
         displaced_a_m = float(end_a[3])
+        blast_a_m = float(end_a[4])
         desig_b = end_b[0]
         lat_b = float(end_b[1])
         lon_b = float(end_b[2])
         displaced_b_m = float(end_b[3])
+        blast_b_m = float(end_b[4])
     except (ValueError, IndexError):
         return None
 
@@ -392,6 +397,7 @@ def _parse_runway(toks: List[str]) -> Optional[Runway]:
         lat_a=lat_a, lon_a=lon_a, lat_b=lat_b, lon_b=lon_b,
         width_m=width_m, surface_code=surface_code,
         displaced_a_m=displaced_a_m, displaced_b_m=displaced_b_m,
+        blast_a_m=blast_a_m, blast_b_m=blast_b_m,
     )
 
 

@@ -403,9 +403,22 @@ def _dico_from_apt_dat(apt_data, tile, fallback_dico):
     for rwy in apt_data.runways:
         try:
             patch_width = rwy.width_m + 2 * RUNWAY_MARGIN
+            # Extend the rectangle by the blast-pad / stopway length
+            # at each end so the emitted footprint covers what
+            # generate_patch_osm draws (runway surface + blast pads).
+            end_a = (rwy.lat_a, rwy.lon_a)
+            end_b = (rwy.lat_b, rwy.lon_b)
+            if rwy.blast_a_m > 0.1:
+                end_a = extend_point(
+                    rwy.lat_b, rwy.lon_b, rwy.lat_a, rwy.lon_a,
+                    rwy.blast_a_m)
+            if rwy.blast_b_m > 0.1:
+                end_b = extend_point(
+                    rwy.lat_a, rwy.lon_a, rwy.lat_b, rwy.lon_b,
+                    rwy.blast_b_m)
             corners = runway_corners(
-                rwy.lat_a, rwy.lon_a,
-                rwy.lat_b, rwy.lon_b,
+                end_a[0], end_a[1],
+                end_b[0], end_b[1],
                 patch_width)
             if corners is None:
                 continue
@@ -582,13 +595,16 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
         runway_pairs: List from pair_runways()
         runway_widths: Dict of {designator: width_m} from apt.dat, or None.
         tile: Optional Tile object with .dem, .lat, .lon for DEM sampling.
-        apt_runways: Optional dict of {designator: (lat, lon, width_m)}
+        apt_runways: Optional dict of
+            ``{designator: (lat, lon, width_m, displaced_m, blast_m)}``
             parsed from apt.dat row-100 records.  When provided,
-            threshold lat/lon and width for each matching designator
-            are taken from apt.dat instead of CIFP, so the emitted
-            runway rectangles align with what X-Plane renders as
-            the runway texture.  CIFP is still the authoritative
-            source for elevations and displaced-threshold distances.
+            apt.dat is the **sole source of truth for runway
+            footprint geometry** — lat/lon, width, displaced
+            threshold, and blast-pad / stopway length all come from
+            apt.dat for each matching designator.  CIFP is used
+            only for threshold elevations.  This keeps the emitted
+            runway rectangles pixel-aligned with what X-Plane
+            renders, and avoids any geometry-source mismatch.
 
     Returns:
         str: Complete OSM XML content for the patch file.
@@ -669,92 +685,92 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
     for desig_a, data_a, desig_b, data_b in runway_pairs:
         if desig_b is not None and data_b is not None:
             # ── Paired runway ────────────────────────────────────────────
-            # CIFP provides the DISPLACED threshold lat/lon and
-            # elevation at that threshold; apt.dat row-100 provides
-            # the PHYSICAL runway-end lat/lon (the same point when
-            # displaced_m == 0) plus the true width.
-            #
-            # Grade is computed from CIFP displaced-threshold
-            # elevations and the CIFP threshold-to-threshold
-            # distance.  apt.dat is used only for the footprint
-            # rectangle positions and width.
-            lat_a, lon_a = data_a["lat"], data_a["lon"]
-            lat_b, lon_b = data_b["lat"], data_b["lon"]
+            # apt.dat is the sole source of truth for runway
+            # footprint geometry (lat/lon, width, displaced
+            # thresholds, blast pads).  CIFP contributes ONLY the
+            # threshold elevations used to seed the per-segment
+            # elevation profile.
             elev_a = data_a["elevation_m"]
             elev_b = data_b["elevation_m"]
-            displaced_a = data_a["displaced_m"]
-            displaced_b = data_b["displaced_m"]
 
             apt_a = apt_runways.get(desig_a)
             apt_b = apt_runways.get(desig_b)
             have_apt_geom = apt_a is not None and apt_b is not None
 
-            # Determine runway width for this pair.  Prefer apt.dat
-            # row-100 width (exact), then the runway_widths dict, then
-            # the default.
             if have_apt_geom:
+                lat_a, lon_a = apt_a[0], apt_a[1]
+                lat_b, lon_b = apt_b[0], apt_b[1]
                 rwy_width = apt_a[2]
+                displaced_a = apt_a[3]
+                displaced_b = apt_b[3]
+                blast_a = apt_a[4]
+                blast_b = apt_b[4]
             else:
+                # Legacy fallback: no apt.dat geometry available,
+                # use CIFP lat/lon + displaced, runway_widths dict
+                # for width.  Blast pads are not in CIFP so fall
+                # back to OVERRUN_EXTENSION.
+                lat_a, lon_a = data_a["lat"], data_a["lon"]
+                lat_b, lon_b = data_b["lat"], data_b["lon"]
+                displaced_a = data_a["displaced_m"]
+                displaced_b = data_b["displaced_m"]
+                blast_a = OVERRUN_EXTENSION
+                blast_b = OVERRUN_EXTENSION
                 rwy_width = runway_widths.get(
                     desig_a,
                     runway_widths.get(desig_b, DEFAULT_RUNWAY_WIDTH),
                 )
             patch_width = rwy_width + 2 * RUNWAY_MARGIN
 
-            # Compute threshold-to-threshold distance for grade calculation
+            # cos(lat) for meter conversions
             mid_lat = (lat_a + lat_b) / 2.0
             cos_lat_v = cos(mid_lat * pi / 180.0)
             if cos_lat_v < 1e-6:
                 cos_lat_v = 1e-6
-            dx_m = (lon_b - lon_a) * cos_lat_v * DEG_TO_M
-            dy_m = (lat_b - lat_a) * DEG_TO_M
-            thresh_dist = sqrt(dx_m ** 2 + dy_m ** 2)
-            if thresh_dist < 1.0:
-                continue
-
-            grade = (elev_b - elev_a) / thresh_dist
 
             # ── Physical runway ends ─────────────────────────────────────
-            # When apt.dat row-100 geometry is available, use its
-            # lat/lon as the physical runway ends directly — apt.dat
-            # row-100 coordinates are the physical ends (displaced
-            # distance is stored separately).  Elevations at those
-            # physical ends come from CIFP threshold elevations
-            # shifted along the runway by ±displaced_m × grade.
+            # apt.dat row-100 lat/lon ARE the physical ends of the
+            # runway surface (excluding blast pads).  CIFP thresholds
+            # are at (lat_a/b) + displaced_a/b inward.
             #
-            # Without apt.dat, fall back to the legacy behaviour:
-            # extend the CIFP threshold outward by displaced_m to
+            # Legacy CIFP fallback: lat_a/b in CIFP are at the
+            # displaced threshold; extend outward by displaced_m to
             # approximate the physical end.
             if have_apt_geom:
-                phys_end_a = (apt_a[0], apt_a[1])
-                phys_end_b = (apt_b[0], apt_b[1])
-                elev_phys_a = elev_a - grade * displaced_a
-                elev_phys_b = elev_b + grade * displaced_b
+                phys_end_a = (lat_a, lon_a)
+                phys_end_b = (lat_b, lon_b)
             else:
                 if displaced_a > 0:
                     phys_end_a = extend_point(
-                        lat_b, lon_b, lat_a, lon_a, displaced_a
-                    )
-                    elev_phys_a = elev_a - grade * displaced_a
+                        lat_b, lon_b, lat_a, lon_a, displaced_a)
                 else:
                     phys_end_a = (lat_a, lon_a)
-                    elev_phys_a = elev_a
-
                 if displaced_b > 0:
                     phys_end_b = extend_point(
-                        lat_a, lon_a, lat_b, lon_b, displaced_b
-                    )
-                    elev_phys_b = elev_b + grade * displaced_b
+                        lat_a, lon_a, lat_b, lon_b, displaced_b)
                 else:
                     phys_end_b = (lat_b, lon_b)
-                    elev_phys_b = elev_b
 
-            # Full physical runway length
+            # Full physical runway length (phys_end to phys_end).
             dx_phys = (phys_end_b[1] - phys_end_a[1]) * cos_lat_v * DEG_TO_M
             dy_phys = (phys_end_b[0] - phys_end_a[0]) * DEG_TO_M
             phys_dist = sqrt(dx_phys ** 2 + dy_phys ** 2)
             if phys_dist < 1.0:
                 continue
+
+            # Threshold-to-threshold distance (between the two
+            # DISPLACED thresholds, where CIFP elevations are
+            # anchored).  This is what "grade" is measured over.
+            thresh_dist = phys_dist - displaced_a - displaced_b
+            if thresh_dist < 1.0:
+                thresh_dist = phys_dist  # degenerate, both disp=0
+            grade = (elev_b - elev_a) / thresh_dist
+
+            # Elevation at each physical end: shift the CIFP
+            # threshold elevation by the grade over the displaced
+            # distance (0 when disp=0 → elev_a/b unchanged).
+            elev_phys_a = elev_a - grade * displaced_a
+            elev_phys_b = elev_b + grade * displaced_b
 
             # ── Build segment sample points along centerline ─────────────
             # Always include: physical end A, threshold A, threshold B,
@@ -921,27 +937,27 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     patch_width,
                 )
 
-            # ── Flat overrun extensions beyond physical ends ─────────────
-            # Skip when apt.dat geometry is authoritative — the
-            # apt.dat row-100 rectangle already represents the full
-            # runway surface, and adding a 30 m extension would push
-            # the emitted patch past the rendered runway edge.
-            if not have_apt_geom:
+            # ── Flat blast-pad / overrun rectangles beyond ends ─────────
+            # Length comes from apt.dat row-100 blast_a/blast_b when
+            # available; otherwise the legacy 30 m OVERRUN_EXTENSION
+            # fallback is already assigned to blast_a/blast_b above.
+            # Zero-length blast pads produce nothing.
+            if blast_a > 0.1:
                 ext_a = extend_point(
                     phys_end_b[0], phys_end_b[1],
                     phys_end_a[0], phys_end_a[1],
-                    OVERRUN_EXTENSION,
+                    blast_a,
                 )
                 add_rect_patch(
                     ext_a[0], ext_a[1], elevs[0],
                     phys_end_a[0], phys_end_a[1], elevs[0],
                     patch_width,
                 )
-
+            if blast_b > 0.1:
                 ext_b = extend_point(
                     phys_end_a[0], phys_end_a[1],
                     phys_end_b[0], phys_end_b[1],
-                    OVERRUN_EXTENSION,
+                    blast_b,
                 )
                 add_rect_patch(
                     phys_end_b[0], phys_end_b[1], elevs[-1],
@@ -1190,13 +1206,15 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                 if _apt_path:
                     _apt = _APR.load_airport(_apt_path, icao)
                     if _apt is not None:
+                        def _norm(d):
+                            return d if d.startswith("RW") else "RW" + d
                         for _r in _apt.runways:
-                            def _norm(d):
-                                return d if d.startswith("RW") else "RW" + d
                             apt_runway_geom[_norm(_r.desig_a)] = (
-                                _r.lat_a, _r.lon_a, _r.width_m)
+                                _r.lat_a, _r.lon_a, _r.width_m,
+                                _r.displaced_a_m, _r.blast_a_m)
                             apt_runway_geom[_norm(_r.desig_b)] = (
-                                _r.lat_b, _r.lon_b, _r.width_m)
+                                _r.lat_b, _r.lon_b, _r.width_m,
+                                _r.displaced_b_m, _r.blast_b_m)
         except Exception as _e:
             UI.vprint(
                 2, "   Auto-patch: apt.dat runway geometry lookup "
