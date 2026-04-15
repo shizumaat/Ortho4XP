@@ -140,18 +140,26 @@ landed and is tested but not yet integrated.
 
 Total tests: **41**.  Run with `./venv/bin/python3 -m pytest tests/`.
 
-### SPJC numbers (post commit 7b)
+### SPJC numbers (post commit 8)
 
-| Metric | Value |
-|---|---|
-| Total emitted ways | ~2 871 |
-| Total cross-feature overlap | 7 638 m² (0.4 %) |
-| flat ∩ flat overlap | 3 085 m² (Phase C3 / coverage fill) |
-| flat ∩ triangle overlap | 3 148 m² (Phase E/F vs Phase D residue) |
-| triangle ∩ triangle | 1 221 m² |
-| Junction triangles | 1 631 (adaptive mesh) |
-| Apron triangles | ~700 |
-| Buildings reconciled for grade | 30 |
+| Metric | Commit 7b | **Commit 8** |
+|---|---|---|
+| Total emitted ways | 2 871 | **2 442** (-15 %) |
+| Total cross-feature overlap | 7 638 m² (0.4 %) | **6 099 m² (0.2 %)** |
+| flat ∩ flat overlap | 3 085 m² | 3 370 m² |
+| flat ∩ triangle overlap | 3 148 m² | **2 729 m²** |
+| triangle ∩ triangle | 1 221 m² | **0 m²** ✓ |
+| Junction triangles (Phase D) | 1 631 | 0 (taxiway_data is empty) |
+| Apron triangles (Phase C2) | ~700 | **2 262** |
+| apt.dat pavements loaded | 0 (OSM) | **51 → 5 merged pieces** |
+| Buildings reconciled for grade | 30 | 27 |
+
+apt.dat pavement polygons are disjoint by design, so the
+Phase D junction pipeline produces zero overlapping triangles
+(junction_zone_m is empty).  The remaining ~6 k m² overlap is
+from the building merge leftovers (flat-flat) and the apron
+clipping against buildings not always preserving tiny holes
+(flat-triangle).  Both will be addressed in commit 9+.
 
 The remaining overlaps are not from the legacy architecture being
 wrong — they're from OSM-derived inputs not being disjoint by
@@ -203,8 +211,9 @@ small modules, not the monolith.
 6. **Commit 6 — wire Phase D (junction) to adaptive_triangulate.** ✅ `7d89f33`
 7. **Commit 7a — Phase D hole-vertex + actual-triangle accumulator.** ✅ `e36e6a1`
 8. **Commit 7b — add `O4_Apt_Dat_Reader` module + tests.** ✅ `ce3b97c`
+9. **Commit 8 — wire `O4_Apt_Dat_Reader` into legacy (Phase A0.5).** ✅ (this commit)
 
-### → Commit 8 (next session): wire `O4_Apt_Dat_Reader` into the legacy
+### ← Commit 8 (done): wire `O4_Apt_Dat_Reader` into the legacy
 
 This is where the real payoff lives.  apt.dat polygons are the
 *authoritative* pavement geometry — they're what X-Plane renders

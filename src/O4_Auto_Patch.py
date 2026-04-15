@@ -281,6 +281,161 @@ def find_aptdat(cifp_path):
     return None
 
 
+def xplane_root_from_cifp_path(cifp_path):
+    """Derive the X-Plane installation root from a CIFP directory path.
+
+    cifp_path is typically ``<X-Plane>/Custom Data/CIFP`` (or the
+    similar ``Resources/default data/CIFP`` location).  Walks up two
+    directory levels to reach the X-Plane root.  Returns ``None`` if
+    the path doesn't look right.
+    """
+    if not cifp_path:
+        return None
+    try:
+        custom_data = os.path.dirname(os.path.normpath(cifp_path))
+        root = os.path.dirname(custom_data)
+        # Basic sanity check: the derived root should contain a
+        # "Custom Scenery" or "Resources" directory.
+        if (os.path.isdir(os.path.join(root, "Custom Scenery"))
+                or os.path.isdir(os.path.join(root, "Resources"))):
+            return root
+    except Exception:
+        pass
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# apt.dat → dico_apt_entry adapter
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase A0.5 in generate_airport_surface_patches calls this to replace
+# the OSM-derived shapes in dico_apt_entry with apt.dat-derived ones.
+# The downstream phases (A1 runway clip poly, A3 apron polys, etc.)
+# read from the dict, so this adapter returns a dict with the same
+# keys in the same format — but with apt.dat geometry.
+#
+# Key design choice for commit 8 (STATUS.md option (a)): every apt.dat
+# row-110 pavement goes into dico_apt_entry["apron"], and
+# dico_apt_entry["taxiway"] is left empty.  Downstream Phase C2
+# triangulates everything at the apron grade (1.0 %).  This loses
+# the looser 1.5 % taxiway grade but keeps the pipeline simple; name-
+# based classification is a follow-up commit.
+#
+# Coordinates: apt.dat polygons are in absolute lat/lon, but
+# dico_apt_entry stores tile-relative shapes (x = lon - tile.lon,
+# y = lat - tile.lat).  This adapter does the conversion per vertex.
+def _dico_from_apt_dat(apt_data, tile, fallback_dico):
+    """Build a dico_apt_entry-shaped dict from an apt.dat Airport.
+
+    Args:
+        apt_data: ``O4_Apt_Dat_Reader.Airport`` parsed from apt.dat.
+        tile: the Tile we're rendering (for tile-relative coords).
+        fallback_dico: the existing dico_apt_entry dict; used to
+            inherit OSM-derived fields we don't have in apt.dat
+            (hangar, repr_node, boundary fallback, etc.).
+
+    Returns:
+        A new dict that shadows ``fallback_dico`` but with
+        apt.dat-derived runway, apron, taxiway, and boundary shapes.
+        Always returns a dict even if apt.dat is partially
+        populated — missing fields stay as whatever fallback_dico
+        had.
+    """
+    from shapely import geometry as _shp_geom
+    from shapely import ops as _shp_ops
+
+    def _to_tile_relative(polygon):
+        """Convert absolute lat/lon polygon to tile-relative
+        (lon - tile.lon, lat - tile.lat) with holes preserved.
+        """
+        try:
+            exterior = [
+                (x - tile.lon, y - tile.lat)
+                for x, y in polygon.exterior.coords
+            ]
+            holes = []
+            for ring in polygon.interiors:
+                holes.append(
+                    [(x - tile.lon, y - tile.lat)
+                     for x, y in ring.coords])
+            p = _shp_geom.Polygon(exterior, holes if holes else None)
+            if not p.is_valid:
+                p = p.buffer(0)
+            if p.is_empty:
+                return None
+            if not isinstance(p, _shp_geom.Polygon):
+                if hasattr(p, "geoms"):
+                    p = max(p.geoms, key=lambda g: g.area)
+                else:
+                    return None
+            return p
+        except Exception:
+            return None
+
+    new_dico = dict(fallback_dico) if fallback_dico else {}
+
+    # ── 1. Aprons: every apt.dat pavement polygon ────────────────────
+    apron_polys = []
+    for pav in apt_data.pavements:
+        p_tr = _to_tile_relative(pav.polygon)
+        if p_tr is not None and not p_tr.is_empty:
+            apron_polys.append(p_tr)
+    if apron_polys:
+        try:
+            apron_union = _shp_ops.unary_union(apron_polys)
+            # Store as a tuple (geom, wayid_list) to match the
+            # format the legacy expects — see O4_Airport_Utils
+            # build_apron_areas.  We have no OSM way IDs, so the
+            # list is empty.
+            new_dico["apron"] = (apron_union, [])
+        except Exception:
+            pass
+
+    # ── 2. Taxiway: empty for commit 8 (all pavement is "apron") ────
+    # Leaving this as an empty tuple signals the downstream Phase A2
+    # loop to skip taxiway centerline / buffer processing entirely.
+    new_dico["taxiway"] = (_shp_geom.Polygon(), [])
+
+    # ── 3. Runway polygons: rectangles from apt.dat row 100 ─────────
+    # Used by Phase A1 for clipping aprons and buildings off the
+    # runway area.  Each Runway gives us two endpoints plus a width,
+    # which we turn into a rectangle via runway_corners().
+    rwy_polys = []
+    for rwy in apt_data.runways:
+        try:
+            patch_width = rwy.width_m + 2 * RUNWAY_MARGIN
+            corners = runway_corners(
+                rwy.lat_a, rwy.lon_a,
+                rwy.lat_b, rwy.lon_b,
+                patch_width)
+            if corners is None:
+                continue
+            # corners is [(lat, lon), ...] — flip to (x, y) and shift.
+            poly = _shp_geom.Polygon([
+                (lon - tile.lon, lat - tile.lat)
+                for (lat, lon) in corners
+            ])
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty and isinstance(poly, _shp_geom.Polygon):
+                rwy_polys.append(poly)
+        except Exception:
+            pass
+    if rwy_polys:
+        try:
+            rwy_union = _shp_ops.unary_union(rwy_polys)
+            new_dico["runway"] = (rwy_union, [])
+        except Exception:
+            pass
+
+    # ── 4. Boundary: prefer apt.dat row 130 when present ────────────
+    if apt_data.boundary is not None and not apt_data.boundary.is_empty:
+        bnd_tr = _to_tile_relative(apt_data.boundary)
+        if bnd_tr is not None and not bnd_tr.is_empty:
+            new_dico["boundary"] = bnd_tr
+
+    return new_dico
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Runway Pairing
 # ──────────────────────────────────────────────────────────────────────────────
@@ -995,6 +1150,7 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                 rwy_pairs_for_elev, tile, dico_apt_entry,
                 start_node_id=-10000,
                 road_data=airport_roads,
+                xplane_root=xplane_root_from_cifp_path(cifp_path),
             )
             if surface_lines:
                 num_surface_patches = sum(
@@ -1830,7 +1986,8 @@ def extract_road_info(dico_airports, tile, road_layer=None):
 
 def generate_airport_surface_patches(icao, taxiway_data, building_data,
                                       runway_pairs, tile, dico_apt_entry,
-                                      start_node_id=-10000, road_data=None):
+                                      start_node_id=-10000, road_data=None,
+                                      xplane_root=None):
     """Generate efficient airport surface patches using JOSM-friendly shapes.
 
     Uses the simplest shape that achieves smooth, grade-limited slopes.
@@ -1857,19 +2014,68 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
     Args:
         icao: Airport ICAO code.
-        taxiway_data: List of dicts with 'centerline' key.
+        taxiway_data: List of dicts with 'centerline' key.  Ignored
+            when apt.dat data is available (see Phase A0.5).
         building_data: List of dicts with 'footprint' key.
         runway_pairs: List of CIFP runway pair dicts.
         tile: Tile object with .dem, .lat, .lon.
         dico_apt_entry: The dico_airports[airport] dict.
         start_node_id: Starting negative node ID.
         road_data: Optional list of road dicts from extract_road_info().
+        xplane_root: X-Plane install root.  If set, Phase A0.5 searches
+            ``<xplane_root>/Custom Scenery`` (per-airport packs first)
+            and falls back to Global Airports / default scenery to
+            locate the airport's apt.dat file.  When found, the
+            apt.dat pavement polygons REPLACE the OSM-derived
+            taxiway/apron/runway shapes in dico_apt_entry.  apt.dat
+            polygons are disjoint by construction, eliminating the
+            buffering / precision-drift artefacts that cause
+            flat-flat and flat-triangle overlap.
 
     Returns:
         tuple: (osm_lines, next_node_id)
     """
     from shapely import geometry as shp_geom
     from shapely import ops as shp_ops
+
+    # ════════════════════════════════════════════════════════════════
+    # PHASE A0.5: Prefer apt.dat pavement data over OSM when available
+    # ════════════════════════════════════════════════════════════════
+    # apt.dat polygons are the authoritative pavement geometry for
+    # what X-Plane actually renders as the ground texture.  When we
+    # can find an apt.dat for this airport (per-airport Custom Scenery
+    # pack first, then Global Airports, then default), we load it and
+    # replace the OSM-derived shapes in dico_apt_entry.
+    #
+    # For commit 8 every apt.dat pavement goes into dico_apt_entry
+    # ["apron"] and taxiway_data is cleared.  Name-based classification
+    # (TWY / RAMP / etc.) is a follow-up commit.
+    #
+    # If no apt.dat is found, the OSM path runs unchanged.
+    apt_dat_used = False
+    if xplane_root:
+        try:
+            import O4_Apt_Dat_Reader as _APR
+            aptdat_path = _APR.find_airport_apt_dat(xplane_root, icao)
+            if aptdat_path:
+                apt_data = _APR.load_airport(aptdat_path, icao)
+                if apt_data is not None and apt_data.pavements:
+                    dico_apt_entry = _dico_from_apt_dat(
+                        apt_data, tile, dico_apt_entry)
+                    taxiway_data = []    # apt.dat ⇒ everything is apron
+                    apt_dat_used = True
+                    UI.vprint(2,
+                        "    {}: apt.dat loaded from {} — "
+                        "{} pavements, {} runways".format(
+                            icao, aptdat_path,
+                            len(apt_data.pavements),
+                            len(apt_data.runways)))
+        except Exception as e:
+            UI.vprint(2,
+                "    {}: apt.dat load failed ({}), "
+                "falling back to OSM".format(icao, e))
+    if not apt_dat_used:
+        UI.vprint(2, "    {}: using OSM aerodrome data".format(icao))
 
     ZONE_BUILDING = 1
     ZONE_APRON = 2
@@ -2223,6 +2429,18 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     #  Phase A5 below, after building platforms are established.)
 
     # A3: Apron polygons
+    # When apt.dat polygons are the source (Phase A0.5 replaced
+    # dico_apt_entry["apron"]), we take the polygons as-is: they're
+    # already the authoritative shape X-Plane renders.  In
+    # particular we do NOT apply APRON_BUFFER — that was an
+    # ad-hoc outward inflation to patch over OSM geometry quality,
+    # and it massively inflates apt.dat output because the pavements
+    # are already clean.  We also preserve interior rings (holes)
+    # so any carved-out regions in the apt.dat polygon survive into
+    # meter space.
+    #
+    # For OSM-derived data the legacy behaviour is preserved: 5 m
+    # outward buffer, exterior-only.
     apron_polys_m = []
     apron_data = dico_apt_entry.get("apron")
     if apron_data is not None:
@@ -2236,13 +2454,28 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         for poly in raw_polys:
             if poly.is_empty or not poly.is_valid:
                 continue
-            coords_m = [
-                to_m(x + tile.lon, y + tile.lat)
-                for x, y in poly.exterior.coords
-            ]
             try:
-                p_m = shp_geom.Polygon(coords_m)
-                if p_m.is_valid and not p_m.is_empty:
+                exterior_m = [
+                    to_m(x + tile.lon, y + tile.lat)
+                    for x, y in poly.exterior.coords
+                ]
+                holes_m = []
+                for ring in poly.interiors:
+                    holes_m.append([
+                        to_m(x + tile.lon, y + tile.lat)
+                        for x, y in ring.coords
+                    ])
+                p_m = shp_geom.Polygon(
+                    exterior_m, holes_m if holes_m else None)
+                if not p_m.is_valid:
+                    p_m = p_m.buffer(0)
+                if p_m.is_empty:
+                    continue
+                if apt_dat_used:
+                    # Trust the source — don't inflate or simplify.
+                    apron_polys_m.append(p_m)
+                else:
+                    # Legacy OSM path: 5 m outward buffer.
                     apron_polys_m.append(p_m.buffer(APRON_BUFFER))
             except Exception:
                 pass
@@ -3289,16 +3522,26 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             # adaptive_triangulate starts with a small seed set.
             # OSM apron polygons commonly have 50-200 contour
             # vertices that don't carry meaningful shape information
-            # at the patch-mesh scale.  5 m tolerance trims those
+            # at the patch-mesh scale.  10 m tolerance trims those
             # without losing the apron's recognisable outline.
-            try:
-                seed_poly = piece.simplify(
-                    APRON_SIMPLIFY_M, preserve_topology=True)
-                if (seed_poly.is_empty
-                        or not hasattr(seed_poly, "exterior")):
-                    seed_poly = piece
-            except Exception:
+            #
+            # When apt.dat is the source, SKIP simplification: the
+            # polygons are already clean, and a 10 m tolerance can
+            # silently delete small interior rings (building-shaped
+            # holes carved by the rwy/bldg subtraction a few lines
+            # above) which then causes triangles to cover building
+            # pads and produce flat-triangle overlap.
+            if apt_dat_used:
                 seed_poly = piece
+            else:
+                try:
+                    seed_poly = piece.simplify(
+                        APRON_SIMPLIFY_M, preserve_topology=True)
+                    if (seed_poly.is_empty
+                            or not hasattr(seed_poly, "exterior")):
+                        seed_poly = piece
+                except Exception:
+                    seed_poly = piece
 
             anchors = _apron_anchors(seed_poly)
             try:
