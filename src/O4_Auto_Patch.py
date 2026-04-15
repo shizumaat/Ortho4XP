@@ -2801,10 +2801,58 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                                     # not re-run the probe
         pool_apron_m = []         # apron-classified OR fallback twy
 
+        # ────────────────────────────────────────────────────────────
+        # Runway edge-anchor closure.
+        #
+        # User rule: "the goal is a perfectly smooth transition from
+        # runway to taxiway.  If the runway has any slope, then a
+        # taxiway joining it has to match that slope when it's close
+        # to the runway — anything < 1 m.  Once we're more than 1 m
+        # from the runway, the taxiway can follow its normal slope
+        # rules."
+        #
+        # Implementation: a centerline sample at meter-space point
+        # (x, y) is "near a runway" if the point lies inside
+        # `rwy_union_m.buffer(1.0)` — the runway rectangles inflated
+        # 1 m outward.  Such samples are anchored to the runway's
+        # own elevation, obtained by projecting the lat/lon onto the
+        # nearest CIFP runway centerline.  Non-near samples fall
+        # back to DEM and the normal grade rule.
+        #
+        # Note rwy_union_m is computed BEFORE Phase A3 in Phase A1;
+        # at this point it's already a valid meter-space geometry.
+        def _runway_edge_anchor_m(x_m, y_m):
+            try:
+                if rwy_union_m.is_empty:
+                    return None
+                pt = shp_geom.Point(x_m, y_m)
+                # Fast reject: more than 1 m outside every runway?
+                # distance > 1.0 means the point is outside buffered
+                # runways — normal DEM applies.
+                try:
+                    if pt.distance(rwy_union_m) > 1.0:
+                        return None
+                except Exception:
+                    return None
+                lon, lat = to_ll(x_m, y_m)
+                # Project onto the nearest runway centerline; use a
+                # max_dist that comfortably covers the widest runway
+                # (SPJC: 45 m), so a point 22 m inside a 45-m runway
+                # still matches.  Returns the CIFP-interpolated
+                # elevation at the projection.
+                elev = _project_point_onto_runway(
+                    lat, lon, runway_pairs, max_dist=60.0)
+                return elev
+            except Exception:
+                return None
+
         def _try_rectify(strip_poly):
             """Return a rect chain if the strip is rectifiable, else
             None.  Factored so the decomposition branch can re-test
-            each branch after morphological splitting."""
+            each branch after morphological splitting.  build_taxiway_
+            rects (MRR-aligned) does NOT receive the runway anchor
+            because its sampling is long-axis-only; runway joins are
+            handled by the centerline builder fallback instead."""
             if _TR is None:
                 return None
             try:
@@ -2896,7 +2944,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                             ln, poly, _dem_at,
                             max_grade=MAX_TAXIWAY_GRADE,
                             seg_length=50.0,
-                            fidelity_tol=1.0)
+                            fidelity_tol=1.0,
+                            runway_anchor=_runway_edge_anchor_m)
                     except Exception:
                         rc = None
                     if not rc:

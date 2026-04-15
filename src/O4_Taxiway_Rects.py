@@ -255,6 +255,73 @@ def _clamp_profile(zs: List[float],
             break
 
 
+def _clamp_profile_with_anchors(zs: List[float],
+                                anchored: List[bool],
+                                seg_len: float,
+                                max_grade: float,
+                                max_dg_per_m: float) -> None:
+    """Grade + rate-of-change clamp that preserves anchored samples.
+
+    Anchored samples (typically taxi-centerline points within 1 m of
+    a runway boundary, pinned to the runway's elevation) are
+    IMMOVABLE.  Non-anchored samples are pulled into the grade
+    envelope imposed by their nearest neighbours, which may be
+    an anchored sample or another non-anchored sample; the clamp
+    propagates the anchor's z through the chain.
+
+    Iterates until convergence.
+    """
+    if len(zs) < 2 or seg_len <= 0:
+        return
+    max_dz = max_grade * seg_len
+    grade_change_budget = max_dg_per_m * seg_len * seg_len
+    n = len(zs)
+
+    for _ in range(_CLAMP_MAX_ITERS):
+        changed = False
+
+        # Pass 1: hard-range clamp.  Upper/lower envelope is seeded
+        # with [z, z] at anchored samples and [-inf, +inf] everywhere
+        # else; then forward / backward passes propagate the
+        # neighbourhood's imposed limits.
+        BIG = 1e18
+        upper = [zs[i] if anchored[i] else +BIG for i in range(n)]
+        lower = [zs[i] if anchored[i] else -BIG for i in range(n)]
+        for i in range(1, n):
+            upper[i] = min(upper[i], upper[i - 1] + max_dz)
+            lower[i] = max(lower[i], lower[i - 1] - max_dz)
+        for i in range(n - 2, -1, -1):
+            upper[i] = min(upper[i], upper[i + 1] + max_dz)
+            lower[i] = max(lower[i], lower[i + 1] - max_dz)
+        for i in range(n):
+            if anchored[i]:
+                continue
+            new_z = zs[i]
+            if new_z > upper[i]:
+                new_z = upper[i]
+            if new_z < lower[i]:
+                new_z = lower[i]
+            if abs(new_z - zs[i]) > 1e-9:
+                zs[i] = new_z
+                changed = True
+
+        # Pass 2: rate-of-change cap.  Skip anchored samples.
+        for i in range(1, n - 1):
+            if anchored[i]:
+                continue
+            expected = (zs[i - 1] + zs[i + 1]) / 2.0
+            dev = zs[i] - expected
+            if dev > grade_change_budget + 1e-9:
+                zs[i] = expected + grade_change_budget
+                changed = True
+            elif dev < -grade_change_budget - 1e-9:
+                zs[i] = expected - grade_change_budget
+                changed = True
+
+        if not changed:
+            break
+
+
 def _rdp_simplify_indices(zs: List[float],
                           tolerance: float) -> List[int]:
     """Ramer-Douglas-Peucker on a 1D z profile sampled at uniform
@@ -457,6 +524,8 @@ def build_rects_along_centerline(
     max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
     min_width_m: float = 8.0,
     max_width_m: float = 50.0,
+    runway_anchor: Optional[Callable[[float, float],
+                                     Optional[float]]] = None,
 ) -> Optional[List[TaxiwayRect]]:
     """Build a chain of sloping rectangles along an arbitrary
     centerline inside a polygon.
@@ -503,10 +572,14 @@ def build_rects_along_centerline(
     n_segs = max(1, int(round(total_len / seg_length)))
     actual_seg = total_len / n_segs
 
-    # Sample centerline at each split point.
+    # Sample centerline at each split point.  A sample within 1 m
+    # of a runway boundary (detected via the optional runway_anchor
+    # callback) is pinned to the runway's elevation and marked
+    # anchored; the grade clamp won't move those.
     centers: List[Tuple[float, float]] = []
     tangents: List[Tuple[float, float]] = []
     zs: List[float] = []
+    anchored: List[bool] = []
     for i in range(n_segs + 1):
         t = i * actual_seg
         pt = centerline.interpolate(t)
@@ -524,12 +597,25 @@ def build_rects_along_centerline(
             tangents.append((1.0, 0.0))
         else:
             tangents.append((tx / mag, ty / mag))
-        z = sample_dem(pt.x, pt.y)
-        if z is None:
-            z = zs[-1] if zs else 0.0
-        zs.append(z)
 
-    _clamp_profile(zs, actual_seg, max_grade, max_dg_per_m)
+        runway_z = None
+        if runway_anchor is not None:
+            try:
+                runway_z = runway_anchor(pt.x, pt.y)
+            except Exception:
+                runway_z = None
+        if runway_z is not None:
+            zs.append(float(runway_z))
+            anchored.append(True)
+        else:
+            z = sample_dem(pt.x, pt.y)
+            if z is None:
+                z = zs[-1] if zs else 0.0
+            zs.append(z)
+            anchored.append(False)
+
+    _clamp_profile_with_anchors(
+        zs, anchored, actual_seg, max_grade, max_dg_per_m)
 
     keep_indices = _rdp_simplify_indices(zs, fidelity_tol)
     if len(keep_indices) < 2:
