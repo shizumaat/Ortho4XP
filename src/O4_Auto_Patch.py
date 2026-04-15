@@ -4547,257 +4547,293 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 pass
 
             # ── E2: Tunnel portals ─────────────────────────────────
-            # Where a tunnel road crosses under or near the airport
-            # boundary, emit grade-down rects and retaining wall flanks
-            # at each portal (entrance/exit).
+            # Model: the tunnel way (OSM tunnel=yes) has a start node
+            # OUTSIDE the airport where the road is at surface
+            # elevation, and it crosses the airport boundary at the
+            # portal, where the road is already at tunnel depth (~6 m
+            # below airport grade).  The ramp is the outside-airport
+            # sub-segment of the tunnel way.  We emit:
+            #
+            #   1. A single sloped rect covering the whole ramp,
+            #      HIGH (surface DEM) at the OSM tunnel node, LOW
+            #      (apt_elev − DEPTH) at the airport boundary.
+            #   2. Retaining walls flat at apt_elev along both sides
+            #      of the ramp plus an end-cap wrapping around the
+            #      LOW (portal) end, with a small gap between wall
+            #      and ramp so they are not touching.
+            #
+            # Divided-highway tunnels are two OSM ways — we cluster
+            # ramps by portal location and emit one wider combined
+            # rect covering all carriageways per cluster.
+            TUNNEL_WALL_GAP = 0.5       # m: gap between wall and ramp
+            CARRIAGEWAY_BASE_WIDTH = TUNNEL_RECT_WIDTH  # per carriageway
             if road_lines_m:
-                from shapely.strtree import STRtree as _STRtree
                 boundary_line = airport_footprint.boundary
                 if boundary_line.geom_type == "MultiLineString":
                     boundary_line = max(
                         boundary_line.geoms, key=lambda g: g.length)
 
-                # ── Collect portal candidates from every tunnel way ──
-                # Each entry: (px, py, r_ls, r_hwy) where r_ls is the
-                # LineString the portal came from, used for local
-                # direction at emission time.
-                portal_candidates = []
-                for r_ls, r_hwy, r_tunnel, r_bridge in road_lines_m:
+                # ── Collect ramps: outside sub-LineStrings of each
+                # tunnel way.  Each ramp's portal end = the endpoint
+                # on/near the boundary; outside end = the OSM tunnel
+                # node (far from boundary).
+                ramps = []  # (portal_xy, outside_xy, length, r_hwy)
+                for r_ls, r_hwy, r_tunnel, _ in road_lines_m:
                     if not r_tunnel:
                         continue
                     if boundary_line.distance(r_ls) > 100.0:
                         continue
-
                     try:
-                        xing = r_ls.intersection(boundary_line)
+                        outside = r_ls.difference(airport_footprint)
                     except Exception:
-                        xing = None
-
-                    r_coords = list(r_ls.coords)
-                    pps = []
-                    if xing is not None and not xing.is_empty:
-                        if hasattr(xing, "geoms"):
-                            for g in xing.geoms:
-                                if hasattr(g, "x"):
-                                    pps.append((g.x, g.y))
-                        elif hasattr(xing, "x"):
-                            pps.append((xing.x, xing.y))
-                    if not pps:
-                        for rc in [r_coords[0], r_coords[-1]]:
-                            pt = shp_geom.Point(rc)
-                            if boundary_line.distance(pt) < 80.0:
-                                pps.append(rc)
-                    for pp in pps:
-                        portal_candidates.append(
-                            (pp[0], pp[1], r_ls, r_hwy))
-
-                # ── Dedupe portals that are close together ────────────
-                # Divided-highway tunnels are split into two OSM ways
-                # (one per carriageway), each producing a portal at
-                # the same physical location a few metres apart.  Emit
-                # the grade-down / retaining-wall geometry once per
-                # unique portal so the two carriageways don't produce
-                # overlapping rects.
-                PORTAL_MERGE_DIST = 40.0
-                merged_portals = []
-                for cand in portal_candidates:
-                    cx, cy, _, _ = cand
-                    dup = False
-                    for kp in merged_portals:
-                        if sqrt((kp[0] - cx) ** 2
-                                + (kp[1] - cy) ** 2) < PORTAL_MERGE_DIST:
-                            dup = True
-                            break
-                    if not dup:
-                        merged_portals.append(cand)
-
-                for px, py, r_ls, r_hwy in merged_portals:
-                    # Compute local road direction at this portal
-                    try:
-                        # Interpolate direction along road ±15m from portal
-                        portal_pt = shp_geom.Point(px, py)
-                        d_along = r_ls.project(portal_pt)
-                        p1 = r_ls.interpolate(max(0, d_along - 15))
-                        p2 = r_ls.interpolate(
-                            min(r_ls.length, d_along + 15))
-                        rdx = p2.x - p1.x
-                        rdy = p2.y - p1.y
-                        r_dir_len = sqrt(rdx * rdx + rdy * rdy)
-                        if r_dir_len < 0.1:
-                            continue
-                        road_dir = (rdx / r_dir_len, rdy / r_dir_len)
-                    except Exception:
+                        outside = None
+                    if outside is None or outside.is_empty:
                         continue
+                    pieces = (list(outside.geoms)
+                              if hasattr(outside, "geoms")
+                              else [outside])
+                    for piece in pieces:
+                        if (piece.is_empty
+                                or piece.geom_type != "LineString"
+                                or piece.length < 5.0):
+                            continue
+                        coords = list(piece.coords)
+                        p0 = coords[0]
+                        p1 = coords[-1]
+                        d0 = boundary_line.distance(shp_geom.Point(p0))
+                        d1 = boundary_line.distance(shp_geom.Point(p1))
+                        # Must touch the boundary at one end
+                        if min(d0, d1) > 5.0:
+                            continue
+                        if d0 <= d1:
+                            portal_xy = p0
+                            outside_xy = p1
+                        else:
+                            portal_xy = p1
+                            outside_xy = p0
+                        ramps.append(
+                            (portal_xy, outside_xy,
+                             piece.length, r_hwy))
 
-                    # Airport elevation at portal
+                # ── Cluster ramps by portal proximity.  Two
+                # carriageways of a divided highway produce two
+                # ramps with portals a few metres apart; they get
+                # merged into one emission.
+                PORTAL_CLUSTER_DIST = 40.0
+                clusters = []
+                for ramp in ramps:
+                    pxy = ramp[0]
+                    placed = False
+                    for cl in clusters:
+                        cref = cl[0][0]
+                        if sqrt((cref[0] - pxy[0]) ** 2
+                                + (cref[1] - pxy[1]) ** 2
+                                ) < PORTAL_CLUSTER_DIST:
+                            cl.append(ramp)
+                            placed = True
+                            break
+                    if not placed:
+                        clusters.append([ramp])
+
+                for cluster in clusters:
+                    # Centroid portal and outside points
+                    cpx = sum(r[0][0] for r in cluster) / len(cluster)
+                    cpy = sum(r[0][1] for r in cluster) / len(cluster)
+                    cox = sum(r[1][0] for r in cluster) / len(cluster)
+                    coy = sum(r[1][1] for r in cluster) / len(cluster)
+
+                    # Ramp direction: from outside to portal
+                    dxr = cpx - cox
+                    dyr = cpy - coy
+                    dlen = sqrt(dxr * dxr + dyr * dyr)
+                    if dlen < 5.0:
+                        continue
+                    ramp_dir = (dxr / dlen, dyr / dlen)
+                    perp = (-ramp_dir[1], ramp_dir[0])
+
+                    # Combined width: base carriageway + the
+                    # perpendicular spread of all member portals
+                    # (so a divided highway with two carriageways
+                    # gets a rect wide enough to cover both).
+                    projs = [
+                        ((r[0][0] - cpx) * perp[0]
+                         + (r[0][1] - cpy) * perp[1])
+                        for r in cluster
+                    ]
+                    span = max(projs) - min(projs) if projs else 0.0
+                    ramp_width = CARRIAGEWAY_BASE_WIDTH + span
+
+                    # Airport elevation at the portal
                     apt_elev = _cifp_surface_elevation(
-                        px, py, max_search=500.0)
+                        cpx, cpy, max_search=500.0)
                     if apt_elev is None:
-                        plon, plat = to_ll(px, py)
+                        plon_p, plat_p = to_ll(cpx, cpy)
                         try:
                             apt_elev = tile.dem.alt(
-                                (plon - tile.lon,
-                                 plat - tile.lat))
+                                (plon_p - tile.lon,
+                                 plat_p - tile.lat))
                         except Exception:
                             continue
+                    if apt_elev is None:
+                        continue
 
-                    # ── Choose the "outward" direction along the road
-                    # that actually exits the airport.
-                    #
-                    # The legacy heuristic compared road_dir to the
-                    # vector from airport centroid, but when a tunnel
-                    # hugs the boundary the centroid vector is nearly
-                    # perpendicular to the road and the dot-product
-                    # flip is unstable — it can pick a direction
-                    # along the road that points back INTO the
-                    # airport, skipping every grade-down segment.
-                    #
-                    # Step 20 m along road_dir in each sign and keep
-                    # whichever lands outside the airport footprint.
-                    apt_buffer_in = (airport_footprint.buffer(-2.0)
-                                     if not airport_footprint.is_empty
-                                     else airport_footprint)
-                    probe = 20.0
-                    fwd_pt = shp_geom.Point(
-                        px + road_dir[0] * probe,
-                        py + road_dir[1] * probe)
-                    bwd_pt = shp_geom.Point(
-                        px - road_dir[0] * probe,
-                        py - road_dir[1] * probe)
-                    fwd_inside = (not apt_buffer_in.is_empty
-                                  and apt_buffer_in.contains(fwd_pt))
-                    bwd_inside = (not apt_buffer_in.is_empty
-                                  and apt_buffer_in.contains(bwd_pt))
-                    if fwd_inside and not bwd_inside:
-                        eff_dir = (-road_dir[0], -road_dir[1])
-                    elif bwd_inside and not fwd_inside:
-                        eff_dir = road_dir
-                    else:
-                        # Fall back to the centroid heuristic when
-                        # both probes are inside/outside (rare: a
-                        # short tunnel with both portals very near
-                        # the centroid axis).
-                        apt_cx = airport_footprint.centroid.x
-                        apt_cy = airport_footprint.centroid.y
-                        away_x = px - apt_cx
-                        away_y = py - apt_cy
-                        away_len = sqrt(away_x ** 2 + away_y ** 2)
-                        if away_len < 0.1:
-                            continue
-                        out_dir = (away_x / away_len,
-                                   away_y / away_len)
-                        dot_out = (road_dir[0] * out_dir[0]
-                                   + road_dir[1] * out_dir[1])
-                        eff_dir = ((-road_dir[0], -road_dir[1])
-                                   if dot_out < 0 else road_dir)
+                    # Surface elevation at the outside (OSM tunnel
+                    # node) end — DEM at that point.
+                    olon, olat = to_ll(cox, coy)
+                    try:
+                        out_elev = tile.dem.alt(
+                            (olon - tile.lon, olat - tile.lat))
+                    except Exception:
+                        out_elev = apt_elev
+                    if out_elev is None:
+                        out_elev = apt_elev
 
-                    _plon, _plat = to_ll(px, py)
+                    # HIGH end (outside, surface DEM), LOW end
+                    # (portal, apt_elev − DEPTH).
+                    elev_high = out_elev
+                    elev_low = apt_elev - TUNNEL_DEPTH_DEFAULT
+
+                    # Log the portal
+                    _plon, _plat = to_ll(cpx, cpy)
                     UI.vprint(
                         2,
                         "      {}: tunnel portal at ({:.5f}, {:.5f}) "
-                        "hwy={} elev={:.1f}m".format(
-                            icao, _plat, _plon, r_hwy, apt_elev))
+                        "hwy={} len={:.0f}m width={:.0f}m "
+                        "elev {:.1f}→{:.1f}m".format(
+                            icao, _plat, _plon, cluster[0][3],
+                            dlen, ramp_width,
+                            elev_high, elev_low))
 
-                    # Grade-down rects from portal outward
-                    n_steps = max(2, int(
-                        TUNNEL_GRADE_DOWN_LENGTH
-                        / GRADE_STEP_LENGTH))
-                    step_len = (TUNNEL_GRADE_DOWN_LENGTH
-                                / n_steps)
-
-                    for si in range(n_steps):
-                        frac_s = si / n_steps
-                        frac_e = (si + 1) / n_steps
-                        e_s = apt_elev - (
-                            TUNNEL_DEPTH_DEFAULT * frac_s)
-                        e_e = apt_elev - (
-                            TUNNEL_DEPTH_DEFAULT * frac_e)
-
-                        sx = px + eff_dir[0] * step_len * si
-                        sy = py + eff_dir[1] * step_len * si
-                        ex = px + eff_dir[0] * step_len * (si + 1)
-                        ey = py + eff_dir[1] * step_len * (si + 1)
-
-                        seg_mid = shp_geom.Point(
-                            (sx + ex) / 2, (sy + ey) / 2)
-                        # Use a small inward buffer for edge cases
-                        apt_buffer = airport_footprint.buffer(-2.0) if not airport_footprint.is_empty else airport_footprint
-                        if not apt_buffer.is_empty and apt_buffer.contains(seg_mid):
+                    # ── Ramp rect: sloped from outside to portal ──
+                    # _emit_sloped_rect expects the HIGH end to be
+                    # passed first (altitude_high applies to its
+                    # first two corners).
+                    oslon, oslat = to_ll(cox, coy)
+                    pslon, pslat = to_ll(cpx, cpy)
+                    try:
+                        rc = runway_corners(
+                            oslat, oslon, pslat, pslon, ramp_width)
+                        if rc is None:
                             continue
-
-                        slon, slat = to_ll(sx, sy)
-                        elon, elat = to_ll(ex, ey)
-                        try:
-                            tc = runway_corners(
-                                slat, slon, elat, elon,
-                                TUNNEL_RECT_WIDTH)
-                            if tc is None:
-                                continue
-                            tp = shp_geom.Polygon(
-                                [to_m(c[1], c[0]) for c in tc]
-                                + [to_m(tc[0][1], tc[0][0])])
-                            if not tp.is_valid:
-                                tp = tp.buffer(0)
-                            if tp.is_empty:
-                                continue
-                        except Exception:
+                        rp = shp_geom.Polygon(
+                            [to_m(c[1], c[0]) for c in rc])
+                        if not rp.is_valid:
+                            rp = rp.buffer(0)
+                        if rp.is_empty:
                             continue
+                    except Exception:
+                        continue
+                    _emit_sloped_rect(
+                        oslat, oslon, round(elev_high, 1),
+                        pslat, pslon, round(elev_low, 1),
+                        ramp_width)
+                    blend_polys_m.append(rp)
+                    n_blend += 1
 
-                        _emit_sloped_rect(
-                            slat, slon, round(e_s, 1),
-                            elat, elon, round(e_e, 1),
-                            TUNNEL_RECT_WIDTH
-                        )
-                        blend_polys_m.append(tp)
-                        n_blend += 1
+                    # ── Retaining walls: U-shape around the LOW end
+                    # with a small gap to the ramp on every edge.
+                    #
+                    # The ramp rect sits in a local frame where
+                    # "along" = ramp_dir (from outside HIGH to portal
+                    # LOW) and "across" = perp.  Walls:
+                    #   * two sides along the ramp, offset outward
+                    #     by ramp_width/2 + GAP + wall_width/2.
+                    #     Each side runs from the outside end to
+                    #     the portal end PLUS a short overhang so
+                    #     it meets the end-cap without a gap at the
+                    #     corner.
+                    #   * one end-cap across the portal end, offset
+                    #     beyond the portal by GAP + wall_width/2
+                    #     (away from the ramp).
+                    wall_off = (ramp_width / 2.0
+                                + TUNNEL_WALL_GAP
+                                + RETAINING_WALL_WIDTH / 2.0)
+                    # End-cap runs across the ramp LOW end, offset
+                    # past the portal into the airport by
+                    # (TUNNEL_WALL_GAP + RETAINING_WALL_WIDTH/2).
+                    cap_back = (TUNNEL_WALL_GAP
+                                + RETAINING_WALL_WIDTH / 2.0)
+                    # Cap center, one wall-width past the portal
+                    ccx = cpx + ramp_dir[0] * cap_back
+                    ccy = cpy + ramp_dir[1] * cap_back
+                    # Cap length = ramp width + both side-wall gaps,
+                    # so the cap fits BETWEEN the two side walls
+                    # without overlapping them at the corners.
+                    cap_len = (ramp_width
+                               + 2 * TUNNEL_WALL_GAP)
+                    cap_a_x = ccx + perp[0] * cap_len / 2.0
+                    cap_a_y = ccy + perp[1] * cap_len / 2.0
+                    cap_b_x = ccx - perp[0] * cap_len / 2.0
+                    cap_b_y = ccy - perp[1] * cap_len / 2.0
+                    cap_rect_corners = None
+                    try:
+                        alon, alat = to_ll(cap_a_x, cap_a_y)
+                        blon, blat = to_ll(cap_b_x, cap_b_y)
+                        cap_rect_corners = runway_corners(
+                            alat, alon, blat, blon,
+                            RETAINING_WALL_WIDTH)
+                    except Exception:
+                        cap_rect_corners = None
 
-                    # Retaining wall flanks
-                    perp_nx = -eff_dir[1]
-                    perp_ny = eff_dir[0]
+                    side_wall_rects = []
                     for side in (1.0, -1.0):
-                        wall_off = (TUNNEL_RECT_WIDTH / 2.0
-                                    + RETAINING_WALL_WIDTH / 2.0)
-                        w_sx = px + side * perp_nx * wall_off
-                        w_sy = py + side * perp_ny * wall_off
-                        w_ex = (px
-                                + eff_dir[0]
-                                * TUNNEL_GRADE_DOWN_LENGTH
-                                + side * perp_nx * wall_off)
-                        w_ey = (py
-                                + eff_dir[1]
-                                * TUNNEL_GRADE_DOWN_LENGTH
-                                + side * perp_ny * wall_off)
-                        wm = shp_geom.Point(
-                            (w_sx + w_ex) / 2,
-                            (w_sy + w_ey) / 2)
-                        # Use a small inward buffer for edge cases
-                        apt_buffer = airport_footprint.buffer(-2.0) if not airport_footprint.is_empty else airport_footprint
-                        if not apt_buffer.is_empty and apt_buffer.contains(wm):
-                            continue
-                        wslon, wslat = to_ll(w_sx, w_sy)
-                        welon, welat = to_ll(w_ex, w_ey)
+                        # Side wall start (outside/high end): at the
+                        # outside node projected out by wall_off.
+                        s_sx = cox + side * perp[0] * wall_off
+                        s_sy = coy + side * perp[1] * wall_off
+                        # Side wall end: at the portal + cap_back
+                        # so it meets the cap cleanly.
+                        s_ex = (cpx + ramp_dir[0] * cap_back
+                                + side * perp[0] * wall_off)
+                        s_ey = (cpy + ramp_dir[1] * cap_back
+                                + side * perp[1] * wall_off)
                         try:
+                            wslon, wslat = to_ll(s_sx, s_sy)
+                            welon, welat = to_ll(s_ex, s_ey)
                             wc = runway_corners(
                                 wslat, wslon, welat, welon,
                                 RETAINING_WALL_WIDTH)
                             if wc is None:
                                 continue
                             wp = shp_geom.Polygon(
-                                [to_m(c[1], c[0]) for c in wc]
-                                + [to_m(wc[0][1], wc[0][0])])
+                                [to_m(c[1], c[0]) for c in wc])
                             if not wp.is_valid:
                                 wp = wp.buffer(0)
                             if wp.is_empty:
                                 continue
                         except Exception:
                             continue
-                        _emit_sloped_rect(
-                            wslat, wslon, round(apt_elev, 1),
-                            welat, welon, round(apt_elev, 1),
-                            RETAINING_WALL_WIDTH
-                        )
+                        side_wall_rects.append(
+                            (wslat, wslon, welat, welon, wp))
+
+                    # Emit each side wall flat at apt_elev
+                    for wslat, wslon, welat, welon, wp in side_wall_rects:
+                        _emit_flat_poly(
+                            [(c[1], c[0])
+                             for c in runway_corners(
+                                 wslat, wslon, welat, welon,
+                                 RETAINING_WALL_WIDTH)],
+                            round(apt_elev, 1))
                         blend_polys_m.append(wp)
                         n_blend += 1
+
+                    # Emit the end-cap (flat, wrapped around LOW end)
+                    if cap_rect_corners is not None:
+                        try:
+                            cp = shp_geom.Polygon(
+                                [to_m(c[1], c[0])
+                                 for c in cap_rect_corners])
+                            if not cp.is_valid:
+                                cp = cp.buffer(0)
+                            if not cp.is_empty:
+                                _emit_flat_poly(
+                                    [(c[1], c[0])
+                                     for c in cap_rect_corners],
+                                    round(apt_elev, 1))
+                                blend_polys_m.append(cp)
+                                n_blend += 1
+                        except Exception:
+                            pass
 
     except Exception:
         pass
