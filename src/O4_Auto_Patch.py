@@ -2702,9 +2702,21 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     apron_polys_m = []
     apt_twy_polys_m = []   # populated only when apt_dat_used
 
+    # apt.dat pavement simplification tolerance.  Per user direction:
+    # "we can simplify taxiway shapes — let's say anything less than
+    # a meter — we don't need to follow detailed curves; too many
+    # shapes hurts performance."  1 m is well below the resolution
+    # of the 1 %-grade apron rule and the 1.5 %-grade taxiway rule
+    # (a 1 m horizontal step at 1 % is 1 cm vertical), so losing
+    # sub-metre polygon detail costs nothing in the emitted mesh
+    # while significantly improving rect-fit of gently curved
+    # strips.
+    APT_DAT_SIMPLIFY_M = 1.0
+
     def _poly_to_meter_space(poly_tile_rel):
         """Convert a tile-relative (lon-tile.lon, lat-tile.lat)
         shapely Polygon to meter space, preserving interior rings.
+        Applies APT_DAT_SIMPLIFY_M tolerance after conversion.
         Returns None if the converted polygon is degenerate.
         """
         try:
@@ -2724,6 +2736,16 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 p_m = p_m.buffer(0)
             if p_m.is_empty or not hasattr(p_m, "exterior"):
                 return None
+            # Simplify sub-metre detail.  preserve_topology=True keeps
+            # interior rings from collapsing and avoids self-intersect.
+            try:
+                simple = p_m.simplify(
+                    APT_DAT_SIMPLIFY_M, preserve_topology=True)
+                if (simple.is_valid and not simple.is_empty
+                        and hasattr(simple, "exterior")):
+                    p_m = simple
+            except Exception:
+                pass
             return p_m
         except Exception:
             return None
@@ -2765,10 +2787,12 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
             import O4_Pavement_Classifier as _PC
             import O4_Taxiway_Rects as _TR
             import O4_Taxiway_Decompose as _TD
+            import O4_Taxiway_Skeleton as _TS
         except Exception:
             _PC = None
             _TR = None
             _TD = None
+            _TS = None
         apt_pavements = dico_apt_entry.get("_apt_pavements") or []
         classify_counts = {"taxiway": 0, "apron": 0}
         classify_reasons = {}
@@ -2791,6 +2815,12 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
         n_twy_decomposed = 0      # mega-polys that needed decomposition
         n_twy_strip_branches = 0  # branches emitted as rects after decomp
+        # Global rect-union across ALL taxiway source polygons so a
+        # rect chain built from polygon A cannot overlap a rect
+        # already emitted from polygon B (apt.dat packs commonly
+        # layer overlapping pavements — e.g. "Base Ramp" under
+        # "Taxiway Aux B, C, D, E, F, G").
+        global_twy_rect_union = shp_geom.Polygon()
         for (poly_tr, pav_name) in apt_pavements:
             if poly_tr is None or poly_tr.is_empty or not poly_tr.is_valid:
                 continue
@@ -2828,40 +2858,157 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                 pool_apron_m.append(p_m)
                 continue
 
+            def _try_skeleton(poly):
+                """Extract Voronoi centerlines and build a rect
+                chain along each one.  Centerlines are processed
+                longest-first, and each new chain is clipped
+                against the running union of previously-emitted
+                chains so sibling branches at a Y-junction don't
+                overlap each other — a new rect is DROPPED if its
+                area already overlaps an earlier rect by more
+                than 5 m².
+
+                Returns (emitted_pairs, residue) where
+                emitted_pairs is a list of (centerline, chain)
+                and residue is the portion of ``poly`` not
+                covered by any chain (for triangulation).
+                """
+                nonlocal global_twy_rect_union
+                if _TS is None or _TR is None:
+                    return [], poly
+                try:
+                    centerlines = _TS.extract_centerlines(poly)
+                except Exception:
+                    return [], poly
+                if not centerlines:
+                    return [], poly
+
+                emitted_pairs = []
+                # Running union of meter-space rect polygons — seeded
+                # with the global union so a rect from this polygon
+                # can't collide with an earlier polygon's emission.
+                emitted_union = global_twy_rect_union
+                OVERLAP_EPS_M2 = 1.0
+
+                for ln in centerlines:
+                    try:
+                        rc = _TR.build_rects_along_centerline(
+                            ln, poly, _dem_at,
+                            max_grade=MAX_TAXIWAY_GRADE)
+                    except Exception:
+                        rc = None
+                    if not rc:
+                        continue
+
+                    # Keep only rects that don't collide with any
+                    # earlier emission — both in previous chains
+                    # AND earlier rects of THIS chain.  Update the
+                    # running union after every accepted rect so
+                    # consecutive rects in one chain also see each
+                    # other at curved joins.
+                    kept_chain = []
+                    for r in rc:
+                        try:
+                            rp = shp_geom.Polygon(r.corners_m)
+                            if not rp.is_valid or rp.is_empty:
+                                continue
+                        except Exception:
+                            continue
+                        try:
+                            ov = (rp.intersection(
+                                emitted_union).area
+                                if not emitted_union.is_empty else 0.0)
+                        except Exception:
+                            ov = 0.0
+                        if ov > OVERLAP_EPS_M2:
+                            continue
+                        kept_chain.append(r)
+                        try:
+                            emitted_union = (
+                                emitted_union.union(rp)
+                                if not emitted_union.is_empty else rp)
+                        except Exception:
+                            pass
+
+                    if not kept_chain:
+                        continue
+                    emitted_pairs.append((ln, kept_chain))
+
+                if not emitted_pairs:
+                    return [], poly
+
+                try:
+                    residue = poly.difference(emitted_union.buffer(0.5))
+                except Exception:
+                    residue = poly
+                # Publish the updated union to the outer scope so
+                # subsequent polygons see this polygon's rects.
+                global_twy_rect_union = emitted_union
+                return emitted_pairs, residue
+
             def _recursive_rectify(poly, depth):
-                """Walk decomposition recursively.  Appends
-                rectifiable branches to rectifiable_twy_m /
-                rectifiable_twy_rects and non-rectifiable residue
-                to pool_apron_m.  Returns (rect_count, hub_count).
+                """Walk decomposition recursively, with a final
+                fall-through to Voronoi-skeleton centerline
+                emission for polygons that don't decompose.
+                Appends rectifiable chains to rectifiable_twy_m /
+                rectifiable_twy_rects and any non-rectifiable
+                residue to pool_apron_m.
                 """
                 nonlocal n_twy_strip_branches
                 if poly is None or poly.is_empty or poly.area < 50.0:
-                    if not poly.is_empty:
+                    if poly is not None and not poly.is_empty:
                         pool_apron_m.append(poly)
                     return
-                # Try rectifying the whole thing.
+
+                # 1. Try rectifying the whole polygon as a single
+                #    MRR-aligned rect chain (cheap fast path).
                 rects = _try_rectify(poly)
                 if rects:
                     rectifiable_twy_m.append(poly)
                     rectifiable_twy_rects.append(rects)
                     n_twy_strip_branches += 1
                     return
-                if depth <= 0:
-                    pool_apron_m.append(poly)
+
+                # 2. Voronoi-skeleton centerline chains.  Handles
+                #    curved or branched polygons — walks the
+                #    medial axis and emits rects along each path,
+                #    which is what works for the common
+                #    "mega-polygon of 6 taxiways concatenated
+                #    through a hub" shape.  Tried BEFORE the
+                #    morphological decomposition because the
+                #    decomposition only succeeds when the hub is
+                #    dramatically wider than the strips, whereas
+                #    skeleton emission works at all width ratios.
+                emitted_pairs, residue = _try_skeleton(poly)
+                if emitted_pairs:
+                    for strip_ln, chain in emitted_pairs:
+                        # Build a tracking polygon for the chain so
+                        # the downstream dedup works.
+                        chain_shapes = [shp_geom.Polygon(r.corners_m)
+                                        for r in chain
+                                        if r is not None]
+                        if chain_shapes:
+                            chain_union = shp_ops.unary_union(chain_shapes)
+                            if not chain_union.is_empty:
+                                rectifiable_twy_m.append(chain_union)
+                                rectifiable_twy_rects.append(chain)
+                                n_twy_strip_branches += 1
+                    # Residue (bays/slivers not covered by any
+                    # centerline chain) goes to the apron path.
+                    if residue is not None and not residue.is_empty:
+                        if hasattr(residue, "geoms"):
+                            for g in residue.geoms:
+                                if (hasattr(g, "exterior")
+                                        and g.area >= 50.0):
+                                    pool_apron_m.append(g)
+                        elif hasattr(residue, "exterior"):
+                            if residue.area >= 50.0:
+                                pool_apron_m.append(residue)
                     return
-                sub = _TD.decompose_multi_taxiway(poly)
-                if not sub.used_decomposition:
-                    # Single strip but rectify failed — no further
-                    # split is possible (a concave bend within one
-                    # strip is NOT a multi-strip junction).  Send
-                    # to the apron path.
-                    pool_apron_m.append(poly)
-                    return
-                for s in sub.strip_polygons:
-                    _recursive_rectify(s, depth - 1)
-                for h in sub.junction_polygons:
-                    # Hubs always triangulate.
-                    pool_apron_m.append(h)
+
+                # 4. Nothing worked — triangulate the whole
+                #    polygon via the apron path.
+                pool_apron_m.append(poly)
 
             n_twy_decomposed += 1
             _recursive_rectify(p_m, depth=4)

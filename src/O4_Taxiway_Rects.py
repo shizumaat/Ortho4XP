@@ -436,3 +436,201 @@ def build_taxiway_rects(
         ))
 
     return rects
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Centerline-driven rect chain (used for curved / multi-strip
+# polygons that fail the MRR-aligned gate above)
+# ──────────────────────────────────────────────────────────────────────
+def build_rects_along_centerline(
+    centerline,
+    polygon: Polygon,
+    sample_dem: Callable[[float, float], Optional[float]],
+    max_grade: float = 0.015,
+    seg_length: float = 30.0,
+    fidelity_tol: float = DEFAULT_FIDELITY_TOL_M,
+    max_dg_per_m: float = DEFAULT_MAX_DG_PER_M,
+    min_width_m: float = 8.0,
+    max_width_m: float = 50.0,
+) -> Optional[List[TaxiwayRect]]:
+    """Build a chain of sloping rectangles along an arbitrary
+    centerline inside a polygon.
+
+    This is the fall-back for curved or multi-strip taxiway
+    polygons whose MRR-aligned rect chain doesn't fit.  The
+    centerline is typically extracted from
+    :func:`O4_Taxiway_Skeleton.extract_centerlines`; each rect
+    in the returned chain covers one ``seg_length``-metre slice
+    of the centerline, sized perpendicular to the local tangent
+    and width-clamped to the local polygon width.
+
+    Args:
+        centerline: a :class:`shapely.geometry.LineString` in
+            meter space, typically from the Voronoi skeleton.
+        polygon: the source taxiway polygon — used to clip each
+            rect's width to the local pavement width.
+        sample_dem: callable ``(x, y) → elevation_m | None``.
+        max_grade: longitudinal grade cap.
+        seg_length: target length of each emitted rect segment.
+        fidelity_tol: RDP tolerance used when simplifying the
+            sampled elevation profile along the centerline.
+        max_dg_per_m: FAA vertical-curve rate-of-change.
+        min_width_m / max_width_m: reject or clamp segments whose
+            local polygon width falls outside this range; a
+            segment that shrinks to < min_width_m is probably near
+            a junction throat and is dropped (the junction
+            triangulator will paint it).
+
+    Returns:
+        A list of :class:`TaxiwayRect`, or ``None`` if the
+        centerline is too short to build at least one segment.
+    """
+    import math
+    from shapely.geometry import Point
+
+    if (centerline is None or centerline.is_empty
+            or centerline.length < seg_length):
+        return None
+    if polygon is None or polygon.is_empty:
+        return None
+
+    total_len = centerline.length
+    n_segs = max(1, int(round(total_len / seg_length)))
+    actual_seg = total_len / n_segs
+
+    # Sample centerline at each split point.
+    centers: List[Tuple[float, float]] = []
+    tangents: List[Tuple[float, float]] = []
+    zs: List[float] = []
+    for i in range(n_segs + 1):
+        t = i * actual_seg
+        pt = centerline.interpolate(t)
+        centers.append((pt.x, pt.y))
+        # Local tangent: central difference using a small epsilon.
+        eps = min(1.0, actual_seg * 0.1)
+        t_fwd = min(total_len, t + eps)
+        t_bck = max(0.0, t - eps)
+        p_f = centerline.interpolate(t_fwd)
+        p_b = centerline.interpolate(t_bck)
+        tx = p_f.x - p_b.x
+        ty = p_f.y - p_b.y
+        mag = math.hypot(tx, ty)
+        if mag < 1e-9:
+            tangents.append((1.0, 0.0))
+        else:
+            tangents.append((tx / mag, ty / mag))
+        z = sample_dem(pt.x, pt.y)
+        if z is None:
+            z = zs[-1] if zs else 0.0
+        zs.append(z)
+
+    _clamp_profile(zs, actual_seg, max_grade, max_dg_per_m)
+
+    keep_indices = _rdp_simplify_indices(zs, fidelity_tol)
+    if len(keep_indices) < 2:
+        keep_indices = [0, n_segs]
+
+    rects: List[TaxiwayRect] = []
+    # For each simplified segment, build one sloping rect whose
+    # width is the local polygon-perpendicular width at the
+    # segment midpoint (averaged between its two endpoints).
+    for k in range(len(keep_indices) - 1):
+        i_a = keep_indices[k]
+        i_b = keep_indices[k + 1]
+        a_center = centers[i_a]
+        b_center = centers[i_b]
+        # Segment tangent from a_center to b_center.
+        tx = b_center[0] - a_center[0]
+        ty = b_center[1] - a_center[1]
+        seg_mag = math.hypot(tx, ty)
+        if seg_mag < 1e-6:
+            continue
+        ux, uy = tx / seg_mag, ty / seg_mag
+        px, py = -uy, ux  # perpendicular
+
+        # Local width: take the min of a few probe points along
+        # the segment (segment midpoint and the two endpoints).
+        widths: List[float] = []
+        for frac in (0.0, 0.5, 1.0):
+            mid_x = a_center[0] + ux * seg_mag * frac
+            mid_y = a_center[1] + uy * seg_mag * frac
+            hw = _local_half_width(
+                polygon, mid_x, mid_y, px, py, max_reach=60.0)
+            if hw > 0:
+                widths.append(hw * 2.0)
+        if not widths:
+            continue
+        local_width = min(widths)
+        if local_width < min_width_m:
+            continue
+        if local_width > max_width_m:
+            local_width = max_width_m
+        half_w = local_width / 2.0
+
+        z_a = zs[i_a]
+        z_b = zs[i_b]
+        if z_a >= z_b:
+            c_high, c_low = a_center, b_center
+            eh, el = z_a, z_b
+        else:
+            c_high, c_low = b_center, a_center
+            eh, el = z_b, z_a
+
+        c0 = (c_high[0] + px * half_w, c_high[1] + py * half_w)
+        c1 = (c_high[0] - px * half_w, c_high[1] - py * half_w)
+        c2 = (c_low[0] - px * half_w, c_low[1] - py * half_w)
+        c3 = (c_low[0] + px * half_w, c_low[1] + py * half_w)
+
+        rects.append(TaxiwayRect(
+            corners_m=(c0, c1, c2, c3),
+            elev_low=el,
+            elev_high=eh,
+            center_high=c_high,
+            center_low=c_low,
+            width_m=local_width,
+        ))
+
+    return rects if rects else None
+
+
+def _local_half_width(polygon: Polygon,
+                      cx: float, cy: float,
+                      px: float, py: float,
+                      max_reach: float = 60.0) -> float:
+    """Return the distance from ``(cx, cy)`` to the nearest polygon
+    boundary in the direction ``±(px, py)``, clipped by the lesser
+    of the two half-rays.  ``(px, py)`` should be a unit
+    perpendicular to the local centerline tangent.
+    """
+    from shapely.geometry import LineString, Point
+    if polygon is None or polygon.is_empty:
+        return 0.0
+    try:
+        if not polygon.contains(Point(cx, cy)):
+            return 0.0
+    except Exception:
+        return 0.0
+
+    left_end = (cx + px * max_reach, cy + py * max_reach)
+    right_end = (cx - px * max_reach, cy - py * max_reach)
+    try:
+        left_seg = LineString(
+            [(cx, cy), left_end]).intersection(polygon)
+        right_seg = LineString(
+            [(cx, cy), right_end]).intersection(polygon)
+    except Exception:
+        return 0.0
+
+    def _len(seg):
+        if seg is None or seg.is_empty:
+            return 0.0
+        try:
+            return float(seg.length)
+        except Exception:
+            return 0.0
+
+    left_d = _len(left_seg)
+    right_d = _len(right_seg)
+    if left_d <= 0 or right_d <= 0:
+        return 0.0
+    return min(left_d, right_d)
