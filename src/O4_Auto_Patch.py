@@ -18,8 +18,6 @@ from shapely import ops as shp_ops
 
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
-import O4_OSM_Utils as OSM
-import O4_Boundary_Model as BND
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -5221,29 +5219,6 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
         if not airport_footprint.is_empty and airport_footprint.area > 100:
             emitted_union = _emitted_union()
 
-            # ── Boundary environment (commits A+B scaffolding) ────────
-            # Load (or download + cache) OSM landuse / natural /
-            # waterway / barrier features that the classifier in
-            # ``O4_Boundary_Model`` will consume once commit C+ lands.
-            # For this commit the features are only used to prove the
-            # load path works — ``classify_segment`` always returns
-            # ``Archetype.FLUSH`` so behaviour is unchanged.
-            try:
-                _bnd_osm_layer = BND.load_boundary_environment(
-                    tile.lat, tile.lon, OSM)
-                _bnd_ext_features = BND.extract_features(
-                    _bnd_osm_layer, to_m)
-                UI.vprint(
-                    2,
-                    "    {}: boundary env loaded — {} exterior features"
-                    .format(icao, len(_bnd_ext_features)))
-            except Exception as _bnd_err:
-                UI.vprint(
-                    2,
-                    "    {}: boundary env load skipped ({})"
-                    .format(icao, _bnd_err))
-                _bnd_ext_features = []
-
             # ── Portal exclusion zones ────────────────────────────────
             # Pre-scan tunnel roads to find portal points so Phase E1
             # can carve a gap in the boundary band around each portal,
@@ -5357,25 +5332,6 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                         if not airport_footprint.contains(probe_pt):
                             perp_b = (-perp_b[0], -perp_b[1])
 
-                        # ── Classifier dispatch (A+B scaffolding) ──
-                        # Ask the boundary model which archetype
-                        # this segment wants.  The context builder
-                        # in commit C will populate exterior DEM
-                        # profile + constraint set; for now only the
-                        # segment endpoints are populated and the
-                        # stub classifier always returns FLUSH.
-                        # Future commits insert
-                        #   if _arch == Archetype.EMBANKMENT:
-                        #       _emit_embankment(...)
-                        #       continue
-                        # above the FLUSH body below, one branch per
-                        # archetype, without reshaping the walk.
-                        _bnd_ctx = BND.BoundaryContext(
-                            seg_start_m=(sx_b, sy_b),
-                            seg_end_m=(ex_b, ey_b))
-                        _arch = BND.classify_segment(_bnd_ctx)
-
-                        # ── FLUSH emitter body ────────────────────
                         # Centerline offset inward by band_width/2
                         # so the runway_corners-built rect spans
                         # [boundary, boundary + band_width inward].
