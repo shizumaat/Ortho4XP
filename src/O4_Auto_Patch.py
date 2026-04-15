@@ -374,11 +374,19 @@ def _dico_from_apt_dat(apt_data, tile, fallback_dico):
     new_dico = dict(fallback_dico) if fallback_dico else {}
 
     # ── 1. Aprons: every apt.dat pavement polygon ────────────────────
+    # The union into dico_apt_entry["apron"] is kept for backwards
+    # compatibility (fallback consumers read only "apron").  For the
+    # taxiway/apron split we ALSO stash the per-pavement objects with
+    # their names in dico_apt_entry["_apt_pavements"] so Phase A3 can
+    # classify each polygon individually before converting to meter
+    # space.
     apron_polys = []
+    pav_tuples = []   # list of (tile_relative_polygon, name)
     for pav in apt_data.pavements:
         p_tr = _to_tile_relative(pav.polygon)
         if p_tr is not None and not p_tr.is_empty:
             apron_polys.append(p_tr)
+            pav_tuples.append((p_tr, pav.name))
     if apron_polys:
         try:
             apron_union = _shp_ops.unary_union(apron_polys)
@@ -389,6 +397,7 @@ def _dico_from_apt_dat(apt_data, tile, fallback_dico):
             new_dico["apron"] = (apron_union, [])
         except Exception:
             pass
+    new_dico["_apt_pavements"] = pav_tuples
 
     # ── 2. Taxiway: empty for commit 8 (all pavement is "apron") ────
     # Leaving this as an empty tuple signals the downstream Phase A2
@@ -2662,46 +2671,108 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # so any carved-out regions in the apt.dat polygon survive into
     # meter space.
     #
+    # When apt.dat is used, we also run each pavement through
+    # O4_Pavement_Classifier and split the polygons into two lists:
+    # taxiway-classified pieces go into apt_twy_polys_m and apron-
+    # classified pieces go into apron_polys_m.  Task 1 in the
+    # refinement plan does classification only — both lists are
+    # unioned for downstream consumers so the emitted output is
+    # bit-identical.  Task 2 consumes apt_twy_polys_m through a
+    # dedicated rect-chain taxiway emission path.
+    #
     # For OSM-derived data the legacy behaviour is preserved: 5 m
-    # outward buffer, exterior-only.
+    # outward buffer, exterior-only, everything into apron_polys_m.
     apron_polys_m = []
-    apron_data = dico_apt_entry.get("apron")
-    if apron_data is not None:
-        apron_geom = (apron_data[0] if isinstance(apron_data, tuple)
-                      else apron_data)
-        raw_polys = []
-        if hasattr(apron_geom, "geoms"):
-            raw_polys = list(apron_geom.geoms)
-        elif hasattr(apron_geom, "exterior"):
-            raw_polys = [apron_geom]
-        for poly in raw_polys:
-            if poly.is_empty or not poly.is_valid:
-                continue
-            try:
-                exterior_m = [
+    apt_twy_polys_m = []   # populated only when apt_dat_used
+
+    def _poly_to_meter_space(poly_tile_rel):
+        """Convert a tile-relative (lon-tile.lon, lat-tile.lat)
+        shapely Polygon to meter space, preserving interior rings.
+        Returns None if the converted polygon is degenerate.
+        """
+        try:
+            exterior_m = [
+                to_m(x + tile.lon, y + tile.lat)
+                for x, y in poly_tile_rel.exterior.coords
+            ]
+            holes_m = []
+            for ring in poly_tile_rel.interiors:
+                holes_m.append([
                     to_m(x + tile.lon, y + tile.lat)
-                    for x, y in poly.exterior.coords
-                ]
-                holes_m = []
-                for ring in poly.interiors:
-                    holes_m.append([
-                        to_m(x + tile.lon, y + tile.lat)
-                        for x, y in ring.coords
-                    ])
-                p_m = shp_geom.Polygon(
-                    exterior_m, holes_m if holes_m else None)
-                if not p_m.is_valid:
-                    p_m = p_m.buffer(0)
-                if p_m.is_empty:
+                    for x, y in ring.coords
+                ])
+            p_m = shp_geom.Polygon(
+                exterior_m, holes_m if holes_m else None)
+            if not p_m.is_valid:
+                p_m = p_m.buffer(0)
+            if p_m.is_empty or not hasattr(p_m, "exterior"):
+                return None
+            return p_m
+        except Exception:
+            return None
+
+    if apt_dat_used:
+        # Per-pavement path: classify each polygon individually so
+        # its name (from apt.dat row 110 header) can steer the
+        # decision.  The raw per-pavement list lives in
+        # dico_apt_entry["_apt_pavements"] (stashed by
+        # _dico_from_apt_dat).
+        try:
+            import O4_Pavement_Classifier as _PC
+        except Exception:
+            _PC = None
+        apt_pavements = dico_apt_entry.get("_apt_pavements") or []
+        classify_counts = {"taxiway": 0, "apron": 0}
+        classify_reasons = {}
+        for (poly_tr, pav_name) in apt_pavements:
+            if poly_tr is None or poly_tr.is_empty or not poly_tr.is_valid:
+                continue
+            p_m = _poly_to_meter_space(poly_tr)
+            if p_m is None:
+                continue
+            if _PC is None:
+                apron_polys_m.append(p_m)
+                continue
+            kind = _PC.classify_pavement_m(p_m, pav_name or "")
+            classify_counts[kind.kind] = classify_counts.get(
+                kind.kind, 0) + 1
+            classify_reasons[kind.reason] = classify_reasons.get(
+                kind.reason, 0) + 1
+            if kind.kind == "taxiway":
+                apt_twy_polys_m.append(p_m)
+            else:
+                apron_polys_m.append(p_m)
+        UI.vprint(2,
+            "    apt.dat pavement classification: "
+            "{} taxiway, {} apron  (reasons: {})".format(
+                classify_counts.get("taxiway", 0),
+                classify_counts.get("apron", 0),
+                ", ".join("{}={}".format(k, v)
+                          for k, v in sorted(classify_reasons.items()))))
+    else:
+        # Legacy OSM path: one unified apron MultiPolygon, 5 m buffer.
+        apron_data = dico_apt_entry.get("apron")
+        if apron_data is not None:
+            apron_geom = (apron_data[0] if isinstance(apron_data, tuple)
+                          else apron_data)
+            raw_polys = []
+            if hasattr(apron_geom, "geoms"):
+                raw_polys = list(apron_geom.geoms)
+            elif hasattr(apron_geom, "exterior"):
+                raw_polys = [apron_geom]
+            for poly in raw_polys:
+                if poly.is_empty or not poly.is_valid:
                     continue
-                if apt_dat_used:
-                    # Trust the source — don't inflate or simplify.
-                    apron_polys_m.append(p_m)
-                else:
-                    # Legacy OSM path: 5 m outward buffer.
-                    apron_polys_m.append(p_m.buffer(APRON_BUFFER))
-            except Exception:
-                pass
+                p_m = _poly_to_meter_space(poly)
+                if p_m is None:
+                    continue
+                apron_polys_m.append(p_m.buffer(APRON_BUFFER))
+
+    # For task 1 the classified taxiway polygons still flow through
+    # the apron emission path so output stays bit-identical.  Task 2
+    # will short-circuit this by emitting apt_twy_polys_m via the
+    # rect-chain path and clearing it before the apron union runs.
+    apron_polys_m.extend(apt_twy_polys_m)
 
     try:
         apron_union_m = shp_ops.unary_union(apron_polys_m) if apron_polys_m \
