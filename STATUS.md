@@ -117,21 +117,73 @@ building, etc.) as well as 161 069 m² of intra-taxiway overlap from
 adjacent centerline rects sharing corners.  The architecture was
 fundamentally wrong for the active invariants.
 
-## Current state
+## Current state (after commit 7b — `ce3b97c`)
 
-- `USE_NEW_SURFACE_PIPELINE` flag has been removed.
-- The delegation shim at the top of `generate_airport_surface_patches`
-  has been removed.
-- `generate_auto_patches()` no longer branches on the flag — it always
-  uses `generate_patch_osm()` for the runway baseline and then calls
-  `generate_airport_surface_patches()` to layer on the rest.
-- The legacy phase-A-through-F implementation runs unchanged.
-- `src/O4_Surface_Patch.py` still exists on disk but is no longer
-  called.  Will be retired in an upcoming commit (or repurposed —
-  see "Plan").
-- `scripts/test_spjc_surface_patch.py` and
-  `scripts/analyze_spjc_patch.py` need to be updated to call the
-  legacy entry point instead of `O4_Surface_Patch.build_surface_patch`.
+The legacy phase-A-through-F surface generator is the active code
+path.  Phases C2 (apron) and D (junctions) have been wired to the
+new `O4_Surface_Mesh.adaptive_triangulate` helper.  Phase E (boundary
+band, tunnel portals) and Phase F (drainage) are still inline and
+unfinished but functional.  A new `O4_Apt_Dat_Reader` module has
+landed and is tested but not yet integrated.
+
+### Modules
+
+| File | Status | Tests |
+|---|---|---|
+| `src/O4_Auto_Patch.py` | active legacy pipeline | none yet |
+| `src/O4_Surface_Mesh.py` | adaptive triangulation, used by C2 + D | 19 |
+| `src/O4_Apt_Dat_Reader.py` | apt.dat parser, **not yet wired in** | 22 |
+| `src/O4_Vector_Map.py` | calls `generate_auto_patches` (unchanged) | none |
+| `tests/test_surface_mesh.py` | mesh + grade + anchors | 19 |
+| `tests/test_apt_dat_reader.py` | runway/pavement/Bezier/search priority | 22 |
+| `tests/fixtures/synthetic_apt.dat` | hand-crafted parser fixture | — |
+
+Total tests: **41**.  Run with `./venv/bin/python3 -m pytest tests/`.
+
+### SPJC numbers (post commit 7b)
+
+| Metric | Value |
+|---|---|
+| Total emitted ways | ~2 871 |
+| Total cross-feature overlap | 7 638 m² (0.4 %) |
+| flat ∩ flat overlap | 3 085 m² (Phase C3 / coverage fill) |
+| flat ∩ triangle overlap | 3 148 m² (Phase E/F vs Phase D residue) |
+| triangle ∩ triangle | 1 221 m² |
+| Junction triangles | 1 631 (adaptive mesh) |
+| Apron triangles | ~700 |
+| Buildings reconciled for grade | 30 |
+
+The remaining overlaps are not from the legacy architecture being
+wrong — they're from OSM-derived inputs not being disjoint by
+construction.  Switching to apt.dat (commit 8) eliminates the
+underlying cause.
+
+### `O4_Apt_Dat_Reader` ready to use
+
+Parses runway, pavement (taxiway/apron/ramp) and boundary geometry
+from any X-Plane apt.dat file.  Handles row 1 (header), 100
+(runway), 110/111/112/113/114 (pavement with Bezier curves), 130
+(boundary).  Public API:
+
+```python
+import O4_Apt_Dat_Reader as APR
+
+# Find the most-specific apt.dat.  Searches per-airport Custom Scenery
+# packs first, then Custom Scenery/Global Airports, then Resources/
+# default scenery.  Returns the file path or None.
+path = APR.find_airport_apt_dat("/Users/noah/X-Plane 12", "SPJC")
+
+# Parse one airport block.
+apt = APR.load_airport(path, "SPJC")
+print(apt.icao, apt.name, apt.reference_elev_m)
+print(len(apt.runways), "runways")
+print(len(apt.pavements), "pavements")  # each is a shapely Polygon
+print(apt.boundary)                      # shapely Polygon or None
+```
+
+Verified against the user's `SPJC Lima by Los Flipantes 3.0 Nueva
+Terminal XP12` Custom Scenery pack: 51 pavements parsed (810 741
+m² total), 2 runways with displaced thresholds, boundary present.
 
 ## Plan
 
@@ -143,35 +195,151 @@ the legacy first extracts the affected helper into its own
 single-purpose module with unit tests.  Future fixes land in the
 small modules, not the monolith.
 
-1. **Commit 1 — revert flag, restore legacy.**  Done.
-2. **Commit 2 — fix A4b building merge bug (no convex_hull).**  Done.
-3. **Commit 3 — add FAA vertical-curve rule + correct STATUS.md.**
-   Done.
-4. **Commit 4 — extract `O4_Surface_Mesh.py` + adopt pytest.**
-   Pure refactor: introduce a new module containing
-   ``adaptive_triangulate``, ``fit_plane``, ``plane_grade``, and the
-   per-vertex bag, with unit tests in ``tests/test_surface_mesh.py``.
-   No behaviour change in the legacy yet — Phases C2/D still call
-   their inline triangulators.  This commit just gives us a tested
-   helper to call in commit 5.
-5. **Commit 5 — wire `adaptive_triangulate` into Phase C2** (apron
-   complex path).  Replace the 200-line inline Delaunay-with-densified-
-   grid with a small call site that uses the new module.  Expected:
-   apron triangle count drops dramatically.
-6. **Commit 6 — wire `adaptive_triangulate` into Phase D** (junction
-   zones).  Same pattern.
-7. **Commit 7+** — extract more helpers into single-purpose modules
-   as we touch them:
-   * ``_compute_taxiway_elevations`` → ``O4_Taxiway_Elevations.py``
-   * runway elevation interpolation → ``O4_Runway_Elevations.py``
-   * Phase A geometry preparation → ``O4_Surface_Inputs.py``
-   * Phase emit helpers → ``O4_Surface_Emit.py``
-8. **Phase E (boundary band, tunnel portals) and Phase F (drainage)**
-   refinement.  These were producing useful output but were never
-   finished; left in place and marked as such.  Will be cleaned up
-   in their own commits after the core (A-D) phases are clean.
-9. **Re-run the test plan** in ``docs/TEST_PLAN_SPJC.md`` — verify
-   all 11+ checks plus the four new invariant checks (12-15).
+1. **Commit 1 — revert flag, restore legacy.** ✅ `ee02cc3`
+2. **Commit 2 — A4b building merge fix (no convex_hull).** ✅ `811dda1`
+3. **Commit 3 — FAA vertical-curve rule + STATUS corrections.** ✅ `27ad1cd`
+4. **Commit 4 — extract `O4_Surface_Mesh.py` + adopt pytest.** ✅ `c68680c`
+5. **Commit 5 — wire Phase C2 (apron) to adaptive_triangulate.** ✅ `26b63c1`
+6. **Commit 6 — wire Phase D (junction) to adaptive_triangulate.** ✅ `7d89f33`
+7. **Commit 7a — Phase D hole-vertex + actual-triangle accumulator.** ✅ `e36e6a1`
+8. **Commit 7b — add `O4_Apt_Dat_Reader` module + tests.** ✅ `ce3b97c`
+
+### → Commit 8 (next session): wire `O4_Apt_Dat_Reader` into the legacy
+
+This is where the real payoff lives.  apt.dat polygons are the
+*authoritative* pavement geometry — they're what X-Plane renders
+as the texture, so elevation patches built against them align
+perfectly with the ground texture (no visible seams).  Most
+importantly, **apt.dat polygons are disjoint by construction**:
+no buffering, no precision-drift artefacts, no overlap fixups
+needed downstream.
+
+#### What commit 8 does
+
+Add a Phase A0.5 step inside `generate_airport_surface_patches`
+in `src/O4_Auto_Patch.py`.  Pseudocode:
+
+```python
+# At the top of generate_airport_surface_patches, BEFORE Phase A:
+import O4_Apt_Dat_Reader as APR
+
+xplane_root = _xplane_root_from_cifp_path(...)  # or pass in
+aptdat_path = APR.find_airport_apt_dat(xplane_root, icao)
+apt_data = APR.load_airport(aptdat_path, icao) if aptdat_path else None
+
+if apt_data is not None and apt_data.pavements:
+    # Replace dico_apt_entry's OSM-derived pavement shapes with
+    # apt.dat-derived ones.  Each Pavement.polygon is in absolute
+    # lat/lon and goes into dico_apt_entry in the same shape the
+    # legacy expects.
+    apt_dat_pavements = _convert_to_dico_format(apt_data, tile)
+    dico_apt_entry["taxiway"] = apt_dat_pavements["taxiway"]
+    dico_apt_entry["apron"]   = apt_dat_pavements["apron"]
+    # boundary may or may not replace dico_apt_entry["boundary"] —
+    # OSM boundary is sometimes more accurate, decide per case
+else:
+    pass  # fall through to OSM data — legacy path
+```
+
+The downstream phases C1/C2/C3/D all read from `dico_apt_entry` and
+work unchanged on the new inputs.  No phase rewrites needed.
+
+#### What integration needs
+
+1. **Find xplane_root.**  The legacy has `find_aptdat(cifp_path)`
+   which traces the xplane root from the CIFP directory.  Reuse
+   that logic — derive `xplane_root = os.path.dirname(os.path.dirname(cifp_path))`.
+
+2. **Distinguish taxiway vs apron in apt.dat output.**  apt.dat
+   row 110 doesn't actually distinguish taxiway from apron — it
+   just has a "name" field that may say things like `"TWY A"`,
+   `"RAMP 1"`, `"Aeronaval"`, `"AV"`.  Two reasonable approaches:
+   (a) Concatenate all pavements into a single `dico_apt_entry["apron"]`
+       MultiPolygon and leave `dico_apt_entry["taxiway"]` empty.
+       Phase C2 then triangulates everything as "apron-style"
+       (1.0 % grade).  Simple but loses the looser 1.5 % grade
+       that taxiways get.
+   (b) Use the pavement name to classify: `"TWY"` / `"TAXIWAY"` /
+       `"taxi"` / etc. → taxiway; everything else → apron.  More
+       work, but preserves the per-feature grade rules.
+
+   Recommendation: **start with (a) and refine later**.  At SPJC
+   the difference is small because most pavements are aprons.
+
+3. **Boundary handling.**  apt.dat row 130 is the airport perimeter.
+   OSM has a `dico_apt_entry["boundary"]` with the same purpose.
+   They usually agree but sometimes disagree.  For commit 8, prefer
+   apt.dat when available, fall back to OSM.
+
+4. **Extraction → meter space.**  apt.dat polygons are in absolute
+   lat/lon; the existing pipeline expects tile-relative shapes for
+   `dico_apt_entry`.  Build a small adapter that subtracts
+   `(tile.lon, tile.lat)` from each vertex.
+
+5. **Buildings stay OSM.**  apt.dat doesn't have detailed building
+   outlines.  `dico_apt_entry["hangar"]` and the OSM building data
+   stream are unchanged.
+
+6. **Fallback path.**  If apt.dat is missing or has no row-110
+   records (small private airfields), fall back silently to the
+   OSM path.  No regression.
+
+#### Expected SPJC outcome
+
+With apt.dat polygons replacing OSM-derived shapes:
+
+* `flat ∩ flat overlap` should drop to near zero (apt.dat polygons
+  are disjoint).
+* `flat ∩ triangle overlap` should drop dramatically (junction
+  zones become explicit edges between adjacent apt.dat polygons,
+  not computed buffer overlaps).
+* Total ways could drop further (no more taxiway-buffer fan
+  overlaps, no synthetic taxiway flats from polylines).
+* Pavement boundaries align exactly with the rendered texture.
+
+Estimated effort: **half a day**.  Implementation is mostly the
+pavement-name classification and the lat/lon → tile-relative
+adapter.  Unit tests for the adapter live in a new
+`tests/test_apt_dat_integration.py`.
+
+### After commit 8
+
+* **Commit 9+** — extract more helpers as we touch them:
+  * `_compute_taxiway_elevations` → `O4_Taxiway_Elevations.py`
+  * runway elevation interpolation → `O4_Runway_Elevations.py`
+  * Phase A geometry preparation → `O4_Surface_Inputs.py`
+  * Phase emit helpers → `O4_Surface_Emit.py`
+* **Phase E (boundary band, tunnel portals) and Phase F (drainage)**
+  refinement.  These were producing useful output but were never
+  finished; left in place and marked as such.  Will be cleaned up
+  after the core (A-D) phases are clean.
+* **Re-run `docs/TEST_PLAN_SPJC.md`** — verify all 11 numeric checks
+  plus the four new invariant checks (12-15).
+
+## How to resume next session
+
+```bash
+cd /Users/noah/Ortho4XP-shred86
+git log --oneline -10            # confirm we're at ce3b97c
+./venv/bin/python3 -m pytest tests/   # 41 pass
+
+# Quick sanity: parse SPJC's custom apt.dat
+./venv/bin/python3 -c "
+import sys; sys.path.insert(0, 'src')
+import O4_Apt_Dat_Reader as APR
+path = APR.find_airport_apt_dat('/Users/noah/X-Plane 12', 'SPJC')
+apt  = APR.load_airport(path, 'SPJC')
+print(path); print(len(apt.pavements), 'pavements,',
+                   len(apt.runways), 'runways')
+"
+
+# Then start commit 8 work — see "Commit 8" section above.
+```
+
+The unfinished bug from commits 5-7a (4 569 → 3 148 m² flat-tri
+overlap) is partially mitigated but not eliminated.  Commit 8
+should remove the underlying cause entirely by replacing the
+buffered OSM taxiways with the disjoint apt.dat polygons.
 
 ## Bugs to fix in the legacy
 
