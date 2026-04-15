@@ -4494,55 +4494,211 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                         for pp in portal_pts]
                     portal_exclusion = shp_ops.unary_union(circles)
 
-            # ── E1: Boundary band (perimeter access road) ──────────
-            # Overlap-free band via polygon difference, with per-piece
-            # elevation sampling from CIFP surface model. Each piece gets
-            # the elevation at its centroid, which naturally follows the
-            # airport slope.
+            # ── E1: Sloped boundary band (segmented) ───────────────
+            # Walk the airport boundary in BAND_SEG_LENGTH steps and
+            # emit one rect per segment.  The rect is band_width deep
+            # (inward from the boundary) and spans seg_length along
+            # the boundary.  Elevations at the two short edges come
+            # from the CIFP surface model (which projects the runway
+            # slope outward via IDW over all runway/building/taxiway
+            # anchors); the rect is emitted sloped when the
+            # endpoint elevations differ by ≥ 0.1 m, otherwise flat.
+            #
+            # This replaces the old "one flat polygon per connected
+            # band piece" approach, which painted huge areas at a
+            # single elevation and didn't track the airport slope.
+            # Each emitted rect is clipped against emitted_union +
+            # portal_exclusion; if the clipped result has ≥ 95 % of
+            # the original area we emit the full sloped rect, else
+            # we emit just the clipped geometry as a flat polygon at
+            # the averaged elevation (handles partial overlaps with
+            # buildings, runway overruns and tunnel portal exclusion
+            # zones without leaving gaps).
             try:
-                inner_ring = airport_footprint.buffer(
-                    -BOUNDARY_BAND_WIDTH)
-                if not inner_ring.is_empty:
-                    band = airport_footprint.difference(inner_ring)
-                    # Subtract already-emitted shapes to avoid overlaps.
-                    # Buffer the union slightly so floating-point slivers
-                    # around building edges are consumed rather than left
-                    # as sub-meter overlaps.
-                    if not emitted_union.is_empty:
-                        band = band.difference(
-                            emitted_union.buffer(1.0))
-                    if not portal_exclusion.is_empty:
-                        band = band.difference(portal_exclusion)
-                    if not band.is_empty:
-                        # Simplify lightly to reduce vertex count
-                        band = band.simplify(
-                            1.0, preserve_topology=True)
-                        band_polys = (
-                            list(band.geoms) if hasattr(band, "geoms")
-                            else [band])
-                        for bp in band_polys:
-                            if (bp.is_empty or bp.area < 20.0
-                                    or not hasattr(bp, "exterior")):
+                if emitted_union.is_empty:
+                    subtract_base = portal_exclusion
+                elif portal_exclusion.is_empty:
+                    subtract_base = emitted_union.buffer(1.0)
+                else:
+                    subtract_base = shp_ops.unary_union([
+                        emitted_union.buffer(1.0),
+                        portal_exclusion])
+                # Rects already emitted in this loop — we subtract
+                # them from each new rect so adjacent segments at
+                # polygon corners don't overlap each other.
+                e1_emitted_union = shp_geom.Polygon()
+
+                boundary_line_e1 = airport_footprint.boundary
+                e1_lines = (
+                    list(boundary_line_e1.geoms)
+                    if boundary_line_e1.geom_type == "MultiLineString"
+                    else [boundary_line_e1])
+
+                for e1_line in e1_lines:
+                    if e1_line.length < BAND_SEG_LENGTH:
+                        continue
+                    n_segs = max(1, int(
+                        e1_line.length / BAND_SEG_LENGTH))
+                    step = e1_line.length / n_segs
+                    for i in range(n_segs):
+                        s_pt = e1_line.interpolate(i * step)
+                        e_pt = e1_line.interpolate((i + 1) * step)
+                        sx_b, sy_b = s_pt.x, s_pt.y
+                        ex_b, ey_b = e_pt.x, e_pt.y
+                        dxs = ex_b - sx_b
+                        dys = ey_b - sy_b
+                        slen = sqrt(dxs * dxs + dys * dys)
+                        if slen < 1.0:
+                            continue
+
+                        # Inward perpendicular: left-90 of along,
+                        # probed against the footprint in case the
+                        # ring is CW-oriented.
+                        along_b = (dxs / slen, dys / slen)
+                        perp_b = (-along_b[1], along_b[0])
+                        mid_x = (sx_b + ex_b) / 2.0
+                        mid_y = (sy_b + ey_b) / 2.0
+                        probe_pt = shp_geom.Point(
+                            mid_x + perp_b[0] * 2.0,
+                            mid_y + perp_b[1] * 2.0)
+                        if not airport_footprint.contains(probe_pt):
+                            perp_b = (-perp_b[0], -perp_b[1])
+
+                        # Centerline offset inward by band_width/2
+                        # so the runway_corners-built rect spans
+                        # [boundary, boundary + band_width inward].
+                        half_bw = BOUNDARY_BAND_WIDTH / 2.0
+                        cs_x = sx_b + perp_b[0] * half_bw
+                        cs_y = sy_b + perp_b[1] * half_bw
+                        ce_x = ex_b + perp_b[0] * half_bw
+                        ce_y = ey_b + perp_b[1] * half_bw
+
+                        # Sample elevation at each short-edge center
+                        # (= boundary point at start / end of the
+                        # segment).  CIFP surface model first; DEM
+                        # fallback if out of range.
+                        e_s = _cifp_surface_elevation(
+                            sx_b, sy_b, max_search=500.0)
+                        if e_s is None:
+                            slon_b, slat_b = to_ll(sx_b, sy_b)
+                            try:
+                                e_s = tile.dem.alt(
+                                    (slon_b - tile.lon,
+                                     slat_b - tile.lat))
+                            except Exception:
                                 continue
-                            # Sample elevation at centroid
-                            cx_b, cy_b = bp.centroid.x, bp.centroid.y
-                            b_elev = _cifp_surface_elevation(
-                                cx_b, cy_b, max_search=500.0)
-                            if b_elev is None:
-                                blon, blat = to_ll(cx_b, cy_b)
-                                try:
-                                    b_elev = tile.dem.alt(
-                                        (blon - tile.lon,
-                                         blat - tile.lat))
-                                except Exception:
-                                    continue
-                            ring_ll = [to_ll(mx, my)
-                                       for mx, my in
-                                       bp.exterior.coords]
-                            _emit_flat_poly(
-                                ring_ll, round(b_elev, 1))
-                            blend_polys_m.append(bp)
+                        e_e = _cifp_surface_elevation(
+                            ex_b, ey_b, max_search=500.0)
+                        if e_e is None:
+                            elon_b, elat_b = to_ll(ex_b, ey_b)
+                            try:
+                                e_e = tile.dem.alt(
+                                    (elon_b - tile.lon,
+                                     elat_b - tile.lat))
+                            except Exception:
+                                continue
+                        if e_s is None or e_e is None:
+                            continue
+
+                        # Build the rect polygon via runway_corners
+                        # for the clipping step.
+                        cs_lon, cs_lat = to_ll(cs_x, cs_y)
+                        ce_lon, ce_lat = to_ll(ce_x, ce_y)
+                        try:
+                            rc_corners = runway_corners(
+                                cs_lat, cs_lon, ce_lat, ce_lon,
+                                BOUNDARY_BAND_WIDTH)
+                            if rc_corners is None:
+                                continue
+                            rp = shp_geom.Polygon([
+                                to_m(c[1], c[0]) for c in rc_corners])
+                            if not rp.is_valid:
+                                rp = rp.buffer(0)
+                            if rp.is_empty or rp.area < 5.0:
+                                continue
+                        except Exception:
+                            continue
+
+                        full_area = rp.area
+                        # Clip against prior phase emitted shapes +
+                        # portal exclusion + rects already emitted
+                        # earlier in THIS walk.
+                        try:
+                            if e1_emitted_union.is_empty:
+                                dyn_subtract = subtract_base
+                            elif subtract_base.is_empty:
+                                dyn_subtract = e1_emitted_union
+                            else:
+                                dyn_subtract = shp_ops.unary_union([
+                                    subtract_base, e1_emitted_union])
+                        except Exception:
+                            dyn_subtract = subtract_base
+                        try:
+                            if not dyn_subtract.is_empty:
+                                rp_clean = rp.difference(dyn_subtract)
+                            else:
+                                rp_clean = rp
+                        except Exception:
+                            rp_clean = rp
+                        if (rp_clean.is_empty
+                                or rp_clean.area < 10.0):
+                            continue
+
+                        clean_ratio = rp_clean.area / full_area
+                        # Full-sloped-rect branch only when the
+                        # overlap is BOTH <0.1% of rect area AND
+                        # <0.25 m² absolute — otherwise a 0.5 m²
+                        # sliver survives the ratio test on a 601
+                        # m² rect and shows up in the overlap
+                        # audit.
+                        if (clean_ratio >= 0.999
+                                and full_area - rp_clean.area < 0.25):
+                            # Emit full sloped rect.
+                            _emit_sloped_rect(
+                                cs_lat, cs_lon, round(e_s, 1),
+                                ce_lat, ce_lon, round(e_e, 1),
+                                BOUNDARY_BAND_WIDTH)
+                            blend_polys_m.append(rp)
                             n_blend += 1
+                            try:
+                                e1_emitted_union = shp_ops.unary_union(
+                                    [e1_emitted_union, rp])
+                            except Exception:
+                                pass
+                        else:
+                            # Partial overlap — emit the clipped
+                            # geometry as a flat polygon at the
+                            # averaged elevation.  This is one of
+                            # the "small flat polygons for flat
+                            # areas" connecting adjacent sloped
+                            # rects where the band is cut short by
+                            # a building edge, runway apron, or a
+                            # previously-emitted E1 rect at a
+                            # polygon corner.
+                            avg_e = round((e_s + e_e) / 2.0, 1)
+                            pieces = (
+                                [rp_clean]
+                                if rp_clean.geom_type == "Polygon"
+                                else list(rp_clean.geoms))
+                            for piece in pieces:
+                                if (piece.is_empty
+                                        or piece.area < 10.0
+                                        or not hasattr(
+                                            piece, "exterior")):
+                                    continue
+                                ring_ll = [
+                                    to_ll(mx, my)
+                                    for mx, my in
+                                    piece.exterior.coords]
+                                _emit_flat_poly(ring_ll, avg_e)
+                                blend_polys_m.append(piece)
+                                n_blend += 1
+                                try:
+                                    e1_emitted_union = (
+                                        shp_ops.unary_union(
+                                            [e1_emitted_union, piece]))
+                                except Exception:
+                                    pass
             except Exception:
                 pass
 
