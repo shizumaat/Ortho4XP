@@ -1,20 +1,11 @@
 # Auto-Patch Refactor — Status
 
-**Current direction (head = `f6d3140`):** the legacy
-`generate_airport_surface_patches()` in `src/O4_Auto_Patch.py`
-remains the active code path, now with a dedicated Phase C0 for
-apt.dat-sourced taxiways.  Taxiway polygons are classified and
-emitted as chains of sloping rectangles via a four-strategy
-pipeline (MRR fast path → Voronoi skeleton → morphological
-decomposition → apron triangulation fallback), with runway-edge
-anchoring tied to the runway chain actually emitted by
-`generate_patch_osm`.  The rect builder walks the centerline at
-its own RDP-simplified vertices (one rect per straight run), not
-at uniform intervals, and uses MAX-of-probes width with 1.5 m
-outward padding so the rects fully cover each polygon with a
-small permitted overflow into neighbouring pavement.
+**Current direction:** bottom-up merge-based pavement
+decomposition, replacing the legacy Phase C0/C1/C2/D pipeline
+with a single pass that produces the minimum number of simple
+shapes covering the paved area.
 
-**Latest session's wins:**
+**Previous session's wins (head = `f6d3140`):**
 
 1. **Vertex-based rect emission** (commit `84953a6`) — SPJC now
    emits **35 taxi rects** (within the user's 25–30 target) over
@@ -25,11 +16,136 @@ small permitted overflow into neighbouring pavement.
    hoisting, Phase C4 STRtree subtract, `_delaunay_clipped`
    prepared geometry + hole-free shortcut.
 
-**Next up (user direction, context-clear pending):** continue
-fixing taxiway issues beyond the 25-30 rect achievement.  The
-apron-prefer-flat and building-pad reconciliation tasks from the
-earlier four-item list remain queued behind whatever taxi
-polishing the user identifies next.
+**Current session findings and new direction:**
+
+The per-polygon taxi/apron classification model (Phases C0/C1/C2/D)
+is fundamentally wrong.  Multiple approaches were tried and failed
+during this session:
+
+1. **Centerline-driven emission (OSM taxi ways as source)** — works
+   for named taxis (TWA, TWE, TWF, TWV) but fails at airports
+   without OSM data, and apt.dat polygon shapes don't align with
+   the feature names anyway.  Abandoned after the user pointed
+   out we'd need apt.dat 120 rows as a fallback, plus width
+   probing, plus junction detection — increasingly complex for a
+   marginal gain.
+
+2. **Flat-fill + transition-strip model** — decompose
+   `pavement_region = apt.dat_union − runways − buildings` into
+   connected components, emit each as a flat N-gon at DEM mean
+   with sloped 4-vertex rects at runway edges.  Produced
+   structurally OK results but:
+   - Flat fills with building holes had to be triangulated (OSM
+     ways don't support multipolygon holes) → 1 010 flat triangles
+     where 20 shapes should suffice.
+   - Adjacent flat fills and building pads had unmatched elevations
+     → cliffs everywhere.
+   - Still 1 912 total shapes — no improvement over legacy.
+
+3. **Recursive top-down split** — start with whole pavement, fit
+   one plane, split if fails.  Splitting is elevation-blind and
+   fragments by geometry instead of by planarity → too many small
+   shapes, odd shapes, parallel rects at different elevations.
+
+**Root cause of all failures:** every approach tried to decompose
+pavement by GEOMETRY (polygon shapes, centerline paths, recursive
+bisection) instead of by ELEVATION PLANARITY.  The minimum shape
+count is a property of the DEM's planar structure, not the
+polygon boundaries.
+
+### New approach: bottom-up merge-based decomposition
+
+**Problem statement:** Given the paved area (from apt.dat), a DEM,
+runway boundary elevations (fixed), and building pad elevations
+(yield-able), produce the fewest simple shapes whose piecewise
+elevation function covers the paved area while satisfying FAA/EASA
+grade limits and matching all boundary anchors.
+
+**Key insight:** minimum shapes ≈ minimum number of planar zones
+in the pavement's FAA-smoothed elevation field.  Because we are
+SMOOTHING terrain to FAA/EASA compliance (not reproducing the raw
+DEM exactly), the effective elevation surface has lower complexity
+than the raw DEM — fewer bumps, gentler gradients — which means
+fewer planar zones are needed to represent it.
+
+**Algorithm (bottom-up merge):**
+
+1. **Seed:** Constrained Delaunay triangulation of pavement_region
+   (minus runways, minus buildings, holes preserved) with runway-
+   boundary and building-boundary anchor vertices.  Use the
+   existing `O4_Surface_Mesh.adaptive_triangulate` which produces
+   a grade-constrained, DEM-faithful set of triangles.  This is
+   fine-grained but guaranteed valid.
+
+2. **Merge:** Greedily merge adjacent triangles into larger
+   regions whenever the combined region still fits one FAA-
+   compliant plane:
+   - Both nearly flat at the same elevation → merge into a
+     larger flat polygon.
+   - Both lie on one sloped plane within grade budget → merge
+     into a larger sloped region.
+   - Otherwise, don't merge.
+   Repeat until no more merges are possible.
+
+3. **Convert** each merged region to its simplest valid shape type:
+   - Flat region → flat N-gon (`altitude=E`).  Any vertex count
+     OK because flat shapes have no per-vertex elevation.
+   - Sloped region ≈ rectangular → 4-vertex sloped rect
+     (`altitude_high` / `altitude_low`).
+   - Sloped region non-rectangular or compound → 3-vertex
+     triangle(s) (`node_altitudes`, exactly 3 unique vertices).
+
+**Why merging works:** it discovers the DEM's natural planar zones
+(flat runway-end aprons, gently-sloped taxi strips, compound
+junctions) without ever classifying anything.  Flat zones become
+flat N-gons; gradient zones become sloped rects; compound zones
+become triangles — all emerging from the math, not from feature
+labels.
+
+**Why smoothing helps:** FAA/EASA grade limits (1.5 % taxi, 1.0 %
+apron, FAA vertical-curve rule for runways) act as a low-pass
+filter on the elevation surface.  The smoothed DEM has fewer
+planar zones than the raw DEM, so merging converges to fewer
+shapes than an approach that tries to reproduce every DEM bump.
+
+**Shape types allowed (reiterated):**
+- Flat N-vertex polygon: `altitude=E` — any vertex count
+- Sloped 4-vertex rectangle: `altitude_high=H, altitude_low=L,
+  cell_size=2, profile=spline`
+- 3-vertex triangle: `node_altitudes=z0,z1,z2,z0` — exactly 3
+  unique vertices, 4 comma-separated values (closing)
+- Runway segment: emitted by `generate_patch_osm`, not by this
+  pipeline
+- No N-vertex sloped polygons (not human-editable)
+
+**Estimated SPJC shape count:** 20–50 pavement shapes (after
+merge), plus ~313 building pads, plus 73 runway segments.
+
+**Phases disabled under the new model (`O4_NEW_MODEL=1`):**
+- Phase C0 (apt.dat rect-chain emission)
+- Phase C1 (OSM taxi buffer emission)
+- Phase C2 (apron triangulation)
+- Phase D (junction triangulation)
+- Phase E1 (boundary band)
+- Coverage fill
+- Drainage (temporarily, until pavement model is validated)
+- Phase C4 transition strip detection (replaced by merge logic)
+
+**Phases kept:**
+- Phase A0.5 (apt.dat ingest — pavement geometry source)
+- Phase A1–A4 (geometry building, building merge)
+- Phase A5 (elevation solve, building reconciliation)
+- Phase C3 (building flat pads — emit after pavement)
+- `generate_patch_osm` (runways, authoritative)
+- `_runway_elev_lookup` (emitted-chain lookup for runway-side
+  anchors at pavement-runway boundary)
+
+**Implementation status:** `_emit_pavement_new_model()` exists in
+`O4_Auto_Patch.py` behind the `O4_NEW_MODEL=1` env flag.
+Currently implements the flat-fill + transition-strip model
+(approach 2 above) which is being replaced by the merge-based
+approach.  The function signature and gating infrastructure are
+reusable; only the emission loop body changes.
 
 ## Active surface invariants (apply to all emitted geometry)
 

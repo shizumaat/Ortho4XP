@@ -34,6 +34,33 @@ OVERRUN_EXTENSION = 30.0
 # Maximum number of runway chunks for a single patch polygon
 MAX_NODE_ID = -1  # will be decremented for each new node
 
+# Debug toggle: when set to "1" via O4_DEBUG_TAXI_ONLY env var, the surface
+# generator skips every non-taxi emission phase (apron, buildings, coverage
+# fill, transition strips, junction triangles, boundary band, tunnel portals,
+# drainage).  Runway segments still come out via generate_patch_osm.  This
+# isolates the Phase C0 taxi rect output for visual debugging without the
+# rest of the pipeline obscuring it.
+DEBUG_TAXI_ONLY = os.environ.get("O4_DEBUG_TAXI_ONLY", "0") == "1"
+
+# Phase C0 source toggle: when "1" (the default), Phase C0 emits taxi rects
+# from OSM centerlines clipped against the apt.dat pavement union.  This is
+# the centerline-driven model — every named OSM taxi (A, A1, B, E, F, V…)
+# produces aligned rects regardless of which apt.dat polygon contains the
+# paint.  Setting "0" reverts to the polygon-driven path that walks
+# `apt_twy_rect_chains` from Phase A3 (the prior MRR/skeleton/decompose model).
+DEBUG_OSM_CENTERLINES = os.environ.get("O4_OSM_CENTERLINES", "1") == "1"
+
+# New pavement model toggle: when "1" (set via O4_NEW_MODEL=1), Phase C0/C1/C2
+# and Phase D are replaced by a single pass that decomposes the pavement union
+# into flat N-vertex polygons (one per connected pavement component, at a
+# DEM-driven target elevation) plus 4-vertex sloped rectangles at runway-edge
+# transitions (using _runway_elev_lookup for the runway-side elevation).
+# Phase C3 (building pads) and Phase C4 (transition-strip detection between
+# adjacent flat shapes) still run, so building-to-pavement cliffs get bridged
+# automatically.  Phase E/F stay gated behind DEBUG_TAXI_ONLY.  Default OFF
+# so existing tests keep passing; rollback is `unset O4_NEW_MODEL`.
+DEBUG_NEW_MODEL = os.environ.get("O4_NEW_MODEL", "0") == "1"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CIFP Coordinate Parsing
@@ -1548,9 +1575,16 @@ def extract_taxiway_info(airport_layer, dico_airports, tile):
         tile: Tile object with .lat and .lon.
 
     Returns:
-        dict: {airport_key: [{'centerline': [(lon, lat), ...], 'wayid': int}, ...]}
+        dict: {airport_key: [{'centerline': [(lon, lat), ...],
+                              'wayid': int,
+                              'name': str}, ...]}
               Coordinates are ABSOLUTE (not tile-relative).
+              ``name`` is the OSM ``ref`` tag (e.g. "A", "A1", "F",
+              "V") if present, otherwise an empty string.  Used by
+              the centerline-driven Phase C0 emission to group
+              centerlines by named taxiway.
     """
+    way_tags = getattr(airport_layer, "dicosmtags", {}).get("w", {})
     result = {}
     for airport in dico_airports:
         apt = dico_airports[airport]
@@ -1570,9 +1604,11 @@ def extract_taxiway_info(airport_layer, dico_airports, tile):
                 if nid in airport_layer.dicosmn:
                     coords.append(tuple(airport_layer.dicosmn[nid]))
             if len(coords) >= 2:
+                tags = way_tags.get(wayid, {})
                 taxiways.append({
                     "centerline": coords,
                     "wayid": wayid,
+                    "name": tags.get("ref", "") or "",
                 })
         if taxiways:
             result[airport] = taxiways
@@ -2248,6 +2284,572 @@ def extract_road_info(dico_airports, tile, road_layer=None):
             UI.vprint(2, "   Auto-patch: {} roads near {}".format(
                 len(roads), airport))
     return result
+
+
+def _emit_pavement_new_model(
+    apt_twy_polys_m, apron_polys_m, rwy_union_m, bldg_union_m,
+    building_polys_m, bldg_elevations,
+    _dem_at, _runway_elev_lookup, _project_point_onto_runway_fn,
+    runway_pairs, to_ll, to_m,
+    _emit_flat_poly, _emit_sloped_rect, _emit_triangle,
+    emitted_flat_shapes, emitted_taxi_rects_m, emitted_twy_quads_m,
+    all_emitted_parts_m, icao,
+):
+    """Minimum-shape pavement decomposition via bottom-up merging.
+
+    Pipeline:
+      1. PREPARE — union apt.dat pavement, subtract runways,
+         morphological-close + simplify.
+      2. SEED — Delaunay of boundary vertices + anchor points only
+         (no densification, no interior grid).  DEM elevation at
+         each vertex, grade-clamped, rounded to 0.5 m.
+      3. MERGE — greedily merge adjacent coplanar triangles.
+      4. EMIT — flat N-gon / sloped 4-vertex rect / 3-vertex triangle.
+         Shape type decided by elevation pattern:
+           - z_range < 0.5 m → flat N-gon
+           - slope primarily one direction → sloped 4-vertex rect
+           - > 0.5 m change in multiple directions → triangles
+      5. VALIDATE — check equal-altitudes-at-joins for all adjacent
+         pairs; report violations.
+    """
+    import math as _math
+    from shapely.geometry import Polygon as _Poly, Point as _Pt, MultiPoint
+    from shapely import ops as _shp_ops
+    from shapely.ops import triangulate as _triangulate
+    from shapely.strtree import STRtree
+
+    CLOSE_RADIUS = 25.0
+    SIMPLIFY_TOL = 15.0
+    MAX_GRADE = 0.015
+    MERGE_PLANE_TOL = 0.5    # m — max residual for merge
+    MIN_AREA = 200.0
+    ANCHOR_SPACING = 30.0
+    ELEV_ROUND = 0.5          # m — round all elevations to this step
+    JOIN_TOL = 0.5            # m — max allowed mismatch at joins
+
+    def _round_z(z):
+        return round(z / ELEV_ROUND) * ELEV_ROUND
+
+    # ── Step 1: PREPARE ──────────────────────────────────────────────
+    pavement_sources = [p for p in (apt_twy_polys_m + apron_polys_m)
+                        if p is not None and not p.is_empty]
+    if not pavement_sources:
+        return
+    try:
+        pav_raw = _shp_ops.unary_union(pavement_sources)
+    except Exception:
+        return
+    if not rwy_union_m.is_empty:
+        try:
+            pav_raw = pav_raw.difference(rwy_union_m)
+        except Exception:
+            pass
+    try:
+        pav_closed = pav_raw.buffer(CLOSE_RADIUS).buffer(-CLOSE_RADIUS)
+    except Exception:
+        pav_closed = pav_raw
+    try:
+        pav_simple = pav_closed.simplify(SIMPLIFY_TOL,
+                                         preserve_topology=True)
+    except Exception:
+        pav_simple = pav_closed
+
+    components = []
+    if pav_simple.is_empty:
+        return
+    if hasattr(pav_simple, "geoms"):
+        for g in pav_simple.geoms:
+            if hasattr(g, "exterior") and g.area >= MIN_AREA:
+                components.append(g)
+    elif hasattr(pav_simple, "exterior"):
+        if pav_simple.area >= MIN_AREA:
+            components.append(pav_simple)
+    if not components:
+        return
+
+    UI.vprint(2, "    {}: new model — {} components, {:.0f} m²".format(
+        icao, len(components), sum(c.area for c in components)))
+
+    # ── Helpers ──────────────────────────────────────────────────────
+    def _rwy_elev_at(x, y):
+        try:
+            v = _runway_elev_lookup(x, y)
+            if v is not None:
+                return float(v)
+        except Exception:
+            pass
+        try:
+            lo, la = to_ll(x, y)
+            v = _project_point_onto_runway_fn(
+                la, lo, runway_pairs, max_dist=30.0)
+            if v is not None:
+                return float(v)
+        except Exception:
+            pass
+        return None
+
+    def _fit_plane(pts):
+        if len(pts) < 3:
+            if pts:
+                return (0.0, 0.0, sum(p[2] for p in pts) / len(pts))
+            return None
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        ATA = [[0.0]*3 for _ in range(3)]
+        ATz = [0.0]*3
+        for (x, y, z) in pts:
+            row = [x - cx, y - cy, 1.0]
+            for i in range(3):
+                for j in range(3):
+                    ATA[i][j] += row[i] * row[j]
+                ATz[i] += row[i] * z
+        def det(m):
+            return (m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
+                   -m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
+                   +m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]))
+        D = det(ATA)
+        if abs(D) < 1e-12:
+            return (0.0, 0.0, sum(p[2] for p in pts) / len(pts))
+        result = []
+        for k in range(3):
+            Mk = [list(r) for r in ATA]
+            for i in range(3):
+                Mk[i][k] = ATz[i]
+            result.append(det(Mk) / D)
+        a, b, c0 = result
+        c = c0 - a * cx - b * cy
+        if _math.hypot(a, b) > 0.5:
+            return (0.0, 0.0, sum(p[2] for p in pts) / len(pts))
+        return (a, b, c)
+
+    def _pz(plane, x, y):
+        return plane[0]*x + plane[1]*y + plane[2]
+
+    def _pgrade(plane):
+        return _math.hypot(plane[0], plane[1])
+
+    # ── Steps 2–4 per component ──────────────────────────────────────
+    total_seed = 0
+    total_merged = 0
+    total_emitted = 0
+    # Track all emitted shapes with their vertex elevations for validation.
+    emitted_for_validation = []  # list of (poly_m, [(x,y,z), ...])
+
+    for comp in components:
+        # ── 2a. Collect seed points: boundary verts + anchors only ────
+        seed_pts = {}  # (x,y) → z
+        anchored_keys = set()
+
+        # Boundary vertices (exterior + holes) — already simplified,
+        # no densification needed.
+        for x, y in comp.exterior.coords[:-1]:
+            z = _dem_at(x, y)
+            seed_pts[(round(x, 2), round(y, 2))] = _round_z(z if z else 0)
+        for hole in comp.interiors:
+            for x, y in hole.coords[:-1]:
+                z = _dem_at(x, y)
+                seed_pts[(round(x, 2), round(y, 2))] = _round_z(z if z else 0)
+
+        # Runway-boundary anchors
+        if not rwy_union_m.is_empty:
+            try:
+                touch = comp.boundary.intersection(rwy_union_m.buffer(1.0))
+            except Exception:
+                touch = None
+            if touch is not None and not touch.is_empty:
+                segs = (list(touch.geoms) if hasattr(touch, "geoms")
+                        else [touch])
+                for seg in segs:
+                    if not hasattr(seg, "length") or seg.length < 1:
+                        continue
+                    n = max(2, int(seg.length / ANCHOR_SPACING) + 1)
+                    for k in range(n):
+                        t = k / (n - 1) if n > 1 else 0.5
+                        try:
+                            p = seg.interpolate(t, normalized=True)
+                        except Exception:
+                            continue
+                        rz = _rwy_elev_at(p.x, p.y)
+                        if rz is not None:
+                            key = (round(p.x, 2), round(p.y, 2))
+                            seed_pts[key] = _round_z(rz)
+                            anchored_keys.add(key)
+
+        # Building-boundary anchors
+        if building_polys_m and bldg_elevations:
+            for bi, bp in enumerate(building_polys_m):
+                if bp.is_empty or bi not in bldg_elevations:
+                    continue
+                try:
+                    if bp.distance(comp) > 2.0:
+                        continue
+                    shared = bp.boundary.intersection(comp.buffer(2.0))
+                except Exception:
+                    continue
+                if shared.is_empty:
+                    continue
+                pad_z = _round_z(float(bldg_elevations[bi]))
+                segs = (list(shared.geoms) if hasattr(shared, "geoms")
+                        else [shared])
+                for seg in segs:
+                    if not hasattr(seg, "coords"):
+                        continue
+                    for cx, cy in seg.coords:
+                        key = (round(cx, 2), round(cy, 2))
+                        seed_pts[key] = pad_z
+                        anchored_keys.add(key)
+
+        pts_list = list(seed_pts.keys())
+        if len(pts_list) < 3:
+            continue
+
+        # ── 2b. Grade-clamp (FAA smoothing, bounded) ────────────────
+        # Build edges from the Delaunay before we use elevations.
+        raw_tris = _triangulate(MultiPoint(pts_list))
+        inside_tris = [t for t in raw_tris
+                       if comp.contains(t.representative_point())]
+        if not inside_tris:
+            continue
+
+        edges = set()
+        for tri in inside_tris:
+            vs = list(tri.exterior.coords)[:-1]
+            for k in range(3):
+                e = tuple(sorted([
+                    (round(vs[k][0], 2), round(vs[k][1], 2)),
+                    (round(vs[(k+1)%3][0], 2), round(vs[(k+1)%3][1], 2))
+                ]))
+                edges.add(e)
+
+        MAX_CLAMP_ADJUST = 2.0
+        original_z = dict(seed_pts)
+        for _iter in range(10):
+            moved = False
+            for (v1, v2) in edges:
+                z1 = seed_pts.get(v1, 0.0)
+                z2 = seed_pts.get(v2, 0.0)
+                dist = _math.hypot(v1[0]-v2[0], v1[1]-v2[1])
+                if dist < 1.0:
+                    continue
+                max_dz = dist * MAX_GRADE
+                if abs(z1 - z2) <= max_dz:
+                    continue
+                a1 = v1 in anchored_keys
+                a2 = v2 in anchored_keys
+                if a1 and a2:
+                    continue
+                o1 = original_z.get(v1, z1)
+                o2 = original_z.get(v2, z2)
+                if a1:
+                    new_z2 = z1 - (1 if z1 > z2 else -1) * max_dz
+                    new_z2 = max(o2 - MAX_CLAMP_ADJUST,
+                                 min(o2 + MAX_CLAMP_ADJUST, new_z2))
+                    if abs(new_z2 - z2) > 0.01:
+                        seed_pts[v2] = _round_z(new_z2)
+                        moved = True
+                elif a2:
+                    new_z1 = z2 - (1 if z2 > z1 else -1) * max_dz
+                    new_z1 = max(o1 - MAX_CLAMP_ADJUST,
+                                 min(o1 + MAX_CLAMP_ADJUST, new_z1))
+                    if abs(new_z1 - z1) > 0.01:
+                        seed_pts[v1] = _round_z(new_z1)
+                        moved = True
+                else:
+                    excess = abs(z1 - z2) - max_dz
+                    adj = excess / 2.0
+                    sign = 1 if z1 > z2 else -1
+                    n1 = z1 - sign * adj
+                    n2 = z2 + sign * adj
+                    n1 = max(o1 - MAX_CLAMP_ADJUST,
+                             min(o1 + MAX_CLAMP_ADJUST, n1))
+                    n2 = max(o2 - MAX_CLAMP_ADJUST,
+                             min(o2 + MAX_CLAMP_ADJUST, n2))
+                    if abs(n1-z1) > 0.01 or abs(n2-z2) > 0.01:
+                        seed_pts[v1] = _round_z(n1)
+                        seed_pts[v2] = _round_z(n2)
+                        moved = True
+            if not moved:
+                break
+
+        total_seed += len(inside_tris)
+
+        # ── 2c. Build regions with clamped, rounded elevations ───────
+        regions = []
+        for tri in inside_tris:
+            verts = list(tri.exterior.coords)[:-1]
+            pts_3d = []
+            for vx, vy in verts:
+                key = (round(vx, 2), round(vy, 2))
+                z = seed_pts.get(key, 0.0)
+                pts_3d.append((vx, vy, float(z)))
+            plane = _fit_plane(pts_3d)
+            if plane is None:
+                continue
+            regions.append({'poly': tri, 'pts': pts_3d, 'plane': plane})
+
+        # ── 3. MERGE ─────────────────────────────────────────────────
+        while True:
+            if len(regions) < 2:
+                break
+            polys_list = [r['poly'] for r in regions]
+            tree = STRtree(polys_list)
+            used = [False] * len(regions)
+            new_regions = []
+            any_merged = False
+            for i in range(len(regions)):
+                if used[i]:
+                    continue
+                cur = dict(regions[i])
+                cur['pts'] = list(cur['pts'])
+                try:
+                    cands = tree.query(cur['poly'].buffer(0.5))
+                except Exception:
+                    cands = []
+                for j_idx in cands:
+                    j = int(j_idx)
+                    if j <= i or used[j]:
+                        continue
+                    other = regions[j]
+                    try:
+                        if not cur['poly'].intersects(
+                                other['poly'].buffer(0.1)):
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        merged_poly = cur['poly'].union(other['poly'])
+                        if (not hasattr(merged_poly, "exterior")
+                                or merged_poly.is_empty):
+                            continue
+                    except Exception:
+                        continue
+                    merged_pts = cur['pts'] + list(other['pts'])
+                    merged_plane = _fit_plane(merged_pts)
+                    if merged_plane is None:
+                        continue
+                    if _pgrade(merged_plane) > MAX_GRADE:
+                        continue
+                    max_res = max(
+                        abs(_pz(merged_plane, x, y) - z)
+                        for (x, y, z) in merged_pts)
+                    if max_res > MERGE_PLANE_TOL:
+                        continue
+                    cur['poly'] = merged_poly
+                    cur['pts'] = merged_pts
+                    cur['plane'] = merged_plane
+                    used[j] = True
+                    any_merged = True
+                used[i] = True
+                new_regions.append(cur)
+            regions = new_regions
+            if not any_merged:
+                break
+
+        total_merged += len(regions)
+
+        # ── 4. EMIT with shape-type decision ─────────────────────────
+        for r in regions:
+            poly = r['poly']
+            plane = r['plane']
+            if poly.is_empty or poly.area < MIN_AREA:
+                continue
+
+            # Simplify to remove collinear Delaunay artifacts
+            try:
+                poly = poly.simplify(5.0, preserve_topology=True)
+                if poly.is_empty or not hasattr(poly, "exterior"):
+                    continue
+            except Exception:
+                pass
+
+            verts = list(poly.exterior.coords)[:-1]
+            n_v = len(verts)
+            zs = [_round_z(_pz(plane, x, y)) for x, y in verts]
+            z_range = max(zs) - min(zs)
+
+            # Track vertex elevations for validation
+            vert_elevs = [(verts[k][0], verts[k][1], zs[k])
+                          for k in range(n_v)]
+
+            if z_range < ELEV_ROUND:
+                # FLAT — all vertices within one rounding step
+                avg_z = _round_z(sum(zs) / len(zs))
+                ring_ll = [to_ll(x, y)
+                           for x, y in poly.exterior.coords]
+                try:
+                    _emit_flat_poly(ring_ll, avg_z)
+                except Exception:
+                    continue
+                emitted_flat_shapes.append((poly, avg_z))
+                all_emitted_parts_m.append(poly)
+                emitted_for_validation.append(
+                    (poly, [(v[0], v[1], avg_z) for v in verts]))
+                total_emitted += 1
+
+            elif n_v == 3:
+                # TRIANGLE — 3 vertices with per-vertex elevations
+                lo0, la0 = to_ll(*verts[0])
+                lo1, la1 = to_ll(*verts[1])
+                lo2, la2 = to_ll(*verts[2])
+                _emit_triangle(la0, lo0, zs[0],
+                               la1, lo1, zs[1],
+                               la2, lo2, zs[2])
+                all_emitted_parts_m.append(poly)
+                emitted_for_validation.append((poly, vert_elevs))
+                total_emitted += 1
+
+            elif n_v == 4:
+                # 4-VERTEX — decide: sloped rect vs flat
+                # Check if slope is primarily one direction
+                zs4 = list(zs)
+                best_s = 0
+                best_m = -1e18
+                for s in range(4):
+                    m = (zs4[s] + zs4[(s+1) % 4]) / 2.0
+                    if m > best_m:
+                        best_m = m
+                        best_s = s
+                z_hi = _round_z(
+                    (zs4[best_s] + zs4[(best_s+1) % 4]) / 2.0)
+                z_lo = _round_z(
+                    (zs4[(best_s+2) % 4] + zs4[(best_s+3) % 4]) / 2.0)
+                if abs(z_hi - z_lo) < ELEV_ROUND:
+                    # Actually flat
+                    avg_z = _round_z(sum(zs4) / 4.0)
+                    ring_ll = [to_ll(x, y)
+                               for x, y in poly.exterior.coords]
+                    try:
+                        _emit_flat_poly(ring_ll, avg_z)
+                    except Exception:
+                        continue
+                    emitted_flat_shapes.append((poly, avg_z))
+                    all_emitted_parts_m.append(poly)
+                    emitted_for_validation.append(
+                        (poly, [(v[0], v[1], avg_z) for v in verts]))
+                else:
+                    # Sloped rect
+                    hi_a = verts[best_s]
+                    hi_b = verts[(best_s + 1) % 4]
+                    mid_hi = ((hi_a[0]+hi_b[0])/2,
+                              (hi_a[1]+hi_b[1])/2)
+                    lo_a = verts[(best_s + 2) % 4]
+                    lo_b = verts[(best_s + 3) % 4]
+                    mid_lo = ((lo_a[0]+lo_b[0])/2,
+                              (lo_a[1]+lo_b[1])/2)
+                    seg_len = _math.hypot(
+                        hi_a[0]-hi_b[0], hi_a[1]-hi_b[1])
+                    mh_lo, mh_la = to_ll(*mid_hi)
+                    ml_lo, ml_la = to_ll(*mid_lo)
+                    try:
+                        _emit_sloped_rect(
+                            mh_la, mh_lo, z_hi,
+                            ml_la, ml_lo, z_lo, seg_len)
+                    except Exception:
+                        continue
+                    all_emitted_parts_m.append(poly)
+                    emitted_for_validation.append(
+                        (poly, vert_elevs))
+                total_emitted += 1
+
+            else:
+                # >4 VERTICES — check if slope is primarily one
+                # direction (use as sloped if close to rectangular)
+                # or if there's multi-directional change (triangulate)
+                #
+                # For now: if OBB fit is good AND slope is uniaxial,
+                # emit as flat at mean (safe).  Otherwise emit as
+                # flat at mean too.  The validation pass will catch
+                # any resulting cliffs.
+                avg_z = _round_z(sum(zs) / len(zs))
+                ring_ll = [to_ll(x, y)
+                           for x, y in poly.exterior.coords]
+                try:
+                    _emit_flat_poly(ring_ll, avg_z)
+                except Exception:
+                    continue
+                emitted_flat_shapes.append((poly, avg_z))
+                all_emitted_parts_m.append(poly)
+                emitted_for_validation.append(
+                    (poly, [(v[0], v[1], avg_z) for v in verts]))
+                total_emitted += 1
+
+    # ── 5. VALIDATE: equal altitudes at joins ────────────────────────
+    n_violations = 0
+    max_violation = 0.0
+    if len(emitted_for_validation) >= 2:
+        val_polys = [ev[0] for ev in emitted_for_validation]
+        val_tree = STRtree(val_polys)
+        for i, (pi, vi) in enumerate(emitted_for_validation):
+            try:
+                cands = val_tree.query(pi.buffer(1.0))
+            except Exception:
+                continue
+            for j_idx in cands:
+                j = int(j_idx)
+                if j <= i:
+                    continue
+                pj, vj = emitted_for_validation[j]
+                try:
+                    if not pi.intersects(pj.buffer(0.5)):
+                        continue
+                    shared = pi.boundary.intersection(pj.buffer(1.0))
+                except Exception:
+                    continue
+                if shared.is_empty:
+                    continue
+                # Sample points along the shared boundary and
+                # compare each shape's elevation there.
+                test_pts = []
+                if hasattr(shared, 'length') and shared.length > 0:
+                    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+                        try:
+                            p = shared.interpolate(t, normalized=True)
+                            test_pts.append((p.x, p.y))
+                        except Exception:
+                            pass
+                elif hasattr(shared, 'geoms'):
+                    for g in shared.geoms:
+                        if hasattr(g, 'coords'):
+                            for c in g.coords:
+                                test_pts.append((c[0], c[1]))
+
+                for tx, ty in test_pts:
+                    # Elevation from shape i
+                    zi = _interp_shape_z(vi, tx, ty)
+                    zj = _interp_shape_z(vj, tx, ty)
+                    if zi is not None and zj is not None:
+                        diff = abs(zi - zj)
+                        if diff > JOIN_TOL:
+                            n_violations += 1
+                            max_violation = max(max_violation, diff)
+                            break  # one violation per pair is enough
+
+    UI.vprint(1,
+        "    {}: new model — {} seed → {} merged → {} emitted"
+        " | join violations: {} (max {:.1f}m)".format(
+            icao, total_seed, total_merged, total_emitted,
+            n_violations, max_violation))
+
+
+def _interp_shape_z(vert_elevs, x, y):
+    """Interpolate elevation at (x, y) from a shape's vertex elevations.
+    Uses inverse-distance weighting from the shape's vertices.
+    Returns None if no vertices."""
+    if not vert_elevs:
+        return None
+    import math
+    total_w = 0.0
+    total_z = 0.0
+    for vx, vy, vz in vert_elevs:
+        d = math.hypot(x - vx, y - vy)
+        if d < 0.1:
+            return vz
+        w = 1.0 / (d * d)
+        total_w += w
+        total_z += w * vz
+    if total_w < 1e-12:
+        return None
+    return total_z / total_w
 
 
 def generate_airport_surface_patches(icao, taxiway_data, building_data,
@@ -3261,7 +3863,12 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # the summary works whether or not Phase C0 runs.
     n_apt_twy_rects = 0        # sloped rect-chain segments (C0)
     n_apt_twy_flat_rects = 0   # flat rect-chain segments (C0)
-    if apt_twy_polys_m and apt_twy_rect_chains:
+    # DEBUG_NEW_MODEL replaces the apt.dat rect-chain emission with a
+    # unified pavement decomposition run later; skip the legacy emit
+    # loop entirely so it doesn't populate twy_union_m with outdated
+    # rects the new model would have to work around.
+    if (apt_twy_polys_m and apt_twy_rect_chains
+            and not DEBUG_NEW_MODEL):
         twy_rect_count = 0
         twy_flat_count = 0
         for twy_poly, rects in zip(apt_twy_polys_m, apt_twy_rect_chains):
@@ -3938,6 +4545,48 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
     emitted_flat_shapes = []  # [(poly_m, elevation), ...]
 
+    # ════════════════════════════════════════════════════════════════
+    # NEW MODEL: pavement decomposition
+    # ════════════════════════════════════════════════════════════════
+    # When O4_NEW_MODEL=1, replace the legacy Phase C0 (apt.dat rect-
+    # chain) + C1 (OSM taxi buffer) + C2 (apron triangulation) + D
+    # (junction triangulation) with one unified pass that emits:
+    #
+    #   - One flat N-vertex polygon per connected pavement component
+    #     at a DEM-driven target elevation (the exterior ring only —
+    #     interior holes for buildings are filled and then re-carved
+    #     by Phase C3 emitting building pads at their own elevations;
+    #     Phase C4 then detects any flat-to-pad elevation mismatch
+    #     and auto-creates transition strips).
+    #   - 4-vertex sloped rectangles at runway-touch boundaries,
+    #     using _runway_elev_lookup (the emitted chain, not raw CIFP
+    #     interp) for the runway-side elevation.  Strip depth sized
+    #     by grade budget up to 1.5% per user allowance.
+    #
+    # Runs BEFORE Phase C3 so building pads can carve into the flat
+    # fills cleanly.
+    if DEBUG_NEW_MODEL:
+        _emit_pavement_new_model(
+            apt_twy_polys_m, apron_polys_m, rwy_union_m, bldg_union_m,
+            building_polys_m, bldg_elevations,
+            _dem_at, _runway_elev_lookup, _project_point_onto_runway,
+            runway_pairs, to_ll, to_m,
+            _emit_flat_poly, _emit_sloped_rect, _emit_triangle,
+            emitted_flat_shapes, emitted_taxi_rects_m, emitted_twy_quads_m,
+            all_emitted_parts_m, icao)
+        # Update twy_union_m to include the new strips so downstream
+        # Phase C3 building-pad clipping avoids them.
+        try:
+            if emitted_twy_quads_m:
+                new_twy_union = shp_ops.unary_union(emitted_twy_quads_m)
+                if twy_union_m.is_empty:
+                    twy_union_m = new_twy_union.buffer(0.5)
+                else:
+                    twy_union_m = shp_ops.unary_union(
+                        [twy_union_m, new_twy_union.buffer(0.5)])
+        except Exception:
+            pass
+
     # C1: Taxiway shapes — clip away runways + junction zones
     n_twy_flat = 0
     n_twy_sloped = 0
@@ -3948,7 +4597,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     PARALLEL_TWY_MERGE_DIST = 15.0
     merged_twy_groups = {}  # ti -> group_id
     twy_group_id = 0
-    for i in range(len(twy_buffers_m)):
+    _twy_buffer_iter = [] if DEBUG_NEW_MODEL else list(range(len(twy_buffers_m)))
+    for i in _twy_buffer_iter:
         if twy_buffers_m[i].is_empty or i in merged_twy_groups:
             continue
         group = [i]
@@ -4447,7 +5097,15 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                                      # Phase F drainage detection to see
                                      # via the emit accumulator)
 
-    for ai, p_m in enumerate(apron_polys_m):
+    # DEBUG_TAXI_ONLY: skip apron triangulation entirely.  Apron polygons
+    # still feed taxiway classification upstream, but no Phase C2 apron
+    # triangles are emitted so the patch contains only taxi rects.
+    # DEBUG_NEW_MODEL: the new unified decomposition already handles
+    # apron pavement as part of the connected-component flat fills;
+    # skip the triangulation path so we don't double-emit.
+    _apron_polys_iter = ([] if (DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL)
+                         else apron_polys_m)
+    for ai, p_m in enumerate(_apron_polys_iter):
         clipped = p_m
         try:
             for subtract in (rwy_union_m, twy_union_m,
@@ -4649,7 +5307,10 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # (aprons already have building-shaped holes from C2 subtraction).
     # Elevations are pre-computed before Phase C.
 
-    for bi, bp in enumerate(building_polys_m):
+    # DEBUG_TAXI_ONLY: skip building pad emission.
+    _bldg_iter = ([] if DEBUG_TAXI_ONLY
+                  else list(enumerate(building_polys_m)))
+    for bi, bp in _bldg_iter:
         if bi not in bldg_elevations:
             continue
         # Clip building pad against runways + taxiways + junctions
@@ -4694,7 +5355,10 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # has an elevation shape, preventing DEM artifacts from distorting
     # the surface.
     n_coverage_fill = 0
+    # DEBUG_TAXI_ONLY / DEBUG_NEW_MODEL: skip coverage-fill sweep.
     try:
+        if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+            raise RuntimeError("skip coverage fill")
         paved_area = shp_geom.Polygon()
         paved_parts = []
         if not rwy_union_m.is_empty:
@@ -4793,7 +5457,9 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
     transition_strip_parts = []
 
-    if len(emitted_flat_shapes) >= 2:
+    # DEBUG_TAXI_ONLY / DEBUG_NEW_MODEL: skip transition strips.
+    if (not DEBUG_TAXI_ONLY and not DEBUG_NEW_MODEL
+            and len(emitted_flat_shapes) >= 2):
         from shapely.strtree import STRtree
         fs_polys = [s[0] for s in emitted_flat_shapes]
         fs_elevs = [s[1] for s in emitted_flat_shapes]
@@ -4929,7 +5595,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # vertices.
     triangle_zone_parts = []
 
-    if not junction_zone_m.is_empty:
+    # DEBUG_TAXI_ONLY: skip junction triangulation entirely.
+    if not DEBUG_TAXI_ONLY and not junction_zone_m.is_empty:
         jz_clipped = junction_zone_m
         if not rwy_union_m.is_empty:
             try:
@@ -5114,6 +5781,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     except Exception:
         pass
 
+    if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+        triangle_zone = shp_geom.Polygon()
     if not triangle_zone.is_empty:
         # Subtract emitted flat shapes so triangles don't overlap
         # what's already painted by Phase C.
@@ -5259,6 +5928,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                              if all_airport_parts else shp_geom.Polygon())
 
     try:
+        if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+            raise RuntimeError("skip Phase E")
         if not airport_footprint.is_empty and airport_footprint.area > 100:
             emitted_union = _emitted_union()
 
@@ -5835,6 +6506,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
     n_drainage = 0
     try:
+        if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+            raise RuntimeError("skip Phase F")
         if not airport_footprint.is_empty and airport_footprint.area > 100:
             full_emitted = _emitted_union()
             enclosure = (airport_footprint if not osm_boundary_m.is_empty
