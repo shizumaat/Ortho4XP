@@ -2647,6 +2647,111 @@ def _emit_pavement_new_model(
 
         total_merged += len(regions)
 
+        # ── 3.5 PRE-EMIT FIX: insert transition rects at all cliffs ─
+        # Scan adjacent region pairs for elevation mismatch.  Where
+        # the boundary z differs by > ELEV_ROUND, build a sloped
+        # transition rect (length = diff / MAX_GRADE) and subtract
+        # it from both regions.  Computed all-at-once before any
+        # emission so there's no cascade.
+        transition_rects = []  # (rect_poly, z_high, z_low, seg_len)
+        for i in range(len(regions)):
+            ri = regions[i]
+            if ri['poly'].is_empty:
+                continue
+            for j in range(i + 1, len(regions)):
+                rj = regions[j]
+                if rj['poly'].is_empty:
+                    continue
+                try:
+                    if not ri['poly'].intersects(rj['poly'].buffer(0.5)):
+                        continue
+                    shared = ri['poly'].boundary.intersection(
+                        rj['poly'].boundary.buffer(1.0))
+                except Exception:
+                    continue
+                if shared.is_empty:
+                    continue
+                segs = (list(shared.geoms) if hasattr(shared, 'geoms')
+                        else [shared])
+                best = max(segs,
+                           key=lambda s: s.length
+                           if hasattr(s, 'length') else 0,
+                           default=None)
+                if (best is None or not hasattr(best, 'length')
+                        or best.length < 5.0):
+                    continue
+                try:
+                    mid = best.interpolate(0.5, normalized=True)
+                except Exception:
+                    continue
+                zi = _pz(ri['plane'], mid.x, mid.y)
+                zj = _pz(rj['plane'], mid.x, mid.y)
+                diff = abs(zi - zj)
+                if diff <= ELEV_ROUND:
+                    continue
+                # Build transition rect
+                rect_len = min(diff / MAX_GRADE, 500.0)
+                seg_coords = list(best.coords)
+                if len(seg_coords) < 2:
+                    continue
+                sx = seg_coords[-1][0] - seg_coords[0][0]
+                sy = seg_coords[-1][1] - seg_coords[0][1]
+                seg_len = _math.hypot(sx, sy)
+                if seg_len < 5.0:
+                    continue
+                ux, uy = sx / seg_len, sy / seg_len
+                px, py = -uy, ux
+                # Orient toward higher-elev region
+                test = _Pt(mid.x + px * 5, mid.y + py * 5)
+                higher = ri['poly'] if zi >= zj else rj['poly']
+                if not higher.contains(test):
+                    px, py = uy, -ux
+                z_high = _round_z(max(zi, zj))
+                z_low = _round_z(min(zi, zj))
+                half = rect_len / 2.0
+                c0 = (seg_coords[0][0]+px*half, seg_coords[0][1]+py*half)
+                c1 = (seg_coords[-1][0]+px*half, seg_coords[-1][1]+py*half)
+                c2 = (seg_coords[-1][0]-px*half, seg_coords[-1][1]-py*half)
+                c3 = (seg_coords[0][0]-px*half, seg_coords[0][1]-py*half)
+                try:
+                    rect_poly = _Poly([c0, c1, c2, c3, c0])
+                    if not rect_poly.is_valid or rect_poly.is_empty:
+                        continue
+                except Exception:
+                    continue
+                transition_rects.append(
+                    (rect_poly, z_high, z_low, seg_len))
+
+        # Subtract all transition rects from merged regions
+        if transition_rects:
+            all_rects = _shp_ops.unary_union([tr[0] for tr in transition_rects])
+            for r in regions:
+                try:
+                    r['poly'] = r['poly'].difference(all_rects.buffer(0.1))
+                except Exception:
+                    pass
+
+        # Emit transition rects
+        n_trans = 0
+        for (rect_poly, z_high, z_low, seg_len) in transition_rects:
+            c = list(rect_poly.exterior.coords)
+            mh_x = (c[0][0]+c[1][0])/2; mh_y = (c[0][1]+c[1][1])/2
+            ml_x = (c[2][0]+c[3][0])/2; ml_y = (c[2][1]+c[3][1])/2
+            mh_lo, mh_la = to_ll(mh_x, mh_y)
+            ml_lo, ml_la = to_ll(ml_x, ml_y)
+            try:
+                _emit_sloped_rect(mh_la, mh_lo, z_high,
+                                  ml_la, ml_lo, z_low, seg_len)
+            except Exception:
+                continue
+            all_emitted_parts_m.append(rect_poly)
+            total_emitted += 1
+            n_trans += 1
+
+        if n_trans:
+            UI.vprint(2, "    {}: inserted {} transition rects"
+                      .format(icao, n_trans))
+
         # ── 4. EMIT with shape-type decision ─────────────────────────
         for r in regions:
             poly = r['poly']
@@ -2752,26 +2857,40 @@ def _emit_pavement_new_model(
                 total_emitted += 1
 
             else:
-                # >4 VERTICES — check if slope is primarily one
-                # direction (use as sloped if close to rectangular)
-                # or if there's multi-directional change (triangulate)
-                #
-                # For now: if OBB fit is good AND slope is uniaxial,
-                # emit as flat at mean (safe).  Otherwise emit as
-                # flat at mean too.  The validation pass will catch
-                # any resulting cliffs.
-                avg_z = _round_z(sum(zs) / len(zs))
-                ring_ll = [to_ll(x, y)
-                           for x, y in poly.exterior.coords]
-                try:
-                    _emit_flat_poly(ring_ll, avg_z)
-                except Exception:
-                    continue
-                emitted_flat_shapes.append((poly, avg_z))
-                all_emitted_parts_m.append(poly)
-                emitted_for_validation.append(
-                    (poly, [(v[0], v[1], avg_z) for v in verts]))
-                total_emitted += 1
+                # >4 VERTICES, sloped — fan-triangulate from centroid
+                # so each triangle preserves the plane's per-vertex
+                # elevations.  This avoids the "flat at mean" cliff
+                # factory.  For an n-vertex polygon this emits n
+                # triangles, each sharing an edge with the next.
+                cx = sum(v[0] for v in verts) / n_v
+                cy = sum(v[1] for v in verts) / n_v
+                cz = _round_z(_pz(plane, cx, cy))
+                for k in range(n_v):
+                    v0 = verts[k]
+                    v1 = verts[(k + 1) % n_v]
+                    z0 = zs[k]
+                    z1 = zs[(k + 1) % n_v]
+                    lo0, la0 = to_ll(*v0)
+                    lo1, la1 = to_ll(*v1)
+                    loc, lac = to_ll(cx, cy)
+                    try:
+                        _emit_triangle(la0, lo0, z0,
+                                       la1, lo1, z1,
+                                       lac, loc, cz)
+                    except Exception:
+                        continue
+                    try:
+                        tri_poly = _Poly([v0, v1, (cx, cy)])
+                        if tri_poly.is_valid and not tri_poly.is_empty:
+                            all_emitted_parts_m.append(tri_poly)
+                            emitted_for_validation.append(
+                                (tri_poly,
+                                 [(v0[0],v0[1],z0),
+                                  (v1[0],v1[1],z1),
+                                  (cx,cy,cz)]))
+                    except Exception:
+                        pass
+                    total_emitted += 1
 
     # ── 5. VALIDATE: equal altitudes at joins ────────────────────────
     n_violations = 0

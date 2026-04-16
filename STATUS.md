@@ -1,151 +1,238 @@
 # Auto-Patch Refactor — Status
 
-**Current direction:** bottom-up merge-based pavement
-decomposition, replacing the legacy Phase C0/C1/C2/D pipeline
-with a single pass that produces the minimum number of simple
-shapes covering the paved area.
+**Current state:** WIP bottom-up merge-based pavement model behind
+`O4_NEW_MODEL=1` flag.  The seed/merge/emit pipeline runs and
+produces output, but join violations remain unsolved.  The next
+agent should focus on the validation-and-fix loop.
 
-**Previous session's wins (head = `f6d3140`):**
+**Commits on dev branch:**
+- `f6d3140` — last stable commit from previous session (legacy
+  pipeline, 35 taxi rects at SPJC, 9.6 s runtime)
+- `7e6199e` — current session: new model function + gating
+  infrastructure + merge-based decomposition
 
-1. **Vertex-based rect emission** (commit `84953a6`) — SPJC now
-   emits **35 taxi rects** (within the user's 25–30 target) over
-   28 rectifiable polygons, down from 158 rects the commit before.
-2. **Profiling pass** (commit `f6d3140`) — full SPJC run time
-   dropped from **45.4 s → 9.6 s** (4.7× speedup).  Four hot
-   spots fixed: `_VertexBag` spatial hash, Phase E1 union
-   hoisting, Phase C4 STRtree subtract, `_delaunay_clipped`
-   prepared geometry + hole-free shortcut.
+## What was tried this session (and what failed)
 
-**Current session findings and new direction:**
+### 1. Per-polygon taxi/apron classification (legacy model review)
 
-The per-polygon taxi/apron classification model (Phases C0/C1/C2/D)
-is fundamentally wrong.  Multiple approaches were tried and failed
-during this session:
+Investigated why named taxiways (TWA, TWE, TWF, TWV) were missing.
+Found that apt.dat polygons don't correspond to named taxiways —
+e.g. "Taxiway Aux B, C, D, E, F, G, Main Ramp, RWY 33 Head" is
+ONE 160k m² polygon.  "Taxiway V / U / Q / R / L / M" is 858k m².
+The morphological decomposition (`buffer(-15).buffer(+15)`) can't
+extract individual taxi strips from these mega-blobs.  Taxiway A
+doesn't even have its own polygon — it's just paint inside "Base
+Ramp."  **Conclusion: per-polygon classification is a dead end.**
 
-1. **Centerline-driven emission (OSM taxi ways as source)** — works
-   for named taxis (TWA, TWE, TWF, TWV) but fails at airports
-   without OSM data, and apt.dat polygon shapes don't align with
-   the feature names anyway.  Abandoned after the user pointed
-   out we'd need apt.dat 120 rows as a fallback, plus width
-   probing, plus junction detection — increasingly complex for a
-   marginal gain.
+### 2. OSM centerline-driven emission
 
-2. **Flat-fill + transition-strip model** — decompose
-   `pavement_region = apt.dat_union − runways − buildings` into
-   connected components, emit each as a flat N-gon at DEM mean
-   with sloped 4-vertex rects at runway edges.  Produced
-   structurally OK results but:
-   - Flat fills with building holes had to be triangulated (OSM
-     ways don't support multipolygon holes) → 1 010 flat triangles
-     where 20 shapes should suffice.
-   - Adjacent flat fills and building pads had unmatched elevations
-     → cliffs everywhere.
-   - Still 1 912 total shapes — no improvement over legacy.
+OSM has 234 `aeroway=taxiway` ways for SPJC, 91 with `ref` tags
+covering all named taxis (A through V).  Prototyped using these
+as the emission source with apt.dat pavement as a clip mask.
+**Abandoned** because: OSM may not exist at small airports, OSM
+and apt.dat don't always align geometrically, and it re-introduces
+the buffer-precision problems that caused the original move to
+apt.dat polygons.
 
-3. **Recursive top-down split** — start with whole pavement, fit
-   one plane, split if fails.  Splitting is elevation-blind and
-   fragments by geometry instead of by planarity → too many small
-   shapes, odd shapes, parallel rects at different elevations.
+### 3. Flat-fill + transition-strip model
 
-**Root cause of all failures:** every approach tried to decompose
-pavement by GEOMETRY (polygon shapes, centerline paths, recursive
-bisection) instead of by ELEVATION PLANARITY.  The minimum shape
-count is a property of the DEM's planar structure, not the
-polygon boundaries.
+Decomposed `pavement_region = apt.dat_union − runways − buildings`
+into connected components, emitted each as a flat N-gon with
+sloped 4-vertex rects at runway edges.  Problems:
+- OSM ways can't represent polygons with holes → flat fills with
+  building holes required triangulation → 1010 flat triangles.
+- Adjacent shapes at different flat elevations → cliffs.
+- Phase E1/C4/coverage-fill noise added hundreds more shapes.
+Result: 1912 total ways, no improvement over legacy.
 
-### New approach: bottom-up merge-based decomposition
+### 4. Recursive top-down split
 
-**Problem statement:** Given the paved area (from apt.dat), a DEM,
-runway boundary elevations (fixed), and building pad elevations
-(yield-able), produce the fewest simple shapes whose piecewise
-elevation function covers the paved area while satisfying FAA/EASA
-grade limits and matching all boundary anchors.
+Start with whole pavement, fit one plane, split if fails.
+Splitting is elevation-blind → fragments by geometry, not by
+elevation planarity.  Produced 210 shapes at first, but with 2.45x
+coverage ratio (OBB waste), random elevation cliffs, and no slope
+awareness.  Various tuning attempts (OBB ratio, merge tolerance,
+simplification) didn't converge to a clean solution.
 
-**Key insight:** minimum shapes ≈ minimum number of planar zones
-in the pavement's FAA-smoothed elevation field.  Because we are
-SMOOTHING terrain to FAA/EASA compliance (not reproducing the raw
-DEM exactly), the effective elevation surface has lower complexity
-than the raw DEM — fewer bumps, gentler gradients — which means
-fewer planar zones are needed to represent it.
+### 5. Bottom-up merge (current implementation)
 
-**Algorithm (bottom-up merge):**
+**Algorithm:**
+1. PREPARE — union apt.dat pavement, subtract runways,
+   morphological-close (25 m) + simplify (15 m).
+2. SEED — `shapely.ops.triangulate` of boundary vertices + anchor
+   points (no densification, no interior grid).  DEM elevation at
+   each vertex, grade-clamped to 1.5 %, rounded to 0.5 m.
+3. MERGE — greedily merge adjacent coplanar triangles when combined
+   region fits one plane (grade ≤ 1.5 %, vertex residual ≤ 0.5 m).
+4. EMIT — flat N-gon / sloped 4-vertex rect / 3-vertex triangle.
 
-1. **Seed:** Constrained Delaunay triangulation of pavement_region
-   (minus runways, minus buildings, holes preserved) with runway-
-   boundary and building-boundary anchor vertices.  Use the
-   existing `O4_Surface_Mesh.adaptive_triangulate` which produces
-   a grade-constrained, DEM-faithful set of triangles.  This is
-   fine-grained but guaranteed valid.
+**SPJC results:** 688 seed → 286 merged → 406 emitted = 479 total
+ways (including 73 runway segments).  17 flat, 93 sloped rect,
+369 triangles.  **202 join violations remaining (max 2.0 m).**
 
-2. **Merge:** Greedily merge adjacent triangles into larger
-   regions whenever the combined region still fits one FAA-
-   compliant plane:
-   - Both nearly flat at the same elevation → merge into a
-     larger flat polygon.
-   - Both lie on one sloped plane within grade budget → merge
-     into a larger sloped region.
-   - Otherwise, don't merge.
-   Repeat until no more merges are possible.
+**Key findings from merge approach:**
+- `adaptive_triangulate` (from `O4_Surface_Mesh`) doesn't guarantee
+  full coverage at airport scale — it left 27.5 % gaps.  Switched
+  to `shapely.ops.triangulate` + centroid-inside-polygon filter
+  which achieves 99.99 % coverage.
+- Grade-clamping vertex elevations BEFORE merging (the "FAA
+  smoothing") dramatically improves merge convergence: 1470 → 48
+  with 30 iterations.  But unconstrained propagation flattens the
+  whole airport.  A bounded clamp (±2 m from original DEM, 10
+  iterations) is the right balance.
+- The ">4 vertex → flat at mean" emit fallback is a **cliff
+  factory**: it discards the plane's per-vertex elevations and
+  emits at a single mean elevation, creating 5 m cliffs with
+  neighbors.  Replaced with fan-triangulation from centroid, which
+  preserves per-vertex elevations but adds ~200 triangles.
+- A greedy post-emit fix loop (insert transition rects at cliffs)
+  DIVERGES: each fix creates new violations with third-party
+  neighbors.  Violations grew from 127 to 1104 over 10 rounds.
+- A pre-emit fix pass (compute all transition rects before emit)
+  catches only 8 of 234 violations because most violations come
+  from the emit step, not from merge boundaries.
+- SPJC is 70 % continuous slope, 30 % flat.  There are no large
+  flat zones to discover.  Elevation-quantized flood-fill at 0.5 m
+  produces 685 tiny zone fragments, not useful.
 
-3. **Convert** each merged region to its simplest valid shape type:
-   - Flat region → flat N-gon (`altitude=E`).  Any vertex count
-     OK because flat shapes have no per-vertex elevation.
-   - Sloped region ≈ rectangular → 4-vertex sloped rect
-     (`altitude_high` / `altitude_low`).
-   - Sloped region non-rectangular or compound → 3-vertex
-     triangle(s) (`node_altitudes`, exactly 3 unique vertices).
+### 6. User's structural insight (not yet implemented)
 
-**Why merging works:** it discovers the DEM's natural planar zones
-(flat runway-end aprons, gently-sloped taxi strips, compound
-junctions) without ever classifying anything.  Flat zones become
-flat N-gons; gradient zones become sloped rects; compound zones
-become triangles — all emerging from the math, not from feature
-labels.
+The user described airport pavement as a **graph of flat zones
+connected by sloped strips**:
 
-**Why smoothing helps:** FAA/EASA grade limits (1.5 % taxi, 1.0 %
-apron, FAA vertical-curve rule for runways) act as a low-pass
-filter on the elevation surface.  The smoothed DEM has fewer
-planar zones than the raw DEM, so merging converges to fewer
-shapes than an approach that tries to reproduce every DEM bump.
+- **Large flat areas** at runway ends and aprons.
+- **Sloped rects** connecting adjacent flat areas (length =
+  `elev_diff / max_grade` — this is physics, not a tunable).
+- **Compound-slope triangles** (~15 m) at runway edges where the
+  runway slope axis differs from the pavement, and at building
+  pad edges where pad elevation differs from pavement.
+- Shared vertices must match **exactly** (not "within tolerance").
 
-**Shape types allowed (reiterated):**
-- Flat N-vertex polygon: `altitude=E` — any vertex count
-- Sloped 4-vertex rectangle: `altitude_high=H, altitude_low=L,
-  cell_size=2, profile=spline`
-- 3-vertex triangle: `node_altitudes=z0,z1,z2,z0` — exactly 3
-  unique vertices, 4 comma-separated values (closing)
-- Runway segment: emitted by `generate_patch_osm`, not by this
-  pipeline
-- No N-vertex sloped polygons (not human-editable)
+The algorithm should build **outward from fixed constraints**
+(runways and buildings), not decompose the surface geometrically:
 
-**Estimated SPJC shape count:** 20–50 pavement shapes (after
-merge), plus ~313 building pads, plus 73 runway segments.
+```
+Step 1: Emit compound-slope connectors at runway boundaries
+        (grade-compliant in all directions, ~15 m but sized
+        to meet grade rule)
+Step 2: Emit compound-slope connectors at building/terminal
+        pad boundaries where needed
+Step 3: Between adjacent zones at different elevations, emit
+        sloped rects (length = diff / 0.015)
+Step 4: Fill remaining area with flat N-gons
+Validate: all shared vertices match exactly, all grades ≤ 1.5 %
+```
 
-**Phases disabled under the new model (`O4_NEW_MODEL=1`):**
-- Phase C0 (apt.dat rect-chain emission)
-- Phase C1 (OSM taxi buffer emission)
-- Phase C2 (apron triangulation)
-- Phase D (junction triangulation)
-- Phase E1 (boundary band)
-- Coverage fill
-- Drainage (temporarily, until pavement model is validated)
-- Phase C4 transition strip detection (replaced by merge logic)
+**This approach has NOT been implemented yet.**  It is the
+recommended next step.
 
-**Phases kept:**
-- Phase A0.5 (apt.dat ingest — pavement geometry source)
-- Phase A1–A4 (geometry building, building merge)
-- Phase A5 (elevation solve, building reconciliation)
-- Phase C3 (building flat pads — emit after pavement)
-- `generate_patch_osm` (runways, authoritative)
-- `_runway_elev_lookup` (emitted-chain lookup for runway-side
-  anchors at pavement-runway boundary)
+## Unsolved problems
 
-**Implementation status:** `_emit_pavement_new_model()` exists in
-`O4_Auto_Patch.py` behind the `O4_NEW_MODEL=1` env flag.
-Currently implements the flat-fill + transition-strip model
-(approach 2 above) which is being replaced by the merge-based
-approach.  The function signature and gating infrastructure are
-reusable; only the emission loop body changes.
+1. **Join validation:** 202 violations remain at up to 2.0 m.
+   Shared vertices between adjacent shapes don't match.  The
+   user requires EXACT match (0.0 m tolerance), not "within 0.5 m."
+
+2. **>4 vertex sloped regions:** can't emit as sloped N-gon
+   (not human-editable) or as flat at mean (creates cliffs).
+   Fan-triangulation preserves elevations but adds many triangles.
+   Need a way to decompose these into clean 4-vertex rects.
+
+3. **Transition rect sizing:** when two shapes differ by X meters,
+   the connecting sloped rect must be `X / 0.015` meters long.
+   This may extend through multiple neighboring shapes, requiring
+   those shapes to be cut and their elevations recalculated.
+
+4. **Building pad interaction:** building pads from Phase C3 emit
+   at their own elevations after the pavement model.  No compound
+   connectors bridge pad-to-pavement elevation differences.
+
+5. **Overlap:** current output has 2.4 % overlap, mostly from fan
+   triangulation on concave polygons and transition rect geometry.
+
+## Implementation details
+
+### `_emit_pavement_new_model()` in `O4_Auto_Patch.py`
+
+Module-level function called from inside `generate_airport_surface_
+patches` when `O4_NEW_MODEL=1`.  Takes all pipeline closures as
+parameters (DEM sampler, emit helpers, runway lookup, etc.).
+
+**Gating:** `O4_NEW_MODEL=1` disables:
+- Phase C0 (apt.dat rect-chain), Phase C1 (OSM taxi buffer)
+- Phase C2 (apron triangulation), Phase D (junction triangulation)
+- Phase C4 (transition strip detection)
+- Phase E1 (boundary band), coverage fill, drainage
+
+**Keeps running:** Phase A0.5–A5 (geometry + elevations),
+Phase C3 (building pads), `generate_patch_osm` (runways).
+
+### Pavement preparation
+
+```python
+pav_region = unary_union(apt_twy_polys_m + apron_polys_m)
+pav_region = pav_region.difference(rwy_union_m)
+pav_region = pav_region.buffer(25).buffer(-25)   # morphological close
+pav_region = pav_region.simplify(15.0)            # RDP simplify
+```
+
+The 25 m closing + 15 m simplify was tuned visually against SPJC:
+- Absorbs thin arms, jogs, and small interior blobs
+- Produces 2 clean connected components with 6 interior holes
+- ~170 exterior vertices, 13 % area overflow vs raw apt.dat
+
+### Seed triangulation
+
+Uses `shapely.ops.triangulate(MultiPoint(pts))` with boundary
+vertices + runway/building anchor points.  Triangles outside the
+polygon or inside holes are discarded via `polygon.contains(
+triangle.representative_point())`.  Produces ~688 seed triangles
+at 99.99 % coverage.  **No densification, no interior grid** —
+boundary vertices + anchors are sufficient.
+
+### Grade clamping
+
+After seed, before merge.  Builds edge adjacency from triangulation.
+For each edge where `|z1 - z2| / distance > 1.5 %`, pulls the
+non-anchored vertex toward compliance.  Anchored vertices (runway/
+building boundary) don't move.  Max adjustment ±2 m from original
+DEM.  10 iterations.  All elevations rounded to 0.5 m.
+
+### Merge
+
+Greedy: for each region pair sharing a boundary, try union + plane
+refit.  Accept if grade ≤ 1.5 % and max vertex residual ≤ 0.5 m.
+Repeat until no merges happen.  Typically reduces 688 → 286.
+
+### Emit
+
+- z_range < 0.5 m → flat N-gon
+- 3 vertices → triangle with `node_altitudes`
+- 4 vertices, slope in one direction → sloped rect
+- \>4 vertices, sloped → fan-triangulate from centroid
+
+### Validation
+
+Post-emit scan of all adjacent shape pairs.  For each pair,
+samples the shared boundary midpoint and compares each shape's
+interpolated elevation (IDW from vertex elevations).  Reports
+violations > 0.5 m.  **Does not fix violations — that's the
+next step.**
+
+## How to run
+
+```bash
+# Current merge model (behind flag):
+O4_NEW_MODEL=1 O4_DEBUG_TAXI_ONLY=1 ./venv/bin/python3 /tmp/run_legacy.py
+
+# Legacy model (default, no flags):
+./venv/bin/python3 /tmp/run_legacy.py
+
+# Audit the output:
+./venv/bin/python3 /tmp/audit_legacy.py
+```
+
+Output goes to `/tmp/SPJC_legacy.patch.osm`.  Copy to
+`Patches/-20-080/-13-078/SPJC_auto.patch.osm` for X-Plane.
 
 ## Active surface invariants (apply to all emitted geometry)
 
