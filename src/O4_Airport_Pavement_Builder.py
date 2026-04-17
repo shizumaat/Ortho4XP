@@ -419,65 +419,81 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         xplane_root, icao, anchor[0], anchor[1])
     osm_centerlines = _extract_osm_taxi_centerlines(nodes, ways, to_m)
 
+    # ── Identify junction node CLUSTERS from OSM topology ───────
+    # Any OSM node referenced by ≥2 taxi ways is a potential junction
+    # point.  Nodes within JUNCTION_CLUSTER_DIST of each other are
+    # merged into one cluster (target junctions often span a whole
+    # multi-way intersection, not just a single OSM node).
+    junction_points = _find_junction_points(nodes, ways, to_m)
+
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
         osm_centerlines, pav_union, layout.runway_union, rwy_centerlines)
 
+    # ── Build junction polys around each junction cluster ───────
+    # Each junction cluster gets a disc polygon of radius based on
+    # the local pavement half-width, clipped to pavement.  Then
+    # taxi rects are trimmed against the junction polys, so rects
+    # become simple straight segments and junction polys absorb the
+    # bends / tapers / intersection zones.
+    junction_polys = _build_junction_polys(
+        junction_points, taxi_rects, pav_union)
+
+    junction_union = (unary_union(junction_polys)
+                      if junction_polys else None)
+
+    # Trim rects against junction polys
     emitted_taxi_rects: List[Polygon] = []
     for rect, axis, role, ref in taxi_rects:
-        emitted_taxi_rects.append(rect)
+        r = rect
+        if junction_union is not None:
+            try:
+                r = rect.difference(junction_union)
+            except Exception:
+                pass
+            if r.is_empty:
+                continue
+            if r.geom_type == "MultiPolygon":
+                # Rect got split by multiple junction polys — keep
+                # the largest piece (the "through" segment).
+                r = max(r.geoms, key=lambda p: p.area)
+            if r.geom_type != "Polygon":
+                continue
+            if r.area < 20.0:
+                continue
+        emitted_taxi_rects.append(r)
         layout.shapes.append(BuiltShape(
-            polygon=rect, role=role, ref=ref, source_axis=axis))
+            polygon=r, role=role, ref=ref, source_axis=axis))
 
-    # ── Residue: pavement minus taxi rects ───────────────────────
-    # Fragments ≥ MIN_APRON_AREA_M2 → apron (terminal / engine_test
-    # scale).  Smaller → junction (gap between taxi rects).  Drops
-    # slivers < MIN_JUNCTION_AREA_M2.
-    #
-    # Adjacent residue fragments are merged via buffer(+2).buffer(-2)
-    # before emission — this closes the narrow strips my rect corners
-    # leave between neighboring taxi rects so the resulting junction
-    # polygon covers the full intersection zone.
+    # Emit junction polys
+    for jp in junction_polys:
+        # Simplify to 5–18 vertex target convention
+        simp = jp.simplify(1.0, preserve_topology=True)
+        if simp.is_empty or simp.geom_type != "Polygon":
+            simp = jp
+        layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_JUNCTION))
+
+    # ── Aprons: residue after rects + junctions subtracted ──────
+    MIN_APRON_AREA_M2 = 3000.0
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
-    MIN_APRON_AREA_M2 = 3000.0
-    MIN_JUNCTION_AREA_M2 = 80.0
-    JUNCTION_MERGE_BUFFER = 5.0
     if pav_union is not None:
         residue = pav_union
         if taxi_rect_union is not None:
             residue = residue.difference(taxi_rect_union)
-        # Morphological close to merge adjacent fragments
-        try:
-            merged = residue.buffer(JUNCTION_MERGE_BUFFER).buffer(
-                -JUNCTION_MERGE_BUFFER)
-        except Exception:
-            merged = residue
-        # Clip back to pavement so the buffer doesn't stick out
-        if not merged.is_empty and pav_union is not None:
-            try:
-                merged = merged.intersection(pav_union)
-            except Exception:
-                merged = residue
-        # Subtract taxi rects again (buffer can grow back into them)
-        if taxi_rect_union is not None:
-            try:
-                merged = merged.difference(taxi_rect_union)
-            except Exception:
-                pass
-
-        parts = [merged] if merged.geom_type == "Polygon" else list(
-            getattr(merged, "geoms", []))
+        if junction_union is not None:
+            residue = residue.difference(junction_union)
+        parts = [residue] if residue.geom_type == "Polygon" else list(
+            getattr(residue, "geoms", []))
         for part in parts:
             if part.geom_type != "Polygon":
                 continue
-            if part.area < MIN_JUNCTION_AREA_M2:
+            if part.area < MIN_APRON_AREA_M2:
                 continue
-            role = ROLE_APRON if part.area >= MIN_APRON_AREA_M2 else ROLE_JUNCTION
             simp = part.simplify(1.0, preserve_topology=True)
             if simp.is_empty or simp.geom_type != "Polygon":
                 simp = part
-            layout.shapes.append(BuiltShape(polygon=simp, role=role))
+            layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
 
     return layout
 
@@ -485,6 +501,106 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
 # ──────────────────────────────────────────────────────────────────
 # Centerline-based taxi rect builder
 # ──────────────────────────────────────────────────────────────────
+
+JUNCTION_CLUSTER_DIST_M = 40.0  # merge junction nodes within this distance
+JUNCTION_RADIUS_SCALE = 1.2     # disc radius = local_half_width × this
+
+
+def _find_junction_points(
+    nodes: Dict[str, Tuple[float, float]],
+    ways: List[Tuple[str, List[str], Dict[str, str]]],
+    to_m,
+) -> List[Tuple[float, float]]:
+    """Identify junction POINTS (clusters of shared OSM nodes).
+
+    Any OSM node referenced by ≥ 2 taxi ways is a candidate junction
+    point.  Candidates within ``JUNCTION_CLUSTER_DIST_M`` of each
+    other merge into one cluster; the cluster centroid is the
+    junction point.
+    """
+    from collections import defaultdict
+    in_ways: Dict[str, int] = defaultdict(int)
+    for wid, nds, tags in ways:
+        if tags.get("aeroway") != "taxiway":
+            continue
+        for n in nds:
+            in_ways[n] += 1
+
+    candidates: List[Tuple[float, float]] = []
+    for nid, count in in_ways.items():
+        if count < 2:
+            continue
+        if nid not in nodes:
+            continue
+        lat, lon = nodes[nid]
+        candidates.append(to_m(lon, lat))
+
+    # Cluster within JUNCTION_CLUSTER_DIST_M (greedy single-link)
+    clusters: List[List[Tuple[float, float]]] = []
+    for pt in candidates:
+        placed = False
+        for cl in clusters:
+            # Check distance to any member
+            if any(math.hypot(pt[0]-q[0], pt[1]-q[1]) <= JUNCTION_CLUSTER_DIST_M
+                   for q in cl):
+                cl.append(pt)
+                placed = True
+                break
+        if not placed:
+            clusters.append([pt])
+
+    # Return centroids
+    return [(sum(p[0] for p in cl)/len(cl),
+             sum(p[1] for p in cl)/len(cl)) for cl in clusters]
+
+
+def _build_junction_polys(
+    junction_points: List[Tuple[float, float]],
+    taxi_rects: List[Tuple[Polygon, LineString, str, str]],
+    pav: Optional[Polygon],
+) -> List[Polygon]:
+    """Emit a junction polygon at each junction point.
+
+    The polygon is a disc of radius proportional to the local taxi
+    half-width (looked up from adjacent rects), clipped to the
+    pavement union.  Returns Polygons only (no MultiPolygons).
+    """
+    if pav is None or not junction_points:
+        return []
+
+    polys = []
+    for (jx, jy) in junction_points:
+        # Find nearest taxi rect to determine local width
+        jpt = Point(jx, jy)
+        nearby_widths = []
+        for rect, axis, role, ref in taxi_rects:
+            if rect.distance(jpt) <= 5.0:  # within 5 m of junction
+                # Width = rect's perpendicular extent.  Use area / length.
+                coords = list(rect.exterior.coords)
+                if len(coords) >= 4:
+                    d01 = math.hypot(coords[1][0]-coords[0][0],
+                                     coords[1][1]-coords[0][1])
+                    d12 = math.hypot(coords[2][0]-coords[1][0],
+                                     coords[2][1]-coords[1][1])
+                    nearby_widths.append(min(d01, d12))
+        if nearby_widths:
+            half_w = max(nearby_widths) / 2.0
+        else:
+            half_w = 25.0  # default for taxi of ~50 m width
+        radius = half_w * JUNCTION_RADIUS_SCALE
+        disc = jpt.buffer(radius, resolution=12)
+        clipped = disc.intersection(pav)
+        if clipped.is_empty:
+            continue
+        if clipped.geom_type == "MultiPolygon":
+            clipped = max(clipped.geoms, key=lambda p: p.area)
+        if clipped.geom_type != "Polygon":
+            continue
+        if clipped.area < 100.0:
+            continue
+        polys.append(clipped)
+    return polys
+
 
 def _extract_osm_taxi_centerlines(
     nodes: Dict[str, Tuple[float, float]],
@@ -532,12 +648,14 @@ def _extract_osm_taxi_centerlines(
             # airport has any refs at all.
             pass
 
-        # RDP-simplify with 3 m tolerance — removes minor GPS wobble
-        # but keeps genuine bend vertices.  Target users typically
-        # break a long taxi at bends of ~5 m deviation, so RDP at 3 m
-        # preserves those segment boundaries.
+        # RDP-simplify with 1 m tolerance — almost lossless, keeps
+        # every bend vertex.  The user's target convention is to
+        # emit simple straight rect segments and fill bends / curves
+        # / intersections with enlarged junction polygons.  So we
+        # need MAXIMAL segmentation: any vertex where the centerline
+        # changes direction breaks into a new segment.
         try:
-            simp = LineString(pts).simplify(3.0, preserve_topology=False)
+            simp = LineString(pts).simplify(1.0, preserve_topology=False)
         except Exception:
             continue
         scoords = list(simp.coords)
