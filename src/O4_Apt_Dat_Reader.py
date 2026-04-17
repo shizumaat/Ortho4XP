@@ -146,8 +146,13 @@ def find_airport_apt_dat(xplane_root: str, icao: str) -> Optional[str]:
         return None
 
     custom_scenery = os.path.join(xplane_root, "Custom Scenery")
-    global_pack = os.path.join(
+    # X-Plane 11 layout:
+    global_pack_v11 = os.path.join(
         custom_scenery, "Global Airports", "Earth nav data", "apt.dat")
+    # X-Plane 12 layout (shipped pack moved to Global Scenery):
+    global_pack_v12 = os.path.join(
+        xplane_root, "Global Scenery", "Global Airports",
+        "Earth nav data", "apt.dat")
     default_pack = os.path.join(
         xplane_root, "Resources", "default scenery",
         "default apt dat", "Earth nav data", "apt.dat")
@@ -162,9 +167,10 @@ def find_airport_apt_dat(xplane_root: str, icao: str) -> Optional[str]:
             if os.path.isfile(pack_apt) and _file_has_airport(pack_apt, icao):
                 return pack_apt
 
-    # Step 2: Global Airports.
-    if os.path.isfile(global_pack) and _file_has_airport(global_pack, icao):
-        return global_pack
+    # Step 2: Global Airports pack (X-Plane 11 or 12 location).
+    for cand in (global_pack_v11, global_pack_v12):
+        if os.path.isfile(cand) and _file_has_airport(cand, icao):
+            return cand
 
     # Step 3: default apt.dat.
     if os.path.isfile(default_pack) and _file_has_airport(default_pack, icao):

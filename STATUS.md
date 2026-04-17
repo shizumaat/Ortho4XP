@@ -1,9 +1,464 @@
 # Auto-Patch Refactor — Status
 
-**Current state:** WIP bottom-up merge-based pavement model behind
-`O4_NEW_MODEL=1` flag.  The seed/merge/emit pipeline runs and
-produces output, but join violations remain unsolved.  The next
-agent should focus on the validation-and-fix loop.
+**Current state:** New emitter `src/O4_Airport_Pavement_Builder.py`
+(Phase 1: shapes + roles only) being built to reproduce hand-drawn
+target OSMs at `tests/fixtures/{SPJC,SPLP}_target.osm`.  Target
+tolerance is **5 m vertex-match for runway** (already passing at
+<0.3 m after target resnap) and **1 m for non-runway shapes with
+freedom to snap to apt.dat pavement edges**.
+
+This supersedes the apron-deformation model below; the elevation
+work is Phase 2.
+
+## Phase 1 — target-driven layout builder
+
+### Infrastructure
+- **`tools/compare_target.py`** — parses target + output OSMs,
+  reports per-role IoU matching + symmetric vertex-match distance
+  distributions.  Success metric is: max vertex distance per matched
+  shape ≤ tolerance.
+- **`tools/build_target_osm.py`** — driver that runs
+  `build_airport_pavement(icao, xplane_root)` and writes OSM.
+- **`src/O4_Airport_Pavement_Builder.py`** — the new builder.
+  Current implementation:
+  1. Emit runway rects (apt.dat row 100 + blast pads).
+  2. Load OSM taxi centerlines from tile cache.
+  3. Clip each centerline to pavement (pavement union minus runway).
+  4. Probe rect width as 2× median distance-to-boundary along axis
+     (ray-cast is unusable at SPJC where pavement is one big blob —
+     perpendicular rays overshoot into apron and saturate at 120 m).
+  5. Extend rect endpoints outward until they leave the pavement,
+     so corners land on apt.dat pavement boundaries.
+  6. Classify role from angle-to-runway + length + proximity.
+  7. Dedup overlapping rects (≥ 70 % inside emitted union).
+  8. Aprons = pavement union minus emitted taxis, per connected
+     component.
+
+### Target file conventions
+- 8 role values (+ 3 unused on SPLP):
+  `runway, primary_parallel, secondary_parallel, stub,
+   cross_connector, junction, apron, terminal`.
+- **Shared vertices pairwise only** (162 of 470 SPJC nodes shared
+  by exactly 2 ways, 0 by ≥ 3).  Pairwise shared-vertex invariant
+  enforces geometric consistency between adjacent shapes.
+- Altitude tags (`altitude`, `altitude_high`, `altitude_low`) are
+  Phase 2 — 9 elevation-only ways in SPJC target ignored by Phase 1.
+- Runway corners in both targets **were resnapped to apt.dat
+  row-100 + blast-pad corners** (user authorized; runways are
+  reference only since `generate_patch_osm` emits sloped segmented
+  runways in production).
+
+### Current scores (commit `1bdae1c` as baseline, HEAD as current)
+
+```
+                        SPJC (72 target shapes)      SPLP (29 target shapes)
+                        baseline  current            baseline  current
+runway                  0/2       2/2 (IoU 1.00)     0/1       1/1 (IoU 0.99)
+primary_parallel        1/9 (0.11) 5/9 (0.40)        0/3       0/3
+secondary_parallel      1/4 (0.20) 0/4               0/0       n/a
+cross_connector         1/2 (0.12) 2/2 (0.56)        0/2       2/2 (0.24)
+stub                    5/15(0.43) 9/15 (0.23)       0/6       2/6 (0.19)
+apron                   0/3       3/3 (0.57)         0/3       1/3 (0.33)
+junction                0/35      0/35 (not emitted) 0/14      0/14
+terminal                0/2       0/2 (not emitted)  —         —
+TOTAL matched           8         21                 —         6
+```
+
+Runways pass at 0.2–0.3 m.  Everything else has max-vertex-
+distance of **60–180 m** on the best matches — well above the 1 m
+target.  Main remaining gaps (next-session priorities):
+
+1. **Ref consolidation.** SPJC has sub-refs A1–A6, D1/D2, F1, M1–M3,
+   R1/R2 that should merge into their parent refs.  Currently each
+   sub-ref emits its own rect, creating 46 stubs vs 15 target.
+2. **Rect endpoint trimming.** Rects extend to pavement edge even
+   when the target rect ends at a neighbour (stub vs parallel).
+   Primary_parallel V: 61 m max vertex distance because my rect
+   extends full length of pavement while target stops at stub
+   intersection.
+3. **Junction emission.** 0/35 SPJC + 0/14 SPLP.  These are the
+   filler polygons between rects — target has them explicit.  Need
+   to compute the gap polygon and emit with shared corner vertices.
+4. **Apron consolidation.** 59 output aprons vs 3 target — each
+   apron-residue fragment is emitting separately instead of unioning
+   into the big terminal/engine-test regions.
+5. **Terminal emission.** From OSM building data; 0 emitted so far.
+6. **SPLP primary parallels.** Only 1 emitted from OSM, target has
+   3.  SPLP OSM has 15 taxi centerlines, none with refs — need
+   smarter selection (length, parallelism, distance to runway).
+
+### Files touched this session
+- New: `src/O4_Airport_Pavement_Builder.py`, `tools/compare_target.py`,
+  `tools/build_target_osm.py`.
+- Modified: `src/O4_Apt_Dat_Reader.py` (X-Plane 12 `Global Scenery/
+  Global Airports` path added to `find_airport_apt_dat`).
+- Modified: `tests/fixtures/SPJC_target.osm`, `SPLP_target.osm` —
+  runway corner nodes resnapped to apt.dat coordinates.  No other
+  nodes touched.
+
+### How to resume
+```
+./venv/bin/python3 tools/build_target_osm.py SPJC
+./venv/bin/python3 tools/build_target_osm.py SPLP
+./venv/bin/python3 tools/compare_target.py \
+    tests/fixtures/SPJC_target.osm /tmp/SPJC_auto.osm --tol 1 -v
+./venv/bin/python3 tools/compare_target.py \
+    tests/fixtures/SPLP_target.osm /tmp/SPLP_auto.osm --tol 1 -v
+```
+
+## Legacy status (Phase 2 territory, not currently active)
+
+(original content below — apron-deformation model, bottom-up merge,
+legacy pipeline history — all still relevant for Phase 2 elevation
+work.)
+
+## Active plan — apron-deformation reactive model
+
+The user converged on this model over the course of this session;
+it supersedes the prior junction-carving model (§5 below) and
+every approach in §1-4.  Implementation is staged.
+
+### Rules (all user-authored, non-negotiable)
+
+1. **No strip buffers.**  Each apt.dat pavement polygon IS a
+   shape.  Narrow pavement (short side ≤ 30 m) classifies as
+   **taxi**; wider pavement classifies as **apron**; runway
+   polygons are handled by `generate_patch_osm`, not here.
+2. **Taxi shapes have a 1D axial slope** (≤ 1.5 %, relaxable to
+   3.0 % when otherwise infeasible).  Axis = MRR midline for
+   simple-strip polygons, Voronoi centerline(s) for mega-polys.
+3. **Apron shapes are 2D deformable surfaces** at ≤ 1.0 % in any
+   direction.  No transition wedges are emitted at apron-apron or
+   apron-taxi or apron-runway joins — the apron itself reshapes
+   so its boundary elevations match every neighbor exactly.
+4. **Shared-boundary vertices have identical elevations.**  All
+   vertex altitudes are quantised to **0.5 m increments**; at any
+   point where two shapes share a vertex, both emit the same
+   quantised value.  "0 m tolerance" means emitted-string
+   equality, not float equality.
+5. **The last 30 m of a taxi polygon may be a triangle zone** for
+   compound-slope blending with an intersecting shape whose axis
+   differs.  Triangle zones use ≤ 1.0 % grade per the transition-
+   triangle rule in STATUS invariant 5.
+6. **Yielding priority:** runway never yields; everything else
+   negotiates within its grade cap.  Buildings yield within
+   `±BLDG_ADJUST_MAX`; aprons yield via 2D deformation; taxis
+   yield via axial profile.  Terminal pads force unrealistic
+   flat zones — taxi grade is allowed up to 3.0 % to absorb
+   this pressure.
+7. **Build order (unchanged from STATUS):** runways → buildings
+   → aprons → taxis → reconciliation.
+
+### Data model
+
+- `Shape(polygon, kind, axis, width_m)` — one per (sub-)polygon
+  extracted from apt.dat; mega-polys may produce multiple Shapes
+  via Voronoi branching.  `kind ∈ {"taxi", "apron"}`.  `axis` is
+  `None` for aprons.
+- `Adjacency(shape_a, shape_b, shared_boundary)` — the planar
+  subdivision's edge graph.  Derived from polygon-boundary
+  intersection, not buffered proximity.
+- **No Junction type.**  No strip buffers.  No pre-carved discs.
+- Shared boundaries are the apt.dat polygon edges themselves
+  (possibly after a single unioning pass to merge co-edged
+  polygons of the same kind).
+
+### Solver sketch
+
+1. Fix runway segment elevations via CIFP (existing
+   `generate_patch_osm`).
+2. Fix building pad elevations (DEM centroid, adjustable
+   `± BLDG_ADJUST_MAX`).
+3. **Solve apron surfaces:** for each connected apron region,
+   compute a 2D elevation field satisfying ≤ 1.0 % grade in any
+   direction and matching exact elevations at every shared
+   boundary with a runway, building pad, or taxi endpoint anchor.
+   Interior seed = DEM, smoothed to grade.
+4. **Solve taxi axial profiles:** each taxi's 1D profile along
+   its axis, endpoints pinned to the apron-edge or runway-segment
+   elevation at each axis terminal.  Grade cap 1.5 %; if
+   infeasible, relax to 3.0 %.
+5. **Reconciliation:** if a taxi still infeasible at 3.0 %,
+   relax the adjacent building pad's elevation toward the
+   constraint.  Runways never relax.
+6. **Quantisation:** round every vertex altitude to 0.5 m.  When
+   two shapes share a vertex, they read the same quantised value.
+
+### Emission (role-based pipeline, user-specified staging)
+
+After decomposition, shapes are classified by role
+(`classify_shape_roles`) into one of five categories, each with
+its own emission treatment:
+
+1. **Primary parallel** (length ≥ 0.25 × runway length, within
+   300 m of runway, parallel ± 15°): handed off to the runway
+   emitter.  Start / end elevations match the runway's same-side
+   elevation at each axis endpoint.  Emitted as a **multi-segment
+   sloped rect chain** (same shape type as runway segments), with
+   DEM-driven undulations between the CIFP anchors honouring the
+   1.5 % grade rule.
+2. **Stub** (short taxi adjacent to a primary parallel, axis ≤
+   300 m): single sloped rect from the primary parallel edge to
+   the runway edge, **leaving an elevation-dependent gap** at both
+   ends for the later triangle-join pass.
+3. **Secondary parallel** (parallel to runway, but too short /
+   too far to be primary): DEM-driven segmented rect chain, same
+   pattern as primary parallel but anchored to neighbour shapes
+   instead of CIFP.
+4. **Cross-connector** (perpendicular to runway, adjacent to two
+   parallels): single sloped rect, **stopping short** of both
+   parallel intersections.  Gap sized for the triangle-join pass.
+5. **Apron:** single flat N-gon when solved elevation range
+   < 0.5 m; otherwise triangulated with per-vertex
+   `node_altitudes`.  Footprint = polygon minus all primary /
+   stub / secondary / cross rects minus their safety gaps.
+
+All shared vertices produce identical `(lat, lon, altitude)`
+strings after 0.5 m quantisation.  Gaps between shape categories
+will be filled in a later "join" pass by either:
+
+- a flat poly (if both sides agree on elevation to within 0.5 m),
+- a single sloped rect (if the slope is 1-axis along the gap),
+- or a triangle wedge (compound slope or runway edge meeting taxi
+  at different altitude).
+
+### What this supersedes
+
+The previous model had `Junction` objects with pre-carved discs
+between meeting strips, plus "transition rect" logic for elevation
+differences.  Both are removed.  The apron-deforms-to-fit rule
+makes wedges/junctions unnecessary.  This also resolves STATUS's
+previously-unsolved problem #3 (transition-rect cascade) because
+the rule becomes "apron absorbs Δelev over its whole surface,"
+not "insert rect of length Δelev / 0.015 that may cut through
+neighbors."
+
+### Intersection handling (derived, not geometric)
+
+Intersections between shapes are **not pre-identified geometric
+objects**.  They emerge from the slope-gradient comparison at
+each adjacency:
+
+- Apron on either side → apron 2D-deforms to match the neighbour's
+  boundary elevation; no extra shape emitted.
+- Taxi-to-taxi with similar axial slopes → shapes meet at shared
+  vertices directly, no extra shape.
+- Taxi-to-anything with incompatible slope axes or nonzero Δelev
+  that the apron can't absorb → the taxi's end becomes a
+  **triangle zone** (up to 30 m by default) that accepts compound
+  slope at ≤ 1.0 %.  The triangle zone is an INTERNAL
+  subdivision of the taxi polygon, not a separately-carved shape.
+
+### Validation + iterative fix loop
+
+Because some airport geometries (e.g. forced-flat terminal pads)
+cannot be satisfied with default parameters, the emitter runs a
+final validation + fix loop:
+
+```
+solve_elevations()
+for iteration in range(MAX_FIX_ITER):
+    violations = validate_joins()
+    if not violations:
+        break
+    for v in violations:
+        apply_geometry_fix(v)        # grow triangle zone, shrink axial region
+    re_solve_affected_subgraph()
+```
+
+Violation types:
+
+1. **Cliff:** two shapes share a vertex with different emitted
+   elevations.  Fix: solver bug — should not happen when shared
+   vertices use the identical quantised value.
+2. **Grade violation in taxi axial region:** edge's slope exceeds
+   1.5 %.  Fix: grow the triangle zone at the violating end,
+   shortening the axial region.
+3. **Grade violation in triangle zone:** compound-slope region's
+   internal gradient exceeds 1.0 %.  Fix: grow the triangle zone
+   further (up to the full taxi polygon length).
+4. **Infeasible at triangle-zone-covers-whole-shape:** fall back
+   in this order:
+   a. relax taxi grade cap 1.5 % → 3.0 %
+   b. relax adjacent building pad ± ``BLDG_ADJUST_MAX``
+   c. log an unresolvable violation (runway anchors never move)
+
+**Why this is different from the old greedy-fix loop** (STATUS
+§5, which diverged): the old approach patched *elevations*
+locally, which introduced new violations at third-party
+neighbours.  The new approach modifies *geometry* (triangle-zone
+extent) and then **re-runs the solver** on the affected
+subgraph.  The solver converges globally even though the loop
+runs locally.
+
+### Staged implementation
+
+1. **Decomposition cleanup:** strip the Junction type and all
+   strip-buffer / junction-carving code from
+   `O4_Pavement_Strips`.  Output is a flat list of Shapes.
+   ✅ done
+2. **Per-branch local-width decomposition:** mega-polygons are
+   split via Voronoi skeleton + median local-width filter;
+   branches wider than 30 m (median) remain apron; narrower
+   branches become individual taxi shapes with their Voronoi-
+   corridor polygon.  Apron residuals union into connected
+   components.  ✅ done (60 shapes at SPJC)
+3. **Adjacency graph:** compute polygon-boundary adjacencies
+   with a 0.5 m tolerance to absorb apt.dat precision gaps.
+   Per-boundary-segment, the nearest-neighbour shape claims the
+   segment (no double-counting).  🔨 in progress — tolerance
+   matching works, nearest-neighbour partition still needed.
+4. **Elevation solver:** apron 2D field + taxi 1D profile with
+   the hierarchical order in the build-order section above.
+5. **Triangulation emitter:** replace the zero-elevation preview
+   with actual elevations + triangulated aprons + triangle zones
+   at taxi ends.
+6. **Validation + fix loop:** the section above.
+
+**Current state:** step 3 (adjacency graph) done with 0.5 m
+boundary tolerance.  Steps 1-2 refined extensively; role
+classification + multi-segment emission + 10 m taxi-end gap +
+apron carving all working.  **Next:** ground-truth-driven
+refinement (see below).
+
+## Ground-truth approach — next phase
+
+The user will hand-craft an OSM file representing the desired
+output shapes for SPJC: `tests/fixtures/SPJC_target.osm`.  Each
+way or multipolygon relation gets:
+
+```
+aeroway=taxiway|apron
+role=primary_parallel|secondary_parallel|stub|cross_connector|apron
+ref=V|L1|A3|...   (optional, human-readable)
+width=NN           (optional, for taxis)
+```
+
+No elevations — this is a **geometry target** only.  The user
+will draw it in JOSM using the SPJC Jeppesen chart as reference.
+
+### What will be built when the target arrives
+
+1. `tools/compare_target.py` — parses both target and current
+   output, matches shapes by best IoU, reports:
+   - matched (IoU ≥ 0.8)
+   - partially matched (0.3 ≤ IoU < 0.8)
+   - missed (no target-side match)
+   - spurious (no algorithm-side match)
+   - per-role F-score
+2. `tests/test_target_match_spjc.py` — runs comparison, asserts
+   F-score threshold.  Fails the build on regression.
+3. **Iterative tuning:** algorithm has ~10-15 tunable knobs
+   (NARROW_WIDTH_M, skeleton tolerances, collinear angles, min
+   trunk length, accept_median_factor, etc.).  With ground truth
+   we can grid-search or manually iterate against the F-score.
+
+### Data sources the algorithm may draw from
+
+- `apt.dat` pavements (primary source currently)
+- `apt.dat` runways (for bearing hints, already used)
+- **OSM `aeroway=taxiway` ways** — SPJC has 234 of these with 91
+  carrying `ref` tags covering A through V.  Previously rejected
+  as primary source; worth using as **secondary signal** to seed
+  decomposition with known-good centerlines.  apt.dat pavement
+  polygons then constrain footprints.
+- OSM `aeroway=apron` / airport boundary polygons — bounding
+  context.
+
+### Caveats to keep in mind
+
+- **Overfitting to SPJC.** Once SPJC matches, test on 2-3 other
+  airports before tuning is locked.
+- **Target must be producible from data.** If a target shape has
+  no apt.dat + OSM support, flag the gap, don't try to
+  hallucinate geometry.
+- **IoU tolerance.** Realistic: 0.85+ for taxis, 0.80+ for
+  aprons.  Exact vertex match is not achievable.
+
+## Where the code is at end of this session
+
+### Module `src/O4_Pavement_Strips.py`
+
+- `Shape(polygon, kind, axis, width_m)` — one per decomposition
+  unit.  kind ∈ {"taxi", "apron"}.
+- `Adjacency(shape_a, shape_b, shared, length_m)` — boundary
+  graph.
+- `decompose_pavement(taxi_polys, apron_polys, …)` → tuple of
+  Shapes.  Classification is GEOMETRIC (based on polygon MRR
+  short ≤ NARROW_WIDTH_M = **45 m**) + mega-poly decomposition
+  via Voronoi skeleton.
+  - Taxi extraction: skeleton → longest-path trunk merging with
+    runway-bearing preference → local-width filtering
+    (accept_median_factor = 1.0, mix_median_factor = 1.5) →
+    claim-based polygon carving.
+  - Apron: connected components of apron-class polygons + mega-
+    polygon residuals.
+- `build_adjacency_graph(shapes, tolerance_m=0.5)` — pairwise
+  boundary-to-polygon-within-tolerance adjacency.
+- `classify_shape_roles(shapes, adjacencies, runway_cls)` — 5
+  roles: primary_parallel (≥0.25× runway length), stub, cross_
+  connector, secondary_parallel, apron.
+- 39 unit tests pass.
+
+### Emitter `_emit_pavement_strip_model` in `src/O4_Auto_Patch.py`
+
+Gated by `O4_STRIP_MODEL=1`.
+
+- Drops apt.dat polygons whose extent is ≥50 % inside runway.
+- Subtracts runway union from both taxi and apron pools.
+- Passes runway bearings to decompose_pavement for trunk bias.
+- For each taxi shape (sorted longest-first to claim pavement):
+  - Trims axis by 10 m at each end (GAP_M).
+  - Primary/secondary parallels: subdivide into ~100 m segments.
+  - Stubs / cross-connectors: single rect from trimmed axis.
+  - Builds clean rectangles from (axis, width).
+  - Clips each rect to the shape's claimed polygon.
+  - Skips rects that would overlap already-claimed taxi area.
+- Apron emission: each input apron polygon MINUS the union of
+  emitted taxi rects.  No 10 m buffer on long sides (user rule).
+  Apron retains the 10 m gap zones at taxi ends.
+- Preview elevation is 0.0 m throughout; solver comes later.
+
+### Known issues at handoff
+
+- Apron still over-fragments (~40 pieces at SPJC) where taxis
+  carve apart a single big input polygon.  Consolidation pass
+  not yet written; candidate: union adjacent apron pieces within
+  ~30 m of each other.
+- Taxi "A" (east parallel at SPJC) is absorbed into the terminal
+  apron because apt.dat classifies it as apron-type pavement.
+  Extraction needs either (a) skeleton pass on the apron pool
+  too, or (b) OSM centerline seeding.
+- L splits at the engine-test-apron jog into two/three primary/
+  secondary fragments rather than one continuous L.  The trunk
+  extractor's collinear threshold (60°) is enough for small
+  bends but not for an explicit jog.  Acceptable per user.
+- The audit script `/tmp/check_shapes.py` uses lossy deg→m area
+  conversion and reports false-positive overlaps.  In
+  meter-space the decomposition has ZERO overlaps.
+
+### Files produced by end-of-day run
+
+- `/tmp/SPJC_shapes.osm` — preview output from
+  `tools/dump_shapes_osm.py` (kept in `/tmp/` for now).
+  172 ways + multipolygon relations, tagged with role.
+- `/tmp/SPJC_legacy.patch.osm` — full pipeline output with
+  `O4_STRIP_MODEL=1`.
+- `/tmp/spjc_osm_plot.png` — colour-coded role plot.
+- `/tmp/run_legacy.py` — launcher for the pipeline.
+
+### How to reproduce at start of next session
+
+```bash
+cd /Users/noah/Ortho4XP-shred86
+./venv/bin/python3 -m pytest tests/            # 139 pass
+O4_STRIP_MODEL=1 O4_DEBUG_TAXI_ONLY=1 \
+  ./venv/bin/python3 /tmp/run_legacy.py        # full pipeline
+./venv/bin/python3 /tmp/dump_shapes_osm.py     # shapes-only preview
+./venv/bin/python3 /tmp/plot_osm.py            # colour-coded PNG
+```
+
+## Earlier bottom-up-merge model (retained for reference)
 
 **Commits on dev branch:**
 - `f6d3140` — last stable commit from previous session (legacy

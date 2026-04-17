@@ -61,6 +61,18 @@ DEBUG_OSM_CENTERLINES = os.environ.get("O4_OSM_CENTERLINES", "1") == "1"
 # so existing tests keep passing; rollback is `unset O4_NEW_MODEL`.
 DEBUG_NEW_MODEL = os.environ.get("O4_NEW_MODEL", "0") == "1"
 
+# Strip-model toggle: when "1" (via O4_STRIP_MODEL=1), pavement is
+# decomposed by O4_Pavement_Strips and emitted as a GEOMETRY
+# PREVIEW with zero elevations — every way is flat at 0.0 m.  This
+# lets you inspect the strip/junction/apron partitioning in JOSM
+# through the real patch pipeline, without the elevation solver in
+# place.  Mutually exclusive with O4_NEW_MODEL.  Default OFF.
+DEBUG_STRIP_MODEL = os.environ.get("O4_STRIP_MODEL", "0") == "1"
+
+# True when ANY of the replacement pavement models is active — the
+# legacy Phase C0/C1/C2/C4/D/E1 steps are skipped in that case.
+DEBUG_REPLACE_LEGACY_PAVEMENT = DEBUG_NEW_MODEL or DEBUG_STRIP_MODEL
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CIFP Coordinate Parsing
@@ -2286,6 +2298,341 @@ def extract_road_info(dico_airports, tile, road_layer=None):
     return result
 
 
+def _emit_pavement_strip_model(
+    apt_twy_polys_m, apron_polys_m, rwy_union_m,
+    to_ll, to_m, apt_data,
+    _emit_flat_poly, _emit_sloped_rect, _emit_triangle,
+    icao,
+):
+    """Zero-elevation preview of the apron-deformation model.
+
+    Calls :func:`O4_Pavement_Strips.decompose_pavement` (which now
+    returns a flat tuple of :class:`Shape`) and emits:
+
+    * each taxi shape as one flat sloped rect along its axis at
+      the shape's representative width;
+    * each apron connected component as a flat N-gon of its
+      polygon exterior.
+
+    There are no junctions, no wedges, no triangle zones yet —
+    that's the job of the elevation solver + triangulated emitter
+    which will replace this preview.
+    """
+    import O4_Pavement_Strips as _PS
+    import O4_Pavement_Classifier as _PC
+    from shapely.ops import transform as _shp_transform, unary_union \
+        as _unary_union
+
+    PREVIEW_ELEV = 0.0
+    # Any apt.dat pavement polygon whose area sits >this fraction
+    # inside the runway union is assumed to BE the runway surface
+    # and is dropped so we don't emit it as a huge apron under the
+    # runway segments.
+    RUNWAY_OVERLAP_DROP_FRAC = 0.5
+
+    # Prefer the RAW apt.dat pavements over the Phase-A3 rectifiable
+    # subset: my strip decomposition does its own mega-polygon
+    # splitting and wants the original polygons.  Fall back to the
+    # pre-decomposed polys when apt.dat isn't available.
+    raw_taxi_m = []
+    raw_apron_m = []
+    if apt_data is not None and apt_data.pavements:
+        def _ll_to_m(lon, lat, z=None):
+            x, y = to_m(lon, lat)
+            return (x, y) if z is None else (x, y, z)
+        for pav in apt_data.pavements:
+            if pav.polygon is None or pav.polygon.is_empty:
+                continue
+            try:
+                pav_m = _shp_transform(_ll_to_m, pav.polygon)
+            except Exception:
+                continue
+            if pav_m.is_empty:
+                continue
+            kind = _PC.classify_pavement_m(pav_m, pav.name or "")
+            if kind.kind == "taxiway":
+                raw_taxi_m.append(pav_m)
+            else:
+                raw_apron_m.append(pav_m)
+    else:
+        raw_taxi_m = list(apt_twy_polys_m or [])
+        raw_apron_m = list(apron_polys_m or [])
+
+    # Filter out polygons whose extent is mostly the runway surface,
+    # then subtract the runway union from the rest.  The first
+    # filter removes apt.dat polygons that ARE the runway (pavement
+    # polygons matching the runway rect + shoulders).  The second
+    # trims polygons that merely overlap a runway corner.
+    def _runway_drop_and_trim(polys):
+        out = []
+        rwy_present = (rwy_union_m is not None
+                       and not rwy_union_m.is_empty)
+        for p in polys:
+            if p is None or p.is_empty:
+                continue
+            if rwy_present:
+                try:
+                    inter_area = p.intersection(rwy_union_m).area
+                except Exception:
+                    inter_area = 0.0
+                if p.area > 0 and inter_area / p.area \
+                        >= RUNWAY_OVERLAP_DROP_FRAC:
+                    continue   # polygon IS (mostly) a runway surface
+                try:
+                    q = p.difference(rwy_union_m)
+                except Exception:
+                    q = p
+            else:
+                q = p
+            if q is None or q.is_empty:
+                continue
+            if q.geom_type == "Polygon":
+                out.append(q)
+            elif hasattr(q, "geoms"):
+                for g in q.geoms:
+                    if g.geom_type == "Polygon" and not g.is_empty:
+                        out.append(g)
+        return out
+
+    safe_taxi = _runway_drop_and_trim(raw_taxi_m)
+    safe_apron = _runway_drop_and_trim(raw_apron_m)
+
+    # Compute runway bearings in meter-space so the trunk extractor
+    # can prefer "parallel to runway" pairings at cross-junctions.
+    # This is what makes V, L, A come out as single long rects
+    # instead of zig-zags through their cross-connectors.
+    rwy_bearings: list = []
+    if apt_data is not None:
+        for r in apt_data.runways:
+            try:
+                ax, ay = to_m(r.lon_a, r.lat_a)
+                bx, by = to_m(r.lon_b, r.lat_b)
+                dx, dy = bx - ax, by - ay
+                import math as _math
+                if _math.hypot(dx, dy) > 1.0:
+                    # Compass bearing: 0 = +Y (north), 90 = +X (east).
+                    bearing = _math.degrees(_math.atan2(dx, dy))
+                    rwy_bearings.append(bearing % 180.0)
+            except Exception:
+                pass
+
+    shapes = _PS.decompose_pavement(
+        safe_taxi, safe_apron,
+        preferred_bearings=rwy_bearings or None,
+    )
+
+    # Role classification → category per shape.
+    from shapely.geometry import LineString as _LineString
+    adjacencies = _PS.build_adjacency_graph(shapes)
+    runway_cls: list = []
+    if apt_data is not None:
+        for r in apt_data.runways:
+            try:
+                ax, ay = to_m(r.lon_a, r.lat_a)
+                bx, by = to_m(r.lon_b, r.lat_b)
+                if ((bx - ax) ** 2 + (by - ay) ** 2) > 1.0:
+                    runway_cls.append(_LineString([(ax, ay), (bx, by)]))
+            except Exception:
+                pass
+    roles = _PS.classify_shape_roles(shapes, adjacencies, runway_cls)
+
+    # ── Build taxi rectangles ────────────────────────────────────
+    # Every taxi rect is a clean rectangle from (trimmed axis +
+    # width).  10 m is trimmed off each short end regardless of
+    # role — V, L, A, every stub, every cross-connector.  Long
+    # sides of the rect touch adjacent apron without any buffer;
+    # that's enforced by the apron carve below.
+    #
+    # Parallels (primary/secondary) subdivide into ~100 m chunks
+    # so the elevation solver can apply a per-segment sloped
+    # profile; stubs and cross-connectors emit as one rect.
+    SEGMENT_LEN_M = 100.0
+    GAP_M = 10.0
+    MIN_TRIMMED_LEN_M = 10.0
+    from shapely.ops import substring as _substring
+    from shapely.geometry import Polygon as _Polygon
+
+    def _subdivide_axis(axis, seg_len):
+        total = axis.length
+        if total <= seg_len:
+            cc = list(axis.coords)
+            return [(cc[0], cc[-1])] if len(cc) >= 2 else []
+        n = max(1, int(round(total / seg_len)))
+        step = total / n
+        pts = []
+        for i in range(n + 1):
+            p = axis.interpolate(i * step)
+            pts.append((p.x, p.y))
+        return list(zip(pts[:-1], pts[1:]))
+
+    def _trim_axis(axis, trim_m):
+        total = axis.length
+        if total <= 2.0 * trim_m + MIN_TRIMMED_LEN_M:
+            return None
+        try:
+            return _substring(axis, trim_m, total - trim_m)
+        except Exception:
+            return axis
+
+    def _rect_between(p1, p2, width):
+        """Axis-aligned rectangle (oriented to the p1→p2 direction)
+        of the given width, centered on the line from p1 to p2.
+        Returns a Polygon in meter space."""
+        import math as _math
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        mag = _math.hypot(dx, dy)
+        if mag < 1e-9:
+            return None
+        ux, uy = dx / mag, dy / mag
+        px, py = -uy, ux   # perpendicular (left)
+        half = width / 2.0
+        p1L = (p1[0] + px * half, p1[1] + py * half)
+        p2L = (p2[0] + px * half, p2[1] + py * half)
+        p1R = (p1[0] - px * half, p1[1] - py * half)
+        p2R = (p2[0] - px * half, p2[1] - py * half)
+        return _Polygon([p1L, p2L, p2R, p1R])
+
+    # Sort shapes by axis length descending — longest taxi (V)
+    # claims its area first, so shorter overlapping taxi candidates
+    # get trimmed.
+    taxi_shape_indices = sorted(
+        (i for i, s in enumerate(shapes)
+         if s.kind == "taxi" and s.axis is not None),
+        key=lambda i: -shapes[i].axis.length,
+    )
+
+    taxi_rect_records = []  # (segments[], width, role)
+    taxi_rect_polys = []    # meter-space Polygons used to carve apron
+    claimed_union = None
+    n_trimmed_too_short = 0
+    n_overlapping_skipped = 0
+
+    for i in taxi_shape_indices:
+        s = shapes[i]
+        role = roles[i]
+        trimmed = _trim_axis(s.axis, GAP_M)
+        if trimmed is None:
+            n_trimmed_too_short += 1
+            continue
+        if role in (_PS.ROLE_PRIMARY_PARALLEL,
+                    _PS.ROLE_SECONDARY_PARALLEL):
+            segments = _subdivide_axis(trimmed, SEGMENT_LEN_M)
+        else:
+            cc = list(trimmed.coords)
+            segments = [(cc[j], cc[j + 1])
+                        for j in range(len(cc) - 1)]
+
+        # Check overlap with already-claimed taxi area.  If a newly-
+        # built rect overlaps more than 20 % with prior claims, skip
+        # it entirely — it's a redundant skeleton branch through
+        # already-covered pavement.
+        candidate_rects = []
+        skip_this = False
+        for (p1, p2) in segments:
+            rect = _rect_between(p1, p2, s.width_m)
+            if rect is None or rect.is_empty:
+                continue
+            if claimed_union is not None and not claimed_union.is_empty:
+                try:
+                    overlap_area = rect.intersection(claimed_union).area
+                except Exception:
+                    overlap_area = 0.0
+                if rect.area > 0 and overlap_area / rect.area > 0.2:
+                    skip_this = True
+                    break
+            candidate_rects.append(((p1, p2), rect))
+        if skip_this or not candidate_rects:
+            n_overlapping_skipped += 1
+            continue
+
+        # Commit the rects.
+        kept_segments = []
+        for (seg, rect) in candidate_rects:
+            kept_segments.append(seg)
+            taxi_rect_polys.append(rect)
+        taxi_rect_records.append((kept_segments, s.width_m, role))
+
+        # Update claimed union.
+        try:
+            new_union = _unary_union([r for _, r in candidate_rects])
+            if claimed_union is None:
+                claimed_union = new_union
+            else:
+                claimed_union = _unary_union(
+                    [claimed_union, new_union])
+        except Exception:
+            pass
+
+    n_taxi_rects = sum(len(segs) for segs, _, _ in taxi_rect_records)
+
+    # ── Emit taxi rects ─────────────────────────────────────────
+    for (segments, width, role) in taxi_rect_records:
+        for (p1, p2) in segments:
+            lon1, lat1 = to_ll(p1[0], p1[1])
+            lon2, lat2 = to_ll(p2[0], p2[1])
+            _emit_sloped_rect(
+                lat1, lon1, PREVIEW_ELEV,
+                lat2, lon2, PREVIEW_ELEV,
+                width)
+
+    # ── Apron carving ────────────────────────────────────────────
+    # Apron footprint = full pavement polygon MINUS the union of
+    # emitted taxi rects (no additional buffer — taxi rect long
+    # sides share a boundary with apron, short ends leave the
+    # 10 m gap that's already baked into the trimmed axis).  Every
+    # input apron polygon gets trimmed against the taxi rect
+    # union so no apron shape overlaps a taxi rect.
+    taxi_rect_union = (_unary_union(taxi_rect_polys)
+                       if taxi_rect_polys else None)
+
+    n_apron = 0
+    for s in shapes:
+        if s.kind != "apron":
+            continue
+        poly = s.polygon
+        if poly is None or poly.is_empty:
+            continue
+        if taxi_rect_union is not None:
+            try:
+                poly = poly.difference(taxi_rect_union)
+            except Exception:
+                pass
+        if poly is None or poly.is_empty:
+            continue
+        if poly.geom_type == "Polygon":
+            apron_parts = [poly]
+        elif hasattr(poly, "geoms"):
+            apron_parts = [g for g in poly.geoms
+                           if g.geom_type == "Polygon" and not g.is_empty]
+        else:
+            apron_parts = []
+        for p in apron_parts:
+            if p.area < 50.0:
+                continue   # sliver from carving
+            coords_m = list(p.exterior.coords)
+            coords_ll = [to_ll(x, y) for (x, y) in coords_m]
+            _emit_flat_poly(coords_ll, PREVIEW_ELEV)
+            n_apron += 1
+
+    try:
+        from O4_UI_Utils import vprint as _vprint
+    except Exception:
+        _vprint = None
+    if _vprint:
+        by_role: dict = {}
+        for r in roles:
+            by_role[r] = by_role.get(r, 0) + 1
+        _vprint(1, "[{}] strip-model preview: "
+                "{} taxi rects from {} shapes, {} apron polys "
+                "({} stubs/crosses too short after 10m trim) — "
+                "roles: {}".format(
+                    icao, n_taxi_rects,
+                    sum(1 for s in shapes if s.kind == "taxi"),
+                    n_apron, n_trimmed_too_short,
+                    ", ".join(f"{k}={v}" for k, v in sorted(by_role.items()))))
+
+
 def _emit_pavement_new_model(
     apt_twy_polys_m, apron_polys_m, rwy_union_m, bldg_union_m,
     building_polys_m, bldg_elevations,
@@ -3987,7 +4334,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # loop entirely so it doesn't populate twy_union_m with outdated
     # rects the new model would have to work around.
     if (apt_twy_polys_m and apt_twy_rect_chains
-            and not DEBUG_NEW_MODEL):
+            and not DEBUG_REPLACE_LEGACY_PAVEMENT):
         twy_rect_count = 0
         twy_flat_count = 0
         for twy_poly, rects in zip(apt_twy_polys_m, apt_twy_rect_chains):
@@ -4684,7 +5031,13 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     #
     # Runs BEFORE Phase C3 so building pads can carve into the flat
     # fills cleanly.
-    if DEBUG_NEW_MODEL:
+    if DEBUG_STRIP_MODEL:
+        _emit_pavement_strip_model(
+            apt_twy_polys_m, apron_polys_m, rwy_union_m,
+            to_ll, to_m, apt_data if apt_dat_used else None,
+            _emit_flat_poly, _emit_sloped_rect, _emit_triangle,
+            icao)
+    elif DEBUG_NEW_MODEL:
         _emit_pavement_new_model(
             apt_twy_polys_m, apron_polys_m, rwy_union_m, bldg_union_m,
             building_polys_m, bldg_elevations,
@@ -4716,7 +5069,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     PARALLEL_TWY_MERGE_DIST = 15.0
     merged_twy_groups = {}  # ti -> group_id
     twy_group_id = 0
-    _twy_buffer_iter = [] if DEBUG_NEW_MODEL else list(range(len(twy_buffers_m)))
+    _twy_buffer_iter = ([] if DEBUG_REPLACE_LEGACY_PAVEMENT
+                        else list(range(len(twy_buffers_m))))
     for i in _twy_buffer_iter:
         if twy_buffers_m[i].is_empty or i in merged_twy_groups:
             continue
@@ -5222,7 +5576,8 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     # DEBUG_NEW_MODEL: the new unified decomposition already handles
     # apron pavement as part of the connected-component flat fills;
     # skip the triangulation path so we don't double-emit.
-    _apron_polys_iter = ([] if (DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL)
+    _apron_polys_iter = ([] if (DEBUG_TAXI_ONLY
+                                or DEBUG_REPLACE_LEGACY_PAVEMENT)
                          else apron_polys_m)
     for ai, p_m in enumerate(_apron_polys_iter):
         clipped = p_m
@@ -5476,7 +5831,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     n_coverage_fill = 0
     # DEBUG_TAXI_ONLY / DEBUG_NEW_MODEL: skip coverage-fill sweep.
     try:
-        if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+        if DEBUG_TAXI_ONLY or DEBUG_REPLACE_LEGACY_PAVEMENT:
             raise RuntimeError("skip coverage fill")
         paved_area = shp_geom.Polygon()
         paved_parts = []
@@ -5577,7 +5932,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     transition_strip_parts = []
 
     # DEBUG_TAXI_ONLY / DEBUG_NEW_MODEL: skip transition strips.
-    if (not DEBUG_TAXI_ONLY and not DEBUG_NEW_MODEL
+    if (not DEBUG_TAXI_ONLY and not DEBUG_REPLACE_LEGACY_PAVEMENT
             and len(emitted_flat_shapes) >= 2):
         from shapely.strtree import STRtree
         fs_polys = [s[0] for s in emitted_flat_shapes]
@@ -5900,7 +6255,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
     except Exception:
         pass
 
-    if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+    if DEBUG_TAXI_ONLY or DEBUG_REPLACE_LEGACY_PAVEMENT:
         triangle_zone = shp_geom.Polygon()
     if not triangle_zone.is_empty:
         # Subtract emitted flat shapes so triangles don't overlap
@@ -6047,7 +6402,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
                              if all_airport_parts else shp_geom.Polygon())
 
     try:
-        if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+        if DEBUG_TAXI_ONLY or DEBUG_REPLACE_LEGACY_PAVEMENT:
             raise RuntimeError("skip Phase E")
         if not airport_footprint.is_empty and airport_footprint.area > 100:
             emitted_union = _emitted_union()
@@ -6625,7 +6980,7 @@ def generate_airport_surface_patches(icao, taxiway_data, building_data,
 
     n_drainage = 0
     try:
-        if DEBUG_TAXI_ONLY or DEBUG_NEW_MODEL:
+        if DEBUG_TAXI_ONLY or DEBUG_REPLACE_LEGACY_PAVEMENT:
             raise RuntimeError("skip Phase F")
         if not airport_footprint.is_empty and airport_footprint.area > 100:
             full_emitted = _emitted_union()
