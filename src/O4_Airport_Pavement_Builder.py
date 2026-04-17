@@ -502,8 +502,8 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
 # Centerline-based taxi rect builder
 # ──────────────────────────────────────────────────────────────────
 
-JUNCTION_CLUSTER_DIST_M = 40.0  # merge junction nodes within this distance
-JUNCTION_RADIUS_SCALE = 1.2     # disc radius = local_half_width × this
+JUNCTION_CLUSTER_DIST_M = 80.0  # merge junction nodes within this distance
+JUNCTION_RADIUS_SCALE = 1.5     # disc radius = local_half_width × this
 
 
 def _find_junction_points(
@@ -862,20 +862,34 @@ def _classify_role(axis: LineString, width: float,
     if ref:
         has_digit = any(c.isdigit() for c in ref)
         if ref in ("Q", "R", "X"):
+            # Q / R have multiple segments at varied bearings; the
+            # combined role is cross_connector as long as ANY segment
+            # is reasonably perpendicular.  Relax to Δ > 40°.
             db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
-            if db is not None and db > 60.0:
+            if db is not None and db > 40.0:
                 return ROLE_CROSS_CONNECTOR
             return ROLE_STUB
         if has_digit:
             # L1, A3, V5 etc. — always stubs in the SPJC target
             return ROLE_STUB
-        # Plain-letter parallel refs.  SPJC target labels M and U as
-        # secondary_parallel (they're between the two runway pairs,
-        # shared between them); A, F, L, V as primary_parallel
-        # (dedicated to one runway pair).
-        if ref in ("M", "U"):
-            return ROLE_SECONDARY_PARALLEL
-        return ROLE_PRIMARY_PARALLEL
+        # Plain-letter refs come in two flavours:
+        #   a. Named parallel taxis (A, F, L, V) — primary_parallel.
+        #   b. Apron-traversing connectors (B, C, D, E, G) — stubs
+        #      even though their bearing may be near-parallel.
+        # Distinguisher: (a) runs NEAR a runway centerline
+        # (< PRIMARY_CORRIDOR_DIST_M = 500 m) AND is parallel
+        # (Δ < 15°).  (b) sits deeper in the apron.
+        db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
+        if db is not None and db < 15.0 and rwy_centerlines:
+            mid = axis.interpolate(0.5, normalized=True)
+            dmin = min(mid.distance(r) for r in rwy_centerlines)
+            if dmin < 500.0:
+                if ref in ("M", "U"):
+                    return ROLE_SECONDARY_PARALLEL
+                return ROLE_PRIMARY_PARALLEL
+        # Parallel-but-far or non-parallel plain-letter refs are
+        # apron connectors = stubs.
+        return ROLE_STUB
 
     # ── Angle-only fallback (SPLP, unnamed airports) ────────────
     db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
@@ -907,24 +921,12 @@ def _axis_to_nearest_rwy_db(axis: LineString,
 
 
 def _refine_roles(emitted, rwy_centerlines):
-    """Second pass: cross_connector must touch ≥ 2 parallels, else demote
-    to stub.  stubs touching no parallel get demoted to 'nowhere' and
-    removed — actually we leave them as stub for now and let the
-    operator decide from the output.
+    """Second pass: currently a no-op.
+
+    The earlier heuristic (cross_connector must touch >= 2 parallels)
+    produced false negatives at SPJC where Q / R rects are corner-
+    snapped and don't share an exact metric boundary with the primary
+    rects they visually connect.  We trust the ref-based classifier
+    instead.
     """
-    # Find parallels
-    parallels = [(i, s) for i, s in enumerate(emitted)
-                 if s[2] in (ROLE_PRIMARY_PARALLEL,
-                             ROLE_SECONDARY_PARALLEL)]
-    for i, (rect, axis, role, ref) in enumerate(emitted):
-        if role != ROLE_CROSS_CONNECTOR:
-            continue
-        # Does it touch ≥ 2 parallel rects?
-        touching = 0
-        for j, ps in parallels:
-            if j == i:
-                continue
-            if rect.intersects(ps[0]):
-                touching += 1
-        if touching < 2:
-            emitted[i] = (rect, axis, ROLE_STUB, ref)
+    pass
