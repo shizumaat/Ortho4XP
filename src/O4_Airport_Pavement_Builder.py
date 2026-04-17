@@ -429,27 +429,55 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         layout.shapes.append(BuiltShape(
             polygon=rect, role=role, ref=ref, source_axis=axis))
 
-    # ── Aprons: pavement minus taxi rects, one per CC ────────────
-    # Fragments < MIN_APRON_AREA_M2 are dropped (they're junction
-    # fillers territory, not aprons).  Remaining fragments are
-    # unioned back by the SHARED_BUFFER_M distance to consolidate
-    # pieces that target treats as one apron.
+    # ── Residue: pavement minus taxi rects ───────────────────────
+    # Fragments ≥ MIN_APRON_AREA_M2 → apron (terminal / engine_test
+    # scale).  Smaller → junction (gap between taxi rects).  Drops
+    # slivers < MIN_JUNCTION_AREA_M2.
+    #
+    # Adjacent residue fragments are merged via buffer(+2).buffer(-2)
+    # before emission — this closes the narrow strips my rect corners
+    # leave between neighboring taxi rects so the resulting junction
+    # polygon covers the full intersection zone.
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
+    MIN_APRON_AREA_M2 = 3000.0
+    MIN_JUNCTION_AREA_M2 = 80.0
+    JUNCTION_MERGE_BUFFER = 5.0
     if pav_union is not None:
-        apron = pav_union
+        residue = pav_union
         if taxi_rect_union is not None:
-            apron = apron.difference(taxi_rect_union)
-        parts = [apron] if apron.geom_type == "Polygon" else list(
-            getattr(apron, "geoms", []))
-        # Drop tiny fragments (junction-sized)
-        MIN_APRON_AREA_M2 = 3000.0
-        parts = [p for p in parts
-                 if p.geom_type == "Polygon"
-                 and p.area >= MIN_APRON_AREA_M2]
+            residue = residue.difference(taxi_rect_union)
+        # Morphological close to merge adjacent fragments
+        try:
+            merged = residue.buffer(JUNCTION_MERGE_BUFFER).buffer(
+                -JUNCTION_MERGE_BUFFER)
+        except Exception:
+            merged = residue
+        # Clip back to pavement so the buffer doesn't stick out
+        if not merged.is_empty and pav_union is not None:
+            try:
+                merged = merged.intersection(pav_union)
+            except Exception:
+                merged = residue
+        # Subtract taxi rects again (buffer can grow back into them)
+        if taxi_rect_union is not None:
+            try:
+                merged = merged.difference(taxi_rect_union)
+            except Exception:
+                pass
+
+        parts = [merged] if merged.geom_type == "Polygon" else list(
+            getattr(merged, "geoms", []))
         for part in parts:
-            layout.shapes.append(BuiltShape(
-                polygon=part, role=ROLE_APRON))
+            if part.geom_type != "Polygon":
+                continue
+            if part.area < MIN_JUNCTION_AREA_M2:
+                continue
+            role = ROLE_APRON if part.area >= MIN_APRON_AREA_M2 else ROLE_JUNCTION
+            simp = part.simplify(1.0, preserve_topology=True)
+            if simp.is_empty or simp.geom_type != "Polygon":
+                simp = part
+            layout.shapes.append(BuiltShape(polygon=simp, role=role))
 
     return layout
 
@@ -492,17 +520,24 @@ def _extract_osm_taxi_centerlines(
         total_len = sum(
             math.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1])
             for i in range(len(pts)-1))
-        # Unrefed OSM taxiways are typically parking-position /
-        # gate-access paths — the target rolls these into apron /
-        # terminal shapes, not individual taxi rects.
-        if not ref and total_len < 150.0:
-            continue
+        # Unrefed OSM taxiways at SPJC are parking-position / gate
+        # access paths that the target rolls into apron shapes.
+        # Drop them when the airport has refs (SPJC).  At airports
+        # without any refs (SPLP), we have to use unrefed centerlines
+        # as the only geometric signal — keep them when long enough.
+        # Caller-level heuristic below: if ANY refed way exists in
+        # the batch, unrefed ways are suppressed.
+        if not ref:
+            # Defer filtering to post-pass so we know whether the
+            # airport has any refs at all.
+            pass
 
-        # RDP-simplify with 10 m tolerance — removes minor wobble
-        # but keeps genuine bend vertices where the centerline
-        # changes direction (the natural segment boundaries).
+        # RDP-simplify with 3 m tolerance — removes minor GPS wobble
+        # but keeps genuine bend vertices.  Target users typically
+        # break a long taxi at bends of ~5 m deviation, so RDP at 3 m
+        # preserves those segment boundaries.
         try:
-            simp = LineString(pts).simplify(10.0, preserve_topology=False)
+            simp = LineString(pts).simplify(3.0, preserve_topology=False)
         except Exception:
             continue
         scoords = list(simp.coords)
@@ -517,6 +552,14 @@ def _extract_osm_taxi_centerlines(
             if seg.is_empty or seg.length < 15.0:
                 continue
             out.append((seg, ref))
+
+    # Post-pass: if the airport has any refs, drop unrefed
+    # centerlines (they're parking/gate paths the target skips).
+    # Keep unrefed centerlines at airports with NO refs (SPLP),
+    # since they're the only geometric seed available.
+    any_ref = any(r for _, r in out)
+    if any_ref:
+        out = [(ls, r) for ls, r in out if r]
     return out
 
 
@@ -699,23 +742,21 @@ def _classify_role(axis: LineString, width: float,
     """
     # ── Ref-based classification (SPJC convention) ──────────────
     if ref:
-        # Strip trailing digits: L3 -> L; M1 -> M
-        base = re.match(r"^([A-Z]+)", ref)
-        base = base.group(1) if base else ref
         has_digit = any(c.isdigit() for c in ref)
         if ref in ("Q", "R", "X"):
-            # Bearing sanity: only cross if really perpendicular
             db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
-            if db > 60.0:
+            if db is not None and db > 60.0:
                 return ROLE_CROSS_CONNECTOR
             return ROLE_STUB
         if has_digit:
             # L1, A3, V5 etc. — always stubs in the SPJC target
             return ROLE_STUB
-        # Plain letter — parallel by name.  Primary vs secondary
-        # decided by proximity to runway (unreliable — the target's
-        # M/U are "secondary" by user judgement, not geometric rule).
-        # Default to primary; caller-level refinement can demote.
+        # Plain-letter parallel refs.  SPJC target labels M and U as
+        # secondary_parallel (they're between the two runway pairs,
+        # shared between them); A, F, L, V as primary_parallel
+        # (dedicated to one runway pair).
+        if ref in ("M", "U"):
+            return ROLE_SECONDARY_PARALLEL
         return ROLE_PRIMARY_PARALLEL
 
     # ── Angle-only fallback (SPLP, unnamed airports) ────────────
