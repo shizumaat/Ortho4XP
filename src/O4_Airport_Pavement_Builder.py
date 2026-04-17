@@ -195,12 +195,15 @@ class PavementLayout:
 # ──────────────────────────────────────────────────────────────────
 
 def _load_osm_tile(path: str) -> Tuple[Dict[str, Tuple[float, float]],
+                                       List[Tuple[str, List[str], Dict[str, str]]],
                                        List[Tuple[str, List[str], Dict[str, str]]]]:
     """Parse an Ortho4XP-cached OSM tile (.osm.bz2 or .osm).
 
-    Returns (nodes, ways) where:
+    Returns (nodes, ways, relations) where:
       * nodes: {id: (lat, lon)}
       * ways:  [(id, [nd_ref, ...], {tag: val})]
+      * relations: [(id, [member_way_ref, ...], {tag: val})]
+        (only outer-role way members are included)
     """
     if path.endswith(".bz2"):
         with bz2.open(path, "rt") as f:
@@ -208,13 +211,16 @@ def _load_osm_tile(path: str) -> Tuple[Dict[str, Tuple[float, float]],
     else:
         txt = Path(path).read_text()
 
-    # Quotes may be ' or "
     node_re = re.compile(
         r"""<node\s+id=["'](-?\d+)["'][^>]*?lat=["']([^"']+)["']\s+lon=["']([^"']+)["']"""
     )
     way_re = re.compile(r"""<way[^>]*?id=["'](-?\d+)["'][^>]*>(.*?)</way>""", re.S)
+    rel_re = re.compile(
+        r"""<relation[^>]*?id=["'](-?\d+)["'][^>]*>(.*?)</relation>""", re.S)
     nd_re = re.compile(r"""<nd\s+ref=["'](-?\d+)["']""")
     tag_re = re.compile(r"""<tag\s+k=["']([^"']+)["']\s+v=["']([^"']+)["']""")
+    outer_member_re = re.compile(
+        r"""<member\s+type=["']way["']\s+ref=["'](-?\d+)["']\s+role=["']outer["']""")
 
     nodes: Dict[str, Tuple[float, float]] = {}
     for m in node_re.finditer(txt):
@@ -223,20 +229,29 @@ def _load_osm_tile(path: str) -> Tuple[Dict[str, Tuple[float, float]],
         except ValueError:
             continue
 
-    ways: List[Tuple[str, List[str], Dict[str, str]]] = []
+    ways = []
     for m in way_re.finditer(txt):
         wid = m.group(1)
         body = m.group(2)
         nds = nd_re.findall(body)
         tags = dict(tag_re.findall(body))
         ways.append((wid, nds, tags))
-    return nodes, ways
+
+    relations = []
+    for m in rel_re.finditer(txt):
+        rid = m.group(1)
+        body = m.group(2)
+        outer = outer_member_re.findall(body)
+        tags = dict(tag_re.findall(body))
+        relations.append((rid, outer, tags))
+    return nodes, ways, relations
 
 
 def _load_osm_airports(xplane_root: str, icao: str,
                        apt_lat: float, apt_lon: float,
                        radius_deg: float = 0.05
                        ) -> Tuple[Dict[str, Tuple[float, float]],
+                                  List[Tuple[str, List[str], Dict[str, str]]],
                                   List[Tuple[str, List[str], Dict[str, str]]]]:
     """Load the airports-layer OSM cache covering the given lat/lon.
 
@@ -264,6 +279,7 @@ def _load_osm_airports(xplane_root: str, icao: str,
     base_lon = int(math.floor(apt_lon))
     nodes: Dict[str, Tuple[float, float]] = {}
     ways: List[Tuple[str, List[str], Dict[str, str]]] = []
+    relations: List[Tuple[str, List[str], Dict[str, str]]] = []
     seen_paths = set()
     for dlat in (0, -1, 1):
         for dlon in (0, -1, 1):
@@ -271,11 +287,12 @@ def _load_osm_airports(xplane_root: str, icao: str,
             if osm_path in seen_paths or not os.path.isfile(osm_path):
                 continue
             seen_paths.add(osm_path)
-            n2, w2 = _load_osm_tile(osm_path)
+            n2, w2, r2 = _load_osm_tile(osm_path)
             nodes.update(n2)
             ways.extend(w2)
+            relations.extend(r2)
     if not nodes:
-        return {}, []
+        return {}, [], []
 
     # Filter by bbox — keep only ways whose node centroids are near
     # the airport center.
@@ -284,7 +301,9 @@ def _load_osm_airports(xplane_root: str, icao: str,
                 abs(lon - apt_lon) <= radius_deg)
 
     kept_ways = []
+    way_by_id: Dict[str, Tuple[str, List[str], Dict[str, str]]] = {}
     for wid, nds, tags in ways:
+        way_by_id[wid] = (wid, nds, tags)
         pts = [nodes[n] for n in nds if n in nodes]
         if not pts:
             continue
@@ -292,7 +311,23 @@ def _load_osm_airports(xplane_root: str, icao: str,
         clon = sum(p[1] for p in pts) / len(pts)
         if _in_box(clat, clon):
             kept_ways.append((wid, nds, tags))
-    return nodes, kept_ways
+    # Relations: keep if ANY member way centroid is in-box
+    kept_rels = []
+    for rid, outer_ids, tags in relations:
+        any_in = False
+        for wid in outer_ids:
+            if wid in way_by_id:
+                _, nds, _ = way_by_id[wid]
+                pts = [nodes[n] for n in nds if n in nodes]
+                if pts:
+                    clat = sum(p[0] for p in pts) / len(pts)
+                    clon = sum(p[1] for p in pts) / len(pts)
+                    if _in_box(clat, clon):
+                        any_in = True
+                        break
+        if any_in:
+            kept_rels.append((rid, outer_ids, tags))
+    return nodes, kept_ways, kept_rels
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -414,10 +449,18 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     if pav_union is not None and layout.runway_union is not None:
         pav_union = pav_union.difference(layout.runway_union)
 
-    # ── Load OSM centerlines ─────────────────────────────────────
-    nodes, ways = _load_osm_airports(
+    # ── Load OSM centerlines + relations ─────────────────────────
+    nodes, ways, relations = _load_osm_airports(
         xplane_root, icao, anchor[0], anchor[1])
     osm_centerlines = _extract_osm_taxi_centerlines(nodes, ways, to_m)
+
+    # ── Terminals from OSM (way or relation aeroway=terminal) ────
+    terminal_polys = _extract_osm_terminals(nodes, ways, relations, to_m)
+    terminal_union = (unary_union(terminal_polys)
+                      if terminal_polys else None)
+    for i, tp in enumerate(terminal_polys):
+        layout.shapes.append(BuiltShape(
+            polygon=tp, role=ROLE_TERMINAL, ref=f"terminal{i+1}"))
 
     # ── Identify junction node CLUSTERS from OSM topology ───────
     # Any OSM node referenced by ≥2 taxi ways is a potential junction
@@ -504,6 +547,64 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
 
 JUNCTION_CLUSTER_DIST_M = 80.0  # merge junction nodes within this distance
 JUNCTION_RADIUS_SCALE = 1.5     # disc radius = local_half_width × this
+
+
+def _extract_osm_terminals(
+    nodes: Dict[str, Tuple[float, float]],
+    ways: List[Tuple[str, List[str], Dict[str, str]]],
+    relations: List[Tuple[str, List[str], Dict[str, str]]],
+    to_m,
+) -> List[Polygon]:
+    """Extract aeroway=terminal polygons (ways OR multipolygon
+    relations with outer rings) in meter space."""
+    out: List[Polygon] = []
+    way_by_id = {wid: (nds, tags) for wid, nds, tags in ways}
+
+    def _ring_polygon(nds: List[str]) -> Optional[Polygon]:
+        pts = []
+        for n in nds:
+            if n in nodes:
+                lat, lon = nodes[n]
+                pts.append(to_m(lon, lat))
+        if len(pts) < 3:
+            return None
+        try:
+            p = Polygon(pts).buffer(0)
+        except Exception:
+            return None
+        if p.is_empty:
+            return None
+        if p.geom_type == "MultiPolygon":
+            p = max(p.geoms, key=lambda g: g.area)
+        return p if p.geom_type == "Polygon" else None
+
+    # Way terminals
+    for wid, nds, tags in ways:
+        if tags.get("aeroway") != "terminal":
+            continue
+        p = _ring_polygon(nds)
+        if p is not None and p.area >= 100.0:
+            out.append(p)
+
+    # Relation terminals — union all outer rings
+    for rid, outer_wids, tags in relations:
+        if tags.get("aeroway") != "terminal":
+            continue
+        rings = []
+        for wid in outer_wids:
+            if wid not in way_by_id:
+                continue
+            nds, _ = way_by_id[wid]
+            p = _ring_polygon(nds)
+            if p is not None:
+                rings.append(p)
+        if rings:
+            merged = unary_union(rings).buffer(0)
+            if merged.geom_type == "MultiPolygon":
+                merged = max(merged.geoms, key=lambda g: g.area)
+            if merged.geom_type == "Polygon" and merged.area >= 100.0:
+                out.append(merged)
+    return out
 
 
 def _find_junction_points(
