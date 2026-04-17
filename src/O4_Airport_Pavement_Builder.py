@@ -43,7 +43,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
-from shapely.ops import linemerge, transform as shp_transform, unary_union
+from shapely.ops import (
+    linemerge, nearest_points, transform as shp_transform, unary_union)
 
 import O4_Apt_Dat_Reader as APR
 import O4_Pavement_Classifier as PC
@@ -429,6 +430,10 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             polygon=rect, role=role, ref=ref, source_axis=axis))
 
     # ── Aprons: pavement minus taxi rects, one per CC ────────────
+    # Fragments < MIN_APRON_AREA_M2 are dropped (they're junction
+    # fillers territory, not aprons).  Remaining fragments are
+    # unioned back by the SHARED_BUFFER_M distance to consolidate
+    # pieces that target treats as one apron.
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
     if pav_union is not None:
@@ -437,11 +442,12 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             apron = apron.difference(taxi_rect_union)
         parts = [apron] if apron.geom_type == "Polygon" else list(
             getattr(apron, "geoms", []))
+        # Drop tiny fragments (junction-sized)
+        MIN_APRON_AREA_M2 = 3000.0
+        parts = [p for p in parts
+                 if p.geom_type == "Polygon"
+                 and p.area >= MIN_APRON_AREA_M2]
         for part in parts:
-            if part.geom_type != "Polygon":
-                continue
-            if part.area < 500.0:
-                continue
             layout.shapes.append(BuiltShape(
                 polygon=part, role=ROLE_APRON))
 
@@ -459,16 +465,23 @@ def _extract_osm_taxi_centerlines(
 ) -> List[Tuple[LineString, str]]:
     """Return list of (linestring_m, ref_tag) for aeroway=taxiway ways.
 
-    Same-ref centerlines are merged when their endpoints meet
-    (within 5 m).  OSM often splits one taxiway into 3–6 ``way``
-    rows at each node — merging gives us ONE polyline per
-    physical strip per ref, which keeps segmentation sensible for
-    downstream role classification and rect emission.
+    We split each OSM way at its internal vertices so the emitter
+    gets ONE SEGMENT PER STRAIGHT RUN between consecutive topology
+    nodes.  This matches how targets are drawn: the user puts one
+    rect per straight taxi segment and fills every bend/junction
+    with a separate junction polygon.  Merging same-ref ways (e.g.
+    A1–A6) would go the opposite direction and produce 400+ m
+    rects that span multiple target segments.
+
+    An OSM way that's already one straight segment yields one
+    centerline.  An OSM way with N internal vertices yields N
+    centerlines.
     """
-    by_ref: Dict[str, List[LineString]] = {}
+    out = []
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
             continue
+        ref = tags.get("ref", "")
         pts = []
         for n in nds:
             if n in nodes:
@@ -476,33 +489,34 @@ def _extract_osm_taxi_centerlines(
                 pts.append(to_m(lon, lat))
         if len(pts) < 2:
             continue
-        try:
-            ls = LineString(pts)
-        except Exception:
+        total_len = sum(
+            math.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1])
+            for i in range(len(pts)-1))
+        # Unrefed OSM taxiways are typically parking-position /
+        # gate-access paths — the target rolls these into apron /
+        # terminal shapes, not individual taxi rects.
+        if not ref and total_len < 150.0:
             continue
-        if ls.is_empty or ls.length < 5.0:
-            continue
-        by_ref.setdefault(tags.get("ref", ""), []).append(ls)
 
-    out: List[Tuple[LineString, str]] = []
-    for ref, lines in by_ref.items():
-        if not ref:
-            # Unrefed: keep each separately (may be gate paths, etc.).
-            out.extend((ls, "") for ls in lines)
-            continue
-        # Merge contiguous same-ref lines
+        # RDP-simplify with 10 m tolerance — removes minor wobble
+        # but keeps genuine bend vertices where the centerline
+        # changes direction (the natural segment boundaries).
         try:
-            merged = linemerge(MultiLineString(lines))
+            simp = LineString(pts).simplify(10.0, preserve_topology=False)
         except Exception:
-            merged = None
-        if merged is None or merged.is_empty:
-            out.extend((ls, ref) for ls in lines)
             continue
-        if merged.geom_type == "LineString":
-            out.append((merged, ref))
-        else:
-            for g in merged.geoms:
-                out.append((g, ref))
+        scoords = list(simp.coords)
+        if len(scoords) < 2:
+            continue
+        # Split the simplified polyline at each remaining vertex.
+        for i in range(len(scoords) - 1):
+            try:
+                seg = LineString([scoords[i], scoords[i+1]])
+            except Exception:
+                continue
+            if seg.is_empty or seg.length < 15.0:
+                continue
+            out.append((seg, ref))
     return out
 
 
@@ -569,7 +583,8 @@ def _build_taxi_rects(
         if rect is None or rect.is_empty:
             continue
 
-        role = _classify_role(clipped, width, rwy_centerlines, rwy_union)
+        role = _classify_role(clipped, width, rwy_centerlines,
+                               rwy_union, ref=ref)
         emitted.append((rect, clipped, role, ref))
         emitted_union = (unary_union([emitted_union, rect])
                          if emitted_union is not None else rect)
@@ -613,11 +628,16 @@ def _probe_axis_width(axis: LineString, pav: Polygon,
 
 def _rect_from_axis_extended(axis: LineString, width: float,
                             pav: Polygon) -> Optional[Polygon]:
-    """Build a rect around axis with endpoints extended to pavement edge.
+    """Build a rect around the axis at its first-to-last direction.
 
-    Extension makes the rect reach both ends of the paved strip so
-    shared corners with neighbours (runway, other taxis) land on
-    apt.dat pavement boundaries.
+    The 4 corners are placed at axis endpoints ± perpendicular half-
+    width, then each corner is snapped to the nearest apt.dat
+    pavement boundary point within SNAP_RADIUS meters.  This matches
+    the snapped target convention where every non-runway vertex sits
+    on a pavement edge.
+
+    If no pavement edge is within SNAP_RADIUS, the corner stays at
+    its un-snapped position.
     """
     coords = list(axis.coords)
     if len(coords) < 2:
@@ -629,73 +649,102 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     if mag < 1e-6:
         return None
     ux, uy = dx / mag, dy / mag
-
-    # Extend endpoints outward along axis until we leave the pavement
-    # (then back off 1 m).  Cap extension so we don't shoot far.
-    def _extend(x, y, dir_x, dir_y, max_d=40.0):
-        d = 0.0
-        last_inside = 0.0
-        while d < max_d:
-            d += 0.5
-            qx = x + dir_x * d
-            qy = y + dir_y * d
-            if pav.contains(Point(qx, qy)):
-                last_inside = d
-            else:
-                break
-        return (x + dir_x * last_inside, y + dir_y * last_inside)
-
-    p1e = _extend(p1[0], p1[1], -ux, -uy)
-    p2e = _extend(p2[0], p2[1], ux, uy)
-
     px, py = -uy, ux
     half = width / 2.0
-    return Polygon([
-        (p1e[0] + px * half, p1e[1] + py * half),
-        (p2e[0] + px * half, p2e[1] + py * half),
-        (p2e[0] - px * half, p2e[1] - py * half),
-        (p1e[0] - px * half, p1e[1] - py * half),
-    ])
+    corners = [
+        (p1[0] + px * half, p1[1] + py * half),
+        (p2[0] + px * half, p2[1] + py * half),
+        (p2[0] - px * half, p2[1] - py * half),
+        (p1[0] - px * half, p1[1] - py * half),
+    ]
+    snapped = _snap_corners_to_pavement(corners, pav)
+    return Polygon(snapped)
+
+
+SNAP_RADIUS_M = 5.0  # output rect corners snapped within this range
+
+
+def _snap_corners_to_pavement(
+    corners: List[Tuple[float, float]],
+    pav: Polygon,
+) -> List[Tuple[float, float]]:
+    """Snap each corner to its nearest point on the pavement boundary,
+    but only if the nearest point is within ``SNAP_RADIUS_M``."""
+    boundary = pav.boundary
+    snapped = []
+    for (cx, cy) in corners:
+        p = Point(cx, cy)
+        near, _ = nearest_points(boundary, p)
+        if p.distance(near) <= SNAP_RADIUS_M:
+            snapped.append((near.x, near.y))
+        else:
+            snapped.append((cx, cy))
+    return snapped
 
 
 def _classify_role(axis: LineString, width: float,
                    rwy_centerlines: List[LineString],
-                   rwy_union: Optional[Polygon]) -> str:
-    """Baseline role classification.
+                   rwy_union: Optional[Polygon],
+                   ref: str = "") -> str:
+    """Classify by (a) ref pattern and (b) axis bearing to runway.
 
-    * parallel to runway, within 300 m, length ≥ 500 m → primary_parallel
-    * parallel to runway, otherwise → secondary_parallel
-    * perpendicular to runway → cross_connector
-    * short (length < 300 m) + not cross → stub
+    * Ref letter-only (A, F, L, V, U, M) → parallel candidate.
+    * Ref Q/R/X (known cross) → cross_connector.
+    * Ref letter+digit (A1, L3, V2) → stub.
+    * Ref unknown or empty: use angle-only classification.
+
+    The ref-pattern rule handles SPJC cleanly because the chart
+    naming convention is stable.  The angle fallback handles SPLP
+    (no refs) and unnamed airports.
     """
-    if not rwy_centerlines:
+    # ── Ref-based classification (SPJC convention) ──────────────
+    if ref:
+        # Strip trailing digits: L3 -> L; M1 -> M
+        base = re.match(r"^([A-Z]+)", ref)
+        base = base.group(1) if base else ref
+        has_digit = any(c.isdigit() for c in ref)
+        if ref in ("Q", "R", "X"):
+            # Bearing sanity: only cross if really perpendicular
+            db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
+            if db > 60.0:
+                return ROLE_CROSS_CONNECTOR
+            return ROLE_STUB
+        if has_digit:
+            # L1, A3, V5 etc. — always stubs in the SPJC target
+            return ROLE_STUB
+        # Plain letter — parallel by name.  Primary vs secondary
+        # decided by proximity to runway (unreliable — the target's
+        # M/U are "secondary" by user judgement, not geometric rule).
+        # Default to primary; caller-level refinement can demote.
+        return ROLE_PRIMARY_PARALLEL
+
+    # ── Angle-only fallback (SPLP, unnamed airports) ────────────
+    db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
+    if db is None:
         return ROLE_STUB
+    if db < 15.0:
+        # parallel
+        return ROLE_PRIMARY_PARALLEL
+    if db > 60.0 and axis.length >= 100.0:
+        return ROLE_CROSS_CONNECTOR
+    return ROLE_STUB
 
-    rwy = rwy_centerlines[0]
-    for r in rwy_centerlines:
-        if axis.distance(r) < rwy.distance(axis):
-            rwy = r
 
-    # Bearing difference modulo 180
+def _axis_to_nearest_rwy_db(axis: LineString,
+                            rwy_centerlines: List[LineString]
+                            ) -> Optional[float]:
+    """Return the bearing difference from ``axis`` to the nearest
+    runway centerline, modulo 180°."""
+    if not rwy_centerlines:
+        return None
+    rwy = min(rwy_centerlines, key=lambda r: axis.distance(r))
+
     def _bearing(ls):
         c = list(ls.coords)
         return math.degrees(math.atan2(c[-1][0] - c[0][0],
                                        c[-1][1] - c[0][1])) % 180.0
     db = abs(_bearing(axis) - _bearing(rwy))
-    db = min(db, 180.0 - db)
-
-    # Closest distance from axis midpoint to runway
-    mid = axis.interpolate(0.5, normalized=True)
-    dist_to_rwy = mid.distance(rwy)
-
-    if db < 20.0:  # parallel
-        if axis.length >= 500.0 and dist_to_rwy < 300.0:
-            return ROLE_PRIMARY_PARALLEL
-        return ROLE_SECONDARY_PARALLEL
-    if 70.0 < db <= 90.0:  # perpendicular
-        if axis.length >= 150.0:
-            return ROLE_CROSS_CONNECTOR
-    return ROLE_STUB
+    return min(db, 180.0 - db)
 
 
 def _refine_roles(emitted, rwy_centerlines):
