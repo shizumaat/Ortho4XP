@@ -457,8 +457,15 @@ def _extract_osm_taxi_centerlines(
     ways: List[Tuple[str, List[str], Dict[str, str]]],
     to_m,
 ) -> List[Tuple[LineString, str]]:
-    """Return list of (linestring_m, ref_tag) for aeroway=taxiway ways."""
-    out = []
+    """Return list of (linestring_m, ref_tag) for aeroway=taxiway ways.
+
+    Same-ref centerlines are merged when their endpoints meet
+    (within 5 m).  OSM often splits one taxiway into 3–6 ``way``
+    rows at each node — merging gives us ONE polyline per
+    physical strip per ref, which keeps segmentation sensible for
+    downstream role classification and rect emission.
+    """
+    by_ref: Dict[str, List[LineString]] = {}
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
             continue
@@ -475,7 +482,27 @@ def _extract_osm_taxi_centerlines(
             continue
         if ls.is_empty or ls.length < 5.0:
             continue
-        out.append((ls, tags.get("ref", "")))
+        by_ref.setdefault(tags.get("ref", ""), []).append(ls)
+
+    out: List[Tuple[LineString, str]] = []
+    for ref, lines in by_ref.items():
+        if not ref:
+            # Unrefed: keep each separately (may be gate paths, etc.).
+            out.extend((ls, "") for ls in lines)
+            continue
+        # Merge contiguous same-ref lines
+        try:
+            merged = linemerge(MultiLineString(lines))
+        except Exception:
+            merged = None
+        if merged is None or merged.is_empty:
+            out.extend((ls, ref) for ls in lines)
+            continue
+        if merged.geom_type == "LineString":
+            out.append((merged, ref))
+        else:
+            for g in merged.geoms:
+                out.append((g, ref))
     return out
 
 
