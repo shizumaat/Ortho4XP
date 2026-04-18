@@ -473,58 +473,69 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     taxi_rects = _build_taxi_rects(
         osm_centerlines, pav_union, layout.runway_union, rwy_centerlines)
 
-    # ── Build junction polys from rect corner vertices ──────────
-    # Per the user's rule: "junction polygon has one vertex for each
-    # corner vertex of the rects it's joining."  Since we've already
-    # trimmed each rect back to the narrow portion of its taxiway,
-    # the rect-end corners land where the apt.dat pavement widens;
-    # stringing those corners together gives the junction polygon.
-    junction_polys = _build_junction_polys_from_corners(
-        junction_points, taxi_rects, pav_union,
-        terminal_union=terminal_union)
-
-    # Emit rects AS-IS (no junction subtraction — rects already
-    # trimmed at the widening point so they don't overlap junctions).
+    # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
     for rect, axis, role, ref in taxi_rects:
         emitted_taxi_rects.append(rect)
         layout.shapes.append(BuiltShape(
             polygon=rect, role=role, ref=ref, source_axis=axis))
 
-    # Emit junction polys
-    for jp in junction_polys:
-        simp = jp.simplify(0.5, preserve_topology=True)
-        if simp.is_empty or simp.geom_type != "Polygon":
-            simp = jp
-        layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_JUNCTION))
+    # ── Junction polys from rect corner vertices ───────────────
+    # For each cluster where >= 2 rect ends meet, junction polygon
+    # has one vertex per rect corner (user's rule).  These are
+    # emitted FIRST; residue fills the rest.  No overlap.
+    corner_junctions = _build_junction_polys_from_corners(
+        junction_points, taxi_rects, pav_union,
+        terminal_union=terminal_union)
+    corner_junction_union = (unary_union(corner_junctions)
+                             if corner_junctions else None)
+    for jp in corner_junctions:
+        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
 
-    # ── Residue classification: aprons vs. junctions ────────────
-    # The corner-vertex junctions only cover clusters where rect
-    # ends meet — target also has junction polygons where a taxi
-    # ends and the pavement simply widens (no neighbouring rect).
-    # We use the pavement residue to fill in:
-    #   - Large residue fragments (>= MIN_APRON_AREA) → apron.
-    #   - Small-to-medium fragments → junction, per user's rules
-    #     "no junctions inside aprons" and "L5/L and south-end-of-L
-    #     residue should be junctions."
-    MIN_APRON_AREA_M2 = 25000.0  # threshold: target aprons >= 28k at SPJC,
-                                  # 12k-252k at SPLP.  At SPLP my residue for
-                                  # the 12k apron area classifies as junction
-                                  # (target apron there extends beyond apt.dat
-                                  # so the residue we see is smaller).
+    # ── Residue (fills areas not covered by rects/terminals/corner-jns)
+    # Classify each connected component by area:
+    #   - >= MIN_APRON_AREA  → apron (terminal apron / engine test)
+    #   - MIN_JUNCTION .. MIN_APRON  → junction
+    # Residue polygon vertices landing within SNAP_TO_CORNER_M of any
+    # rect corner are snapped to that corner — junctions share
+    # vertices exactly with adjacent rects.
+    MIN_APRON_AREA_M2 = 25000.0
     MIN_JUNCTION_AREA_M2 = 80.0
+    SNAP_TO_CORNER_M = 1.5
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
-    junction_union = (unary_union(junction_polys)
-                      if junction_polys else None)
+    rect_corners = []
+    for rect in emitted_taxi_rects:
+        rc = list(rect.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        rect_corners.extend(rc)
+
+    def _snap_to_rect_corners(poly: Polygon) -> Polygon:
+        coords = list(poly.exterior.coords)
+        out = []
+        for (x, y) in coords:
+            best = None
+            best_d = SNAP_TO_CORNER_M
+            for (rx, ry) in rect_corners:
+                d = math.hypot(x - rx, y - ry)
+                if d < best_d:
+                    best = (rx, ry)
+                    best_d = d
+            out.append(best if best else (x, y))
+        try:
+            return Polygon(out).buffer(0)
+        except Exception:
+            return poly
+
     if pav_union is not None:
         residue = pav_union
         if taxi_rect_union is not None:
             residue = residue.difference(taxi_rect_union)
-        if junction_union is not None:
-            residue = residue.difference(junction_union)
         if terminal_union is not None:
             residue = residue.difference(terminal_union)
+        if corner_junction_union is not None:
+            residue = residue.difference(corner_junction_union)
         parts = [residue] if residue.geom_type == "Polygon" else list(
             getattr(residue, "geoms", []))
         for part in parts:
@@ -536,7 +547,10 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             simp = part.simplify(1.0, preserve_topology=True)
             if simp.is_empty or simp.geom_type != "Polygon":
                 simp = part
-            layout.shapes.append(BuiltShape(polygon=simp, role=role))
+            snapped = _snap_to_rect_corners(simp)
+            if snapped.is_empty or snapped.geom_type != "Polygon":
+                snapped = simp
+            layout.shapes.append(BuiltShape(polygon=snapped, role=role))
 
     return layout
 
@@ -894,9 +908,12 @@ def _build_taxi_rects(
         if natural_hw < 3.5 or natural_hw > 40.0:
             continue
 
-        # Trim endpoints inward where half-width exceeds widening threshold
+        # Trim endpoints inward where half-width exceeds widening threshold.
+        # Aggressive widen_factor = 1.05 pulls the rect back to where the
+        # apt.dat pavement is essentially at its natural width — the
+        # trimmed region becomes junction territory.
         trimmed = _trim_to_narrow(clipped, pav_non_rwy, natural_hw,
-                                 widen_factor=1.3)
+                                 widen_factor=1.05)
         if trimmed is None or trimmed.length < 15.0:
             continue
 
