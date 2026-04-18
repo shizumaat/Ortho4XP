@@ -21,6 +21,34 @@ Latest wins (2026-04-18 session):
 - **Clip to full pavement union** (not pav - runway) so stubs
   extending to runway edge keep their full physical length.
 
+## NEXT SESSION: flip two algorithmic choices
+
+User's authoritative rules (confirmed 2026-04-18):
+
+**Taxi rect (primary / secondary / cross_connector):**
+- Cut at every curve OR intersection (straight segments only).
+- For each straight segment: find the NARROWEST pavement width
+  between adjacent intersections; cover as much straight pavement
+  at that width as possible (axis aligned to pavement direction).
+  The remainder (widened portions) is junction territory.
+- **Rect width = narrowest** probe along the segment, not
+  90th-percentile.  (Current algo uses max — needs to flip.)
+
+**Junction polygon:**
+- One vertex per incoming rect corner + one per incoming apron
+  corner.
+- Between consecutive incoming corners, trace the apt.dat pavement
+  vertices that lie on the boundary arc between them.
+- No convex hulls, no residue hulls.
+
+Current algorithm uses residue-hull with 20–50 vertices traced
+along the full pavement boundary (IoU 0.31).  Target junctions
+have 4–26 vertices.  Switching to the corner+arc construction
+should close most of the remaining gap.
+
+Memory: `~/.claude/projects/-Users-noah-Ortho4XP-shred86/memory/feedback_shape_rules.md`
+has the full spec.
+
 Elevation is Phase 2, not started.
 
 ## Algorithm overview
