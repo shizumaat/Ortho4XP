@@ -647,6 +647,56 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             rc = rc[:-1]
         rect_corners_all.extend(rc)
 
+    def _insert_corners_near_boundary(poly: Polygon, tol: float = 5.0) -> Polygon:
+        """Add any rect corner that lies within ``tol`` of the
+        polygon boundary to the polygon's exterior ring, inserted
+        at the appropriate position along the boundary.
+        """
+        boundary = poly.boundary
+        inserts = []  # (param_along_boundary, (x, y))
+        for (rx, ry) in rect_corners_all:
+            p = Point(rx, ry)
+            if p.distance(boundary) > tol:
+                continue
+            try:
+                param = boundary.project(p)
+                nearest = boundary.interpolate(param)
+                if nearest.distance(p) <= tol:
+                    inserts.append((param, (rx, ry)))
+            except Exception:
+                pass
+        if not inserts:
+            return poly
+        # Walk boundary with insertions
+        inserts.sort()
+        coords = list(poly.exterior.coords)
+        if coords[0] == coords[-1]:
+            coords = coords[:-1]
+        # Build new coords by walking along boundary
+        try:
+            new_coords = []
+            cur_param = 0.0
+            insert_i = 0
+            for i in range(len(coords)):
+                new_coords.append(coords[i])
+                next_i = (i + 1) % len(coords)
+                seg = LineString([coords[i], coords[next_i]])
+                seg_start = cur_param
+                seg_end = seg_start + seg.length
+                while insert_i < len(inserts) and inserts[insert_i][0] < seg_end:
+                    new_coords.append(inserts[insert_i][1])
+                    insert_i += 1
+                cur_param = seg_end
+            new_coords.append(new_coords[0])
+            p2 = Polygon(new_coords).buffer(0)
+            if p2.geom_type == "MultiPolygon":
+                p2 = max(p2.geoms, key=lambda g: g.area)
+            if p2.geom_type == "Polygon" and not p2.is_empty:
+                return p2
+        except Exception:
+            pass
+        return poly
+
     def _snap_to_corners(poly: Polygon, tol: float = 3.0) -> Polygon:
         coords = list(poly.exterior.coords)
         out = []
@@ -670,7 +720,11 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         return poly
 
     for jp in final_junctions:
-        jp2 = _snap_to_corners(jp, tol=3.0)
+        jp2 = _insert_corners_near_boundary(jp, tol=5.0)
+        jp2 = _snap_to_corners(jp2, tol=3.0)
+        jp2 = jp2.simplify(2.0, preserve_topology=True)
+        if jp2.is_empty or jp2.geom_type != "Polygon":
+            continue
         layout.shapes.append(BuiltShape(polygon=jp2, role=ROLE_JUNCTION))
 
     # Merge apron pieces split by thin rect strips (e.g. parallel
@@ -1381,12 +1435,14 @@ def _natural_half_width(axis: LineString, pav: Polygon,
                         n_probes: int = 11) -> Tuple[float, float]:
     """Return (natural_hw, max_hw) distance-to-boundary along axis.
 
-    * ``natural_hw`` = MEDIAN probe distance — used by the trim
-      algorithm to detect where the strip begins widening.
-    * ``max_hw`` = 90-th-percentile probe distance — used as the
-      actual RECT half-width, so the rect spans the full pavement
-      width along its section (per user rule "rect width should be
-      the widest portion of the pavement anywhere along the section").
+    * ``natural_hw`` = 25-th-percentile probe distance.  Represents
+      the "narrow part" of the strip; used by the trim algorithm
+      as the widening detector baseline.  Biased LOW so the trim
+      pulls aggressively past anywhere the pavement is noticeably
+      wider than the strip's narrowest portion.
+    * ``max_hw`` = 90-th-percentile probe distance.  Used as the
+      RECT half-width so the rect spans the widest portion of
+      pavement within its covered section.
     """
     if axis.length < 1e-3:
         return 0.0, 0.0
@@ -1404,8 +1460,6 @@ def _natural_half_width(axis: LineString, pav: Polygon,
         return 0.0, 0.0
     dists.sort()
     median = dists[len(dists) // 2]
-    # 90th percentile keeps the max slightly robust to outliers
-    # from apron-adjacent probes on rectangular widening.
     p90_idx = max(0, int(len(dists) * 0.9) - 1)
     p90 = dists[p90_idx] if p90_idx < len(dists) else dists[-1]
     return median, p90
