@@ -536,11 +536,24 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     for jp in junctions:
         layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
 
-    # ── Aprons: pavement residue that remains after all other
-    # emissions, filtered to big areas only (terminal / engine test).
+    # ── Residue classification ──────────────────────────────────
+    # Pavement residue after rects + junctions + terminals.  Each
+    # connected component:
+    #   * If area >= MIN_APRON_AREA_M2 → apron.
+    #   * Else if adjacent to at least one rect end → junction
+    #     (the "pavement widens before this rect" case).
+    #   * Else → drop (spurious sliver).
+    MIN_JUNCTION_AREA_M2 = 80.0
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
     junction_union = (unary_union(junctions) if junctions else None)
+    # Collect axis-endpoint positions for residue-junction adjacency test
+    axis_endpoints = []
+    for _, axis, _, _ in taxi_rects:
+        coords_ax = list(axis.coords)
+        if coords_ax:
+            axis_endpoints.append(Point(coords_ax[0]))
+            axis_endpoints.append(Point(coords_ax[-1]))
     if pav_union is not None:
         residue = pav_union
         if taxi_rect_union is not None:
@@ -554,12 +567,26 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         for part in parts:
             if part.geom_type != "Polygon":
                 continue
-            if part.area < MIN_APRON_AREA_M2:
+            if part.area >= MIN_APRON_AREA_M2:
+                simp = part.simplify(1.0, preserve_topology=True)
+                if simp.is_empty or simp.geom_type != "Polygon":
+                    simp = part
+                layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
+                continue
+            if part.area < MIN_JUNCTION_AREA_M2:
+                continue
+            # Junction candidate: only emit if adjacent to a rect end
+            is_adjacent = False
+            for ep in axis_endpoints:
+                if part.distance(ep) <= 25.0:
+                    is_adjacent = True
+                    break
+            if not is_adjacent:
                 continue
             simp = part.simplify(1.0, preserve_topology=True)
             if simp.is_empty or simp.geom_type != "Polygon":
                 simp = part
-            layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
+            layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_JUNCTION))
 
     return layout
 
