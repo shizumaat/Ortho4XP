@@ -987,7 +987,7 @@ def _build_junction_polys_from_corners(
     return polys
 
 
-RDP_SIMPLIFY_TOL_M = 2.0      # RDP tolerance after ref-merge
+RDP_SIMPLIFY_TOL_M = 1.0      # RDP tolerance after ref-merge
 MIN_SEGMENT_LEN_M = 15.0      # drop segments shorter than this
 GAP_BRIDGE_MAX_M = 120.0       # bridge same-ref polyline gaps up to this
 STUB_MAX_LEN_M = 250.0         # polylines <= this emit as one rect
