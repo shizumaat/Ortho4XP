@@ -720,9 +720,9 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         return poly
 
     for jp in final_junctions:
-        jp2 = _insert_corners_near_boundary(jp, tol=5.0)
-        jp2 = _snap_to_corners(jp2, tol=3.0)
-        jp2 = jp2.simplify(2.0, preserve_topology=True)
+        jp2 = _insert_corners_near_boundary(jp, tol=10.0)
+        jp2 = _snap_to_corners(jp2, tol=5.0)
+        jp2 = jp2.simplify(3.0, preserve_topology=True)
         if jp2.is_empty or jp2.geom_type != "Polygon":
             continue
         layout.shapes.append(BuiltShape(polygon=jp2, role=ROLE_JUNCTION))
