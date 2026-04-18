@@ -549,13 +549,48 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     #    no two junctions touch or run alongside each other.
     MIN_APRON_AREA_M2 = 25000.0
     MIN_JUNCTION_AREA_M2 = 80.0
-    JUNCTION_MERGE_DIST_M = 15.0
+    JUNCTION_MERGE_DIST_M = 40.0
 
     all_junction_candidates: List[Polygon] = []
     apron_polys: List[Polygon] = []
 
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
+
+    # Seed junction candidates at each OSM multi-ref cluster.  Even
+    # when the pavement residue is split here, seeding a disc
+    # anchors the junction at the topological intersection.
+    for (cx, cy) in junction_points:
+        disc = Point(cx, cy).buffer(30.0)
+        if pav_union is not None:
+            try:
+                disc = disc.intersection(pav_union)
+            except Exception:
+                continue
+            if disc.is_empty:
+                continue
+            if disc.geom_type == "MultiPolygon":
+                disc = max(disc.geoms, key=lambda g: g.area)
+            if disc.geom_type != "Polygon":
+                continue
+            if taxi_rect_union is not None:
+                try:
+                    disc = disc.difference(taxi_rect_union)
+                except Exception:
+                    continue
+            if terminal_union is not None:
+                try:
+                    disc = disc.difference(terminal_union)
+                except Exception:
+                    pass
+            if disc.is_empty or disc.geom_type == "MultiPolygon":
+                if disc.geom_type == "MultiPolygon":
+                    disc = max(disc.geoms, key=lambda g: g.area)
+                else:
+                    continue
+            if disc.geom_type != "Polygon" or disc.area < 50.0:
+                continue
+            all_junction_candidates.append(disc)
     if pav_union is not None:
         residue = pav_union
         if taxi_rect_union is not None:
@@ -601,8 +636,41 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         except Exception:
             final_junctions = all_junction_candidates
 
+    # Snap junction vertices within 3 m of any rect corner to that
+    # corner — target junctions share vertices exactly with adjacent
+    # rect corners.
+    rect_corners_all: List[Tuple[float, float]] = []
+    for rect in emitted_taxi_rects:
+        rc = list(rect.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        rect_corners_all.extend(rc)
+
+    def _snap_to_corners(poly: Polygon, tol: float = 3.0) -> Polygon:
+        coords = list(poly.exterior.coords)
+        out = []
+        for (x, y) in coords:
+            best = None
+            best_d = tol
+            for (rx, ry) in rect_corners_all:
+                d = math.hypot(x - rx, y - ry)
+                if d < best_d:
+                    best = (rx, ry)
+                    best_d = d
+            out.append(best if best else (x, y))
+        try:
+            p = Polygon(out).buffer(0)
+            if p.geom_type == "MultiPolygon":
+                p = max(p.geoms, key=lambda g: g.area)
+            if p.geom_type == "Polygon" and not p.is_empty:
+                return p
+        except Exception:
+            pass
+        return poly
+
     for jp in final_junctions:
-        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
+        jp2 = _snap_to_corners(jp, tol=3.0)
+        layout.shapes.append(BuiltShape(polygon=jp2, role=ROLE_JUNCTION))
 
     # Merge apron pieces split by thin rect strips (e.g. parallel
     # taxi cutting across the apron).  Target has aprons that wrap
