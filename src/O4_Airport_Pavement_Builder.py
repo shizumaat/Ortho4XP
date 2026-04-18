@@ -478,7 +478,8 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     # point.  Nodes within JUNCTION_CLUSTER_DIST of each other are
     # merged into one cluster (target junctions often span a whole
     # multi-way intersection, not just a single OSM node).
-    junction_points = _find_junction_points(nodes, ways, to_m)
+    junction_points = _find_junction_points(
+        nodes, ways, to_m, osm_centerlines=osm_centerlines)
 
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
@@ -805,6 +806,7 @@ def _find_junction_points(
     nodes: Dict[str, Tuple[float, float]],
     ways: List[Tuple[str, List[str], Dict[str, str]]],
     to_m,
+    osm_centerlines: Optional[List[Tuple[LineString, str]]] = None,
 ) -> List[Tuple[float, float]]:
     """Identify junction POINTS — OSM nodes shared by ≥ 2 DIFFERENT refs.
 
@@ -835,6 +837,33 @@ def _find_junction_points(
             continue
         lat, lon = nodes[nid]
         candidates.append(to_m(lon, lat))
+
+    # ALSO add geometric crossing points between different-ref
+    # centerlines (helps SPLP where few OSM nodes are shared).
+    if osm_centerlines:
+        for i in range(len(osm_centerlines)):
+            ls1, ref1 = osm_centerlines[i]
+            for j in range(i+1, len(osm_centerlines)):
+                ls2, ref2 = osm_centerlines[j]
+                if ref1 and ref2 and ref1 == ref2:
+                    continue
+                if not ls1.intersects(ls2):
+                    continue
+                try:
+                    inter = ls1.intersection(ls2)
+                except Exception:
+                    continue
+                if inter.is_empty:
+                    continue
+                pts = []
+                if inter.geom_type == "Point":
+                    pts.append((inter.x, inter.y))
+                elif inter.geom_type == "MultiPoint":
+                    pts.extend((p.x, p.y) for p in inter.geoms)
+                elif inter.geom_type == "LineString":
+                    pts.append(inter.centroid.coords[0])
+                for pt in pts:
+                    candidates.append(pt)
 
     # Cluster within JUNCTION_CLUSTER_DIST_M (greedy single-link)
     clusters: List[List[Tuple[float, float]]] = []
@@ -1578,34 +1607,17 @@ def _refine_roles(emitted, rwy_centerlines):
     runway-connector within a parallel ref's polyline) from
     primary_parallel to stub.
 
-    Rule: for each parallel ref, find the segment that is MOST
-    perpendicular to the runway (highest Δ bearing).  If its bearing
-    is >= 35° off the runway AND it has a rect-corner within 60 m of
-    the runway, demote to stub.
+    Rule: for each parallel ref, find SEGMENTS that are
+    significantly perpendicular (>= 40° off runway) AND short (< 150 m).
+    Demote to stub.  Multiple per ref allowed.
     """
     if not rwy_centerlines or not emitted:
         return
-    from collections import defaultdict
-    by_ref: Dict[str, List[int]] = defaultdict(list)
     for i, (rect, axis, role, ref) in enumerate(emitted):
-        if role == ROLE_PRIMARY_PARALLEL:
-            by_ref[ref].append(i)
-    for ref, idxs in by_ref.items():
-        if not idxs:
+        if role != ROLE_PRIMARY_PARALLEL:
             continue
-        # Find the most-perpendicular segment
-        best_i = -1
-        best_db = 0.0
-        for i in idxs:
-            rect, axis, _, _ = emitted[i]
-            db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
-            if db is None:
-                continue
-            if db > best_db:
-                best_db = db
-                best_i = i
-        if best_i < 0 or best_db < 35.0:
+        db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
+        if db is None:
             continue
-        # Demote to stub
-        rect, axis, _, r = emitted[best_i]
-        emitted[best_i] = (rect, axis, ROLE_STUB, r)
+        if db >= 40.0 and axis.length < 150.0:
+            emitted[i] = (rect, axis, ROLE_STUB, ref)
