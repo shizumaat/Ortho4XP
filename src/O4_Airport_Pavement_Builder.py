@@ -816,6 +816,64 @@ def _build_junction_polys_from_corners(
 
 RDP_SIMPLIFY_TOL_M = 2.0      # RDP tolerance after ref-merge
 MIN_SEGMENT_LEN_M = 15.0      # drop segments shorter than this
+GAP_BRIDGE_MAX_M = 120.0       # bridge same-ref polyline gaps up to this
+STUB_MAX_LEN_M = 250.0         # polylines <= this emit as one rect
+
+# Parallel refs at SPJC.  These are the "long taxi" refs where target
+# splits into many segments.  For these, we aggressively bridge gaps
+# across intermediate intersections.
+PARALLEL_REFS = frozenset({"A", "F", "L", "V", "M", "U"})
+
+
+def _bridge_same_ref_polylines(lines: List[LineString]
+                               ) -> List[LineString]:
+    """Greedily connect endpoints of same-ref polylines within
+    ``GAP_BRIDGE_MAX_M`` by concatenation.  Produces fewer, longer
+    polylines covering the ref's full extent.
+    """
+    if len(lines) < 2:
+        return lines
+
+    remaining = list(lines)
+    merged_lines: List[LineString] = []
+    while remaining:
+        cur = remaining.pop(0)
+        while True:
+            cur_coords = list(cur.coords)
+            cur_start = cur_coords[0]
+            cur_end = cur_coords[-1]
+            best_idx = -1
+            best_d = GAP_BRIDGE_MAX_M
+            best_order = None  # "append_end", "append_start", "append_end_rev", "append_start_rev"
+            for i, other in enumerate(remaining):
+                oc = list(other.coords)
+                o_start, o_end = oc[0], oc[-1]
+                for order, pair in (
+                    ("append_end", (cur_end, o_start)),
+                    ("append_end_rev", (cur_end, o_end)),
+                    ("append_start", (cur_start, o_end)),
+                    ("append_start_rev", (cur_start, o_start)),
+                ):
+                    d = math.hypot(pair[0][0]-pair[1][0],
+                                   pair[0][1]-pair[1][1])
+                    if d < best_d:
+                        best_d = d
+                        best_idx = i
+                        best_order = order
+            if best_idx < 0:
+                merged_lines.append(cur)
+                break
+            other = remaining.pop(best_idx)
+            oc = list(other.coords)
+            if best_order == "append_end":
+                cur = LineString(cur_coords + oc)
+            elif best_order == "append_end_rev":
+                cur = LineString(cur_coords + oc[::-1])
+            elif best_order == "append_start":
+                cur = LineString(oc + cur_coords)
+            elif best_order == "append_start_rev":
+                cur = LineString(oc[::-1] + cur_coords)
+    return merged_lines
 
 
 def _extract_osm_taxi_centerlines(
@@ -867,7 +925,7 @@ def _extract_osm_taxi_centerlines(
 
     out: List[Tuple[LineString, str]] = []
     for ref, lines in by_ref.items():
-        # Merge same-ref contiguous ways
+        # Stage 1: contiguous-endpoint linemerge.
         if len(lines) > 1:
             try:
                 merged = linemerge(MultiLineString(lines))
@@ -882,6 +940,12 @@ def _extract_osm_taxi_centerlines(
         else:
             merged_lines = lines
 
+        # Stage 2: for PARALLEL refs (A, F, L, V, M, U), bridge any
+        # remaining gaps across intermediate intersections so one
+        # physical parallel taxi becomes ONE polyline.
+        if ref in PARALLEL_REFS and len(merged_lines) > 1:
+            merged_lines = _bridge_same_ref_polylines(merged_lines)
+
         for ls in merged_lines:
             try:
                 simp = ls.simplify(RDP_SIMPLIFY_TOL_M,
@@ -891,17 +955,16 @@ def _extract_osm_taxi_centerlines(
             scoords = list(simp.coords)
             if len(scoords) < 2:
                 continue
-            # Short polylines (stubs, cross-connector pieces, etc.)
-            # emit as ONE rect regardless of internal bends — user
-            # spec: "for stubs, it should be a single rect."
-            # Long polylines (parallels) split at RDP bends so the
-            # user's 9-segment L taxiway emits 9 rects, not 1.
-            STUB_MAX_LEN_M = 250.0
-            if simp.length <= STUB_MAX_LEN_M:
-                seg = LineString([scoords[0], scoords[-1]])
-                if seg.length >= MIN_SEGMENT_LEN_M:
-                    out.append((seg, ref))
-            else:
+            # Parallel refs split at bends; everything else (stubs,
+            # cross-connector pieces, sub-refs) emits as ONE rect
+            # regardless of internal bends or length.  Exception:
+            # unrefed airports (SPLP) — treat long unrefed polylines
+            # as parallels so they split at bends.
+            is_parallel = (
+                ref in PARALLEL_REFS or
+                (ref == "" and simp.length > 500.0)
+            )
+            if is_parallel:
                 for i in range(len(scoords) - 1):
                     try:
                         seg = LineString([scoords[i], scoords[i+1]])
@@ -909,6 +972,10 @@ def _extract_osm_taxi_centerlines(
                         continue
                     if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
                         continue
+                    out.append((seg, ref))
+            else:
+                seg = LineString([scoords[0], scoords[-1]])
+                if seg.length >= MIN_SEGMENT_LEN_M:
                     out.append((seg, ref))
 
     any_ref = any(r for _, r in out)
