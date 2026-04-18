@@ -940,10 +940,11 @@ def _extract_osm_taxi_centerlines(
         else:
             merged_lines = lines
 
-        # Stage 2: for PARALLEL refs (A, F, L, V, M, U), bridge any
-        # remaining gaps across intermediate intersections so one
-        # physical parallel taxi becomes ONE polyline.
-        if ref in PARALLEL_REFS and len(merged_lines) > 1:
+        # Stage 2: for refs that physically span multiple segments
+        # (parallels + Q/R), bridge any remaining gaps across
+        # intermediate intersections so one physical taxi becomes
+        # ONE polyline.
+        if ref in (PARALLEL_REFS | {"Q", "R", "X"}) and len(merged_lines) > 1:
             merged_lines = _bridge_same_ref_polylines(merged_lines)
 
         for ls in merged_lines:
@@ -955,13 +956,14 @@ def _extract_osm_taxi_centerlines(
             scoords = list(simp.coords)
             if len(scoords) < 2:
                 continue
-            # Parallel refs split at bends; everything else (stubs,
-            # cross-connector pieces, sub-refs) emits as ONE rect
-            # regardless of internal bends or length.  Exception:
-            # unrefed airports (SPLP) — treat long unrefed polylines
-            # as parallels so they split at bends.
+            # Parallel refs (A/F/L/V/M/U) and cross-connector refs
+            # (Q/R/X) split at bends — user draws multi-piece long
+            # taxiways.  Everything else (stubs, sub-refs) emits as
+            # ONE rect regardless of internal bends or length.
+            # Unrefed airports: treat long polylines as parallels.
+            SPLIT_AT_BENDS_REFS = PARALLEL_REFS | {"Q", "R", "X"}
             is_parallel = (
-                ref in PARALLEL_REFS or
+                ref in SPLIT_AT_BENDS_REFS or
                 (ref == "" and simp.length > 500.0)
             )
             if is_parallel:
