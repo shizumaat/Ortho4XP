@@ -480,30 +480,69 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         layout.shapes.append(BuiltShape(
             polygon=rect, role=role, ref=ref, source_axis=axis))
 
-    # ── Junction polys from rect corner vertices ───────────────
-    # For each cluster where >= 2 rect ends meet, junction polygon
-    # has one vertex per rect corner (user's rule).  These are
-    # emitted FIRST; residue fills the rest.  No overlap.
+    # ── Junction candidates: corner + residue ───────────────────
+    # Corner-vertex junctions come from multi-ref cluster nodes
+    # (filtered in _find_junction_points to exclude pure bends).
+    # Residue fragments that are apron-sized classify as apron;
+    # smaller residue fragments merge with the corner junctions.
+    # Then we proximity-union any two junction polys within
+    # JUNCTION_MERGE_DIST to satisfy the user's rule
+    # "two junctions should never be connected to each other —
+    #  join them into one larger junction."
+    MIN_APRON_AREA_M2 = 25000.0
+    MIN_JUNCTION_AREA_M2 = 80.0
+    JUNCTION_MERGE_DIST_M = 5.0
+    SNAP_TO_CORNER_M = 1.5
+
     corner_junctions = _build_junction_polys_from_corners(
         junction_points, taxi_rects, pav_union,
         terminal_union=terminal_union)
-    corner_junction_union = (unary_union(corner_junctions)
-                             if corner_junctions else None)
-    for jp in corner_junctions:
-        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
 
-    # ── Residue (fills areas not covered by rects/terminals/corner-jns)
-    # Classify each connected component by area:
-    #   - >= MIN_APRON_AREA  → apron (terminal apron / engine test)
-    #   - MIN_JUNCTION .. MIN_APRON  → junction
-    # Residue polygon vertices landing within SNAP_TO_CORNER_M of any
-    # rect corner are snapped to that corner — junctions share
-    # vertices exactly with adjacent rects.
-    MIN_APRON_AREA_M2 = 25000.0
-    MIN_JUNCTION_AREA_M2 = 80.0
-    SNAP_TO_CORNER_M = 1.5
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
+    corner_junction_union = (unary_union(corner_junctions)
+                             if corner_junctions else None)
+
+    # Residue classification
+    apron_polys: List[Polygon] = []
+    junction_candidates: List[Polygon] = list(corner_junctions)
+    if pav_union is not None:
+        residue = pav_union
+        if taxi_rect_union is not None:
+            residue = residue.difference(taxi_rect_union)
+        if terminal_union is not None:
+            residue = residue.difference(terminal_union)
+        if corner_junction_union is not None:
+            residue = residue.difference(corner_junction_union)
+        parts = [residue] if residue.geom_type == "Polygon" else list(
+            getattr(residue, "geoms", []))
+        for part in parts:
+            if part.geom_type != "Polygon":
+                continue
+            if part.area < MIN_JUNCTION_AREA_M2:
+                continue
+            if part.area >= MIN_APRON_AREA_M2:
+                apron_polys.append(part)
+            else:
+                junction_candidates.append(part)
+
+    # Proximity-merge junctions: buffer-close then unbuffer.
+    if junction_candidates:
+        jn_union = unary_union(junction_candidates)
+        merged = jn_union.buffer(JUNCTION_MERGE_DIST_M).buffer(
+            -JUNCTION_MERGE_DIST_M)
+        # Clip back to pavement so buffer doesn't escape
+        if pav_union is not None:
+            merged = merged.intersection(pav_union)
+            if taxi_rect_union is not None:
+                merged = merged.difference(taxi_rect_union)
+            if terminal_union is not None:
+                merged = merged.difference(terminal_union)
+        merged_parts = [merged] if merged.geom_type == "Polygon" else list(
+            getattr(merged, "geoms", []))
+    else:
+        merged_parts = []
+
     rect_corners = []
     for rect in emitted_taxi_rects:
         rc = list(rect.exterior.coords)
@@ -528,29 +567,26 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         except Exception:
             return poly
 
-    if pav_union is not None:
-        residue = pav_union
-        if taxi_rect_union is not None:
-            residue = residue.difference(taxi_rect_union)
-        if terminal_union is not None:
-            residue = residue.difference(terminal_union)
-        if corner_junction_union is not None:
-            residue = residue.difference(corner_junction_union)
-        parts = [residue] if residue.geom_type == "Polygon" else list(
-            getattr(residue, "geoms", []))
-        for part in parts:
-            if part.geom_type != "Polygon":
-                continue
-            if part.area < MIN_JUNCTION_AREA_M2:
-                continue
-            role = ROLE_APRON if part.area >= MIN_APRON_AREA_M2 else ROLE_JUNCTION
-            simp = part.simplify(1.0, preserve_topology=True)
-            if simp.is_empty or simp.geom_type != "Polygon":
-                simp = part
-            snapped = _snap_to_rect_corners(simp)
-            if snapped.is_empty or snapped.geom_type != "Polygon":
-                snapped = simp
-            layout.shapes.append(BuiltShape(polygon=snapped, role=role))
+    # Emit merged junctions
+    for part in merged_parts:
+        if part.geom_type != "Polygon":
+            continue
+        if part.area < MIN_JUNCTION_AREA_M2:
+            continue
+        simp = part.simplify(1.0, preserve_topology=True)
+        if simp.is_empty or simp.geom_type != "Polygon":
+            simp = part
+        snapped = _snap_to_rect_corners(simp)
+        if snapped.is_empty or snapped.geom_type != "Polygon":
+            snapped = simp
+        layout.shapes.append(BuiltShape(polygon=snapped, role=ROLE_JUNCTION))
+
+    # Emit aprons
+    for ap in apron_polys:
+        simp = ap.simplify(1.0, preserve_topology=True)
+        if simp.is_empty or simp.geom_type != "Polygon":
+            simp = ap
+        layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
 
     return layout
 
@@ -626,24 +662,30 @@ def _find_junction_points(
     ways: List[Tuple[str, List[str], Dict[str, str]]],
     to_m,
 ) -> List[Tuple[float, float]]:
-    """Identify junction POINTS (clusters of shared OSM nodes).
+    """Identify junction POINTS — OSM nodes shared by ≥ 2 DIFFERENT refs.
 
-    Any OSM node referenced by ≥ 2 taxi ways is a candidate junction
-    point.  Candidates within ``JUNCTION_CLUSTER_DIST_M`` of each
-    other merge into one cluster; the cluster centroid is the
+    Per user rule: pure bends within one taxi (two same-ref ways
+    meeting at a node) are NOT junctions — they emit as adjacent
+    same-role rects sharing a vertex line.  Only nodes where
+    multiple distinct refs (or an unrefed way + a refed way) meet
+    are junction candidates.
+
+    Candidates within ``JUNCTION_CLUSTER_DIST_M`` of each other
+    collapse into one cluster; the cluster centroid is the
     junction point.
     """
     from collections import defaultdict
-    in_ways: Dict[str, int] = defaultdict(int)
+    refs_at_node: Dict[str, set] = defaultdict(set)
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
             continue
+        ref = tags.get("ref", "") or "<unrefed>"
         for n in nds:
-            in_ways[n] += 1
+            refs_at_node[n].add(ref)
 
     candidates: List[Tuple[float, float]] = []
-    for nid, count in in_ways.items():
-        if count < 2:
+    for nid, refs in refs_at_node.items():
+        if len(refs) < 2:
             continue
         if nid not in nodes:
             continue
@@ -655,7 +697,6 @@ def _find_junction_points(
     for pt in candidates:
         placed = False
         for cl in clusters:
-            # Check distance to any member
             if any(math.hypot(pt[0]-q[0], pt[1]-q[1]) <= JUNCTION_CLUSTER_DIST_M
                    for q in cl):
                 cl.append(pt)
@@ -664,7 +705,6 @@ def _find_junction_points(
         if not placed:
             clusters.append([pt])
 
-    # Return centroids
     return [(sum(p[0] for p in cl)/len(cl),
              sum(p[1] for p in cl)/len(cl)) for cl in clusters]
 
@@ -774,26 +814,38 @@ def _build_junction_polys_from_corners(
     return polys
 
 
+RDP_SIMPLIFY_TOL_M = 2.0      # RDP tolerance after ref-merge
+MIN_SEGMENT_LEN_M = 15.0      # drop segments shorter than this
+
+
 def _extract_osm_taxi_centerlines(
     nodes: Dict[str, Tuple[float, float]],
     ways: List[Tuple[str, List[str], Dict[str, str]]],
     to_m,
 ) -> List[Tuple[LineString, str]]:
-    """Return list of (linestring_m, ref_tag) for aeroway=taxiway ways.
+    """Extract one polyline segment per (ref, straight-run).
 
-    We split each OSM way at its internal vertices so the emitter
-    gets ONE SEGMENT PER STRAIGHT RUN between consecutive topology
-    nodes.  This matches how targets are drawn: the user puts one
-    rect per straight taxi segment and fills every bend/junction
-    with a separate junction polygon.  Merging same-ref ways (e.g.
-    A1–A6) would go the opposite direction and produce 400+ m
-    rects that span multiple target segments.
+    Algorithm:
+      1. Gather all OSM taxi ways per ref.
+      2. linemerge() the per-ref ways into the fewest possible
+         contiguous polylines.  OSM splits one physical taxi
+         across many <way> rows at each node — merging restores
+         the single polyline per strip.
+      3. RDP-simplify each merged polyline at
+         ``RDP_SIMPLIFY_TOL_M``.  Minor GPS wobble collapses;
+         genuine bends remain as internal vertices.
+      4. Split the simplified polyline at each remaining vertex
+         into individual straight-run segments.
+      5. Drop segments shorter than ``MIN_SEGMENT_LEN_M`` and
+         (at airports with any refs) drop unrefed segments.
 
-    An OSM way that's already one straight segment yields one
-    centerline.  An OSM way with N internal vertices yields N
-    centerlines.
+    Per user convention, stubs and cross-connectors typically merge
+    down to a single polyline with a single straight run (emitted
+    as 1 rect).  Long parallel taxis that physically bend (like L
+    at SPJC) retain bend vertices and emit multiple rects that
+    share corner vertices at the bend.
     """
-    out = []
+    by_ref: Dict[str, List[LineString]] = {}
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
             continue
@@ -805,48 +857,60 @@ def _extract_osm_taxi_centerlines(
                 pts.append(to_m(lon, lat))
         if len(pts) < 2:
             continue
-        total_len = sum(
-            math.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1])
-            for i in range(len(pts)-1))
-        # Unrefed OSM taxiways at SPJC are parking-position / gate
-        # access paths that the target rolls into apron shapes.
-        # Drop them when the airport has refs (SPJC).  At airports
-        # without any refs (SPLP), we have to use unrefed centerlines
-        # as the only geometric signal — keep them when long enough.
-        # Caller-level heuristic below: if ANY refed way exists in
-        # the batch, unrefed ways are suppressed.
-        if not ref:
-            # Defer filtering to post-pass so we know whether the
-            # airport has any refs at all.
-            pass
-
-        # RDP-simplify with 1 m tolerance — almost lossless, keeps
-        # every bend vertex.  The user's target convention is to
-        # emit simple straight rect segments and fill bends / curves
-        # / intersections with enlarged junction polygons.  So we
-        # need MAXIMAL segmentation: any vertex where the centerline
-        # changes direction breaks into a new segment.
         try:
-            simp = LineString(pts).simplify(1.0, preserve_topology=False)
+            ls = LineString(pts)
         except Exception:
             continue
-        scoords = list(simp.coords)
-        if len(scoords) < 2:
+        if ls.is_empty or ls.length < 5.0:
             continue
-        # Split the simplified polyline at each remaining vertex.
-        for i in range(len(scoords) - 1):
+        by_ref.setdefault(ref, []).append(ls)
+
+    out: List[Tuple[LineString, str]] = []
+    for ref, lines in by_ref.items():
+        # Merge same-ref contiguous ways
+        if len(lines) > 1:
             try:
-                seg = LineString([scoords[i], scoords[i+1]])
+                merged = linemerge(MultiLineString(lines))
+            except Exception:
+                merged = None
+            if merged is None or merged.is_empty:
+                merged_lines = lines
+            elif merged.geom_type == "LineString":
+                merged_lines = [merged]
+            else:
+                merged_lines = list(merged.geoms)
+        else:
+            merged_lines = lines
+
+        for ls in merged_lines:
+            try:
+                simp = ls.simplify(RDP_SIMPLIFY_TOL_M,
+                                   preserve_topology=False)
             except Exception:
                 continue
-            if seg.is_empty or seg.length < 15.0:
+            scoords = list(simp.coords)
+            if len(scoords) < 2:
                 continue
-            out.append((seg, ref))
+            # Short polylines (stubs, cross-connector pieces, etc.)
+            # emit as ONE rect regardless of internal bends — user
+            # spec: "for stubs, it should be a single rect."
+            # Long polylines (parallels) split at RDP bends so the
+            # user's 9-segment L taxiway emits 9 rects, not 1.
+            STUB_MAX_LEN_M = 250.0
+            if simp.length <= STUB_MAX_LEN_M:
+                seg = LineString([scoords[0], scoords[-1]])
+                if seg.length >= MIN_SEGMENT_LEN_M:
+                    out.append((seg, ref))
+            else:
+                for i in range(len(scoords) - 1):
+                    try:
+                        seg = LineString([scoords[i], scoords[i+1]])
+                    except Exception:
+                        continue
+                    if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
+                        continue
+                    out.append((seg, ref))
 
-    # Post-pass: if the airport has any refs, drop unrefed
-    # centerlines (they're parking/gate paths the target skips).
-    # Keep unrefed centerlines at airports with NO refs (SPLP),
-    # since they're the only geometric seed available.
     any_ref = any(r for _, r in out)
     if any_ref:
         out = [(ls, r) for ls, r in out if r]
@@ -903,21 +967,25 @@ def _build_taxi_rects(
         if clipped.length < 20.0:
             continue
 
-        # Sample half-widths along clipped axis to find natural width
-        natural_hw = _natural_half_width(clipped, pav_non_rwy)
+        # Probe half-widths along axis.  ``natural_hw`` detects where
+        # widening begins; ``max_hw`` is the actual rect half-width.
+        natural_hw, max_hw = _natural_half_width(clipped, pav_non_rwy)
         if natural_hw < 3.5 or natural_hw > 40.0:
             continue
 
         # Trim endpoints inward where half-width exceeds widening threshold.
-        # Aggressive widen_factor = 1.05 pulls the rect back to where the
-        # apt.dat pavement is essentially at its natural width — the
-        # trimmed region becomes junction territory.
         trimmed = _trim_to_narrow(clipped, pav_non_rwy, natural_hw,
                                  widen_factor=1.05)
         if trimmed is None or trimmed.length < 15.0:
             continue
 
-        # Dedup (against trimmed axis so shorter dupes don't fall through)
+        # Re-probe along the TRIMMED axis to find the widest pavement
+        # anywhere in the rect's coverage — that's the rect width.
+        _, trim_max_hw = _natural_half_width(trimmed, pav_non_rwy)
+        if trim_max_hw < 3.5:
+            trim_max_hw = natural_hw
+
+        # Dedup against trimmed axis
         if emitted_union is not None and not emitted_union.is_empty:
             try:
                 inside_len = trimmed.intersection(emitted_union).length
@@ -926,7 +994,7 @@ def _build_taxi_rects(
             except Exception:
                 pass
 
-        width = 2.0 * natural_hw
+        width = 2.0 * trim_max_hw
         rect = _rect_from_axis_extended(trimmed, width, pav_non_rwy)
         if rect is None or rect.is_empty:
             continue
@@ -944,15 +1012,18 @@ def _build_taxi_rects(
 
 
 def _natural_half_width(axis: LineString, pav: Polygon,
-                        n_probes: int = 11) -> float:
-    """Return the MEDIAN distance-to-boundary along the axis.
+                        n_probes: int = 11) -> Tuple[float, float]:
+    """Return (natural_hw, max_hw) distance-to-boundary along axis.
 
-    This is the natural half-width of the strip — where the apt.dat
-    pavement is narrowest along the centerline.  Endpoints that
-    widen into junctions skew the mean, so median is robust.
+    * ``natural_hw`` = MEDIAN probe distance — used by the trim
+      algorithm to detect where the strip begins widening.
+    * ``max_hw`` = 90-th-percentile probe distance — used as the
+      actual RECT half-width, so the rect spans the full pavement
+      width along its section (per user rule "rect width should be
+      the widest portion of the pavement anywhere along the section").
     """
     if axis.length < 1e-3:
-        return 0.0
+        return 0.0, 0.0
     boundary = pav.boundary
     dists = []
     for k in range(n_probes):
@@ -964,9 +1035,14 @@ def _natural_half_width(axis: LineString, pav: Polygon,
         if d > 0.1:
             dists.append(d)
     if not dists:
-        return 0.0
+        return 0.0, 0.0
     dists.sort()
-    return dists[len(dists) // 2]
+    median = dists[len(dists) // 2]
+    # 90th percentile keeps the max slightly robust to outliers
+    # from apron-adjacent probes on rectangular widening.
+    p90_idx = max(0, int(len(dists) * 0.9) - 1)
+    p90 = dists[p90_idx] if p90_idx < len(dists) else dists[-1]
+    return median, p90
 
 
 def _trim_to_narrow(axis: LineString, pav: Polygon, natural_hw: float,

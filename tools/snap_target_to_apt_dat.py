@@ -140,10 +140,18 @@ def main(argv=None):
     ap.add_argument("--max-snap", type=float, default=MAX_SNAP_DIST_M)
     ap.add_argument("--out", type=Path, default=None,
                     help="Output path; default: <target>_snapped.osm")
+    ap.add_argument("--force", action="store_true",
+                    help="Overwrite existing output file (default: refuse).")
     args = ap.parse_args(argv)
 
     out_path = args.out or args.target_path.with_name(
         args.target_path.stem + "_snapped.osm")
+    if out_path.exists() and not args.force:
+        raise SystemExit(
+            f"Refusing to overwrite existing {out_path}.\n"
+            f"Pass --force if you really want to clobber it "
+            f"(existing manual edits to the snapped file will be lost)."
+        )
 
     apt_path = APR.find_airport_apt_dat(args.xplane, args.icao)
     apt = APR.load_airport(apt_path, args.icao)
