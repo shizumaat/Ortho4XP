@@ -454,8 +454,19 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         xplane_root, icao, anchor[0], anchor[1])
     osm_centerlines = _extract_osm_taxi_centerlines(nodes, ways, to_m)
 
-    # ── Terminals from OSM (way or relation aeroway=terminal) ────
-    terminal_polys = _extract_osm_terminals(nodes, ways, relations, to_m)
+
+    # ── Terminals: expand OSM building outlines to the containing
+    # apt.dat pavement polygon (or buffer if no polygon contains).
+    # The target terminal is the "pad" — apt.dat pavement up to the
+    # apron boundary.  OSM aeroway=terminal gives the building
+    # footprint; we use that as a seed.
+    osm_terminal_polys = _extract_osm_terminals(
+        nodes, ways, relations, to_m)
+    terminal_polys: List[Polygon] = []
+    for otp in osm_terminal_polys:
+        pad = _terminal_pad_from_building(otp, pav_polys)
+        if pad is not None:
+            terminal_polys.append(pad)
     terminal_union = (unary_union(terminal_polys)
                       if terminal_polys else None)
     for i, tp in enumerate(terminal_polys):
@@ -481,8 +492,12 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     # that the user's target doesn't emit.
     # Look up raw OSM ways per ref (untrimmed).  A stub "connects to
     # a runway" iff one of its raw endpoints lies within
-    # RUNWAY_ENDPOINT_DIST_M of the runway footprint.
-    RUNWAY_ENDPOINT_DIST_M = 35.0
+    # RUNWAY_ENDPOINT_DIST_M of the runway footprint.  The threshold
+    # accounts for the junction polygon between the stub rect and
+    # the runway: target stub-rect corners are 22–66 m from the
+    # runway edge (measured from the actual target), so 80 m gives
+    # a small margin for freehand drift.
+    RUNWAY_ENDPOINT_DIST_M = 80.0
     raw_endpoints_by_ref: Dict[str, List[Tuple[float, float]]] = {}
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
@@ -520,43 +535,31 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         layout.shapes.append(BuiltShape(
             polygon=rect, role=role, ref=ref, source_axis=axis))
 
-    # ── Junctions from rect endpoint clusters ──────────────────
-    # User rule: build rects first, then generate junctions by
-    # connecting the corner vertices of rects whose axis endpoints
-    # cluster together.  Two rect endpoints within
-    # INTERSECTION_MERGE_DIST_M are part of the same junction.
-    # (Derived from target: shortest rect = 51 m, so intersections
-    # closer than that merge instead of getting a rect between.)
-    INTERSECTION_MERGE_DIST_M = 50.0
+    # ── Pure-residue junction emission ──────────────────────────
+    # Per user's confirmation: "Drop corner-vertex path; emit
+    # junctions purely from pavement residue (between rects), then
+    # merge at some threshold — that would always give ONE polygon
+    # per connected widening region."
+    #
+    # 1. Compute pavement residue = pavement - rects - terminals.
+    # 2. Split into connected components.
+    # 3. Large components (>= MIN_APRON_AREA) → apron.
+    # 4. Smaller components → junction candidates.
+    # 5. Merge junction candidates within JUNCTION_MERGE_DIST_M so
+    #    no two junctions touch or run alongside each other.
     MIN_APRON_AREA_M2 = 25000.0
-    junctions = _build_junctions_from_rect_endpoints(
-        taxi_rects, INTERSECTION_MERGE_DIST_M,
-        pav_union=pav_union,
-        terminal_union=terminal_union)
-
-    # ── Collect junction candidates (corner + residue) ──────────
-    # corner-vertex junctions come from _build_junctions_from_rect_
-    # endpoints (multi-rect clusters); residue junctions cover
-    # widening areas adjacent to a lone rect end.
     MIN_JUNCTION_AREA_M2 = 80.0
-    all_junction_candidates: List[Polygon] = list(junctions)
+    JUNCTION_MERGE_DIST_M = 10.0
+
+    all_junction_candidates: List[Polygon] = []
     apron_polys: List[Polygon] = []
 
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
-    corner_junction_union = (unary_union(junctions) if junctions else None)
-    axis_endpoints = []
-    for _, axis, _, _ in taxi_rects:
-        coords_ax = list(axis.coords)
-        if coords_ax:
-            axis_endpoints.append(Point(coords_ax[0]))
-            axis_endpoints.append(Point(coords_ax[-1]))
     if pav_union is not None:
         residue = pav_union
         if taxi_rect_union is not None:
             residue = residue.difference(taxi_rect_union)
-        if corner_junction_union is not None:
-            residue = residue.difference(corner_junction_union)
         if terminal_union is not None:
             residue = residue.difference(terminal_union)
         parts = [residue] if residue.geom_type == "Polygon" else list(
@@ -569,25 +572,15 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                 continue
             if part.area < MIN_JUNCTION_AREA_M2:
                 continue
-            is_adjacent = False
-            for ep in axis_endpoints:
-                if part.distance(ep) <= 25.0:
-                    is_adjacent = True
-                    break
-            if not is_adjacent:
-                continue
             all_junction_candidates.append(part)
 
-    # ── Merge any junctions that touch or come within 15 m ──────
-    # Per user: "two junctions should never be connected to each
-    # other — join them into one larger junction."  Buffer-close
-    # at 15 m then unbuffer: any two junction polys that are within
-    # 15 m of each other merge into a single larger junction.
+    # Merge junctions within JUNCTION_MERGE_DIST_M
     final_junctions: List[Polygon] = []
     if all_junction_candidates:
         try:
             combined = unary_union(all_junction_candidates)
-            closed = combined.buffer(15.0).buffer(-15.0)
+            closed = combined.buffer(JUNCTION_MERGE_DIST_M).buffer(
+                -JUNCTION_MERGE_DIST_M)
             if pav_union is not None:
                 closed = closed.intersection(pav_union)
             if taxi_rect_union is not None:
@@ -627,6 +620,38 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
 
 JUNCTION_CLUSTER_DIST_M = 80.0  # merge junction nodes within this distance
 JUNCTION_RADIUS_SCALE = 1.5     # disc radius = local_half_width × this
+
+
+def _terminal_pad_from_building(
+    building: Polygon,
+    pav_polys: List[Polygon],
+) -> Optional[Polygon]:
+    """Expand an OSM building outline into the terminal pad.
+
+    The pad is the apt.dat pavement polygon that **contains** the
+    building (the pavement area dedicated to the terminal).  If no
+    pavement polygon contains the building centroid, fall back to
+    a buffered version of the building.
+    """
+    if building.is_empty:
+        return None
+    ctr = building.centroid
+    best = None
+    best_area = -1.0
+    for pav in pav_polys:
+        if pav.contains(ctr):
+            # Prefer the SMALLEST containing polygon (most specific).
+            if best is None or pav.area < best_area:
+                best = pav
+                best_area = pav.area
+    if best is not None:
+        return best
+    # Fallback: buffered building
+    try:
+        buf = building.buffer(20.0)
+    except Exception:
+        return building
+    return buf if buf.geom_type == "Polygon" else None
 
 
 def _extract_osm_terminals(
@@ -1417,8 +1442,9 @@ def _classify_role(axis: LineString, width: float,
             if db is not None and db > 40.0:
                 return ROLE_CROSS_CONNECTOR
             return ROLE_STUB
-        # Known parallel refs always classify as parallel — don't
-        # demote individual bend segments to stub.
+        # Known parallel refs (A/F/L/V/M/U) always emit as parallel.
+        # A separate post-pass detects the SHORT runway-connector
+        # segment (stub-A) and demotes it.
         if ref in ("M", "U"):
             return ROLE_SECONDARY_PARALLEL
         if ref in PARALLEL_REFS:
@@ -1459,12 +1485,38 @@ def _axis_to_nearest_rwy_db(axis: LineString,
 
 
 def _refine_roles(emitted, rwy_centerlines):
-    """Second pass: currently a no-op.
+    """Post-classify: demote the stub-A / stub-F segment (the short
+    runway-connector within a parallel ref's polyline) from
+    primary_parallel to stub.
 
-    The earlier heuristic (cross_connector must touch >= 2 parallels)
-    produced false negatives at SPJC where Q / R rects are corner-
-    snapped and don't share an exact metric boundary with the primary
-    rects they visually connect.  We trust the ref-based classifier
-    instead.
+    Rule: for each parallel ref, find the segment that is MOST
+    perpendicular to the runway (highest Δ bearing).  If its bearing
+    is >= 35° off the runway AND it has a rect-corner within 60 m of
+    the runway, demote to stub.
     """
-    pass
+    if not rwy_centerlines or not emitted:
+        return
+    from collections import defaultdict
+    by_ref: Dict[str, List[int]] = defaultdict(list)
+    for i, (rect, axis, role, ref) in enumerate(emitted):
+        if role == ROLE_PRIMARY_PARALLEL:
+            by_ref[ref].append(i)
+    for ref, idxs in by_ref.items():
+        if not idxs:
+            continue
+        # Find the most-perpendicular segment
+        best_i = -1
+        best_db = 0.0
+        for i in idxs:
+            rect, axis, _, _ = emitted[i]
+            db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
+            if db is None:
+                continue
+            if db > best_db:
+                best_db = db
+                best_i = i
+        if best_i < 0 or best_db < 35.0:
+            continue
+        # Demote to stub
+        rect, axis, _, r = emitted[best_i]
+        emitted[best_i] = (rect, axis, ROLE_STUB, r)
