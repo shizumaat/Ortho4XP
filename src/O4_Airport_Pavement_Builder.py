@@ -1267,9 +1267,11 @@ def _extract_osm_taxi_centerlines(
                         continue
                     out.append((seg, ref))
             else:
-                seg = LineString([scoords[0], scoords[-1]])
-                if seg.length >= MIN_SEGMENT_LEN_M:
-                    out.append((seg, ref))
+                # For stubs, use the ORIGINAL (un-simplified) polyline
+                # so curves don't get chord-cut.  Pass the full line
+                # in; downstream trim + rect-build works with it.
+                if ls.length >= MIN_SEGMENT_LEN_M:
+                    out.append((ls, ref))
 
     any_ref = any(r for _, r in out)
     if any_ref:
@@ -1314,8 +1316,12 @@ def _build_taxi_rects(
     emitted_union: Optional[Polygon] = None
 
     for axis, ref in centerlines:
+        # Clip to the full pavement (including runway).  The rect may
+        # overlap runway slightly at stubs that reach the runway edge;
+        # we prefer a stub that correctly reaches the runway over
+        # clipping it at the runway boundary and losing most of it.
         try:
-            clipped = axis.intersection(pav_non_rwy)
+            clipped = axis.intersection(pav_union)
         except Exception:
             continue
         if clipped.is_empty:
