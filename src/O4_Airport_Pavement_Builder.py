@@ -480,113 +480,46 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         layout.shapes.append(BuiltShape(
             polygon=rect, role=role, ref=ref, source_axis=axis))
 
-    # ── Junction candidates: corner + residue ───────────────────
-    # Corner-vertex junctions come from multi-ref cluster nodes
-    # (filtered in _find_junction_points to exclude pure bends).
-    # Residue fragments that are apron-sized classify as apron;
-    # smaller residue fragments merge with the corner junctions.
-    # Then we proximity-union any two junction polys within
-    # JUNCTION_MERGE_DIST to satisfy the user's rule
-    # "two junctions should never be connected to each other —
-    #  join them into one larger junction."
+    # ── Junctions from rect endpoint clusters ──────────────────
+    # User rule: build rects first, then generate junctions by
+    # connecting the corner vertices of rects whose axis endpoints
+    # cluster together.  Two rect endpoints within
+    # INTERSECTION_MERGE_DIST_M are part of the same junction.
+    # (Derived from target: shortest rect = 51 m, so intersections
+    # closer than that merge instead of getting a rect between.)
+    INTERSECTION_MERGE_DIST_M = 50.0
     MIN_APRON_AREA_M2 = 25000.0
-    MIN_JUNCTION_AREA_M2 = 80.0
-    JUNCTION_MERGE_DIST_M = 5.0
-    SNAP_TO_CORNER_M = 1.5
-
-    corner_junctions = _build_junction_polys_from_corners(
-        junction_points, taxi_rects, pav_union,
+    junctions = _build_junctions_from_rect_endpoints(
+        taxi_rects, INTERSECTION_MERGE_DIST_M,
+        pav_union=pav_union,
         terminal_union=terminal_union)
+    for jp in junctions:
+        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
 
+    # ── Aprons: pavement residue that remains after all other
+    # emissions, filtered to big areas only (terminal / engine test).
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
-    corner_junction_union = (unary_union(corner_junctions)
-                             if corner_junctions else None)
-
-    # Residue classification
-    apron_polys: List[Polygon] = []
-    junction_candidates: List[Polygon] = list(corner_junctions)
+    junction_union = (unary_union(junctions) if junctions else None)
     if pav_union is not None:
         residue = pav_union
         if taxi_rect_union is not None:
             residue = residue.difference(taxi_rect_union)
+        if junction_union is not None:
+            residue = residue.difference(junction_union)
         if terminal_union is not None:
             residue = residue.difference(terminal_union)
-        if corner_junction_union is not None:
-            residue = residue.difference(corner_junction_union)
         parts = [residue] if residue.geom_type == "Polygon" else list(
             getattr(residue, "geoms", []))
         for part in parts:
             if part.geom_type != "Polygon":
                 continue
-            if part.area < MIN_JUNCTION_AREA_M2:
+            if part.area < MIN_APRON_AREA_M2:
                 continue
-            if part.area >= MIN_APRON_AREA_M2:
-                apron_polys.append(part)
-            else:
-                junction_candidates.append(part)
-
-    # Proximity-merge junctions: buffer-close then unbuffer.
-    if junction_candidates:
-        jn_union = unary_union(junction_candidates)
-        merged = jn_union.buffer(JUNCTION_MERGE_DIST_M).buffer(
-            -JUNCTION_MERGE_DIST_M)
-        # Clip back to pavement so buffer doesn't escape
-        if pav_union is not None:
-            merged = merged.intersection(pav_union)
-            if taxi_rect_union is not None:
-                merged = merged.difference(taxi_rect_union)
-            if terminal_union is not None:
-                merged = merged.difference(terminal_union)
-        merged_parts = [merged] if merged.geom_type == "Polygon" else list(
-            getattr(merged, "geoms", []))
-    else:
-        merged_parts = []
-
-    rect_corners = []
-    for rect in emitted_taxi_rects:
-        rc = list(rect.exterior.coords)
-        if rc and rc[0] == rc[-1]:
-            rc = rc[:-1]
-        rect_corners.extend(rc)
-
-    def _snap_to_rect_corners(poly: Polygon) -> Polygon:
-        coords = list(poly.exterior.coords)
-        out = []
-        for (x, y) in coords:
-            best = None
-            best_d = SNAP_TO_CORNER_M
-            for (rx, ry) in rect_corners:
-                d = math.hypot(x - rx, y - ry)
-                if d < best_d:
-                    best = (rx, ry)
-                    best_d = d
-            out.append(best if best else (x, y))
-        try:
-            return Polygon(out).buffer(0)
-        except Exception:
-            return poly
-
-    # Emit merged junctions
-    for part in merged_parts:
-        if part.geom_type != "Polygon":
-            continue
-        if part.area < MIN_JUNCTION_AREA_M2:
-            continue
-        simp = part.simplify(1.0, preserve_topology=True)
-        if simp.is_empty or simp.geom_type != "Polygon":
-            simp = part
-        snapped = _snap_to_rect_corners(simp)
-        if snapped.is_empty or snapped.geom_type != "Polygon":
-            snapped = simp
-        layout.shapes.append(BuiltShape(polygon=snapped, role=ROLE_JUNCTION))
-
-    # Emit aprons
-    for ap in apron_polys:
-        simp = ap.simplify(1.0, preserve_topology=True)
-        if simp.is_empty or simp.geom_type != "Polygon":
-            simp = ap
-        layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
+            simp = part.simplify(1.0, preserve_topology=True)
+            if simp.is_empty or simp.geom_type != "Polygon":
+                simp = part
+            layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
 
     return layout
 
@@ -707,6 +640,124 @@ def _find_junction_points(
 
     return [(sum(p[0] for p in cl)/len(cl),
              sum(p[1] for p in cl)/len(cl)) for cl in clusters]
+
+
+def _build_junctions_from_rect_endpoints(
+    taxi_rects: List[Tuple[Polygon, LineString, str, str]],
+    merge_dist: float,
+    pav_union: Optional[Polygon],
+    terminal_union: Optional[Polygon] = None,
+) -> List[Polygon]:
+    """Build junctions from rect endpoint clusters (user's approach).
+
+    Algorithm:
+      1. Collect each rect's 2 axis endpoints + 2 corner vertices at
+         each end (total: 2 endpoints × 2 corners = 4 corners per rect).
+      2. Cluster axis endpoints by single-link within ``merge_dist``.
+      3. For each cluster of ≥ 2 endpoints:
+         * If all endpoints share the same ref → same-taxi bend (no
+           junction emitted; same-ref rects connect via shared vertices
+           handled elsewhere).
+         * Else → emit a junction polygon whose vertices are the 2
+           corner vertices of each participating rect at the cluster.
+
+    The polygon vertices are ordered angularly around the cluster
+    centroid, giving a star polygon that wraps through each rect's
+    corner pair.
+    """
+    if not taxi_rects:
+        return []
+
+    # Endpoint records: (rect_idx, end_index, axis_pt, corner_pair, ref)
+    endpoints = []
+    for i, (rect, axis, role, ref) in enumerate(taxi_rects):
+        pairs = _rect_end_corners(rect, axis)
+        if len(pairs) < 2:
+            continue
+        coords = list(axis.coords)
+        endpoints.append((i, 0, coords[0], pairs[0], ref))
+        endpoints.append((i, 1, coords[-1], pairs[1], ref))
+
+    # Single-link cluster by axis-endpoint proximity
+    n = len(endpoints)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i+1, n):
+            ax = endpoints[i][2]
+            bx = endpoints[j][2]
+            if math.hypot(ax[0]-bx[0], ax[1]-bx[1]) <= merge_dist:
+                union(i, j)
+
+    clusters: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = find(i)
+        clusters.setdefault(r, []).append(i)
+
+    out: List[Polygon] = []
+    for cl in clusters.values():
+        if len(cl) < 2:
+            continue
+        # Unique refs in cluster
+        refs = {endpoints[i][4] for i in cl}
+        # Unique rect ids (cluster can contain multiple ends of same rect)
+        unique_rects = {endpoints[i][0] for i in cl}
+        # Pure same-ref bend (only one ref AND only one rect pairs bends) — skip junction
+        if len(refs) == 1 and len(unique_rects) <= 2:
+            continue
+        # Collect all corner vertices
+        all_corners = []
+        for i in cl:
+            c1, c2 = endpoints[i][3]
+            all_corners.append(c1)
+            all_corners.append(c2)
+        if len(all_corners) < 3:
+            continue
+        # Deduplicate near-identical corners
+        uniq: List[Tuple[float, float]] = []
+        for c in all_corners:
+            if not any(math.hypot(c[0]-u[0], c[1]-u[1]) < 0.1 for u in uniq):
+                uniq.append(c)
+        if len(uniq) < 3:
+            continue
+        cx = sum(p[0] for p in uniq) / len(uniq)
+        cy = sum(p[1] for p in uniq) / len(uniq)
+        ordered = sorted(uniq, key=lambda p: math.atan2(p[1]-cy, p[0]-cx))
+        try:
+            poly = Polygon(ordered).buffer(0)
+        except Exception:
+            continue
+        if poly.is_empty:
+            continue
+        if poly.geom_type == "MultiPolygon":
+            poly = max(poly.geoms, key=lambda g: g.area)
+        if poly.geom_type != "Polygon" or poly.area < 100.0:
+            continue
+        # Don't let junction bleed into a terminal
+        if terminal_union is not None:
+            try:
+                poly = poly.difference(terminal_union)
+            except Exception:
+                pass
+            if poly.is_empty:
+                continue
+            if poly.geom_type == "MultiPolygon":
+                poly = max(poly.geoms, key=lambda g: g.area)
+            if poly.geom_type != "Polygon":
+                continue
+        out.append(poly)
+    return out
 
 
 def _rect_end_corners(rect: Polygon, axis: LineString
