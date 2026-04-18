@@ -481,6 +481,13 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     junction_points = _find_junction_points(
         nodes, ways, to_m, osm_centerlines=osm_centerlines)
 
+    # Per user rule (2026-04-18): "Implement splitting at cross ref
+    # crossings" — split every centerline at each multi-ref
+    # junction node along its path, so each straight section
+    # between intersections emits as a single rect.
+    osm_centerlines = _split_centerlines_at_points(
+        osm_centerlines, junction_points, approach_tol_m=25.0)
+
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
         osm_centerlines, pav_union, layout.runway_union, rwy_centerlines)
@@ -536,66 +543,239 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         layout.shapes.append(BuiltShape(
             polygon=rect, role=role, ref=ref, source_axis=axis))
 
-    # ── Pure-residue junction emission ──────────────────────────
-    # Per user's confirmation: "Drop corner-vertex path; emit
-    # junctions purely from pavement residue (between rects), then
-    # merge at some threshold — that would always give ONE polygon
-    # per connected widening region."
-    #
-    # 1. Compute pavement residue = pavement - rects - terminals.
-    # 2. Split into connected components.
-    # 3. Large components (>= MIN_APRON_AREA) → apron.
-    # 4. Smaller components → junction candidates.
-    # 5. Merge junction candidates within JUNCTION_MERGE_DIST_M so
-    #    no two junctions touch or run alongside each other.
+    # ── Junction emission: corner + apt.dat pavement arc ────────
+    # Per user's authoritative rules (memory: feedback_shape_rules,
+    # session 2026-04-18):
+    #   Rule 8:  vertices = incoming rect corners + apron corners.
+    #   Rule 9:  arcs between consecutive corners trace apt.dat
+    #            pavement vertices, MAX 4 points per arc.
+    #   Rule 10: no hulls, no smooths.
+    #   Rule 11: junctions fill widened portions left by trimmed rects.
     MIN_APRON_AREA_M2 = 25000.0
     MIN_JUNCTION_AREA_M2 = 80.0
-    JUNCTION_MERGE_DIST_M = 40.0
-
-    all_junction_candidates: List[Polygon] = []
-    apron_polys: List[Polygon] = []
+    CLUSTER_MERGE_DIST_M = 40.0  # tight — each OSM multi-ref cluster
+                                 # typically maps to one target junction
 
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
 
-    # Seed junction candidates at each OSM multi-ref cluster.  Even
-    # when the pavement residue is split here, seeding a disc
-    # anchors the junction at the topological intersection.
-    for (cx, cy) in junction_points:
-        disc = Point(cx, cy).buffer(50.0)
-        if pav_union is not None:
+    # Detect per-rect trim at each end.  A rect end is "uniform"
+    # (no widening) if the trimmed axis endpoint sits right on the
+    # pav-union (or runway) boundary — i.e. the axis went all the
+    # way through.  Otherwise there was a widening, reserving the
+    # adjacent region for a junction.
+    pav_full = unary_union([pav_union, layout.runway_union]) if (
+        pav_union is not None and layout.runway_union is not None
+    ) else (pav_union or layout.runway_union)
+    rect_trim_flags: List[Tuple[bool, bool]] = []  # (trim_start, trim_end)
+    for rect, axis, role, ref in taxi_rects:
+        coords_ax = list(axis.coords)
+        if len(coords_ax) < 2 or pav_full is None:
+            rect_trim_flags.append((False, False))
+            continue
+        ts = Point(coords_ax[0]).distance(pav_full.boundary) > 2.0
+        te = Point(coords_ax[-1]).distance(pav_full.boundary) > 2.0
+        rect_trim_flags.append((ts, te))
+
+    # Seed junctions from ALL rect-end points + OSM junction_points.
+    # Every rect end is a potential junction (two rects meeting
+    # share an end region); the constructive build returns None
+    # when there aren't ≥2 rects contributing, so excess seeds are
+    # harmless.  Using all ends catches bend-junctions (same-ref
+    # rects meeting after a turn) that aren't in OSM multi-ref
+    # nodes.
+    rect_end_pts: List[Tuple[float, float]] = []
+    for i, (rect, axis, role, ref) in enumerate(taxi_rects):
+        coords_ax = list(axis.coords)
+        if len(coords_ax) < 2:
+            continue
+        rect_end_pts.append(coords_ax[0])
+        rect_end_pts.append(coords_ax[-1])
+    # Seed points: all rect-ends + OSM multi-ref clusters.
+    seed_points = list(rect_end_pts) + list(junction_points)
+
+    # Cluster seed points.
+    merged_clusters: List[List[Tuple[float, float]]] = []
+    for jp in seed_points:
+        placed = False
+        for grp in merged_clusters:
+            for p in grp:
+                if math.hypot(jp[0] - p[0], jp[1] - p[1]) <= CLUSTER_MERGE_DIST_M:
+                    grp.append(jp)
+                    placed = True
+                    break
+            if placed:
+                break
+        if not placed:
+            merged_clusters.append([jp])
+
+    final_junctions: List[Polygon] = []
+    for grp in merged_clusters:
+        gx = sum(p[0] for p in grp) / len(grp)
+        gy = sum(p[1] for p in grp) / len(grp)
+        extent = max((math.hypot(p[0] - gx, p[1] - gy) for p in grp),
+                     default=0.0)
+        # Local disc: cluster extent + enough to reach rect widening points.
+        local_radius = max(60.0, extent + 80.0)
+        poly = _build_junction_constructive(
+            (gx, gy), taxi_rects, pav_union, terminal_union,
+            max_corner_dist_m=max(80.0, extent + 80.0),
+            local_disc_radius_m=max(120.0, extent + 120.0),
+            max_arc_vertices=4,
+        )
+        if poly is None:
+            continue
+        # Keep clear of rects + terminal (already clipped to local
+        # pav inside constructive, but rect-union subtract is needed
+        # because corners sit on rect edges).
+        if taxi_rect_union is not None:
             try:
-                disc = disc.intersection(pav_union)
+                poly = poly.difference(taxi_rect_union)
             except Exception:
+                pass
+            if poly.is_empty:
                 continue
-            if disc.is_empty:
+            if poly.geom_type == "MultiPolygon":
+                poly = max(poly.geoms, key=lambda g: g.area)
+            if poly.geom_type != "Polygon":
                 continue
-            if disc.geom_type == "MultiPolygon":
-                disc = max(disc.geoms, key=lambda g: g.area)
-            if disc.geom_type != "Polygon":
+        if poly.area < MIN_JUNCTION_AREA_M2:
+            continue
+        final_junctions.append(poly)
+
+    # Dedup junctions that overlap heavily (multiple seeds can produce
+    # nearly-identical polygons).  Keep the larger-area one.
+    def _polys_overlap_heavily(p1: Polygon, p2: Polygon,
+                               thresh: float = 0.5) -> bool:
+        try:
+            inter = p1.intersection(p2).area
+        except Exception:
+            return False
+        if inter <= 0:
+            return False
+        return inter / min(p1.area, p2.area) >= thresh
+
+    final_junctions.sort(key=lambda p: -p.area)
+    kept_junctions: List[Polygon] = []
+    for jp in final_junctions:
+        if any(_polys_overlap_heavily(jp, kp) for kp in kept_junctions):
+            continue
+        kept_junctions.append(jp)
+    final_junctions = kept_junctions
+
+    for jp in final_junctions:
+        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
+
+    # ── Runway-taxiway junction: ONLY for widening stubs ────────
+    # Per user rule 13 (2026-04-18): uniform-width stub (e.g. L1)
+    # connects directly to the runway with NO junction; only
+    # widening stubs (e.g. V1, whose end trim pulled back from the
+    # runway edge because pavement widened) get a junction between
+    # stub and runway.  We detect "widening end" as: rect end sits
+    # > 2 m from the runway boundary after trim (rect_trim_flags).
+    RWY_JUNCTION_DIST_M = 60.0
+    rwy_vertex_inserts: List[Tuple[float, float]] = []
+    if layout.runway_union is not None and not layout.runway_union.is_empty:
+        rwy_boundary = layout.runway_union.boundary
+        rwy_tj_polys: List[Polygon] = []
+        for i, (rect, axis, role, ref) in enumerate(taxi_rects):
+            coords_ax = list(axis.coords)
+            if len(coords_ax) < 2:
                 continue
-            if taxi_rect_union is not None:
+            trim_s, trim_e = rect_trim_flags[i]
+            for end_idx, (ax_pt, was_trimmed) in enumerate(
+                    [(coords_ax[0], trim_s), (coords_ax[-1], trim_e)]):
+                if not was_trimmed:
+                    continue  # uniform stub — direct connect to runway
+                d_rwy = Point(ax_pt).distance(rwy_boundary)
+                if d_rwy > RWY_JUNCTION_DIST_M:
+                    continue
+                pairs = _rect_end_corners(rect, axis)
+                if len(pairs) < 2:
+                    continue
+                c1, c2 = pairs[end_idx]
                 try:
-                    disc = disc.difference(taxi_rect_union)
+                    rp1 = nearest_points(rwy_boundary, Point(c1))[0]
+                    rp2 = nearest_points(rwy_boundary, Point(c2))[0]
                 except Exception:
                     continue
-            if terminal_union is not None:
+                # 4-corner trapezoid; junction polygon vertices are
+                # the 2 stub corners and the 2 runway-side projections.
+                poly_coords = [c1, c2, (rp2.x, rp2.y), (rp1.x, rp1.y)]
                 try:
-                    disc = disc.difference(terminal_union)
+                    poly = Polygon(poly_coords)
+                    if not poly.is_valid:
+                        poly = poly.buffer(0)
+                except Exception:
+                    continue
+                if (poly.is_empty
+                        or poly.geom_type not in ("Polygon", "MultiPolygon")):
+                    continue
+                if poly.geom_type == "MultiPolygon":
+                    poly = max(poly.geoms, key=lambda g: g.area)
+                if poly.geom_type != "Polygon" or poly.area < 10.0:
+                    continue
+                try:
+                    poly = poly.difference(layout.runway_union)
                 except Exception:
                     pass
-            if disc.is_empty or disc.geom_type == "MultiPolygon":
-                if disc.geom_type == "MultiPolygon":
-                    disc = max(disc.geoms, key=lambda g: g.area)
-                else:
+                if taxi_rect_union is not None:
+                    try:
+                        poly = poly.difference(taxi_rect_union)
+                    except Exception:
+                        pass
+                if terminal_union is not None and not terminal_union.is_empty:
+                    try:
+                        poly = poly.difference(terminal_union)
+                    except Exception:
+                        pass
+                if poly.is_empty:
                     continue
-            if disc.geom_type != "Polygon" or disc.area < 50.0:
+                if poly.geom_type == "MultiPolygon":
+                    poly = max(poly.geoms, key=lambda g: g.area)
+                if poly.geom_type != "Polygon" or poly.area < 10.0:
+                    continue
+                rwy_tj_polys.append(poly)
+                rwy_vertex_inserts.append((rp1.x, rp1.y))
+                rwy_vertex_inserts.append((rp2.x, rp2.y))
+        for rtp in rwy_tj_polys:
+            layout.shapes.append(BuiltShape(polygon=rtp, role=ROLE_JUNCTION))
+
+    # Insert runway-side projection points as vertices in the
+    # runway polygons so taxi-stub junctions share exact vertex
+    # positions with the runway they attach to.
+    if rwy_vertex_inserts:
+        for shape in layout.shapes:
+            if shape.role != ROLE_RUNWAY:
                 continue
-            all_junction_candidates.append(disc)
+            shape.polygon = _insert_points_on_boundary(
+                shape.polygon, rwy_vertex_inserts, tol=2.0)
+
+    # ── Apron emission: pavement residue after rects + junctions ──
+    junctions_union = None
+    if final_junctions:
+        try:
+            junctions_union = unary_union(final_junctions)
+        except Exception:
+            # Fallback: union valid ones iteratively.
+            junctions_union = None
+            for jp in final_junctions:
+                if not jp.is_valid:
+                    jp = jp.buffer(0)
+                if jp.is_empty or jp.geom_type not in ("Polygon", "MultiPolygon"):
+                    continue
+                try:
+                    junctions_union = (jp if junctions_union is None
+                                       else junctions_union.union(jp))
+                except Exception:
+                    pass
+    apron_polys: List[Polygon] = []
     if pav_union is not None:
         residue = pav_union
         if taxi_rect_union is not None:
             residue = residue.difference(taxi_rect_union)
+        if junctions_union is not None:
+            residue = residue.difference(junctions_union)
         if terminal_union is not None:
             residue = residue.difference(terminal_union)
         parts = [residue] if residue.geom_type == "Polygon" else list(
@@ -605,127 +785,21 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                 continue
             if part.area >= MIN_APRON_AREA_M2:
                 apron_polys.append(part)
-                continue
-            if part.area < MIN_JUNCTION_AREA_M2:
-                continue
-            all_junction_candidates.append(part)
-
-    # Merge junctions within JUNCTION_MERGE_DIST_M
-    final_junctions: List[Polygon] = []
-    if all_junction_candidates:
-        try:
-            combined = unary_union(all_junction_candidates)
-            closed = combined.buffer(JUNCTION_MERGE_DIST_M).buffer(
-                -JUNCTION_MERGE_DIST_M)
-            if pav_union is not None:
-                closed = closed.intersection(pav_union)
-            if taxi_rect_union is not None:
-                closed = closed.difference(taxi_rect_union)
-            if terminal_union is not None:
-                closed = closed.difference(terminal_union)
-            merged_parts = ([closed] if closed.geom_type == "Polygon"
-                            else list(getattr(closed, "geoms", [])))
-            for jp in merged_parts:
-                if jp.geom_type != "Polygon":
+            elif part.area >= 500.0:
+                # Residue gap smaller than an apron but > 500 m² →
+                # emit as a junction (rule 15: no gaps).  Filter
+                # below 500 m² to skip sliver noise from rect-snap
+                # inexactness.  Simplified to bound vertex count.
+                try:
+                    simp = part.simplify(3.0, preserve_topology=True)
+                except Exception:
+                    simp = part
+                if (simp.is_empty
+                        or simp.geom_type != "Polygon"
+                        or simp.area < 500.0):
                     continue
-                if jp.area < MIN_JUNCTION_AREA_M2:
-                    continue
-                simp = jp.simplify(1.0, preserve_topology=True)
-                if simp.is_empty or simp.geom_type != "Polygon":
-                    simp = jp
-                final_junctions.append(simp)
-        except Exception:
-            final_junctions = all_junction_candidates
-
-    # Snap junction vertices within 3 m of any rect corner to that
-    # corner — target junctions share vertices exactly with adjacent
-    # rect corners.
-    rect_corners_all: List[Tuple[float, float]] = []
-    for rect in emitted_taxi_rects:
-        rc = list(rect.exterior.coords)
-        if rc and rc[0] == rc[-1]:
-            rc = rc[:-1]
-        rect_corners_all.extend(rc)
-
-    def _insert_corners_near_boundary(poly: Polygon, tol: float = 5.0) -> Polygon:
-        """Add any rect corner that lies within ``tol`` of the
-        polygon boundary to the polygon's exterior ring, inserted
-        at the appropriate position along the boundary.
-        """
-        boundary = poly.boundary
-        inserts = []  # (param_along_boundary, (x, y))
-        for (rx, ry) in rect_corners_all:
-            p = Point(rx, ry)
-            if p.distance(boundary) > tol:
-                continue
-            try:
-                param = boundary.project(p)
-                nearest = boundary.interpolate(param)
-                if nearest.distance(p) <= tol:
-                    inserts.append((param, (rx, ry)))
-            except Exception:
-                pass
-        if not inserts:
-            return poly
-        # Walk boundary with insertions
-        inserts.sort()
-        coords = list(poly.exterior.coords)
-        if coords[0] == coords[-1]:
-            coords = coords[:-1]
-        # Build new coords by walking along boundary
-        try:
-            new_coords = []
-            cur_param = 0.0
-            insert_i = 0
-            for i in range(len(coords)):
-                new_coords.append(coords[i])
-                next_i = (i + 1) % len(coords)
-                seg = LineString([coords[i], coords[next_i]])
-                seg_start = cur_param
-                seg_end = seg_start + seg.length
-                while insert_i < len(inserts) and inserts[insert_i][0] < seg_end:
-                    new_coords.append(inserts[insert_i][1])
-                    insert_i += 1
-                cur_param = seg_end
-            new_coords.append(new_coords[0])
-            p2 = Polygon(new_coords).buffer(0)
-            if p2.geom_type == "MultiPolygon":
-                p2 = max(p2.geoms, key=lambda g: g.area)
-            if p2.geom_type == "Polygon" and not p2.is_empty:
-                return p2
-        except Exception:
-            pass
-        return poly
-
-    def _snap_to_corners(poly: Polygon, tol: float = 3.0) -> Polygon:
-        coords = list(poly.exterior.coords)
-        out = []
-        for (x, y) in coords:
-            best = None
-            best_d = tol
-            for (rx, ry) in rect_corners_all:
-                d = math.hypot(x - rx, y - ry)
-                if d < best_d:
-                    best = (rx, ry)
-                    best_d = d
-            out.append(best if best else (x, y))
-        try:
-            p = Polygon(out).buffer(0)
-            if p.geom_type == "MultiPolygon":
-                p = max(p.geoms, key=lambda g: g.area)
-            if p.geom_type == "Polygon" and not p.is_empty:
-                return p
-        except Exception:
-            pass
-        return poly
-
-    for jp in final_junctions:
-        jp2 = _insert_corners_near_boundary(jp, tol=10.0)
-        jp2 = _snap_to_corners(jp2, tol=5.0)
-        jp2 = jp2.simplify(3.0, preserve_topology=True)
-        if jp2.is_empty or jp2.geom_type != "Polygon":
-            continue
-        layout.shapes.append(BuiltShape(polygon=jp2, role=ROLE_JUNCTION))
+                layout.shapes.append(BuiltShape(
+                    polygon=simp, role=ROLE_JUNCTION))
 
     # Merge apron pieces split by thin rect strips (e.g. parallel
     # taxi cutting across the apron).  Target has aprons that wrap
@@ -1073,6 +1147,212 @@ def _rect_end_corners(rect: Polygon, axis: LineString
     return [start_pair, end_pair]
 
 
+def _build_junction_constructive(
+    cluster_centroid: Tuple[float, float],
+    taxi_rects: List[Tuple[Polygon, LineString, str, str]],
+    pav_union,
+    terminal_union,
+    max_corner_dist_m: float = 80.0,
+    local_disc_radius_m: float = 120.0,
+    max_arc_vertices: int = 4,
+) -> Optional[Polygon]:
+    """Constructive junction-polygon build per the user's
+    authoritative shape rule
+    (memory: feedback_shape_rules):
+
+      1. One vertex per incoming rect corner (outer corners at the
+         rect end that meets this junction).
+      2. Between consecutive corners belonging to DIFFERENT rects,
+         trace apt.dat pavement vertices that lie on the local pav
+         boundary arc between them.
+      3. Between consecutive corners of the SAME rect, connect
+         directly (that's the rect's short edge — the junction's
+         inner face on that side).
+
+    Arcs are bounded by clipping pav_union to a disc of radius
+    ``local_disc_radius_m`` around the cluster centroid; this keeps
+    the boundary walk local and avoids wrap-around issues at large
+    multi-component pavements.
+
+    Returns ``None`` if fewer than 2 rect ends cluster here or
+    construction fails.
+    """
+    if pav_union is None or pav_union.is_empty:
+        return None
+    cx, cy = cluster_centroid
+    cp = Point(cx, cy)
+    if terminal_union is not None and not terminal_union.is_empty:
+        try:
+            if terminal_union.contains(cp):
+                return None
+        except Exception:
+            pass
+
+    # Gather rect ends near the cluster centroid.
+    rect_ends: List[Tuple[int, Tuple[float, float], Tuple[float, float]]] = []
+    for i, (rect, axis, role, ref) in enumerate(taxi_rects):
+        coords_ax = list(axis.coords)
+        if len(coords_ax) < 2:
+            continue
+        ax_start = coords_ax[0]
+        ax_end = coords_ax[-1]
+        d_start = math.hypot(ax_start[0] - cx, ax_start[1] - cy)
+        d_end = math.hypot(ax_end[0] - cx, ax_end[1] - cy)
+        if min(d_start, d_end) > max_corner_dist_m:
+            continue
+        pairs = _rect_end_corners(rect, axis)
+        if len(pairs) < 2:
+            continue
+        idx = 0 if d_start <= d_end else 1
+        c1, c2 = pairs[idx]
+        rect_ends.append((i, c1, c2))
+
+    if len(rect_ends) < 2:
+        return None
+
+    # Local pavement: intersect pav with a disc around the cluster.
+    try:
+        disc = cp.buffer(local_disc_radius_m)
+        local_pav = pav_union.intersection(disc)
+    except Exception:
+        return None
+    if local_pav.is_empty:
+        return None
+    if local_pav.geom_type == "MultiPolygon":
+        # Take the component containing (or closest to) the centroid.
+        best = None
+        best_d = float('inf')
+        for g in local_pav.geoms:
+            if g.geom_type != "Polygon":
+                continue
+            d = g.distance(cp)
+            if d < best_d:
+                best_d = d
+                best = g
+        if best is None:
+            return None
+        local_pav = best
+    if local_pav.geom_type != "Polygon":
+        return None
+
+    # Projection helper: use the exterior ring as a line for param.
+    ext_coords = list(local_pav.exterior.coords)
+    if len(ext_coords) < 4:
+        return None
+    # LinearRing is closed (first == last); use as LineString for project()
+    ext_ls = LineString(ext_coords)
+    ext_length = ext_ls.length
+    if ext_length <= 0:
+        return None
+
+    # Project each rect outer corner onto the exterior ring.
+    corner_data: List[Tuple[float, Tuple[float, float], int]] = []
+    for rect_idx, c1, c2 in rect_ends:
+        for c in (c1, c2):
+            try:
+                param = ext_ls.project(Point(c))
+            except Exception:
+                continue
+            proj_pt = ext_ls.interpolate(param)
+            # If the projection is far (corner inside pav interior,
+            # not on boundary — e.g. the local disc cut through a
+            # rect short edge), use the original corner position.
+            if proj_pt.distance(Point(c)) > 20.0:
+                continue
+            corner_data.append((param, c, rect_idx))
+
+    # Need at least 3 corners for a polygon.
+    if len(corner_data) < 3:
+        return None
+
+    # Sort corners by boundary param.  This orders them around the
+    # local pav exterior ring; same-rect corner pairs will typically
+    # be adjacent (a rect's 2 outer corners land close together on
+    # the boundary).
+    corner_data.sort(key=lambda t: t[0])
+
+    # Collect all exterior-ring vertices with their params for arc walks.
+    ext_verts = ext_coords[:-1] if ext_coords[0] == ext_coords[-1] else ext_coords
+    ext_vert_params: List[Tuple[float, Tuple[float, float]]] = []
+    acc = 0.0
+    for i, v in enumerate(ext_verts):
+        if i > 0:
+            acc += math.hypot(v[0] - ext_verts[i-1][0],
+                              v[1] - ext_verts[i-1][1])
+        ext_vert_params.append((acc, (v[0], v[1])))
+
+    # Build polygon by walking sorted corners.  Between consecutive
+    # corners of different rects, insert all exterior-ring vertices
+    # whose params lie between the 2 corner params (forward direction,
+    # with wrap-around from last to first).
+    n = len(corner_data)
+    poly_coords: List[Tuple[float, float]] = []
+    for i in range(n):
+        cur_param, cur_xy, cur_rect = corner_data[i]
+        nxt_param, nxt_xy, nxt_rect = corner_data[(i + 1) % n]
+        poly_coords.append(cur_xy)
+        if cur_rect == nxt_rect:
+            # Same-rect: direct connection (rect short edge), no arc.
+            continue
+        # Different rect: walk exterior ring from cur_param to nxt_param
+        # in increasing-param direction (wrap at end).
+        if i == n - 1 or nxt_param < cur_param:
+            arc_verts = (
+                [v for (vp, v) in ext_vert_params if vp > cur_param] +
+                [v for (vp, v) in ext_vert_params if vp < nxt_param])
+        else:
+            arc_verts = [v for (vp, v) in ext_vert_params
+                         if cur_param < vp < nxt_param]
+        # Per user rule (2026-04-18): "use a maximum of 4 points
+        # between each" rect corner pair.  Sub-sample evenly.
+        if len(arc_verts) > max_arc_vertices:
+            step = len(arc_verts) / max_arc_vertices
+            arc_verts = [arc_verts[int(k * step)]
+                         for k in range(max_arc_vertices)]
+        for v in arc_verts:
+            poly_coords.append(v)
+
+    if len(poly_coords) < 3:
+        return None
+    try:
+        poly = Polygon(poly_coords).buffer(0)
+    except Exception:
+        return None
+    if poly.is_empty:
+        return None
+    if poly.geom_type == "MultiPolygon":
+        poly = max(poly.geoms, key=lambda g: g.area)
+    if poly.geom_type != "Polygon" or poly.area < 80.0:
+        return None
+
+    # Clip to the local pav (in case rect short-edges extend past it)
+    try:
+        poly = poly.intersection(local_pav)
+    except Exception:
+        pass
+    if poly.is_empty:
+        return None
+    if poly.geom_type == "MultiPolygon":
+        poly = max(poly.geoms, key=lambda g: g.area)
+    if poly.geom_type != "Polygon":
+        return None
+
+    # Exclude terminal overlap
+    if terminal_union is not None and not terminal_union.is_empty:
+        try:
+            poly = poly.difference(terminal_union)
+        except Exception:
+            pass
+        if poly.is_empty or poly.geom_type not in ("Polygon", "MultiPolygon"):
+            return None
+        if poly.geom_type == "MultiPolygon":
+            poly = max(poly.geoms, key=lambda g: g.area)
+        if poly.geom_type != "Polygon":
+            return None
+
+    return poly
+
+
 def _build_junction_polys_from_corners(
     junction_points: List[Tuple[float, float]],
     taxi_rects: List[Tuple[Polygon, LineString, str, str]],
@@ -1334,6 +1614,131 @@ def _extract_osm_taxi_centerlines(
     return out
 
 
+def _insert_points_on_boundary(
+    poly: Polygon,
+    pts: List[Tuple[float, float]],
+    tol: float = 2.0,
+) -> Polygon:
+    """Insert each point in ``pts`` as a vertex on the polygon's
+    exterior ring at its projected position, if within ``tol`` of
+    the boundary.  Used to add runway-taxi projection vertices
+    to the runway rect per the shared-vertex invariant."""
+    if not pts:
+        return poly
+    ext = poly.exterior
+    inserts: List[Tuple[float, Tuple[float, float]]] = []
+    for (x, y) in pts:
+        p = Point(x, y)
+        if p.distance(ext) > tol:
+            continue
+        try:
+            param = ext.project(p)
+            proj = ext.interpolate(param)
+        except Exception:
+            continue
+        inserts.append((param, (proj.x, proj.y)))
+    if not inserts:
+        return poly
+    inserts.sort()
+    coords = list(ext.coords)
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) < 3:
+        return poly
+    try:
+        new_coords: List[Tuple[float, float]] = []
+        cur_param = 0.0
+        insert_i = 0
+        for i in range(len(coords)):
+            new_coords.append(coords[i])
+            next_i = (i + 1) % len(coords)
+            seg_len = math.hypot(coords[next_i][0] - coords[i][0],
+                                 coords[next_i][1] - coords[i][1])
+            seg_end = cur_param + seg_len
+            while (insert_i < len(inserts)
+                   and inserts[insert_i][0] < seg_end):
+                new_coords.append(inserts[insert_i][1])
+                insert_i += 1
+            cur_param = seg_end
+        new_coords.append(new_coords[0])
+        new_poly = Polygon(new_coords)
+        if not new_poly.is_valid:
+            new_poly = new_poly.buffer(0)
+        if (new_poly.geom_type == "Polygon"
+                and new_poly.is_valid and not new_poly.is_empty):
+            return new_poly
+    except Exception:
+        pass
+    return poly
+
+
+def _split_centerlines_at_points(
+    centerlines: List[Tuple[LineString, str]],
+    split_points: List[Tuple[float, float]],
+    approach_tol_m: float = 25.0,
+    endpoint_guard_m: float = 5.0,
+) -> List[Tuple[LineString, str]]:
+    """Split each centerline at every point in ``split_points`` that
+    passes within ``approach_tol_m`` of the line.  The line is cut
+    at the nearest point on the line to each split point, with a
+    guard against cutting right at the line's own endpoints.
+
+    Per user rule (2026-04-18): "Implement splitting at cross ref
+    crossings."  OSM centerlines of different refs rarely share
+    EXACT coordinates at their intersection nodes, so we can't rely
+    on strict geometric crossings.  Instead we use the pre-computed
+    multi-ref OSM node cluster centroids (``split_points``) as
+    logical intersection markers, and split any centerline that
+    passes through that neighbourhood.
+    """
+    if not centerlines or not split_points:
+        return centerlines
+    from shapely.ops import substring
+
+    result: List[Tuple[LineString, str]] = []
+    for ls, ref in centerlines:
+        # Collect split-parameters along the line for each split
+        # point within ``approach_tol_m``.
+        cut_params: List[float] = []
+        for (sx, sy) in split_points:
+            sp = Point(sx, sy)
+            if ls.distance(sp) > approach_tol_m:
+                continue
+            try:
+                param = ls.project(sp)
+            except Exception:
+                continue
+            if param < endpoint_guard_m:
+                continue
+            if param > ls.length - endpoint_guard_m:
+                continue
+            cut_params.append(param)
+        if not cut_params:
+            result.append((ls, ref))
+            continue
+        # Dedupe near-duplicate params (within 2 m along the line).
+        cut_params.sort()
+        deduped: List[float] = []
+        for p in cut_params:
+            if not deduped or p - deduped[-1] > 2.0:
+                deduped.append(p)
+        # Build segments via substring between 0, cuts..., line.length
+        breaks = [0.0] + deduped + [ls.length]
+        for i in range(len(breaks) - 1):
+            p0, p1 = breaks[i], breaks[i+1]
+            if p1 - p0 < MIN_SEGMENT_LEN_M:
+                continue
+            try:
+                piece = substring(ls, p0, p1)
+            except Exception:
+                continue
+            if (piece.geom_type == "LineString"
+                    and not piece.is_empty
+                    and piece.length >= MIN_SEGMENT_LEN_M):
+                result.append((piece, ref))
+    return result
+
+
 def _build_taxi_rects(
     centerlines: List[Tuple[LineString, str]],
     pav_union: Optional[Polygon],
@@ -1388,23 +1793,33 @@ def _build_taxi_rects(
         if clipped.length < 20.0:
             continue
 
-        # Probe half-widths along axis.  ``natural_hw`` detects where
-        # widening begins; ``max_hw`` is the actual rect half-width.
-        natural_hw, max_hw = _natural_half_width(clipped, pav_non_rwy)
-        if natural_hw < 3.5 or natural_hw > 40.0:
+        # Probe half-widths along axis.  ``narrow_hw`` (p10) is the
+        # strip's narrowest portion; we use it both as the trim
+        # baseline AND as the rect's half-width per the user's
+        # authoritative rule.  The factor 1.15 means trim ends
+        # where pavement grows more than 15% wider than the rect —
+        # that extra width is junction territory.
+        _natural_hw, _max_hw, narrow_hw = _natural_half_width(
+            clipped, pav_non_rwy)
+        if narrow_hw < 3.5 or narrow_hw > 40.0:
             continue
 
         # Trim endpoints inward where half-width exceeds widening threshold.
-        trimmed = _trim_to_narrow(clipped, pav_non_rwy, natural_hw,
-                                 widen_factor=1.05)
+        # Per user rule (2026-04-18): "If pavement widens 1% cut the
+        # rect."  Baseline = narrow_hw (p10), factor 1.01 → any
+        # pavement more than 1% wider than the rect's own half-width
+        # is already junction territory.
+        trimmed = _trim_to_narrow(clipped, pav_non_rwy, narrow_hw,
+                                 widen_factor=1.01)
         if trimmed is None or trimmed.length < 15.0:
             continue
 
-        # Re-probe along the TRIMMED axis to find the widest pavement
-        # anywhere in the rect's coverage — that's the rect width.
-        _, trim_max_hw = _natural_half_width(trimmed, pav_non_rwy)
-        if trim_max_hw < 3.5:
-            trim_max_hw = natural_hw
+        # Re-probe along the TRIMMED axis.  Per user rule: rect
+        # half-width = narrowest probe within the covered segment;
+        # anything wider belongs to the adjacent junction.
+        _, _, trim_narrow_hw = _natural_half_width(trimmed, pav_non_rwy)
+        if trim_narrow_hw < 3.5:
+            trim_narrow_hw = narrow_hw
 
         # Dedup against trimmed axis
         if emitted_union is not None and not emitted_union.is_empty:
@@ -1415,7 +1830,7 @@ def _build_taxi_rects(
             except Exception:
                 pass
 
-        width = 2.0 * trim_max_hw
+        width = 2.0 * trim_narrow_hw
         rect = _rect_from_axis_extended(trimmed, width, pav_non_rwy)
         if rect is None or rect.is_empty:
             continue
@@ -1433,20 +1848,21 @@ def _build_taxi_rects(
 
 
 def _natural_half_width(axis: LineString, pav: Polygon,
-                        n_probes: int = 11) -> Tuple[float, float]:
-    """Return (natural_hw, max_hw) distance-to-boundary along axis.
+                        n_probes: int = 11) -> Tuple[float, float, float]:
+    """Return (natural_hw, max_hw, narrow_hw) distance-to-boundary along axis.
 
-    * ``natural_hw`` = 25-th-percentile probe distance.  Represents
-      the "narrow part" of the strip; used by the trim algorithm
-      as the widening detector baseline.  Biased LOW so the trim
-      pulls aggressively past anywhere the pavement is noticeably
-      wider than the strip's narrowest portion.
-    * ``max_hw`` = 90-th-percentile probe distance.  Used as the
-      RECT half-width so the rect spans the widest portion of
-      pavement within its covered section.
+    * ``natural_hw`` = 25-th-percentile probe distance.  Used by the
+      trim algorithm as the widening-detector baseline.
+    * ``max_hw`` = 90-th-percentile probe distance.  Retained for
+      legacy callers that still want the "widest section" width.
+    * ``narrow_hw`` = min(p10, 2nd-lowest) probe distance.  Per the
+      user's authoritative rule (memory: feedback_shape_rules),
+      the rect half-width is the NARROWEST pavement width along the
+      covered segment — the widened portions near each intersection
+      are junction territory, not rect territory.
     """
     if axis.length < 1e-3:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     boundary = pav.boundary
     dists = []
     for k in range(n_probes):
@@ -1458,12 +1874,17 @@ def _natural_half_width(axis: LineString, pav: Polygon,
         if d > 0.1:
             dists.append(d)
     if not dists:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     dists.sort()
     median = dists[len(dists) // 2]
     p90_idx = max(0, int(len(dists) * 0.9) - 1)
     p90 = dists[p90_idx] if p90_idx < len(dists) else dists[-1]
-    return median, p90
+    # Narrow = 10th-percentile (or second-lowest for small n).  Pulling
+    # the absolute min sometimes grabs a pinch from a neighbouring
+    # building; p10 is a robust "narrowest straight section" proxy.
+    p10_idx = max(0, int(len(dists) * 0.1))
+    narrow = dists[p10_idx] if p10_idx < len(dists) else dists[0]
+    return median, p90, narrow
 
 
 def _trim_to_narrow(axis: LineString, pav: Polygon, natural_hw: float,
@@ -1577,15 +1998,25 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     return Polygon(snapped)
 
 
-SNAP_RADIUS_M = 5.0  # output rect corners snapped within this range
+SNAP_RADIUS_M = 15.0  # rect corners snap onto pav boundary within this
 
 
 def _snap_corners_to_pavement(
     corners: List[Tuple[float, float]],
     pav: Polygon,
 ) -> List[Tuple[float, float]]:
-    """Snap each corner to its nearest point on the pavement boundary,
-    but only if the nearest point is within ``SNAP_RADIUS_M``."""
+    """Snap each corner to the nearest point on the pavement boundary
+    within ``SNAP_RADIUS_M``.
+
+    Per the user's rule (2026-04-18): rect corners should always lie
+    on a pavement boundary.  In normal cases (rect ends trimmed to
+    the widening point), the corner is within a few meters of the
+    boundary and snaps cleanly.  The radius is a safety rail: for
+    degenerate rects (axis entirely internal to a mega-pavement)
+    we leave the corner unsnapped rather than warp the rect toward
+    a far-away boundary, which would produce a self-intersecting
+    polygon and break downstream unions.
+    """
     boundary = pav.boundary
     snapped = []
     for (cx, cy) in corners:
