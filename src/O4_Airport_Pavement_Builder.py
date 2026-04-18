@@ -561,7 +561,7 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     # when the pavement residue is split here, seeding a disc
     # anchors the junction at the topological intersection.
     for (cx, cy) in junction_points:
-        disc = Point(cx, cy).buffer(30.0)
+        disc = Point(cx, cy).buffer(50.0)
         if pav_union is not None:
             try:
                 disc = disc.intersection(pav_union)
