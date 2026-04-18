@@ -473,6 +473,46 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     taxi_rects = _build_taxi_rects(
         osm_centerlines, pav_union, layout.runway_union, rwy_centerlines)
 
+    # Filter stubs by user's runway-connection rule: a stub rect is
+    # kept only if its OSM centerline reaches a runway.  Stubs whose
+    # pavement is only between apron and parallel (or apron-internal)
+    # get dropped — that pavement folds into the apron or junction.
+    # This removes OSM sub-refs like A1-A6, D1/D2, F1, M1-M3, R1/R2, N
+    # that the user's target doesn't emit.
+    # Look up raw OSM ways per ref (untrimmed).  A stub "connects to
+    # a runway" iff one of its raw endpoints lies within
+    # RUNWAY_ENDPOINT_DIST_M of the runway footprint.
+    RUNWAY_ENDPOINT_DIST_M = 35.0
+    raw_endpoints_by_ref: Dict[str, List[Tuple[float, float]]] = {}
+    for wid, nds, tags in ways:
+        if tags.get("aeroway") != "taxiway":
+            continue
+        ref = tags.get("ref", "")
+        pts = []
+        for n in nds:
+            if n in nodes:
+                lat, lon = nodes[n]
+                pts.append(to_m(lon, lat))
+        if len(pts) >= 2:
+            raw_endpoints_by_ref.setdefault(ref, []).append(pts[0])
+            raw_endpoints_by_ref.setdefault(ref, []).append(pts[-1])
+
+    if layout.runway_union is not None:
+        filtered: List[Tuple[Polygon, LineString, str, str]] = []
+        for rect, axis, role, ref in taxi_rects:
+            if role != ROLE_STUB:
+                filtered.append((rect, axis, role, ref))
+                continue
+            reaches_runway = False
+            for (px, py) in raw_endpoints_by_ref.get(ref, []):
+                if Point(px, py).distance(
+                        layout.runway_union) <= RUNWAY_ENDPOINT_DIST_M:
+                    reaches_runway = True
+                    break
+            if reaches_runway:
+                filtered.append((rect, axis, role, ref))
+        taxi_rects = filtered
+
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
     for rect, axis, role, ref in taxi_rects:
@@ -991,11 +1031,11 @@ def _extract_osm_taxi_centerlines(
         else:
             merged_lines = lines
 
-        # Stage 2: for refs that physically span multiple segments
-        # (parallels + Q/R), bridge any remaining gaps across
-        # intermediate intersections so one physical taxi becomes
-        # ONE polyline.
-        if ref in (PARALLEL_REFS | {"Q", "R", "X"}) and len(merged_lines) > 1:
+        # Stage 2: for ANY ref, bridge any remaining gaps across
+        # intermediate intersections so one physical taxi (even a
+        # short stub like V2 split by OSM at an internal node)
+        # becomes ONE polyline.
+        if ref and len(merged_lines) > 1:
             merged_lines = _bridge_same_ref_polylines(merged_lines)
 
         for ls in merged_lines:
@@ -1316,33 +1356,20 @@ def _classify_role(axis: LineString, width: float,
     if ref:
         has_digit = any(c.isdigit() for c in ref)
         if ref in ("Q", "R", "X"):
-            # Q / R have multiple segments at varied bearings; the
-            # combined role is cross_connector as long as ANY segment
-            # is reasonably perpendicular.  Relax to Δ > 40°.
             db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
             if db is not None and db > 40.0:
                 return ROLE_CROSS_CONNECTOR
             return ROLE_STUB
+        # Known parallel refs always classify as parallel — don't
+        # demote individual bend segments to stub.
+        if ref in ("M", "U"):
+            return ROLE_SECONDARY_PARALLEL
+        if ref in PARALLEL_REFS:
+            return ROLE_PRIMARY_PARALLEL
         if has_digit:
-            # L1, A3, V5 etc. — always stubs in the SPJC target
+            # L1, A3, V5 etc. — sub-refs = stub
             return ROLE_STUB
-        # Plain-letter refs come in two flavours:
-        #   a. Named parallel taxis (A, F, L, V) — primary_parallel.
-        #   b. Apron-traversing connectors (B, C, D, E, G) — stubs
-        #      even though their bearing may be near-parallel.
-        # Distinguisher: (a) runs NEAR a runway centerline
-        # (< PRIMARY_CORRIDOR_DIST_M = 500 m) AND is parallel
-        # (Δ < 15°).  (b) sits deeper in the apron.
-        db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
-        if db is not None and db < 15.0 and rwy_centerlines:
-            mid = axis.interpolate(0.5, normalized=True)
-            dmin = min(mid.distance(r) for r in rwy_centerlines)
-            if dmin < 500.0:
-                if ref in ("M", "U"):
-                    return ROLE_SECONDARY_PARALLEL
-                return ROLE_PRIMARY_PARALLEL
-        # Parallel-but-far or non-parallel plain-letter refs are
-        # apron connectors = stubs.
+        # Plain-letter non-parallel (B, C, D, E, G) = stub
         return ROLE_STUB
 
     # ── Angle-only fallback (SPLP, unnamed airports) ────────────
