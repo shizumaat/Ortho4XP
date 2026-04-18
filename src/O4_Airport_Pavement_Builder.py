@@ -533,21 +533,18 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         taxi_rects, INTERSECTION_MERGE_DIST_M,
         pav_union=pav_union,
         terminal_union=terminal_union)
-    for jp in junctions:
-        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
 
-    # ── Residue classification ──────────────────────────────────
-    # Pavement residue after rects + junctions + terminals.  Each
-    # connected component:
-    #   * If area >= MIN_APRON_AREA_M2 → apron.
-    #   * Else if adjacent to at least one rect end → junction
-    #     (the "pavement widens before this rect" case).
-    #   * Else → drop (spurious sliver).
+    # ── Collect junction candidates (corner + residue) ──────────
+    # corner-vertex junctions come from _build_junctions_from_rect_
+    # endpoints (multi-rect clusters); residue junctions cover
+    # widening areas adjacent to a lone rect end.
     MIN_JUNCTION_AREA_M2 = 80.0
+    all_junction_candidates: List[Polygon] = list(junctions)
+    apron_polys: List[Polygon] = []
+
     taxi_rect_union = (unary_union(emitted_taxi_rects)
                        if emitted_taxi_rects else None)
-    junction_union = (unary_union(junctions) if junctions else None)
-    # Collect axis-endpoint positions for residue-junction adjacency test
+    corner_junction_union = (unary_union(junctions) if junctions else None)
     axis_endpoints = []
     for _, axis, _, _ in taxi_rects:
         coords_ax = list(axis.coords)
@@ -558,8 +555,8 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         residue = pav_union
         if taxi_rect_union is not None:
             residue = residue.difference(taxi_rect_union)
-        if junction_union is not None:
-            residue = residue.difference(junction_union)
+        if corner_junction_union is not None:
+            residue = residue.difference(corner_junction_union)
         if terminal_union is not None:
             residue = residue.difference(terminal_union)
         parts = [residue] if residue.geom_type == "Polygon" else list(
@@ -568,14 +565,10 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             if part.geom_type != "Polygon":
                 continue
             if part.area >= MIN_APRON_AREA_M2:
-                simp = part.simplify(1.0, preserve_topology=True)
-                if simp.is_empty or simp.geom_type != "Polygon":
-                    simp = part
-                layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
+                apron_polys.append(part)
                 continue
             if part.area < MIN_JUNCTION_AREA_M2:
                 continue
-            # Junction candidate: only emit if adjacent to a rect end
             is_adjacent = False
             for ep in axis_endpoints:
                 if part.distance(ep) <= 25.0:
@@ -583,10 +576,47 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                     break
             if not is_adjacent:
                 continue
-            simp = part.simplify(1.0, preserve_topology=True)
-            if simp.is_empty or simp.geom_type != "Polygon":
-                simp = part
-            layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_JUNCTION))
+            all_junction_candidates.append(part)
+
+    # ── Merge any junctions that touch or come within 15 m ──────
+    # Per user: "two junctions should never be connected to each
+    # other — join them into one larger junction."  Buffer-close
+    # at 15 m then unbuffer: any two junction polys that are within
+    # 15 m of each other merge into a single larger junction.
+    final_junctions: List[Polygon] = []
+    if all_junction_candidates:
+        try:
+            combined = unary_union(all_junction_candidates)
+            closed = combined.buffer(15.0).buffer(-15.0)
+            if pav_union is not None:
+                closed = closed.intersection(pav_union)
+            if taxi_rect_union is not None:
+                closed = closed.difference(taxi_rect_union)
+            if terminal_union is not None:
+                closed = closed.difference(terminal_union)
+            merged_parts = ([closed] if closed.geom_type == "Polygon"
+                            else list(getattr(closed, "geoms", [])))
+            for jp in merged_parts:
+                if jp.geom_type != "Polygon":
+                    continue
+                if jp.area < MIN_JUNCTION_AREA_M2:
+                    continue
+                simp = jp.simplify(1.0, preserve_topology=True)
+                if simp.is_empty or simp.geom_type != "Polygon":
+                    simp = jp
+                final_junctions.append(simp)
+        except Exception:
+            final_junctions = all_junction_candidates
+
+    for jp in final_junctions:
+        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
+
+    # Emit aprons
+    for ap in apron_polys:
+        simp = ap.simplify(1.0, preserve_topology=True)
+        if simp.is_empty or simp.geom_type != "Polygon":
+            simp = ap
+        layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
 
     return layout
 
