@@ -1285,11 +1285,12 @@ def _extract_osm_taxi_centerlines(
         else:
             merged_lines = lines
 
-        # Stage 2: for ANY ref, bridge any remaining gaps across
-        # intermediate intersections so one physical taxi (even a
-        # short stub like V2 split by OSM at an internal node)
-        # becomes ONE polyline.
-        if ref and len(merged_lines) > 1:
+        # Stage 2: gap bridging.  For NON-parallel refs (stubs,
+        # cross-connectors, sub-refs), bridge gaps up to
+        # GAP_BRIDGE_MAX_M.  For parallel refs (A/F/L/V/M/U), DON'T
+        # bridge — user keeps their parallel polylines separate at
+        # intermediate intersections.
+        if ref and len(merged_lines) > 1 and ref not in PARALLEL_REFS:
             merged_lines = _bridge_same_ref_polylines(merged_lines)
 
         for ls in merged_lines:

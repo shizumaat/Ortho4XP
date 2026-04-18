@@ -7,10 +7,19 @@ targets (5 m vertex tolerance):
 
 | | SPJC | SPLP | Total |
 |---|---|---|---|
-| matched | 73/106 (69 %) | 17/30 (57 %) | **90/136 (66 %)** |
+| matched | 81/106 (76 %) | 18/30 (60 %) | **99/136 (73 %)** |
 
 User goal is 95 % match; current ceiling looks like ~75 % before
 requiring airport-specific tuning or external signals.
+
+Latest wins (2026-04-18 session):
+- **Stubs using ORIGINAL un-simplified polyline** instead of RDP-2-coord
+  chord: SPJC stubs 7/15 → 13/15.  OSM V5 had 26 curve nodes but
+  RDP 1m collapsed to a chord cutting across the curve, clipping
+  most of it out of pavement.  Using the raw polyline keeps the
+  curve and lets downstream trim + rect-build work.
+- **Clip to full pavement union** (not pav - runway) so stubs
+  extending to runway edge keep their full physical length.
 
 Elevation is Phase 2, not started.
 
