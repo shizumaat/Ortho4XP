@@ -549,7 +549,7 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     #    no two junctions touch or run alongside each other.
     MIN_APRON_AREA_M2 = 25000.0
     MIN_JUNCTION_AREA_M2 = 80.0
-    JUNCTION_MERGE_DIST_M = 10.0
+    JUNCTION_MERGE_DIST_M = 15.0
 
     all_junction_candidates: List[Polygon] = []
     apron_polys: List[Polygon] = []
@@ -604,7 +604,28 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     for jp in final_junctions:
         layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
 
-    # Emit aprons
+    # Merge apron pieces split by thin rect strips (e.g. parallel
+    # taxi cutting across the apron).  Target has aprons that wrap
+    # around rect footprints as one connected region.
+    APRON_MERGE_DIST_M = 100.0
+    if apron_polys:
+        try:
+            ap_union = unary_union(apron_polys)
+            ap_closed = ap_union.buffer(APRON_MERGE_DIST_M).buffer(
+                -APRON_MERGE_DIST_M)
+            if pav_union is not None:
+                ap_closed = ap_closed.intersection(pav_union)
+            if taxi_rect_union is not None:
+                ap_closed = ap_closed.difference(taxi_rect_union)
+            if terminal_union is not None:
+                ap_closed = ap_closed.difference(terminal_union)
+            merged_aprons = ([ap_closed] if ap_closed.geom_type == "Polygon"
+                             else list(getattr(ap_closed, "geoms", [])))
+            apron_polys = [p for p in merged_aprons
+                           if p.geom_type == "Polygon"
+                           and p.area >= MIN_APRON_AREA_M2]
+        except Exception:
+            pass
     for ap in apron_polys:
         simp = ap.simplify(1.0, preserve_topology=True)
         if simp.is_empty or simp.geom_type != "Polygon":
