@@ -1,11 +1,94 @@
 # Auto-Patch Refactor — Status
 
-**Current state:** New emitter `src/O4_Airport_Pavement_Builder.py`
-(Phase 1: shapes + roles only) being built to reproduce hand-drawn
-target OSMs at `tests/fixtures/{SPJC,SPLP}_target.osm`.  Target
-tolerance is **5 m vertex-match for runway** (already passing at
-<0.3 m after target resnap) and **1 m for non-runway shapes with
-freedom to snap to apt.dat pavement edges**.
+**Current state:** Phase 1 emitter
+`src/O4_Airport_Pavement_Builder.py` reproducing hand-drawn target
+layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.  Score against
+targets (5 m vertex tolerance):
+
+| | SPJC | SPLP | Total |
+|---|---|---|---|
+| matched | 73/106 (69 %) | 17/30 (57 %) | **90/136 (66 %)** |
+
+User goal is 95 % match; current ceiling looks like ~75 % before
+requiring airport-specific tuning or external signals.
+
+Elevation is Phase 2, not started.
+
+## Algorithm overview
+
+1. **Runway:** apt.dat row 100 + blast pads → 4-vertex rect.  IoU
+   0.96 at SPJC.
+2. **Terminals:** OSM `aeroway=terminal` (ways + multipolygon
+   relations); expanded to the containing apt.dat pavement polygon
+   (the "pad").  IoU 0.29.
+3. **Taxi rects:** OSM taxi centerlines per ref, linemerge,
+   same-ref gap-bridge (up to 120 m), RDP at 1 m, split at bends.
+   Parallel refs (A/F/L/V/M/U + Q/R/X) split at bends; other refs
+   emit ONE rect per merged polyline.  Rect width = 2× 90th-percentile
+   probe distance-to-boundary (full pavement span).  Axis trimmed
+   at widening points (widen_factor = 1.05 × natural_hw).
+4. **Classification:**
+   * `A/F/L/V` → primary_parallel; `M/U` → secondary_parallel.
+   * `Q/R/X` → cross_connector when Δ-to-runway > 40°.
+   * `letter+digit` and plain-letter non-parallels (B/C/D/E/G) → stub.
+   * Post-pass demotes short perpendicular (>40°, <150 m) segments
+     of parallel refs to stub (captures "short A-runway connector").
+5. **Stub filter:** drop stubs whose raw OSM endpoint is > 80 m
+   from any runway (user: "stubs must connect to a runway").
+6. **Junction seeding:** at every OSM multi-ref node cluster OR
+   geometric crossing between different-ref centerlines, seed a
+   50 m disc clipped to pavement.
+7. **Junction + apron emission:** pavement residue (pav - rects -
+   terminals) plus junction discs → merge at 40 m → junction if
+   < 25000 m², apron if ≥ 25000 m².
+8. **Junction snap-to-rect-corners:** polygon vertices within 3 m
+   of a rect corner snap to that corner (shared-vertex invariant).
+
+## Per-role scores at 5 m tolerance (SPJC, 106 target shapes)
+
+| Role | matched / target | avgIoU |
+|---|---|---|
+| runway | 2/2 | 1.00 |
+| apron | 3/3 | 0.64 |
+| terminal | 2/2 | 0.29 |
+| primary_parallel | 19/30 | 0.56 |
+| secondary_parallel | 3/4 | 0.41 |
+| cross_connector | 4/6 | 0.40 |
+| stub | 6/15 | 0.29 |
+| junction | 34/44 | 0.34 |
+
+## Missing ~30 % gap — what it'd take
+
+1. **Primary parallels (11 missed, 12 spurious):** my RDP bends
+   don't coincide with user's segment cut points.  Target's 30
+   primary segments for A/F/L/V reflect chart-level judgement I
+   can't extract from apt.dat + OSM alone.
+2. **Stubs (9 missed, 10 spurious):** specifically L1/L7/V5
+   (sometimes missing from OSM, sometimes filtered); and the
+   short parallel-to-stub demotions don't always pick the right
+   segment.
+3. **Junctions (10 missed, 24 spurious):** junction polygon shapes
+   differ from target (IoU 0.34) — target polygons trace specific
+   vertex paths around rect corners + pavement edges; mine are
+   residue-hulls.
+
+The last 30 % is hard without external signals (chart / imagery /
+detailed user rules per ref).
+
+## Workflow
+
+1. Edit target freehand: `tests/fixtures/SPJC_target.osm` (or
+   SPLP_target.osm).
+2. Re-snap: `python3 tools/snap_target_to_apt_dat.py SPJC
+   tests/fixtures/SPJC_target.osm --force`
+3. Re-run: `python3 tools/build_target_osm.py SPJC`
+4. Compare: `python3 tools/compare_target.py
+   tests/fixtures/SPJC_target_snapped.osm /tmp/SPJC_auto.osm --tol 5`
+
+The snap tool won't overwrite `_snapped.osm` without `--force` (to
+avoid losing user's manual edits to snapped files).
+
+---
 
 This supersedes the apron-deformation model below; the elevation
 work is Phase 2.
