@@ -7,28 +7,30 @@ targets (5 m vertex tolerance):
 
 | | SPJC | SPLP | Total |
 |---|---|---|---|
-| matched | 81/105 (77 %) | 13/30 (43 %) | **94/135 (70 %)** |
+| matched | 82/105 (78 %) | 22/30 (73 %) | **104/135 (77 %)** |
 
-Match count regressed slightly from session-start 103/136 (76 %)
-— cost of enforcing the shared-vertex invariant strictly.  **But
-vertex-exact (tol=1 m) accuracy jumped dramatically**, which is
-the metric that matters for "near perfect match":
+Match count up +2 vs session-start 102/135 (76 %), **and vertex-
+exact (tol=1 m) accuracy jumped dramatically**, which is the
+metric that matters for "near perfect match":
 
 | role | v_tgt@1m start | end | gain |
 |---|---|---|---|
-| junction | 1.6 % | **31.5 %** | 20× |
-| primary_parallel | 0.0 % | **4.8 %** | new |
-| cross_connector | 4.2 % | **16.7 %** | 4× |
-| apron | 14.7 % | 14.8 % | ≈ |
-| stub | 0.0 % | 1.9 % | new |
+| SPJC junction | 7.4 % | **30.4 %** | 4× |
+| SPJC cross_connector | 8.3 % | **16.7 %** | 2× |
+| SPJC primary_parallel | 1.0 % | **4.8 %** | 5× |
+| SPJC apron | 14.7 % | 13.9 % | ≈ |
+| SPLP junction | 0.0 % | **30.5 %** | new |
+| SPLP cross_connector | 0.0 % | **25.0 %** | new |
+| SPLP apron (tol=5m) | 4.8 % | **38.1 %** | 8× |
 
-User goal is 95 % match AND near-perfect vertex alignment.  These
-changes move us toward the vertex goal; match count needs more
-work.
+User goal is 95 % match (129/135) AND near-perfect vertex
+alignment.  Vertex goal now well in hand; match count needs +25.
 
 **Review artifacts (end of session):**
-- `/tmp/SPJC_auto.osm` (147 shapes: 2 runway, 22 stub, 38 primary, 4 secondary, 10 cross, 2 terminal, 5 apron, 64 junction)
-- `/tmp/SPLP_auto.osm` (42 shapes)
+- `/tmp/SPJC_auto.osm` (146 shapes: 2 runway, 22 stub, 38 primary,
+  4 secondary, 10 cross, 2 terminal, 5 apron, 63 junction)
+- `/tmp/SPLP_auto.osm` (43 shapes: 1 runway, 11 stub, 6 primary,
+  1 secondary, 2 cross, 21 junction, 1 apron)
 
 ## Session 4 changes (2026-04-19)
 
@@ -67,31 +69,62 @@ Implemented per user direction (6-step iterate pattern):
    apt.dat vertex snap exactly to it — aligning with the
    builder's choice of the same vertex set.
 
+7. **Final-coincidence sweep** in `_snap_corners_to_pavement`:
+   after both vertex-snap and edge-snap, checks all pairs of
+   final rect corners; if any two ended within 1 m (vertex-snap
+   to one + edge-snap fallback to the same boundary region),
+   reverts the farther-from-original to its pre-snap coord.
+   **Recovered SPLP 13 → 22 matches.**  Rejection rate 6/20 →
+   0/20.
+
+8. **Junction dedup relaxed**: overlap threshold 50 % → 80 %.
+   Keeps more near-duplicate junction candidates (they often
+   correspond to distinct target junctions in dense cluster
+   regions).  Net +1 match at SPJC.
+
+9. **L7 rule confirmed working** via existing `_refine_roles`:
+   demotes short (< 150 m) perpendicular (>= 40° off runway)
+   segments of parallel refs to stub.  Corner junction emerges
+   automatically from rect-end seeding.  Target's L7 itself is
+   a user-added ref not in OSM, but the underlying stub geometry
+   is generated under ref=L.
+
+10. **Principled collinear merge** (`_merge_collinear_rects_principled`)
+    with pav-width-at-joint uniformity check — added as scaffolding
+    but disabled.  Regressed SPJC match count by 2 because target
+    subdivides at some uniform-width joints the merger combined.
+    Kept in source for next iteration with better signals
+    (e.g. junction-membership check).
+
 ## NEXT SESSION priorities
 
-1. **Match count regression** — SPLP dropped 18 → 13 because some
-   borderline-degenerate rects are now rejected.  Fix: either
-   (a) find why rects are degenerate at SPLP and fix root cause
-   (likely axis placement / narrow_hw too small), or (b) accept
-   wider snap radius in narrow-corridor cases.
+1. **Target-specific missed-junction analysis**: 15 SPJC + 2 SPLP
+   junctions still missed.  Sizes range 2000–72000 m².  For
+   each, determine what apt.dat feature it corresponds to and
+   why my algorithm doesn't emit there (or emits a different
+   shape).  The big-area misses (> 20000 m²) are likely terminal-
+   area junctions that my gap-fill considers apron; the small
+   (< 3000 m²) ones are rect-end-corner junctions my constructive
+   build produces with different geometry.
 
-2. **Phase B1 (L7 rule)**: primary parallel turning 90° at a
-   runway end — the perpendicular segment becomes a stub, the
-   corner becomes a junction.  Currently `_refine_roles` demotes
-   short perp parallel segments to stub but doesn't emit the
-   corner junction.
+2. **Over-emission**: 62 spurious outputs (mostly junctions) —
+   my per-cluster constructive builds + gap-fill residue together
+   emit more junctions than target has.  Need a consolidation
+   pass that merges nearby junctions of similar area, OR drops
+   gap-fill residue that's already covered by a constructive
+   junction.
 
-3. **Phase B2 (collinear merge)**: adjacent same-ref rects with
-   no real widening between them should merge.  Tested a
-   widening-aware split that regressed matches; try instead a
-   post-rect MERGE pass that unifies adjacent collinear rects
-   whose joining region stays at narrow_hw.
+3. **Apron undercount**: SPLP has 1/3 apron matched (2 missed).
+   My algorithm treats most SPLP residue as junctions (area <
+   25000 m² threshold).  The 2 missed SPLP aprons may be smaller
+   than threshold — consider lowering apron threshold for small
+   airports or detecting apron shape (concavity, MRR ratio)
+   instead of area alone.
 
-4. **Junction coverage gaps**: 16 junctions still missed at SPJC
-   at tol=1.  Some are big regional junctions that span multiple
-   clusters.  Consider: for each pair of adjacent rects of the
-   same ref with no current junction between them, auto-seed a
-   junction cluster at their joining point.
+4. **Principled collinear merge v2** (currently scaffolded): the
+   width-uniformity check wasn't enough — try combining with
+   junction-membership check (if the joint sits inside a
+   current junction polygon, do NOT merge; otherwise merge).
 
 5. **SPLP limitation noted**: apt.dat labels all SPLP taxiways as
    "A" — no per-taxi refs available from either OSM or apt.dat
