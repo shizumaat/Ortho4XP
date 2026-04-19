@@ -2114,7 +2114,115 @@ def _build_taxi_rects(
     # Post-classify: secondary passes to fix roles based on neighbour
     # topology (stubs touch parallels, cross_connector touches 2 parallels)
     _refine_roles(emitted, rwy_centerlines)
+
+    # NOTE: Phase B2 collinear-rect merge attempted with angle tol
+    # 2°-8° and gap tol 5-15m; all regressed match count because
+    # target subdivides at some collinear transitions that my
+    # merger combined.  Needs a more principled "joining region is
+    # narrow" check — pending.  Disabled for now.
+    # emitted = _merge_collinear_rects(emitted, pav_non_rwy,
+    #                                  apt_vertices=apt_vertices)
     return emitted
+
+
+def _merge_collinear_rects(
+    emitted: List[Tuple[Polygon, LineString, str, str]],
+    pav: Polygon,
+    apt_vertices: Optional[List[Tuple[float, float]]] = None,
+    angle_tol_deg: float = 4.0,
+    gap_tol_m: float = 8.0,
+    width_ratio_tol: float = 1.15,
+) -> List[Tuple[Polygon, LineString, str, str]]:
+    """Merge adjacent same-ref rects whose axes are nearly
+    collinear and whose meeting point sits in the narrow corridor
+    (no widening).  Produces one rect per straight pavement
+    section between real junctions.
+    """
+    if not emitted:
+        return emitted
+    # Group by ref and role so we only merge within a ref's rects.
+    merged = True
+    work = list(emitted)
+    while merged:
+        merged = False
+        n = len(work)
+        for i in range(n):
+            for j in range(i + 1, n):
+                ri, ai, roli, refi = work[i]
+                rj, aj, rolj, refj = work[j]
+                # Only merge same ref + compatible role.
+                if refi != refj or roli != rolj:
+                    continue
+                if refi == "" or refj == "":
+                    continue  # refless: don't auto-merge (SPLP)
+                # Axis bearings (mod 180°).
+                def _bearing(a):
+                    c = list(a.coords)
+                    return math.degrees(
+                        math.atan2(c[-1][0] - c[0][0],
+                                   c[-1][1] - c[0][1])) % 180.0
+                bi = _bearing(ai)
+                bj = _bearing(aj)
+                db = abs(bi - bj)
+                db = min(db, 180.0 - db)
+                if db > angle_tol_deg:
+                    continue
+                # Closest endpoints between axes.
+                coords_i = list(ai.coords)
+                coords_j = list(aj.coords)
+                pairs = [
+                    (coords_i[0], coords_j[0], 0, 0),
+                    (coords_i[0], coords_j[-1], 0, 1),
+                    (coords_i[-1], coords_j[0], 1, 0),
+                    (coords_i[-1], coords_j[-1], 1, 1),
+                ]
+                best = min(pairs, key=lambda p: math.hypot(
+                    p[0][0] - p[1][0], p[0][1] - p[1][1]))
+                endp_i, endp_j, ei, ej = best
+                gap = math.hypot(endp_i[0] - endp_j[0],
+                                 endp_i[1] - endp_j[1])
+                if gap > gap_tol_m:
+                    continue
+                # Width similarity: compare rect widths (from their
+                # polygons' minimum-rotated-rect short-side).
+                def _rect_width(p):
+                    mrr = p.minimum_rotated_rectangle
+                    coords = list(mrr.exterior.coords)
+                    if len(coords) < 5:
+                        return 0.0
+                    s1 = math.hypot(coords[1][0] - coords[0][0],
+                                    coords[1][1] - coords[0][1])
+                    s2 = math.hypot(coords[2][0] - coords[1][0],
+                                    coords[2][1] - coords[1][1])
+                    return min(s1, s2)
+                wi = _rect_width(ri)
+                wj = _rect_width(rj)
+                if wi < 1.0 or wj < 1.0:
+                    continue
+                if max(wi, wj) / min(wi, wj) > width_ratio_tol:
+                    continue
+                # Build merged axis: take the 2 FAR endpoints.
+                far_i = coords_i[0] if ei == 1 else coords_i[-1]
+                far_j = coords_j[0] if ej == 1 else coords_j[-1]
+                try:
+                    merged_axis = LineString([far_i, far_j])
+                except Exception:
+                    continue
+                # Build merged rect from merged axis at average width.
+                avg_width = (wi + wj) / 2.0
+                merged_rect = _rect_from_axis_extended(
+                    merged_axis, avg_width, pav,
+                    apt_vertices=apt_vertices)
+                if merged_rect is None or merged_rect.is_empty:
+                    continue
+                # Replace i with merged, drop j.
+                work[i] = (merged_rect, merged_axis, roli, refi)
+                del work[j]
+                merged = True
+                break
+            if merged:
+                break
+    return work
 
 
 def _natural_half_width(axis: LineString, pav: Polygon,
