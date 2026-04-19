@@ -2426,30 +2426,46 @@ def _snap_corners_to_pavement(
                     best_d = d
         candidates.append(best_v)
 
-    # Guard: reject any candidate that equals another candidate
-    # (would produce coincident corners).
+    # Collision handling: when two vertex-snap candidates collide
+    # (would coincide), keep the nearer one on the vertex.  The
+    # other corner uses the ORIGINAL pre-snap coordinate (NOT
+    # edge-snap, which could pull back to the same region).  This
+    # preserves a valid 4-corner rect while still placing the
+    # kept corner exactly on an apt.dat vertex.
+    # Use proximity (not identity) — two candidates within 1 m
+    # would also collapse the rect corner.  Collapse collision:
+    # drop the farther-from-original candidate, use pre-snap.
+    use_original: List[bool] = [False] * len(candidates)
+    COLLISION_TOL = 1.0
     for i in range(len(candidates)):
         if candidates[i] is None:
             continue
         for j in range(i + 1, len(candidates)):
             if candidates[j] is None:
                 continue
-            if (candidates[i][0] == candidates[j][0]
-                    and candidates[i][1] == candidates[j][1]):
-                # Keep the candidate nearer to its original corner.
+            d_cand = math.hypot(candidates[i][0] - candidates[j][0],
+                                candidates[i][1] - candidates[j][1])
+            if d_cand <= COLLISION_TOL:
                 di = math.hypot(corners[i][0] - candidates[i][0],
                                 corners[i][1] - candidates[i][1])
                 dj = math.hypot(corners[j][0] - candidates[j][0],
                                 corners[j][1] - candidates[j][1])
                 if di <= dj:
                     candidates[j] = None
+                    use_original[j] = True
                 else:
                     candidates[i] = None
+                    use_original[i] = True
 
     snapped: List[Tuple[float, float]] = []
     for i, (cx, cy) in enumerate(corners):
         if candidates[i] is not None:
             snapped.append(candidates[i])
+            continue
+        if use_original[i]:
+            # Collision fallback — keep pre-snap coord to avoid
+            # coincident corners.
+            snapped.append((cx, cy))
             continue
         # Stage 2: nearest pav edge point.
         p = Point(cx, cy)
@@ -2458,6 +2474,26 @@ def _snap_corners_to_pavement(
             snapped.append((near.x, near.y))
         else:
             snapped.append((cx, cy))
+
+    # Final coincidence sweep: vertex-snap AND edge-snap can BOTH
+    # pull two corners onto the same area (e.g. edge-snap falls
+    # through to the same boundary vertex a vertex-snap picked
+    # from the other corner).  If any two final coords are within
+    # 1 m, revert the farther-from-original to its pre-snap coord.
+    FINAL_COLLISION_TOL = 1.0
+    for i in range(len(snapped)):
+        for j in range(i + 1, len(snapped)):
+            d = math.hypot(snapped[i][0] - snapped[j][0],
+                           snapped[i][1] - snapped[j][1])
+            if d <= FINAL_COLLISION_TOL:
+                di = math.hypot(corners[i][0] - snapped[i][0],
+                                corners[i][1] - snapped[i][1])
+                dj = math.hypot(corners[j][0] - snapped[j][0],
+                                corners[j][1] - snapped[j][1])
+                if di <= dj:
+                    snapped[j] = corners[j]
+                else:
+                    snapped[i] = corners[i]
     return snapped
 
 
