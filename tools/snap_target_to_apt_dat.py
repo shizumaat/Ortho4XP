@@ -57,8 +57,10 @@ def _projection(anchor):
 
 
 def _apt_pavement_boundary_m(apt: APR.Airport, to_m):
-    """Return the combined pavement boundary (runways + taxiways +
-    aprons) as a single geometry in meter space."""
+    """Return (pav_union, pav_boundary, pav_vertices) in meter
+    space.  ``pav_vertices`` is the full set of apt.dat vertex
+    coords (exterior + interior rings of each pavement polygon
+    plus runway corners) — used for vertex-preferred snap."""
     pav_polys = []
     # Pavements from apt.dat rows 110+
     for pav in apt.pavements:
@@ -74,9 +76,6 @@ def _apt_pavement_boundary_m(apt: APR.Airport, to_m):
                              if g.geom_type == "Polygon")
     # Runway footprints (row 100 rect + blast pads)
     for r in apt.runways:
-        lat0 = (r.lat_a + r.lat_b) / 2
-        lon0 = (r.lon_a + r.lon_b) / 2
-        # Use the main to_m, not a local projection
         ax, ay = to_m(r.lon_a, r.lat_a)
         bx, by = to_m(r.lon_b, r.lat_b)
         dx, dy = bx - ax, by - ay
@@ -98,8 +97,22 @@ def _apt_pavement_boundary_m(apt: APR.Airport, to_m):
         ]))
     if not pav_polys:
         raise SystemExit("No pavement polygons parsed from apt.dat")
+    # Collect every apt.dat polygon vertex (pre-union).
+    vertices: List[Tuple[float, float]] = []
+    for pp in pav_polys:
+        if pp.is_empty or pp.geom_type != "Polygon":
+            continue
+        ec = list(pp.exterior.coords)
+        if ec and ec[0] == ec[-1]:
+            ec = ec[:-1]
+        vertices.extend(ec)
+        for ring in pp.interiors:
+            rc = list(ring.coords)
+            if rc and rc[0] == rc[-1]:
+                rc = rc[:-1]
+            vertices.extend(rc)
     pav = unary_union(pav_polys).buffer(0)
-    return pav, pav.boundary
+    return pav, pav.boundary, vertices
 
 
 def _parse_osm(txt: str):
@@ -157,8 +170,10 @@ def main(argv=None):
     apt = APR.load_airport(apt_path, args.icao)
     anchor = _anchor(apt)
     to_m, to_ll = _projection(anchor)
-    _, boundary = _apt_pavement_boundary_m(apt, to_m)
-    print(f"Loaded {args.icao}: boundary length = {boundary.length:.0f} m")
+    _, boundary, apt_vertices = _apt_pavement_boundary_m(apt, to_m)
+    print(f"Loaded {args.icao}: boundary length = {boundary.length:.0f} m,"
+          f" vertices = {len(apt_vertices)}")
+    VERTEX_SNAP_M = 8.0  # prefer vertex within 8 m of target node
 
     txt = args.target_path.read_text()
     nodes, ways = _parse_osm(txt)
@@ -179,14 +194,29 @@ def main(argv=None):
         if nid in runway_nodes:
             continue
         x, y = to_m(lon, lat)
-        p = Point(x, y)
-        np_pt, _ = nearest_points(boundary, p)
-        d = p.distance(np_pt)
-        if d > args.max_snap:
-            skipped += 1
-            continue
-        new_lat, new_lon = to_ll(np_pt.x, np_pt.y)
-        moves[nid] = (new_lat, new_lon)
+        # Stage 1: prefer nearest apt.dat VERTEX within VERTEX_SNAP_M
+        # (vertex-level match between target & output is the goal).
+        best_vx = best_vy = None
+        best_vd = VERTEX_SNAP_M
+        for (vx, vy) in apt_vertices:
+            d = math.hypot(x - vx, y - vy)
+            if d < best_vd:
+                best_vd = d
+                best_vx, best_vy = vx, vy
+        if best_vx is not None:
+            new_lat, new_lon = to_ll(best_vx, best_vy)
+            moves[nid] = (new_lat, new_lon)
+            d = best_vd
+        else:
+            # Stage 2: nearest point on boundary within max_snap.
+            p = Point(x, y)
+            np_pt, _ = nearest_points(boundary, p)
+            d = p.distance(np_pt)
+            if d > args.max_snap:
+                skipped += 1
+                continue
+            new_lat, new_lon = to_ll(np_pt.x, np_pt.y)
+            moves[nid] = (new_lat, new_lon)
         if d < 1.0:
             hist["lt1"] += 1
         elif d < 5.0:

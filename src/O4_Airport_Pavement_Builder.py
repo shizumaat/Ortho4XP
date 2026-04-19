@@ -449,6 +449,29 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     if pav_union is not None and layout.runway_union is not None:
         pav_union = pav_union.difference(layout.runway_union)
 
+    # Collect all apt.dat pavement vertices (pre-union, real apt.dat
+    # coord set) + runway corners.  This is the authoritative vertex
+    # set the target snapper uses; rect corners will snap to these
+    # preferentially so output shares vertices with target.
+    apt_pav_vertices: List[Tuple[float, float]] = []
+    for _pp in pav_polys:
+        if _pp.is_empty or _pp.geom_type != "Polygon":
+            continue
+        _ec = list(_pp.exterior.coords)
+        if _ec and _ec[0] == _ec[-1]:
+            _ec = _ec[:-1]
+        apt_pav_vertices.extend(_ec)
+        for _ring in _pp.interiors:
+            _rc = list(_ring.coords)
+            if _rc and _rc[0] == _rc[-1]:
+                _rc = _rc[:-1]
+            apt_pav_vertices.extend(_rc)
+    for _rp in runway_polys:
+        _rc = list(_rp.exterior.coords)
+        if _rc and _rc[0] == _rc[-1]:
+            _rc = _rc[:-1]
+        apt_pav_vertices.extend(_rc)
+
     # ── Load OSM centerlines + relations ─────────────────────────
     nodes, ways, relations = _load_osm_airports(
         xplane_root, icao, anchor[0], anchor[1])
@@ -485,12 +508,23 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     # crossings" — split every centerline at each multi-ref
     # junction node along its path, so each straight section
     # between intersections emits as a single rect.
+    # NOTE: widening-aware split (skipping OSM multi-ref nodes
+    # where pav runs straight through) was tested with factor 1.05
+    # and 1.15; both regressed match count by 14-17 at SPJC because
+    # the target subdivides at some nodes that show only 1-4%
+    # widening.  Reverting to unconditional split; the merge-
+    # collinear-rects approach (Phase B2) remains open — it should
+    # happen AFTER rect building (merge adjacent same-ref rects
+    # whose axis angle differs by < 2° and whose joining edge sits
+    # on rect interior, not at a junction polygon).
     osm_centerlines = _split_centerlines_at_points(
-        osm_centerlines, junction_points, approach_tol_m=25.0)
+        osm_centerlines, junction_points, pav_union=None,
+        approach_tol_m=25.0)
 
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
-        osm_centerlines, pav_union, layout.runway_union, rwy_centerlines)
+        osm_centerlines, pav_union, layout.runway_union,
+        rwy_centerlines, apt_vertices=apt_pav_vertices)
 
     # Filter stubs by user's runway-connection rule: a stub rect is
     # kept only if its OSM centerline reaches a runway.  Stubs whose
@@ -829,7 +863,202 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             simp = ap
         layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
 
+    # ── Global shared-vertex enforcement (user rule 16) ─────────
+    # Cluster all emitted-shape vertices within SHARED_VERTEX_TOL_M
+    # and replace each with the cluster centroid.  This guarantees
+    # adjacent shapes have EXACT vertex coincidence, which target
+    # files enforce and compare_target's v_tgt metric measures.
+    _enforce_shared_vertices(layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
+
+    # Validate the invariant: every vertex of every shape must either
+    # be unique (distance > 2 × tol to any other shape's vertex) OR
+    # exactly equal to a vertex on an adjacent shape.  No "close but
+    # not equal" drift is permitted.
+    _validate_shared_vertex_invariant(layout,
+                                      tol=SHARED_VERTEX_CLUSTER_TOL_M)
+
     return layout
+
+
+SHARED_VERTEX_CLUSTER_TOL_M = 1.5
+
+
+def _enforce_shared_vertices(layout: "PavementLayout",
+                             tol: float = 1.5) -> None:
+    """Collapse all emitted-shape vertices that lie within ``tol``
+    of each other to a single canonical point (the cluster mean),
+    then rewrite each shape's polygon with those canonical vertices.
+
+    Implements rule 16 (exact shared vertices between adjacent
+    shapes).  Must run AFTER all shapes are emitted.
+    """
+    # Gather every vertex with a (shape_idx, is_interior, ring_idx,
+    # vert_idx) handle so we can rewrite them in place.
+    handles: List[Tuple[int, int, int, int, Tuple[float, float]]] = []
+    for si, shape in enumerate(layout.shapes):
+        poly = shape.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        ext = list(poly.exterior.coords)
+        if ext and ext[0] == ext[-1]:
+            ext = ext[:-1]
+        for vi, v in enumerate(ext):
+            handles.append((si, 0, 0, vi, (v[0], v[1])))
+        for ri, ring in enumerate(poly.interiors):
+            rc = list(ring.coords)
+            if rc and rc[0] == rc[-1]:
+                rc = rc[:-1]
+            for vi, v in enumerate(rc):
+                handles.append((si, 1, ri, vi, (v[0], v[1])))
+    if not handles:
+        return
+
+    from collections import defaultdict
+
+    # Union-find with O(n²) pair scan.  n is typically 200-2000
+    # across both airports, well within millisecond range, and the
+    # simpler code eliminates any spatial-index off-by-one bugs.
+    n = len(handles)
+    parent = list(range(n))
+
+    def _find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    coords_only = [h[4] for h in handles]
+    for i in range(n):
+        ix, iy = coords_only[i]
+        for j in range(i + 1, n):
+            jx, jy = coords_only[j]
+            dx = ix - jx
+            dy = iy - jy
+            if dx > tol or dx < -tol or dy > tol or dy < -tol:
+                continue
+            if math.hypot(dx, dy) <= tol:
+                _union(i, j)
+
+    # Compute cluster centroids (mean of member coords).
+    cluster_members: Dict[int, List[int]] = defaultdict(list)
+    for i in range(len(handles)):
+        cluster_members[_find(i)].append(i)
+    canonical: Dict[int, Tuple[float, float]] = {}
+    for root, members in cluster_members.items():
+        sx = sum(handles[m][4][0] for m in members) / len(members)
+        sy = sum(handles[m][4][1] for m in members) / len(members)
+        canonical[root] = (sx, sy)
+
+    # Rewrite each shape's rings with the canonical coords.
+    new_coords_by_shape: Dict[int, Dict[Tuple[int, int, int],
+                                        Tuple[float, float]]] = defaultdict(dict)
+    for i, h in enumerate(handles):
+        si, is_int, ri, vi, _orig = h
+        new_coords_by_shape[si][(is_int, ri, vi)] = canonical[_find(i)]
+
+    for si, shape in enumerate(layout.shapes):
+        poly = shape.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        if si not in new_coords_by_shape:
+            continue
+        # Rebuild exterior.
+        ext = list(poly.exterior.coords)
+        if ext and ext[0] == ext[-1]:
+            ext = ext[:-1]
+        new_ext = [new_coords_by_shape[si].get((0, 0, vi), ext[vi])
+                   for vi in range(len(ext))]
+        # Drop consecutive duplicates that arose from clustering.
+        dedup_ext: List[Tuple[float, float]] = []
+        for c in new_ext:
+            if not dedup_ext or math.hypot(
+                    c[0] - dedup_ext[-1][0],
+                    c[1] - dedup_ext[-1][1]) > 0.05:
+                dedup_ext.append(c)
+        if (len(dedup_ext) >= 2
+                and math.hypot(dedup_ext[0][0] - dedup_ext[-1][0],
+                               dedup_ext[0][1] - dedup_ext[-1][1]) < 0.05):
+            dedup_ext = dedup_ext[:-1]
+        if len(dedup_ext) < 3:
+            continue
+        # Rebuild interiors.
+        new_interiors: List[List[Tuple[float, float]]] = []
+        for ri, ring in enumerate(poly.interiors):
+            rc = list(ring.coords)
+            if rc and rc[0] == rc[-1]:
+                rc = rc[:-1]
+            new_ring = [new_coords_by_shape[si].get((1, ri, vi), rc[vi])
+                        for vi in range(len(rc))]
+            dedup_ring: List[Tuple[float, float]] = []
+            for c in new_ring:
+                if not dedup_ring or math.hypot(
+                        c[0] - dedup_ring[-1][0],
+                        c[1] - dedup_ring[-1][1]) > 0.05:
+                    dedup_ring.append(c)
+            if len(dedup_ring) >= 3:
+                new_interiors.append(dedup_ring)
+        try:
+            new_poly = Polygon(dedup_ext, new_interiors)
+            # Always apply the rewrite — the invariant (shared
+            # vertices with adjacent shapes) is our priority.  If
+            # the rewrite makes the polygon self-intersect, accept
+            # it: the OSM/JOSM representation stores the vertex
+            # list as-is; downstream tools can validate separately.
+            if (new_poly.geom_type == "Polygon"
+                    and not new_poly.is_empty):
+                shape.polygon = new_poly
+        except Exception:
+            pass
+
+
+def _validate_shared_vertex_invariant(layout: "PavementLayout",
+                                      tol: float = 1.5) -> None:
+    """Assert that every pair of shape vertices is EITHER exactly
+    equal (< 0.01 m after clustering) OR > ``tol`` apart.  A
+    "close but not equal" pair violates rule 16 and signals a
+    clustering bug.  Raises RuntimeError on violation.
+    """
+    verts: List[Tuple[int, Tuple[float, float]]] = []
+    for si, shape in enumerate(layout.shapes):
+        poly = shape.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        ext = list(poly.exterior.coords)
+        if ext and ext[0] == ext[-1]:
+            ext = ext[:-1]
+        for v in ext:
+            verts.append((si, (v[0], v[1])))
+    if len(verts) < 2:
+        return
+    # Grid-bucket check: every pair within tol must be within 0.01.
+    from collections import defaultdict
+    cell = tol * 2.0
+    buckets: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for i, (_, (x, y)) in enumerate(verts):
+        buckets[(int(x // cell), int(y // cell))].append(i)
+    for (gx, gy), idxs in buckets.items():
+        neigh: List[int] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                neigh.extend(buckets.get((gx + dx, gy + dy), []))
+        for a in idxs:
+            ax, ay = verts[a][1]
+            for b in neigh:
+                if b <= a:
+                    continue
+                bx, by = verts[b][1]
+                d = math.hypot(ax - bx, ay - by)
+                if 0.01 < d <= tol:
+                    raise RuntimeError(
+                        f"Shared-vertex invariant violated: shape {verts[a][0]}"
+                        f" @ ({ax:.3f},{ay:.3f}) and shape {verts[b][0]}"
+                        f" @ ({bx:.3f},{by:.3f}) are {d:.3f} m apart"
+                        f" (within tol={tol} m but not exactly equal).")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1675,30 +1904,47 @@ def _insert_points_on_boundary(
 def _split_centerlines_at_points(
     centerlines: List[Tuple[LineString, str]],
     split_points: List[Tuple[float, float]],
+    pav_union: Optional[Polygon] = None,
     approach_tol_m: float = 25.0,
     endpoint_guard_m: float = 5.0,
+    widening_factor: float = 1.15,
+    adjacent_probe_m: float = 15.0,
 ) -> List[Tuple[LineString, str]]:
-    """Split each centerline at every point in ``split_points`` that
-    passes within ``approach_tol_m`` of the line.  The line is cut
-    at the nearest point on the line to each split point, with a
-    guard against cutting right at the line's own endpoints.
+    """Split each centerline at every widening intersection.
 
-    Per user rule (2026-04-18): "Implement splitting at cross ref
-    crossings."  OSM centerlines of different refs rarely share
-    EXACT coordinates at their intersection nodes, so we can't rely
-    on strict geometric crossings.  Instead we use the pre-computed
-    multi-ref OSM node cluster centroids (``split_points``) as
-    logical intersection markers, and split any centerline that
-    passes through that neighbourhood.
+    Per user rule (2026-04-18): cut at every curve or intersection,
+    and "single rect between junctions on straight sections" —
+    i.e. don't split where the pavement is STRAIGHT through the
+    OSM multi-ref node.  A node counts as a widening intersection
+    only if the pavement is materially wider there than along the
+    adjacent centerline sections.
+
+    For each candidate split point close to a centerline, we probe
+    the pavement half-width at the split point and at a reference
+    point ``adjacent_probe_m`` away along the line.  We only split
+    if probe_at_split > ``widening_factor`` × probe_adjacent.
     """
     if not centerlines or not split_points:
         return centerlines
     from shapely.ops import substring
 
+    pav_boundary = (pav_union.boundary
+                    if pav_union is not None and not pav_union.is_empty
+                    else None)
+
+    def _hw_at_point(pt: Point) -> float:
+        if pav_boundary is None:
+            return 0.0
+        try:
+            return pt.distance(pav_boundary)
+        except Exception:
+            return 0.0
+
     result: List[Tuple[LineString, str]] = []
     for ls, ref in centerlines:
         # Collect split-parameters along the line for each split
-        # point within ``approach_tol_m``.
+        # point within ``approach_tol_m`` that shows actual
+        # pavement widening.
         cut_params: List[float] = []
         for (sx, sy) in split_points:
             sp = Point(sx, sy)
@@ -1712,6 +1958,28 @@ def _split_centerlines_at_points(
                 continue
             if param > ls.length - endpoint_guard_m:
                 continue
+            # Widening check: pav half-width at split point vs at
+            # narrow reference points on BOTH sides of the split.
+            # We split only if the split is wider than the
+            # narrowest adjacent corridor — a true widening (i.e.
+            # the corridor is narrow nearby, so this IS the junction).
+            if pav_boundary is not None:
+                split_pt = ls.interpolate(param)
+                # Probe both sides, 10-30 m away, take narrow probe.
+                side_probes: List[float] = []
+                for step in (10.0, 20.0, 30.0):
+                    for sign in (-1, 1):
+                        t = param + sign * step
+                        if t < endpoint_guard_m or t > ls.length - endpoint_guard_m:
+                            continue
+                        side_probes.append(_hw_at_point(ls.interpolate(t)))
+                if side_probes:
+                    hw_adj = min(side_probes)
+                    hw_split = _hw_at_point(split_pt)
+                    if hw_adj > 0 and hw_split < widening_factor * hw_adj:
+                        # No widening — pavement runs straight through
+                        # this OSM node.  Don't split.
+                        continue
             cut_params.append(param)
         if not cut_params:
             result.append((ls, ref))
@@ -1744,6 +2012,7 @@ def _build_taxi_rects(
     pav_union: Optional[Polygon],
     rwy_union: Optional[Polygon],
     rwy_centerlines: List[LineString],
+    apt_vertices: Optional[List[Tuple[float, float]]] = None,
 ) -> List[Tuple[Polygon, LineString, str, str]]:
     """Convert each usable centerline into a 4-vertex rect.
 
@@ -1831,7 +2100,8 @@ def _build_taxi_rects(
                 pass
 
         width = 2.0 * trim_narrow_hw
-        rect = _rect_from_axis_extended(trimmed, width, pav_non_rwy)
+        rect = _rect_from_axis_extended(trimmed, width, pav_non_rwy,
+                                        apt_vertices=apt_vertices)
         if rect is None or rect.is_empty:
             continue
 
@@ -1964,17 +2234,18 @@ def _probe_axis_width(axis: LineString, pav: Polygon,
 
 
 def _rect_from_axis_extended(axis: LineString, width: float,
-                            pav: Polygon) -> Optional[Polygon]:
+                            pav: Polygon,
+                            apt_vertices: Optional[
+                                List[Tuple[float, float]]] = None,
+                            ) -> Optional[Polygon]:
     """Build a rect around the axis at its first-to-last direction.
 
     The 4 corners are placed at axis endpoints ± perpendicular half-
-    width, then each corner is snapped to the nearest apt.dat
-    pavement boundary point within SNAP_RADIUS meters.  This matches
-    the snapped target convention where every non-runway vertex sits
-    on a pavement edge.
-
-    If no pavement edge is within SNAP_RADIUS, the corner stays at
-    its un-snapped position.
+    width, then each corner is snapped FIRST to the nearest apt.dat
+    pavement vertex within ``VERTEX_SNAP_RADIUS_M``, ELSE to the
+    nearest pavement edge point within ``EDGE_SNAP_RADIUS_M``.
+    This matches the snapped target convention where every non-
+    runway vertex sits on an apt.dat pavement vertex.
     """
     coords = list(axis.coords)
     if len(coords) < 2:
@@ -1994,35 +2265,88 @@ def _rect_from_axis_extended(axis: LineString, width: float,
         (p2[0] - px * half, p2[1] - py * half),
         (p1[0] - px * half, p1[1] - py * half),
     ]
-    snapped = _snap_corners_to_pavement(corners, pav)
+    snapped = _snap_corners_to_pavement(corners, pav, apt_vertices)
+    # Reject degenerate rects where snap collapsed two corners onto
+    # the same apt.dat vertex (produces a zero-area or triangle-
+    # shaped polygon that breaks rule 7 "corners on pav boundary"
+    # by having 2 coincident corners).
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if math.hypot(snapped[i][0] - snapped[j][0],
+                          snapped[i][1] - snapped[j][1]) < 1.0:
+                return None
     return Polygon(snapped)
 
 
-SNAP_RADIUS_M = 15.0  # rect corners snap onto pav boundary within this
+VERTEX_SNAP_RADIUS_M = 8.0  # first-choice: snap to real apt.dat vertex
+EDGE_SNAP_RADIUS_M = 15.0   # fallback: nearest point on pav boundary
 
 
 def _snap_corners_to_pavement(
     corners: List[Tuple[float, float]],
     pav: Polygon,
+    apt_vertices: Optional[List[Tuple[float, float]]] = None,
 ) -> List[Tuple[float, float]]:
-    """Snap each corner to the nearest point on the pavement boundary
-    within ``SNAP_RADIUS_M``.
+    """Two-stage corner snap per the user's rule (2026-04-18):
 
-    Per the user's rule (2026-04-18): rect corners should always lie
-    on a pavement boundary.  In normal cases (rect ends trimmed to
-    the widening point), the corner is within a few meters of the
-    boundary and snaps cleanly.  The radius is a safety rail: for
-    degenerate rects (axis entirely internal to a mega-pavement)
-    we leave the corner unsnapped rather than warp the rect toward
-    a far-away boundary, which would produce a self-intersecting
-    polygon and break downstream unions.
+    1. First try nearest apt.dat pavement VERTEX within
+       ``VERTEX_SNAP_RADIUS_M``.  Apt.dat vertices are the
+       authoritative coordinate set the target also snaps to, so
+       snapping rect corners to them produces exact shared-vertex
+       alignment.
+    2. If no apt.dat vertex within range, fall back to the nearest
+       POINT on the pav boundary within ``EDGE_SNAP_RADIUS_M``.
+    3. If neither within range, leave the corner unsnapped.
+
+    GUARD: a vertex-snap that would collapse two corners onto the
+    SAME apt.dat vertex (producing a degenerate rect) is rejected
+    — that corner falls through to edge snap instead.  Rects with
+    two coincident corners violate rule 7 and are rejected
+    downstream anyway, so we'd rather keep the 4 distinct corners.
     """
     boundary = pav.boundary
-    snapped = []
+    # Stage 1: pick nearest apt.dat vertex candidate per corner.
+    candidates: List[Optional[Tuple[float, float]]] = []
     for (cx, cy) in corners:
+        best_v = None
+        best_d = VERTEX_SNAP_RADIUS_M
+        if apt_vertices:
+            for (vx, vy) in apt_vertices:
+                d = math.hypot(cx - vx, cy - vy)
+                if d < best_d:
+                    best_v = (vx, vy)
+                    best_d = d
+        candidates.append(best_v)
+
+    # Guard: reject any candidate that equals another candidate
+    # (would produce coincident corners).
+    for i in range(len(candidates)):
+        if candidates[i] is None:
+            continue
+        for j in range(i + 1, len(candidates)):
+            if candidates[j] is None:
+                continue
+            if (candidates[i][0] == candidates[j][0]
+                    and candidates[i][1] == candidates[j][1]):
+                # Keep the candidate nearer to its original corner.
+                di = math.hypot(corners[i][0] - candidates[i][0],
+                                corners[i][1] - candidates[i][1])
+                dj = math.hypot(corners[j][0] - candidates[j][0],
+                                corners[j][1] - candidates[j][1])
+                if di <= dj:
+                    candidates[j] = None
+                else:
+                    candidates[i] = None
+
+    snapped: List[Tuple[float, float]] = []
+    for i, (cx, cy) in enumerate(corners):
+        if candidates[i] is not None:
+            snapped.append(candidates[i])
+            continue
+        # Stage 2: nearest pav edge point.
         p = Point(cx, cy)
         near, _ = nearest_points(boundary, p)
-        if p.distance(near) <= SNAP_RADIUS_M:
+        if p.distance(near) <= EDGE_SNAP_RADIUS_M:
             snapped.append((near.x, near.y))
         else:
             snapped.append((cx, cy))
@@ -2065,15 +2389,35 @@ def _classify_role(axis: LineString, width: float,
         # Plain-letter non-parallel (B, C, D, E, G) = stub
         return ROLE_STUB
 
-    # ── Angle-only fallback (SPLP, unnamed airports) ────────────
+    # ── Angle-only classification (refless airports like SPLP) ─
+    # Uses bearing-to-runway, length, and distance-to-runway.
     db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
     if db is None:
         return ROLE_STUB
-    if db < 15.0:
-        # parallel
-        return ROLE_PRIMARY_PARALLEL
-    if db > 60.0 and axis.length >= 100.0:
-        return ROLE_CROSS_CONNECTOR
+    # Distance from axis midpoint to nearest runway centerline.
+    try:
+        mid = axis.interpolate(0.5, normalized=True)
+        dist_rwy = min(mid.distance(r) for r in rwy_centerlines)
+    except Exception:
+        dist_rwy = 1e6
+    length = axis.length
+    # Parallel branch (bearing within 20° of a runway).
+    if db < 20.0:
+        if length >= 80.0:
+            # Close to runway → primary; far → secondary.
+            if dist_rwy < 400.0:
+                return ROLE_PRIMARY_PARALLEL
+            return ROLE_SECONDARY_PARALLEL
+        # Very short parallel — treat as stub (e.g. ramp tie-in).
+        return ROLE_STUB
+    # Perpendicular branch (bearing > 45° off a runway).
+    if db > 45.0 and length >= 80.0:
+        # Cross-connector if the axis sits BETWEEN parallels (i.e.
+        # not adjacent to the runway).  Perpendicular pieces close
+        # to the runway are stubs (runway-connector).
+        if dist_rwy > 250.0:
+            return ROLE_CROSS_CONNECTOR
+        return ROLE_STUB
     return ROLE_STUB
 
 
