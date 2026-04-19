@@ -680,7 +680,7 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     # Dedup junctions that overlap heavily (multiple seeds can produce
     # nearly-identical polygons).  Keep the larger-area one.
     def _polys_overlap_heavily(p1: Polygon, p2: Polygon,
-                               thresh: float = 0.5) -> bool:
+                               thresh: float = 0.8) -> bool:
         try:
             inter = p1.intersection(p2).area
         except Exception:
@@ -2115,14 +2115,120 @@ def _build_taxi_rects(
     # topology (stubs touch parallels, cross_connector touches 2 parallels)
     _refine_roles(emitted, rwy_centerlines)
 
-    # NOTE: Phase B2 collinear-rect merge attempted with angle tol
-    # 2°-8° and gap tol 5-15m; all regressed match count because
-    # target subdivides at some collinear transitions that my
-    # merger combined.  Needs a more principled "joining region is
-    # narrow" check — pending.  Disabled for now.
-    # emitted = _merge_collinear_rects(emitted, pav_non_rwy,
-    #                                  apt_vertices=apt_vertices)
+    # Phase B2 (2026-04-19 principled) tested with width-uniformity
+    # check and still regressed SPJC match count by 2 — target
+    # subdivides at some joint that meets the uniformity test.
+    # Leaving the function available as scaffolding; disabled.
+    # emitted = _merge_collinear_rects_principled(
+    #     emitted, pav_non_rwy, apt_vertices=apt_vertices)
     return emitted
+
+
+def _merge_collinear_rects_principled(
+    emitted: List[Tuple[Polygon, LineString, str, str]],
+    pav: Polygon,
+    apt_vertices: Optional[List[Tuple[float, float]]] = None,
+    angle_tol_deg: float = 4.0,
+    gap_tol_m: float = 12.0,
+    width_uniformity_tol: float = 1.10,
+) -> List[Tuple[Polygon, LineString, str, str]]:
+    """Merge adjacent same-ref rects whose joining point shows
+    NO widening — the pavement runs straight at uniform narrow
+    width through the joint.  This is the only case where "single
+    rect between junctions on straight sections" applies.
+    """
+    if not emitted or pav is None or pav.is_empty:
+        return emitted
+    boundary = pav.boundary
+    changed = True
+    work = list(emitted)
+    while changed:
+        changed = False
+        for i in range(len(work)):
+            for j in range(i + 1, len(work)):
+                ri, ai, roli, refi = work[i]
+                rj, aj, rolj, refj = work[j]
+                if refi != refj or refi == "":
+                    continue  # refless airports handled separately
+                if roli != rolj:
+                    continue
+                # Bearings (mod 180°).
+                def _bearing(a):
+                    c = list(a.coords)
+                    return math.degrees(
+                        math.atan2(c[-1][0] - c[0][0],
+                                   c[-1][1] - c[0][1])) % 180.0
+                bi = _bearing(ai)
+                bj = _bearing(aj)
+                db = abs(bi - bj)
+                db = min(db, 180.0 - db)
+                if db > angle_tol_deg:
+                    continue
+                # Closest endpoints & far endpoints.
+                coords_i = list(ai.coords)
+                coords_j = list(aj.coords)
+                pairs = [
+                    (coords_i[0], coords_j[0], 0, 0),
+                    (coords_i[0], coords_j[-1], 0, 1),
+                    (coords_i[-1], coords_j[0], 1, 0),
+                    (coords_i[-1], coords_j[-1], 1, 1),
+                ]
+                best = min(pairs, key=lambda p: math.hypot(
+                    p[0][0] - p[1][0], p[0][1] - p[1][1]))
+                endp_i, endp_j, ei, ej = best
+                gap = math.hypot(endp_i[0] - endp_j[0],
+                                 endp_i[1] - endp_j[1])
+                if gap > gap_tol_m:
+                    continue
+                # Joining-region pavement half-width: probe at the
+                # midpoint of the two touching endpoints.
+                mid = Point((endp_i[0] + endp_j[0]) / 2,
+                            (endp_i[1] + endp_j[1]) / 2)
+                hw_joint = mid.distance(boundary) if pav.contains(mid) else 0
+                if hw_joint <= 0:
+                    continue
+                # Each rect's own half-width (MRR short side / 2).
+                def _rect_hw(p):
+                    mrr = p.minimum_rotated_rectangle
+                    c = list(mrr.exterior.coords)
+                    if len(c) < 5:
+                        return 0.0
+                    s1 = math.hypot(c[1][0] - c[0][0], c[1][1] - c[0][1])
+                    s2 = math.hypot(c[2][0] - c[1][0], c[2][1] - c[1][1])
+                    return min(s1, s2) / 2.0
+                hwi = _rect_hw(ri)
+                hwj = _rect_hw(rj)
+                if hwi <= 0 or hwj <= 0:
+                    continue
+                # No widening: joint hw is within uniformity_tol of
+                # each rect's own hw (equivalently, joint hw ≤
+                # max(hwi, hwj) × uniformity_tol AND rects have
+                # similar widths).
+                max_hw = max(hwi, hwj)
+                if hw_joint > max_hw * width_uniformity_tol:
+                    continue
+                ratio_ij = max(hwi, hwj) / min(hwi, hwj)
+                if ratio_ij > width_uniformity_tol:
+                    continue
+                # All checks pass — merge.
+                far_i = coords_i[0] if ei == 1 else coords_i[-1]
+                far_j = coords_j[0] if ej == 1 else coords_j[-1]
+                try:
+                    merged_axis = LineString([far_i, far_j])
+                except Exception:
+                    continue
+                merged_rect = _rect_from_axis_extended(
+                    merged_axis, 2.0 * (hwi + hwj) / 2.0, pav,
+                    apt_vertices=apt_vertices)
+                if merged_rect is None or merged_rect.is_empty:
+                    continue
+                work[i] = (merged_rect, merged_axis, roli, refi)
+                del work[j]
+                changed = True
+                break
+            if changed:
+                break
+    return work
 
 
 def _merge_collinear_rects(
