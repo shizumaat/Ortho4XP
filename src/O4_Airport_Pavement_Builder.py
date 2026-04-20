@@ -2505,11 +2505,13 @@ def _split_centerlines_at_points(
                     # the midpoint.  If wide (combined junction
                     # region), cluster; if narrow (true straight
                     # corridor between separate intersections),
-                    # keep separate.
+                    # keep separate.  Factor 1.05 catches modest
+                    # widening at combined junction areas (e.g.
+                    # V between V-V3 cluster and V-U1 cluster).
                     if pav_union is not None and narrow_hw > 0:
                         midp = (clusters[-1][-1] + p) / 2.0
                         mid_hw = _perp_hw(ls, midp)
-                        if mid_hw > 1.15 * narrow_hw:
+                        if mid_hw > 1.05 * narrow_hw:
                             clusters[-1].append(p)
                             continue
             clusters.append([p])
