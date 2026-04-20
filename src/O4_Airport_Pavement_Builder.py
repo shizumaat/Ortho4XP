@@ -521,9 +521,28 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     #           pavement belongs to junctions.
     # Uses OSM multi-ref nodes as intersection anchors, gated by
     # gap + pav-width clustering at the midpoint.
-    osm_centerlines = _split_centerlines_at_points(
-        osm_centerlines, junction_points, pav_union=pav_union,
-        approach_tol_m=25.0)
+    # Sub-ref narrow-corridor selection per user (2026-04-20):
+    # target sub-ref stubs (V1/V2/V3/V5, A1-A6, L1/L3/L5, etc.)
+    # are short rects centered in the NARROW STRAIGHT portion of
+    # the sub-ref taxi.  OSM sub-ref polylines include the runway
+    # curve and the junction widening at the parent-taxi
+    # connection.  Process sub-refs BEFORE split-at-points so
+    # they don't get double-trimmed, and skip them in the main
+    # split pass.
+    if pav_union is not None:
+        sub_ref_lines = [(l, r) for l, r in osm_centerlines
+                         if r and any(c.isdigit() for c in r)]
+        primary_lines = [(l, r) for l, r in osm_centerlines
+                         if not r or not any(c.isdigit() for c in r)]
+        sub_ref_out = _sub_ref_narrow_corridor(sub_ref_lines, pav_union)
+        primary_split = _split_centerlines_at_points(
+            primary_lines, junction_points, pav_union=pav_union,
+            approach_tol_m=25.0)
+        osm_centerlines = primary_split + sub_ref_out
+    else:
+        osm_centerlines = _split_centerlines_at_points(
+            osm_centerlines, junction_points, pav_union=pav_union,
+            approach_tol_m=25.0)
 
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
@@ -1914,12 +1933,15 @@ def _extract_osm_taxi_centerlines(
         else:
             merged_lines = lines
 
-        # Stage 2: gap bridging.  Bridge gaps up to GAP_BRIDGE_MAX_M
-        # for ALL refs — OSM fragments a long taxiway into many
-        # short pieces at every intersection, but target treats
-        # them as ONE logical taxi and splits only at real
-        # bends + widening intersections (handled downstream).
-        if ref and len(merged_lines) > 1:
+        # Stage 2: gap bridging.  Bridge gaps for PRIMARY refs
+        # (long continuous taxis) where OSM fragments across
+        # intersections.  For SUB-REFS (letter+digit like V2, L3)
+        # each OSM way is typically a separate short stub;
+        # bridging their gaps creates fake segments through
+        # non-pavement and confuses downstream width-profile
+        # narrow-corridor detection.
+        is_sub_ref = ref and any(c.isdigit() for c in ref)
+        if ref and len(merged_lines) > 1 and not is_sub_ref:
             merged_lines = _bridge_same_ref_polylines(merged_lines)
 
         for ls in merged_lines:
@@ -2031,78 +2053,9 @@ def _extract_osm_taxi_centerlines(
                         continue
                     out.append((seg, ref))
             else:
-                # For stubs, detect curves near runway and split off
-                # the straight portion only.  OSM often has one
-                # ref=V1 way that spans the straight stub + the
-                # curve into the runway; target treats the curve
-                # itself as junction territory and emits only the
-                # short straight portion as the stub rect.
-                stub_candidate_bends: List[int] = []
-                for i in range(1, len(scoords) - 1):
-                    a = scoords[i - 1]
-                    b = scoords[i]
-                    c = scoords[i + 1]
-                    v1 = (b[0] - a[0], b[1] - a[1])
-                    v2 = (c[0] - b[0], c[1] - b[1])
-                    m1 = math.hypot(*v1)
-                    m2 = math.hypot(*v2)
-                    if m1 < 1e-6 or m2 < 1e-6:
-                        continue
-                    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2)
-                    dot = max(-1.0, min(1.0, dot))
-                    angle_change = math.degrees(math.acos(dot))
-                    if angle_change >= SIGNIFICANT_BEND_DEG:
-                        stub_candidate_bends.append(i)
-                stub_clusters: List[List[int]] = []
-                for bi in stub_candidate_bends:
-                    if stub_clusters and (scoords[bi][0] - scoords[stub_clusters[-1][-1]][0])**2 + \
-                            (scoords[bi][1] - scoords[stub_clusters[-1][-1]][1])**2 \
-                            <= BEND_CLUSTER_M * BEND_CLUSTER_M:
-                        stub_clusters[-1].append(bi)
-                    else:
-                        stub_clusters.append([bi])
-                # If there's a significant curve cluster NEAR a
-                # runway, split the polyline there: keep the
-                # pre-curve straight portion, skip the curve.
-                stub_events: List[Tuple[int, str]] = [(0, "point")]
-                for cl in stub_clusters:
-                    near_rwy = False
-                    if rwy_centerlines and len(cl) >= 2:
-                        cmid = scoords[cl[len(cl) // 2]]
-                        cp = Point(cmid)
-                        for r in rwy_centerlines:
-                            if cp.distance(r) < 200.0:
-                                near_rwy = True
-                                break
-                    if near_rwy and len(cl) >= 2:
-                        stub_events.append((cl[0], "interval_start"))
-                        stub_events.append((cl[-1], "interval_end"))
-                stub_events.append((len(scoords) - 1, "point"))
-                stub_events.sort()
-                # Collect candidate straight segments (curve intervals
-                # skipped); for stubs, keep ONLY the LONGEST one —
-                # target treats a sub-ref stub as ONE rect at its
-                # narrow straight portion, not the curve pieces on
-                # each side.
-                stub_candidates: List[LineString] = []
-                for k in range(len(stub_events) - 1):
-                    i0, k0 = stub_events[k]
-                    i1, k1 = stub_events[k + 1]
-                    if k0 == "interval_start" and k1 == "interval_end":
-                        continue  # skip curve interval
-                    if i0 == i1:
-                        continue
-                    try:
-                        seg = LineString(scoords[i0:i1 + 1])
-                    except Exception:
-                        continue
-                    if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
-                        continue
-                    stub_candidates.append(seg)
-                if stub_candidates:
-                    longest = max(stub_candidates, key=lambda s: s.length)
-                    out.append((longest, ref))
-                elif ls.length >= MIN_SEGMENT_LEN_M:
+                # Stubs: keep full polyline; downstream width-profile
+                # pass picks the narrow-corridor portion as the rect.
+                if ls.length >= MIN_SEGMENT_LEN_M:
                     out.append((ls, ref))
 
     any_ref = any(r for _, r in out)
@@ -2242,6 +2195,155 @@ def _split_by_width_profile(
                     and not seg.is_empty
                     and seg.length >= min_rect_len_m):
                 result.append((seg, ref))
+    return result
+
+
+def _sub_ref_narrow_corridor(
+    centerlines: List[Tuple[LineString, str]],
+    pav_union: Polygon,
+    probe_step_m: float = 4.0,
+    wide_factor: float = 1.30,
+    narrow_margin_frac: float = 0.15,
+) -> List[Tuple[LineString, str]]:
+    """For each sub-ref (ref like V1/V3/A1/L3 — letter+digit),
+    replace its centerline(s) with the 70% middle slice of the
+    LONGEST narrow-corridor interval.
+
+    Algorithm:
+      1. Perpendicular ray-cast half-width probes every
+         ``probe_step_m`` along the centerline.
+      2. narrow_hw = min probe (≥ 3.5 m floor).
+      3. Flag each probe narrow/wide by ``wide_factor × narrow_hw``.
+      4. Longest contiguous narrow interval → emit 70% middle.
+
+    Also de-dupes multiple OSM ways with the same sub-ref by
+    keeping the one whose selected-slice is longest and narrowest.
+    """
+    if not centerlines or pav_union is None or pav_union.is_empty:
+        return centerlines
+    from shapely.ops import substring
+
+    RAY_CAP_M = 40.0
+    RAY_STEP_M = 0.5
+
+    def _perp_hw(line: LineString, t: float) -> float:
+        dt = min(2.0, line.length * 0.05)
+        t0 = max(0.0, t - dt)
+        t1 = min(line.length, t + dt)
+        a = line.interpolate(t0)
+        b = line.interpolate(t1)
+        tx, ty = b.x - a.x, b.y - a.y
+        mag = math.hypot(tx, ty)
+        if mag < 1e-6:
+            return 0.0
+        ux, uy = tx / mag, ty / mag
+        nx, ny = -uy, ux
+        pt = line.interpolate(t)
+        ox, oy = pt.x, pt.y
+        best = RAY_CAP_M
+        for sign in (-1, 1):
+            d = 0.0
+            while d <= RAY_CAP_M:
+                qx = ox + sign * nx * d
+                qy = oy + sign * ny * d
+                if not pav_union.contains(Point(qx, qy)):
+                    if d < best:
+                        best = d
+                    break
+                d += RAY_STEP_M
+        return best
+
+    # ICAO Code E taxi: 23m wide = 11.5m half-width.
+    # Allow up to 16m half-width as "still on the taxi strip";
+    # beyond that we're in a widening (intersection or apron).
+    NARROW_TAXI_HW_M = 16.0
+
+    def _narrow_slice(ls: LineString) -> Optional[Tuple[LineString, float]]:
+        """Return (slice, avg_hw_in_narrow) for the 70% middle of
+        the longest narrow-corridor interval along ls.  Uses a
+        FIXED narrow-width threshold (NARROW_TAXI_HW_M) based on
+        ICAO standards rather than per-line percentiles, which
+        are unreliable on short or highly-curved sub-refs."""
+        if ls.length < MIN_SEGMENT_LEN_M:
+            return None
+        n = max(10, int(ls.length / probe_step_m))
+        samples: List[Tuple[float, float]] = []
+        for i in range(n + 1):
+            t = i / n * ls.length
+            hw = _perp_hw(ls, t)
+            samples.append((t, hw))
+        if not any(h > 0 for _, h in samples):
+            return None
+        is_narrow = [3.5 <= h <= NARROW_TAXI_HW_M for (_, h) in samples]
+        # Longest contiguous narrow interval.
+        best_i, best_j = -1, -1
+        i = 0
+        while i < len(samples):
+            if not is_narrow[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(samples) and is_narrow[j + 1]:
+                j += 1
+            if j - i > best_j - best_i:
+                best_i, best_j = i, j
+            i = j + 1
+        if best_i < 0:
+            return None
+        a_t = samples[best_i][0]
+        b_t = samples[best_j][0]
+        interval_len = b_t - a_t
+        if interval_len < MIN_SEGMENT_LEN_M:
+            return None
+        margin = narrow_margin_frac * interval_len
+        s_t = a_t + margin
+        e_t = b_t - margin
+        if e_t - s_t < MIN_SEGMENT_LEN_M:
+            return None
+        try:
+            seg = substring(ls, s_t, e_t)
+        except Exception:
+            return None
+        if (seg.geom_type != "LineString"
+                or seg.is_empty
+                or seg.length < MIN_SEGMENT_LEN_M):
+            return None
+        # Average hw within the narrow interval (for dedup scoring).
+        narrow_hws = [h for (t, h) in samples
+                      if best_i <= samples.index((t, h)) <= best_j
+                      if 3.5 <= h <= NARROW_TAXI_HW_M]
+        avg_hw = sum(narrow_hws) / len(narrow_hws) if narrow_hws else 0.0
+        return seg, avg_hw
+
+    # Group sub-ref lines; keep all other lines as-is.
+    from collections import defaultdict
+    sub_ref_lines: Dict[str, List[LineString]] = defaultdict(list)
+    result: List[Tuple[LineString, str]] = []
+    for ls, ref in centerlines:
+        if ref and any(c.isdigit() for c in ref):
+            sub_ref_lines[ref].append(ls)
+        else:
+            result.append((ls, ref))
+
+    # For each sub-ref, pick the best slice.
+    for ref, lines in sub_ref_lines.items():
+        slices: List[Tuple[LineString, float]] = []
+        for l in lines:
+            r = _narrow_slice(l)
+            if r is not None:
+                slices.append(r)
+        if not slices:
+            # Fallback: keep the longest raw polyline.
+            lines_sorted = sorted(lines, key=lambda l: -l.length)
+            if lines_sorted and lines_sorted[0].length >= MIN_SEGMENT_LEN_M:
+                result.append((lines_sorted[0], ref))
+            continue
+        # Prefer the LONGEST slice — the physical taxi corridor
+        # typically has the longest continuous narrow interval.
+        slices.sort(key=lambda sh: -sh[0].length)
+        best = slices[0][0]
+        result.append((best, ref))
+
     return result
 
 
@@ -2560,26 +2662,9 @@ def _build_taxi_rects(
     # topology (stubs touch parallels, cross_connector touches 2 parallels)
     _refine_roles(emitted, rwy_centerlines)
 
-    # Sub-ref dedup: OSM often has multiple disjoint ways with the
-    # same sub-ref label (e.g. V2 has 3 separate pieces).  Target
-    # emits ONE rect per sub-ref at its narrow straight portion.
-    # Keep only the longest rect per sub-ref.
-    sub_ref_best: Dict[str, int] = {}
-    for i, (rect, axis, role, ref) in enumerate(emitted):
-        if not ref or not any(c.isdigit() for c in ref):
-            continue
-        # It's a sub-ref (letter+digit like V1/V2/A1/L3 etc.).
-        cur = sub_ref_best.get(ref)
-        if cur is None or axis.length > emitted[cur][1].length:
-            sub_ref_best[ref] = i
-    keep: List[Tuple[Polygon, LineString, str, str]] = []
-    for i, item in enumerate(emitted):
-        ref = item[3]
-        if ref and any(c.isdigit() for c in ref):
-            if sub_ref_best.get(ref) != i:
-                continue  # drop non-longest sub-ref duplicate
-        keep.append(item)
-    emitted = keep
+    # Sub-ref dedup is now handled in _sub_ref_narrow_corridor
+    # upstream (at the centerline level).  No post-build dedup
+    # needed.
     return emitted
 
 
