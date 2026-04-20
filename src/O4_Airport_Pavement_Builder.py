@@ -2025,10 +2025,78 @@ def _extract_osm_taxi_centerlines(
                         continue
                     out.append((seg, ref))
             else:
-                # For stubs, use the ORIGINAL (un-simplified) polyline
-                # so curves don't get chord-cut.  Pass the full line
-                # in; downstream trim + rect-build works with it.
-                if ls.length >= MIN_SEGMENT_LEN_M:
+                # For stubs, detect curves near runway and split off
+                # the straight portion only.  OSM often has one
+                # ref=V1 way that spans the straight stub + the
+                # curve into the runway; target treats the curve
+                # itself as junction territory and emits only the
+                # short straight portion as the stub rect.
+                stub_candidate_bends: List[int] = []
+                for i in range(1, len(scoords) - 1):
+                    a = scoords[i - 1]
+                    b = scoords[i]
+                    c = scoords[i + 1]
+                    v1 = (b[0] - a[0], b[1] - a[1])
+                    v2 = (c[0] - b[0], c[1] - b[1])
+                    m1 = math.hypot(*v1)
+                    m2 = math.hypot(*v2)
+                    if m1 < 1e-6 or m2 < 1e-6:
+                        continue
+                    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2)
+                    dot = max(-1.0, min(1.0, dot))
+                    angle_change = math.degrees(math.acos(dot))
+                    if angle_change >= SIGNIFICANT_BEND_DEG:
+                        stub_candidate_bends.append(i)
+                stub_clusters: List[List[int]] = []
+                for bi in stub_candidate_bends:
+                    if stub_clusters and (scoords[bi][0] - scoords[stub_clusters[-1][-1]][0])**2 + \
+                            (scoords[bi][1] - scoords[stub_clusters[-1][-1]][1])**2 \
+                            <= BEND_CLUSTER_M * BEND_CLUSTER_M:
+                        stub_clusters[-1].append(bi)
+                    else:
+                        stub_clusters.append([bi])
+                # If there's a significant curve cluster NEAR a
+                # runway, split the polyline there: keep the
+                # pre-curve straight portion, skip the curve.
+                stub_events: List[Tuple[int, str]] = [(0, "point")]
+                for cl in stub_clusters:
+                    near_rwy = False
+                    if rwy_centerlines and len(cl) >= 2:
+                        cmid = scoords[cl[len(cl) // 2]]
+                        cp = Point(cmid)
+                        for r in rwy_centerlines:
+                            if cp.distance(r) < 200.0:
+                                near_rwy = True
+                                break
+                    if near_rwy and len(cl) >= 2:
+                        stub_events.append((cl[0], "interval_start"))
+                        stub_events.append((cl[-1], "interval_end"))
+                stub_events.append((len(scoords) - 1, "point"))
+                stub_events.sort()
+                # Collect candidate straight segments (curve intervals
+                # skipped); for stubs, keep ONLY the LONGEST one —
+                # target treats a sub-ref stub as ONE rect at its
+                # narrow straight portion, not the curve pieces on
+                # each side.
+                stub_candidates: List[LineString] = []
+                for k in range(len(stub_events) - 1):
+                    i0, k0 = stub_events[k]
+                    i1, k1 = stub_events[k + 1]
+                    if k0 == "interval_start" and k1 == "interval_end":
+                        continue  # skip curve interval
+                    if i0 == i1:
+                        continue
+                    try:
+                        seg = LineString(scoords[i0:i1 + 1])
+                    except Exception:
+                        continue
+                    if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
+                        continue
+                    stub_candidates.append(seg)
+                if stub_candidates:
+                    longest = max(stub_candidates, key=lambda s: s.length)
+                    out.append((longest, ref))
+                elif ls.length >= MIN_SEGMENT_LEN_M:
                     out.append((ls, ref))
 
     any_ref = any(r for _, r in out)
@@ -2271,7 +2339,25 @@ def _split_centerlines_at_points(
             # coarse and rejected legitimate split points.
             cut_params.append(param)
         if not cut_params:
-            result.append((ls, ref))
+            # No internal junctions — still trim 15% on each end
+            # (both ends connect to some junction territory:
+            # parent taxi, runway, or apron).
+            GAP_MARGIN_FRAC = 0.15
+            margin = GAP_MARGIN_FRAC * ls.length
+            if ls.length - 2 * margin < MIN_SEGMENT_LEN_M:
+                result.append((ls, ref))
+                continue
+            try:
+                piece = substring(ls, margin, ls.length - margin)
+            except Exception:
+                result.append((ls, ref))
+                continue
+            if (piece.geom_type == "LineString"
+                    and not piece.is_empty
+                    and piece.length >= MIN_SEGMENT_LEN_M):
+                result.append((piece, ref))
+            else:
+                result.append((ls, ref))
             continue
         # Sort cut_params and decide whether consecutive close
         # intersections should CLUSTER (combined junction region —
@@ -2325,14 +2411,27 @@ def _split_centerlines_at_points(
             breaks.append(cl[0])   # rect segment ENDS here
             breaks.append(cl[-1])  # NEXT rect segment STARTS here
         breaks.append(ls.length)
-        # Emit segments 0-1, 2-3, 4-5 … (skip intervals 1-2, 3-4 which
-        # are junction territory between close intersections).
-        for i in range(0, len(breaks) - 1, 2):
+        # Emit segments 0-1, 2-3, 4-5 … (skip intervals 1-2, 3-4
+        # which are junction territory between close intersections).
+        # Per user (2026-04-20): "simpler method of just making
+        # taxiway rects 70% of the distance between intersections".
+        # Each gap between junctions is trimmed by GAP_MARGIN_FRAC
+        # on BOTH ends (both sides are either an intersection or
+        # a runway/apron connection — either way a junction).
+        GAP_MARGIN_FRAC = 0.15
+        n_breaks = len(breaks)
+        for i in range(0, n_breaks - 1, 2):
             p0, p1 = breaks[i], breaks[i + 1]
-            if p1 - p0 < MIN_SEGMENT_LEN_M:
+            gap = p1 - p0
+            if gap < MIN_SEGMENT_LEN_M:
+                continue
+            margin = GAP_MARGIN_FRAC * gap
+            rect_p0 = p0 + margin
+            rect_p1 = p1 - margin
+            if rect_p1 - rect_p0 < MIN_SEGMENT_LEN_M:
                 continue
             try:
-                piece = substring(ls, p0, p1)
+                piece = substring(ls, rect_p0, rect_p1)
             except Exception:
                 continue
             if (piece.geom_type == "LineString"
@@ -2408,22 +2507,14 @@ def _build_taxi_rects(
         if narrow_hw < 3.5 or narrow_hw > 40.0:
             continue
 
-        # Trim endpoints inward where half-width exceeds widening threshold.
-        # Per user rule (2026-04-18): "If pavement widens 1% cut the
-        # rect."  Baseline = narrow_hw (p10), factor 1.01 → any
-        # pavement more than 1% wider than the rect's own half-width
-        # is already junction territory.
-        trimmed = _trim_to_narrow(clipped, pav_non_rwy, narrow_hw,
-                                 widen_factor=1.01)
-        if trimmed is None or trimmed.length < 15.0:
-            continue
-
-        # Re-probe along the TRIMMED axis.  Per user rule: rect
-        # half-width = narrowest probe within the covered segment;
-        # anything wider belongs to the adjacent junction.
-        _, _, trim_narrow_hw = _natural_half_width(trimmed, pav_non_rwy)
-        if trim_narrow_hw < 3.5:
-            trim_narrow_hw = narrow_hw
+        # Per user (2026-04-20): trimming is now handled by the
+        # upstream _split_centerlines_at_points which emits each
+        # rect axis at 70% of the distance between intersections
+        # (15% margin on each junction-facing end).  Skip the
+        # width-based trim here — the axis is already cut to the
+        # rect's intended length.
+        trimmed = clipped
+        trim_narrow_hw = narrow_hw
 
         # Dedup against trimmed axis
         if emitted_union is not None and not emitted_union.is_empty:
@@ -2463,12 +2554,26 @@ def _build_taxi_rects(
     # topology (stubs touch parallels, cross_connector touches 2 parallels)
     _refine_roles(emitted, rwy_centerlines)
 
-    # Phase B2 (2026-04-19 principled) tested with width-uniformity
-    # check and still regressed SPJC match count by 2 — target
-    # subdivides at some joint that meets the uniformity test.
-    # Leaving the function available as scaffolding; disabled.
-    # emitted = _merge_collinear_rects_principled(
-    #     emitted, pav_non_rwy, apt_vertices=apt_vertices)
+    # Sub-ref dedup: OSM often has multiple disjoint ways with the
+    # same sub-ref label (e.g. V2 has 3 separate pieces).  Target
+    # emits ONE rect per sub-ref at its narrow straight portion.
+    # Keep only the longest rect per sub-ref.
+    sub_ref_best: Dict[str, int] = {}
+    for i, (rect, axis, role, ref) in enumerate(emitted):
+        if not ref or not any(c.isdigit() for c in ref):
+            continue
+        # It's a sub-ref (letter+digit like V1/V2/A1/L3 etc.).
+        cur = sub_ref_best.get(ref)
+        if cur is None or axis.length > emitted[cur][1].length:
+            sub_ref_best[ref] = i
+    keep: List[Tuple[Polygon, LineString, str, str]] = []
+    for i, item in enumerate(emitted):
+        ref = item[3]
+        if ref and any(c.isdigit() for c in ref):
+            if sub_ref_best.get(ref) != i:
+                continue  # drop non-longest sub-ref duplicate
+        keep.append(item)
+    emitted = keep
     return emitted
 
 
