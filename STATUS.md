@@ -2,8 +2,100 @@
 
 **Current state:** Phase 1 emitter
 `src/O4_Airport_Pavement_Builder.py` reproducing hand-drawn target
-layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.  Score against
-targets (5 m vertex tolerance):
+layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.
+
+**SESSION 5 (2026-04-20 ongoing): JUNCTIONS DISABLED for rect
+review (`EMIT_JUNCTIONS = False` at top of builder).  Focus is on
+getting V taxiway rects correct per user's detailed chart
+feedback, then moving to other taxis.**
+
+## Session 5 V-focused iteration — in progress
+
+Switched from "rect width = narrowest pav probe" to user's
+simpler rule: **rect covers 70% of distance between intersections,
+centered**.  Added perpendicular ray-cast half-width probe
+(replaced distance-to-nearest-boundary which inflated narrow_hw
+at SPJC where V's centerline is surrounded by adjacent aprons).
+
+**V-family state (TGT vs OUT at SPJC):**
+
+| | Target | Output |
+|---|---|---|
+| V1 stub | 98 m | 107 m ✓ close |
+| V2 stub | 118 m | 126 m ✓ close |
+| V3 stub | 116 m | 225 m ✗ |
+| V5 stub | 103 m | 60 m ✗ |
+| V primary count | 5 | 6 |
+
+Stubs V1/V2 are close to target.  V3 and V5 still wrong:
+- **V3**: OSM is a 483m gently-curved branch; my stub
+  curve-skip picks a 225m pre-curve segment.  Target's 116m
+  is a different portion (likely the narrow corridor between
+  two widening points).
+- **V5**: OSM is a 240m heavily-curved way (9 bends); my
+  bend-cluster eats most of it, leaving a 60m stub fragment.
+  Target's 103m is the runway-connector straight inside the
+  curve region.
+- **V primary extra** (6 vs 5): a 159m V primary remains in
+  the V-V3 intersection area.  User said "no V rect there"
+  — whole region should be junction.
+
+## Session 5 code changes in this iteration
+
+1. **`EMIT_JUNCTIONS = False`** at top of file — skip all
+   junction polygon emission.
+2. **Perpendicular ray-cast half-width probe** in
+   `_natural_half_width`, `_trim_to_narrow`, and
+   `_split_centerlines_at_points`.  Capped at 40 m to avoid
+   saturating across aprons.  Gives accurate taxi-local
+   half-width instead of distance-to-nearest-pav-edge.
+3. **70% gap trim**: `_split_centerlines_at_points` emits
+   each rect at 70% of inter-junction gap (15% margin on
+   each end).  Replaces width-based `_trim_to_narrow`.
+4. **No-junction lines still trim 15%** on each end
+   (endpoints are still junction-adjacent: runway / apron /
+   parent taxi).
+5. **Sub-ref stub curve-skip**: ref=V1/V2/V3/V5 etc. detect
+   bends-near-runway and keep only the LONGEST straight
+   pre-curve segment as the rect.
+6. **Sub-ref dedup**: OSM often has multiple disjoint ways
+   with the same sub-ref label (V2 has 3 OSM ways).  Keep
+   only the longest per label.
+7. **`BEND_CLUSTER_M` 40→100 m**: V has 2 small (9°) bends
+   76m apart in the V2 area; 40m threshold emitted a
+   spurious 76m rect between them.  100m clusters them as
+   one curve (junction territory).
+8. **`CLOSE_INTERSECTION_M` 120→200 m**: catch larger
+   junction regions where multiple sub-ref connections span
+   up to ~180m on the parent's axis.
+9. **`SAME_INTERSECTION_M = 60`**: always cluster
+   junction_points within 60m (likely OSM fragmentation).
+10. **Width-check factor 1.25→1.15**: looser at the 60-200m
+    zone to catch intersections where apt.dat widening is
+    modest.
+11. **Ignore unrefed OSM ways** in `_find_junction_points`:
+    tiny connectors / apron markings that don't represent
+    real taxiway intersections.
+12. **Gap-bridging enabled for all refs** (previously only
+    non-parallels): F/L have OSM fragmented across
+    intersections; gap-bridge restores the logical taxi.
+
+## Session 5 next priorities
+
+1. **Fix V3 sub-ref extraction**: pick the NARROW-corridor
+   portion of V3's 483m polyline, not the longest segment.
+   Probably requires width-profile analysis along V3.
+2. **Fix V5 stub selection**: target's 103m is in the
+   runway-connector area, not pre-curve.  Maybe emit the
+   LONGEST NARROW straight instead of pre-curve-only.
+3. **Eliminate V primary extra at V-V3 junction area**:
+   strengthen junction clustering there.
+4. **Then re-enable junctions** and apply the same refined
+   rules to L, F, A, M, U, etc.
+
+---
+
+## Session 4 (2026-04-19) — legacy
 
 | | SPJC | SPLP | Total |
 |---|---|---|---|
