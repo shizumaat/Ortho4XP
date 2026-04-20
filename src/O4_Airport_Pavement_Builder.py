@@ -521,28 +521,11 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     #           pavement belongs to junctions.
     # Uses OSM multi-ref nodes as intersection anchors, gated by
     # gap + pav-width clustering at the midpoint.
-    # Sub-ref narrow-corridor selection per user (2026-04-20):
-    # target sub-ref stubs (V1/V2/V3/V5, A1-A6, L1/L3/L5, etc.)
-    # are short rects centered in the NARROW STRAIGHT portion of
-    # the sub-ref taxi.  OSM sub-ref polylines include the runway
-    # curve and the junction widening at the parent-taxi
-    # connection.  Process sub-refs BEFORE split-at-points so
-    # they don't get double-trimmed, and skip them in the main
-    # split pass.
-    if pav_union is not None:
-        sub_ref_lines = [(l, r) for l, r in osm_centerlines
-                         if r and any(c.isdigit() for c in r)]
-        primary_lines = [(l, r) for l, r in osm_centerlines
-                         if not r or not any(c.isdigit() for c in r)]
-        sub_ref_out = _sub_ref_narrow_corridor(sub_ref_lines, pav_union)
-        primary_split = _split_centerlines_at_points(
-            primary_lines, junction_points, pav_union=pav_union,
-            approach_tol_m=25.0)
-        osm_centerlines = primary_split + sub_ref_out
-    else:
-        osm_centerlines = _split_centerlines_at_points(
-            osm_centerlines, junction_points, pav_union=pav_union,
-            approach_tol_m=25.0)
+    # Uniform pipeline per user (2026-04-20): intersections +
+    # sharp curves define break points; 70% rect between
+    # consecutive breaks.  No width analysis.
+    osm_centerlines = _split_centerlines_at_points(
+        osm_centerlines, junction_points, approach_tol_m=25.0)
 
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
@@ -1953,16 +1936,11 @@ def _extract_osm_taxi_centerlines(
             scoords = list(simp.coords)
             if len(scoords) < 2:
                 continue
-            # Parallel refs (A/F/L/V/M/U) and cross-connector refs
-            # (Q/R/X) split at bends — user draws multi-piece long
-            # taxiways.  Everything else (stubs, sub-refs) emits as
-            # ONE rect regardless of internal bends or length.
-            # Unrefed airports: treat long polylines as parallels.
-            SPLIT_AT_BENDS_REFS = PARALLEL_REFS | {"Q", "R", "X"}
-            is_parallel = (
-                ref in SPLIT_AT_BENDS_REFS or
-                (ref == "" and simp.length > 500.0)
-            )
+            # All refs (including sub-refs) split at significant
+            # bends.  Per user (2026-04-20 refined): intersections
+            # + sharp curves define rect break points; there's no
+            # reason sub-refs should be exempt from curve detection.
+            is_parallel = True  # unified: all refs use bend-split
             if is_parallel:
                 # Split at INTERNAL bends with angle change ≥
                 # SIGNIFICANT_BEND_DEG, but cluster consecutive
@@ -2052,11 +2030,6 @@ def _extract_osm_taxi_centerlines(
                     if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
                         continue
                     out.append((seg, ref))
-            else:
-                # Stubs: keep full polyline; downstream width-profile
-                # pass picks the narrow-corridor portion as the rect.
-                if ls.length >= MIN_SEGMENT_LEN_M:
-                    out.append((ls, ref))
 
     any_ref = any(r for _, r in out)
     if any_ref:
@@ -2350,85 +2323,33 @@ def _sub_ref_narrow_corridor(
 def _split_centerlines_at_points(
     centerlines: List[Tuple[LineString, str]],
     split_points: List[Tuple[float, float]],
-    pav_union: Optional[Polygon] = None,
     approach_tol_m: float = 25.0,
     endpoint_guard_m: float = 5.0,
-    widening_factor: float = 1.15,
-    adjacent_probe_m: float = 15.0,
 ) -> List[Tuple[LineString, str]]:
-    """Split each centerline at every widening intersection.
+    """Split each centerline at intersection points; emit 70% of
+    the distance between consecutive intersections as a rect.
 
-    Per user rule (2026-04-18): cut at every curve or intersection,
-    and "single rect between junctions on straight sections" —
-    i.e. don't split where the pavement is STRAIGHT through the
-    OSM multi-ref node.  A node counts as a widening intersection
-    only if the pavement is materially wider there than along the
-    adjacent centerline sections.
+    Per user (2026-04-20 refined): rects are defined by
+    intersections (and sharp curves already embedded in the
+    centerlines via upstream bend-splitting).  No pavement-
+    width analysis — just distance-based clustering of close
+    intersections (within CLOSE_INTERSECTION_M → combined
+    junction, no rect between).
 
-    For each candidate split point close to a centerline, we probe
-    the pavement half-width at the split point and at a reference
-    point ``adjacent_probe_m`` away along the line.  We only split
-    if probe_at_split > ``widening_factor`` × probe_adjacent.
+    Each centerline's 2 outer endpoints are treated as
+    junction-adjacent (parent taxi / runway / apron) so a
+    15% margin is trimmed at those ends too.
     """
-    if not centerlines or not split_points:
+    if not centerlines:
         return centerlines
     from shapely.ops import substring
 
-    pav_boundary = (pav_union.boundary
-                    if pav_union is not None and not pav_union.is_empty
-                    else None)
-
-    # Perpendicular ray-cast half-width probe — matches the probe
-    # used by _natural_half_width and _trim_to_narrow so the
-    # widening-check here is calibrated to the same narrow-hw scale.
-    RAY_CAP_M = 40.0
-    RAY_STEP_M = 0.5
-
-    def _perp_hw(line: LineString, t: float) -> float:
-        if pav_union is None:
-            return 0.0
-        total = line.length
-        dt = min(2.0, total * 0.05)
-        t0 = max(0.0, t - dt)
-        t1 = min(total, t + dt)
-        a = line.interpolate(t0)
-        b = line.interpolate(t1)
-        tx, ty = b.x - a.x, b.y - a.y
-        mag = math.hypot(tx, ty)
-        if mag < 1e-6:
-            return 0.0
-        ux, uy = tx / mag, ty / mag
-        nx, ny = -uy, ux
-        pt = line.interpolate(t)
-        ox, oy = pt.x, pt.y
-        best = RAY_CAP_M
-        for sign in (-1, 1):
-            d = 0.0
-            while d <= RAY_CAP_M:
-                qx = ox + sign * nx * d
-                qy = oy + sign * ny * d
-                if not pav_union.contains(Point(qx, qy)):
-                    if d < best:
-                        best = d
-                    break
-                d += RAY_STEP_M
-        return best
-
-    def _hw_at_point(pt: Point) -> float:
-        if pav_boundary is None:
-            return 0.0
-        try:
-            return pt.distance(pav_boundary)
-        except Exception:
-            return 0.0
-
     result: List[Tuple[LineString, str]] = []
+    GAP_MARGIN_FRAC = 0.15
     for ls, ref in centerlines:
-        # Collect split-parameters along the line for each split
-        # point within ``approach_tol_m`` that shows actual
-        # pavement widening.
+        # Collect cut params for intersections that lie on this line.
         cut_params: List[float] = []
-        for (sx, sy) in split_points:
+        for (sx, sy) in split_points or ():
             sp = Point(sx, sy)
             if ls.distance(sp) > approach_tol_m:
                 continue
@@ -2440,95 +2361,26 @@ def _split_centerlines_at_points(
                 continue
             if param > ls.length - endpoint_guard_m:
                 continue
-            # Widening check removed — clustering pass below uses
-            # pav width at the MIDPOINT between close intersections
-            # to decide whether to cluster (combined junction) or
-            # keep separate.  Per-split widening check was too
-            # coarse and rejected legitimate split points.
             cut_params.append(param)
-        if not cut_params:
-            # No internal junctions — still trim 15% on each end
-            # (both ends connect to some junction territory:
-            # parent taxi, runway, or apron).
-            GAP_MARGIN_FRAC = 0.15
-            margin = GAP_MARGIN_FRAC * ls.length
-            if ls.length - 2 * margin < MIN_SEGMENT_LEN_M:
-                result.append((ls, ref))
-                continue
-            try:
-                piece = substring(ls, margin, ls.length - margin)
-            except Exception:
-                result.append((ls, ref))
-                continue
-            if (piece.geom_type == "LineString"
-                    and not piece.is_empty
-                    and piece.length >= MIN_SEGMENT_LEN_M):
-                result.append((piece, ref))
-            else:
-                result.append((ls, ref))
-            continue
-        # Sort cut_params and decide whether consecutive close
-        # intersections should CLUSTER (combined junction region —
-        # no rect between them) or STAY SEPARATE.  The decision
-        # uses the apt.dat pavement width at the MIDPOINT between
-        # them: if the pavement is materially wider than the
-        # narrow corridor, they share a combined junction (cluster);
-        # if the pavement returns to narrow between them, they're
-        # separate junctions (don't cluster).
+
+        # Cluster close intersections (within CLOSE_INTERSECTION_M)
+        # into a single junction region.
         cut_params.sort()
-        # Narrow baseline: min perpendicular probe along the line.
-        narrow_hw = 0.0
-        if pav_union is not None:
-            narrow_probes = []
-            n_probes = 15
-            for k in range(n_probes):
-                t = (k + 1) / (n_probes + 1) * ls.length
-                d = _perp_hw(ls, t)
-                if d > 3.5:  # skip noise from building edges
-                    narrow_probes.append(d)
-            if narrow_probes:
-                narrow_probes.sort()
-                narrow_hw = narrow_probes[0]
         clusters: List[List[float]] = []
-        SAME_INTERSECTION_M = 60.0  # always cluster below this gap
         for p in cut_params:
-            if clusters:
-                gap = p - clusters[-1][-1]
-                if gap <= SAME_INTERSECTION_M:
-                    # Very close — certainly same/inseparable
-                    # intersection (OSM fragmentation artifact or
-                    # multi-node at one crossing).  Always cluster.
-                    clusters[-1].append(p)
-                    continue
-                if gap <= CLOSE_INTERSECTION_M:
-                    # Moderately close — check perp half-width at
-                    # the midpoint.  If wide (combined junction
-                    # region), cluster; if narrow (true straight
-                    # corridor between separate intersections),
-                    # keep separate.  Factor 1.05 catches modest
-                    # widening at combined junction areas (e.g.
-                    # V between V-V3 cluster and V-U1 cluster).
-                    if pav_union is not None and narrow_hw > 0:
-                        midp = (clusters[-1][-1] + p) / 2.0
-                        mid_hw = _perp_hw(ls, midp)
-                        if mid_hw > 1.05 * narrow_hw:
-                            clusters[-1].append(p)
-                            continue
-            clusters.append([p])
-        # Build break intervals: each cluster = [min, max].
+            if clusters and p - clusters[-1][-1] <= CLOSE_INTERSECTION_M:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+
+        # Build break points: endpoints + cluster boundaries.
+        # Segment i is breaks[2i] → breaks[2i+1].
         breaks: List[float] = [0.0]
         for cl in clusters:
-            breaks.append(cl[0])   # rect segment ENDS here
-            breaks.append(cl[-1])  # NEXT rect segment STARTS here
+            breaks.append(cl[0])
+            breaks.append(cl[-1])
         breaks.append(ls.length)
-        # Emit segments 0-1, 2-3, 4-5 … (skip intervals 1-2, 3-4
-        # which are junction territory between close intersections).
-        # Per user (2026-04-20): "simpler method of just making
-        # taxiway rects 70% of the distance between intersections".
-        # Each gap between junctions is trimmed by GAP_MARGIN_FRAC
-        # on BOTH ends (both sides are either an intersection or
-        # a runway/apron connection — either way a junction).
-        GAP_MARGIN_FRAC = 0.15
+
         n_breaks = len(breaks)
         for i in range(0, n_breaks - 1, 2):
             p0, p1 = breaks[i], breaks[i + 1]
@@ -2664,10 +2516,25 @@ def _build_taxi_rects(
     # topology (stubs touch parallels, cross_connector touches 2 parallels)
     _refine_roles(emitted, rwy_centerlines)
 
-    # Sub-ref dedup is now handled in _sub_ref_narrow_corridor
-    # upstream (at the centerline level).  No post-build dedup
-    # needed.
-    return emitted
+    # Sub-ref dedup: OSM often has multiple disjoint ways with the
+    # same sub-ref label (e.g. V2 has 3 separate OSM pieces, each
+    # contributing a rect).  Target emits ONE rect per sub-ref.
+    # Keep only the LONGEST rect per sub-ref.
+    sub_ref_best: Dict[str, int] = {}
+    for i, (rect, axis, role, ref) in enumerate(emitted):
+        if not ref or not any(c.isdigit() for c in ref):
+            continue
+        cur = sub_ref_best.get(ref)
+        if cur is None or axis.length > emitted[cur][1].length:
+            sub_ref_best[ref] = i
+    keep: List[Tuple[Polygon, LineString, str, str]] = []
+    for i, item in enumerate(emitted):
+        ref = item[3]
+        if ref and any(c.isdigit() for c in ref):
+            if sub_ref_best.get(ref) != i:
+                continue
+        keep.append(item)
+    return keep
 
 
 def _merge_collinear_rects_principled(
