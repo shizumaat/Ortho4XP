@@ -2202,6 +2202,42 @@ def _split_centerlines_at_points(
                     if pav_union is not None and not pav_union.is_empty
                     else None)
 
+    # Perpendicular ray-cast half-width probe — matches the probe
+    # used by _natural_half_width and _trim_to_narrow so the
+    # widening-check here is calibrated to the same narrow-hw scale.
+    RAY_CAP_M = 40.0
+    RAY_STEP_M = 0.5
+
+    def _perp_hw(line: LineString, t: float) -> float:
+        if pav_union is None:
+            return 0.0
+        total = line.length
+        dt = min(2.0, total * 0.05)
+        t0 = max(0.0, t - dt)
+        t1 = min(total, t + dt)
+        a = line.interpolate(t0)
+        b = line.interpolate(t1)
+        tx, ty = b.x - a.x, b.y - a.y
+        mag = math.hypot(tx, ty)
+        if mag < 1e-6:
+            return 0.0
+        ux, uy = tx / mag, ty / mag
+        nx, ny = -uy, ux
+        pt = line.interpolate(t)
+        ox, oy = pt.x, pt.y
+        best = RAY_CAP_M
+        for sign in (-1, 1):
+            d = 0.0
+            while d <= RAY_CAP_M:
+                qx = ox + sign * nx * d
+                qy = oy + sign * ny * d
+                if not pav_union.contains(Point(qx, qy)):
+                    if d < best:
+                        best = d
+                    break
+                d += RAY_STEP_M
+        return best
+
     def _hw_at_point(pt: Point) -> float:
         if pav_boundary is None:
             return 0.0
@@ -2246,20 +2282,19 @@ def _split_centerlines_at_points(
         # if the pavement returns to narrow between them, they're
         # separate junctions (don't cluster).
         cut_params.sort()
-        # Narrow baseline: min probe along the line.
+        # Narrow baseline: min perpendicular probe along the line.
         narrow_hw = 0.0
-        if pav_boundary is not None:
+        if pav_union is not None:
             narrow_probes = []
-            n_probes = 11
+            n_probes = 15
             for k in range(n_probes):
                 t = (k + 1) / (n_probes + 1) * ls.length
-                pt = ls.interpolate(t)
-                d = _hw_at_point(pt)
-                if d > 0.1:
+                d = _perp_hw(ls, t)
+                if d > 3.5:  # skip noise from building edges
                     narrow_probes.append(d)
             if narrow_probes:
                 narrow_probes.sort()
-                narrow_hw = narrow_probes[len(narrow_probes) // 10]
+                narrow_hw = narrow_probes[0]
         clusters: List[List[float]] = []
         SAME_INTERSECTION_M = 60.0  # always cluster below this gap
         for p in cut_params:
@@ -2272,14 +2307,14 @@ def _split_centerlines_at_points(
                     clusters[-1].append(p)
                     continue
                 if gap <= CLOSE_INTERSECTION_M:
-                    # Moderately close — check pav width at the
-                    # midpoint.  If wide (combined junction region),
-                    # cluster; if narrow (true straight corridor
-                    # between separate intersections), keep separate.
-                    if pav_boundary is not None and narrow_hw > 0:
+                    # Moderately close — check perp half-width at
+                    # the midpoint.  If wide (combined junction
+                    # region), cluster; if narrow (true straight
+                    # corridor between separate intersections),
+                    # keep separate.
+                    if pav_union is not None and narrow_hw > 0:
                         midp = (clusters[-1][-1] + p) / 2.0
-                        mid_pt = ls.interpolate(midp)
-                        mid_hw = _hw_at_point(mid_pt)
+                        mid_hw = _perp_hw(ls, midp)
                         if mid_hw > 1.25 * narrow_hw:
                             clusters[-1].append(p)
                             continue
@@ -2404,12 +2439,25 @@ def _build_taxi_rects(
                                         apt_vertices=apt_vertices)
         if rect is None or rect.is_empty:
             continue
+        # Skip invalid rects (self-intersecting after snap).
+        if not rect.is_valid:
+            try:
+                rect = rect.buffer(0)
+            except Exception:
+                continue
+            if (rect.is_empty or rect.geom_type != "Polygon"
+                    or not rect.is_valid):
+                continue
 
         role = _classify_role(trimmed, width, rwy_centerlines,
                                rwy_union, ref=ref)
         emitted.append((rect, trimmed, role, ref))
-        emitted_union = (unary_union([emitted_union, rect])
-                         if emitted_union is not None else rect)
+        try:
+            emitted_union = (unary_union([emitted_union, rect])
+                             if emitted_union is not None else rect)
+        except Exception:
+            # Self-intersection of accumulated union — skip update.
+            pass
 
     # Post-classify: secondary passes to fix roles based on neighbour
     # topology (stubs touch parallels, cross_connector touches 2 parallels)
@@ -2632,81 +2680,136 @@ def _merge_collinear_rects(
 
 
 def _natural_half_width(axis: LineString, pav: Polygon,
-                        n_probes: int = 11) -> Tuple[float, float, float]:
-    """Return (natural_hw, max_hw, narrow_hw) distance-to-boundary along axis.
+                        n_probes: int = 15) -> Tuple[float, float, float]:
+    """Return (natural_hw, max_hw, narrow_hw) LOCAL half-width probes
+    along the axis.
 
-    * ``natural_hw`` = 25-th-percentile probe distance.  Used by the
-      trim algorithm as the widening-detector baseline.
-    * ``max_hw`` = 90-th-percentile probe distance.  Retained for
-      legacy callers that still want the "widest section" width.
-    * ``narrow_hw`` = min(p10, 2nd-lowest) probe distance.  Per the
-      user's authoritative rule (memory: feedback_shape_rules),
-      the rect half-width is the NARROWEST pavement width along the
-      covered segment — the widened portions near each intersection
-      are junction territory, not rect territory.
+    Uses PERPENDICULAR RAY CAST (not distance-to-boundary) so the
+    probe measures the taxi's own local half-width on EACH side
+    rather than the distance to some faraway edge.  Per user
+    rule 4 (2026-04-20): the rect half-width should be the
+    NARROWEST pavement width (the taxi's own strip width), not
+    an inflated value from adjacent aprons or runway clearance.
+
+    For each probe point:
+      * cast a ray perpendicular LEFT from axis; find where ray
+        first exits the pavement polygon.
+      * cast a ray perpendicular RIGHT from axis similarly.
+      * half-width at this probe = min(left, right), capped at
+        RAY_CAP_M to avoid saturating across an apron.
     """
+    RAY_CAP_M = 40.0
+    RAY_STEP_M = 0.5
     if axis.length < 1e-3:
         return 0.0, 0.0, 0.0
-    boundary = pav.boundary
-    dists = []
+
+    def _perpendicular_half_at(t: float) -> float:
+        """Cast perpendicular rays left/right at axis param t."""
+        # Local tangent: use points slightly before/after t.
+        dt = min(2.0, axis.length * 0.05)
+        t0 = max(0.0, t - dt)
+        t1 = min(axis.length, t + dt)
+        a = axis.interpolate(t0)
+        b = axis.interpolate(t1)
+        tx, ty = b.x - a.x, b.y - a.y
+        mag = math.hypot(tx, ty)
+        if mag < 1e-6:
+            return 0.0
+        ux, uy = tx / mag, ty / mag
+        nx, ny = -uy, ux  # left-perp
+        pt = axis.interpolate(t)
+        ox, oy = pt.x, pt.y
+        best = RAY_CAP_M
+        for sign in (-1, 1):
+            d = 0.0
+            while d <= RAY_CAP_M:
+                qx = ox + sign * nx * d
+                qy = oy + sign * ny * d
+                if not pav.contains(Point(qx, qy)):
+                    if d < best:
+                        best = d
+                    break
+                d += RAY_STEP_M
+        return best
+
+    dists: List[float] = []
     for k in range(n_probes):
-        t = (k + 1) / (n_probes + 1)
-        pt = axis.interpolate(t, normalized=True)
-        if not pav.contains(pt):
-            continue
-        d = pt.distance(boundary)
-        if d > 0.1:
-            dists.append(d)
+        t = (k + 1) / (n_probes + 1) * axis.length
+        hw = _perpendicular_half_at(t)
+        if hw > 0.1:
+            dists.append(hw)
     if not dists:
         return 0.0, 0.0, 0.0
     dists.sort()
     median = dists[len(dists) // 2]
     p90_idx = max(0, int(len(dists) * 0.9) - 1)
     p90 = dists[p90_idx] if p90_idx < len(dists) else dists[-1]
-    # Narrow = 10th-percentile (or second-lowest for small n).  Pulling
-    # the absolute min sometimes grabs a pinch from a neighbouring
-    # building; p10 is a robust "narrowest straight section" proxy.
-    p10_idx = max(0, int(len(dists) * 0.1))
-    narrow = dists[p10_idx] if p10_idx < len(dists) else dists[0]
+    # ``narrow`` = the MIN half-width probe with a floor to guard
+    # against grazing a building corner (skip probes < 3.5 m as
+    # noise).  Per user rule 4: rect width = the ACTUAL narrowest
+    # section, so the rect fits snugly along the taxi's own narrow
+    # corridor, leaving widened areas to junctions.
+    filtered = [d for d in dists if d >= 3.5]
+    narrow = filtered[0] if filtered else dists[0]
     return median, p90, narrow
 
 
 def _trim_to_narrow(axis: LineString, pav: Polygon, natural_hw: float,
                     widen_factor: float = 1.3) -> Optional[LineString]:
-    """Trim the axis inward from each end until the half-width at
-    the endpoint drops below ``widen_factor × natural_hw``.
+    """Trim the axis inward from each end until the PERPENDICULAR
+    half-width at the endpoint drops below ``widen_factor × natural_hw``.
 
-    The ``widen_factor`` threshold is where we declare the pavement
-    is "widening into a junction" — anything past that point is
-    not part of the rect, it's junction territory.
+    Uses the same perpendicular ray-cast probing as
+    ``_natural_half_width`` so the trim threshold is applied to
+    the taxi's LOCAL half-width (not distance-to-boundary).
 
     Trim step is 2 m.  We never trim more than 50 % of the axis
-    length; if the trim would eat too much, fall back to the
-    original axis (rect emits as-is, which may overlap a junction
-    that later subtracts from it).
+    length.
     """
-    boundary = pav.boundary
+    RAY_CAP_M = 40.0
+    RAY_STEP_M = 0.5
     total_len = axis.length
     thresh = natural_hw * widen_factor
     step = 2.0
     max_trim = total_len * 0.45
 
-    def _hw_at(t: float) -> float:
-        pt = axis.interpolate(t)
-        if not pav.contains(pt):
+    def _perp_hw(t: float) -> float:
+        dt = min(2.0, total_len * 0.05)
+        t0 = max(0.0, t - dt)
+        t1 = min(total_len, t + dt)
+        a = axis.interpolate(t0)
+        b = axis.interpolate(t1)
+        tx, ty = b.x - a.x, b.y - a.y
+        mag = math.hypot(tx, ty)
+        if mag < 1e-6:
             return 0.0
-        return pt.distance(boundary)
+        ux, uy = tx / mag, ty / mag
+        nx, ny = -uy, ux
+        pt = axis.interpolate(t)
+        ox, oy = pt.x, pt.y
+        best = RAY_CAP_M
+        for sign in (-1, 1):
+            d = 0.0
+            while d <= RAY_CAP_M:
+                qx = ox + sign * nx * d
+                qy = oy + sign * ny * d
+                if not pav.contains(Point(qx, qy)):
+                    if d < best:
+                        best = d
+                    break
+                d += RAY_STEP_M
+        return best
 
     trim_a = 0.0
     while trim_a < max_trim:
-        if _hw_at(trim_a) <= thresh:
+        if _perp_hw(trim_a) <= thresh:
             break
         trim_a += step
 
     trim_b = total_len
     min_b = total_len - max_trim
     while trim_b > min_b:
-        if _hw_at(trim_b) <= thresh:
+        if _perp_hw(trim_b) <= thresh:
             break
         trim_b -= step
 
