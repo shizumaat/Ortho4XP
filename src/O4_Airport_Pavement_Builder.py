@@ -863,6 +863,12 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             simp = ap
         layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
 
+    # NOTE: Consolidation of touching junctions was tested
+    # (tol=1m) and regressed match count by 4 — target retains
+    # separate junctions at some physical touch points.  Function
+    # `_consolidate_touching_junctions` retained as scaffold.
+    # _consolidate_touching_junctions(layout)
+
     # ── Global shared-vertex enforcement (user rule 16) ─────────
     # Cluster all emitted-shape vertices within SHARED_VERTEX_TOL_M
     # and replace each with the cluster centroid.  This guarantees
@@ -881,6 +887,81 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
 
 
 SHARED_VERTEX_CLUSTER_TOL_M = 1.5
+
+
+def _consolidate_touching_junctions(layout: "PavementLayout",
+                                    tol: float = 1.0) -> None:
+    """Union adjacent (touching within ``tol``) junction polygons.
+
+    Target files sometimes use ONE large junction polygon where my
+    pipeline emits multiple smaller fragments (one per OSM multi-
+    ref cluster + residue gap-fill).  Physically touching junctions
+    should be one shape.
+    """
+    junctions = [(i, s) for i, s in enumerate(layout.shapes)
+                 if s.role == ROLE_JUNCTION
+                 and s.polygon is not None
+                 and not s.polygon.is_empty
+                 and s.polygon.geom_type == "Polygon"]
+    if len(junctions) < 2:
+        return
+
+    # Single-link cluster: junctions within tol of each other merge.
+    n = len(junctions)
+    parent = list(range(n))
+
+    def _find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            pi = junctions[i][1].polygon
+            pj = junctions[j][1].polygon
+            try:
+                if pi.distance(pj) <= tol:
+                    _union(i, j)
+            except Exception:
+                pass
+
+    clusters: Dict[int, List[int]] = {}
+    for i in range(n):
+        clusters.setdefault(_find(i), []).append(i)
+
+    # For each cluster > 1 member, union polygons; drop originals.
+    drop_shape_ids: set = set()
+    for root, members in clusters.items():
+        if len(members) < 2:
+            continue
+        try:
+            polys = [junctions[m][1].polygon for m in members]
+            merged = unary_union(polys)
+        except Exception:
+            continue
+        if merged.geom_type == "MultiPolygon":
+            # Rare — distance check said they touch but union is
+            # still multi-poly (shared only at a point).  Keep
+            # each piece separate.
+            continue
+        if merged.geom_type != "Polygon" or merged.is_empty:
+            continue
+        # Replace the first member's polygon with the union; mark
+        # others for removal.
+        first_shape_idx = junctions[members[0]][0]
+        layout.shapes[first_shape_idx].polygon = merged
+        for m in members[1:]:
+            drop_shape_ids.add(junctions[m][0])
+
+    if drop_shape_ids:
+        layout.shapes[:] = [s for i, s in enumerate(layout.shapes)
+                            if i not in drop_shape_ids]
 
 
 def _enforce_shared_vertices(layout: "PavementLayout",
@@ -1065,7 +1146,11 @@ def _validate_shared_vertex_invariant(layout: "PavementLayout",
 # Centerline-based taxi rect builder
 # ──────────────────────────────────────────────────────────────────
 
-JUNCTION_CLUSTER_DIST_M = 80.0  # merge junction nodes within this distance
+JUNCTION_CLUSTER_DIST_M = 40.0  # merge junction nodes within this distance
+                                # — between 80 (too coarse, merged
+                                # distinct crossings) and 25 (too
+                                # fine, created spurious crossings at
+                                # every sub-way endpoint)
 JUNCTION_RADIUS_SCALE = 1.5     # disc radius = local_half_width × this
 
 
@@ -1182,7 +1267,13 @@ def _find_junction_points(
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
             continue
-        ref = tags.get("ref", "") or "<unrefed>"
+        ref = tags.get("ref", "")
+        if not ref:
+            # Unrefed OSM ways are often tiny connectors or apron
+            # markings that do NOT represent a real taxiway
+            # intersection.  Excluding them prevents spurious
+            # junction_points along long parallel taxis.
+            continue
         for n in nds:
             refs_at_node[n].add(ref)
 
@@ -1212,15 +1303,13 @@ def _find_junction_points(
                     continue
                 if inter.is_empty:
                     continue
-                pts = []
                 if inter.geom_type == "Point":
-                    pts.append((inter.x, inter.y))
+                    candidates.append((inter.x, inter.y))
                 elif inter.geom_type == "MultiPoint":
-                    pts.extend((p.x, p.y) for p in inter.geoms)
+                    for p in inter.geoms:
+                        candidates.append((p.x, p.y))
                 elif inter.geom_type == "LineString":
-                    pts.append(inter.centroid.coords[0])
-                for pt in pts:
-                    candidates.append(pt)
+                    candidates.append(inter.centroid.coords[0])
 
     # Cluster within JUNCTION_CLUSTER_DIST_M (greedy single-link)
     clusters: List[List[Tuple[float, float]]] = []
@@ -1670,6 +1759,12 @@ def _build_junction_polys_from_corners(
 
 RDP_SIMPLIFY_TOL_M = 1.0      # RDP tolerance after ref-merge
 MIN_SEGMENT_LEN_M = 15.0      # drop segments shorter than this
+SIGNIFICANT_BEND_DEG = 5.0    # only split parallels at bends this sharp
+BEND_CLUSTER_M = 40.0         # cluster consecutive bends within this
+                              # distance (a curve of many tiny bends
+                              # becomes ONE break point)
+                              # (RDP keeps small wobbles; target subdivides
+                              # only at chart-level direction changes)
 GAP_BRIDGE_MAX_M = 120.0       # bridge same-ref polyline gaps up to this
 STUB_MAX_LEN_M = 250.0         # polylines <= this emit as one rect
 
@@ -1794,12 +1889,12 @@ def _extract_osm_taxi_centerlines(
         else:
             merged_lines = lines
 
-        # Stage 2: gap bridging.  For NON-parallel refs (stubs,
-        # cross-connectors, sub-refs), bridge gaps up to
-        # GAP_BRIDGE_MAX_M.  For parallel refs (A/F/L/V/M/U), DON'T
-        # bridge — user keeps their parallel polylines separate at
-        # intermediate intersections.
-        if ref and len(merged_lines) > 1 and ref not in PARALLEL_REFS:
+        # Stage 2: gap bridging.  Bridge gaps up to GAP_BRIDGE_MAX_M
+        # for ALL refs — OSM fragments a long taxiway into many
+        # short pieces at every intersection, but target treats
+        # them as ONE logical taxi and splits only at real
+        # bends + widening intersections (handled downstream).
+        if ref and len(merged_lines) > 1:
             merged_lines = _bridge_same_ref_polylines(merged_lines)
 
         for ls in merged_lines:
@@ -1822,9 +1917,49 @@ def _extract_osm_taxi_centerlines(
                 (ref == "" and simp.length > 500.0)
             )
             if is_parallel:
-                for i in range(len(scoords) - 1):
+                # Split at INTERNAL bends with angle change ≥
+                # SIGNIFICANT_BEND_DEG, but cluster consecutive
+                # bends within BEND_CLUSTER_M together.  A curve
+                # (many tiny bends adding up to a big turn) counts
+                # as ONE break point at its midpoint — matching
+                # how the target treats a curve as a single logical
+                # transition between rects.
+                candidate_bends: List[int] = []
+                for i in range(1, len(scoords) - 1):
+                    a = scoords[i - 1]
+                    b = scoords[i]
+                    c = scoords[i + 1]
+                    v1 = (b[0] - a[0], b[1] - a[1])
+                    v2 = (c[0] - b[0], c[1] - b[1])
+                    m1 = math.hypot(*v1)
+                    m2 = math.hypot(*v2)
+                    if m1 < 1e-6 or m2 < 1e-6:
+                        continue
+                    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2)
+                    dot = max(-1.0, min(1.0, dot))
+                    angle_change = math.degrees(math.acos(dot))
+                    if angle_change >= SIGNIFICANT_BEND_DEG:
+                        candidate_bends.append(i)
+                # Cluster consecutive bends within BEND_CLUSTER_M of
+                # each other along the line.  Each cluster yields a
+                # single break index (the cluster's middle bend).
+                clusters: List[List[int]] = []
+                for bi in candidate_bends:
+                    if clusters and (scoords[bi][0] - scoords[clusters[-1][-1]][0])**2 + \
+                            (scoords[bi][1] - scoords[clusters[-1][-1]][1])**2 \
+                            <= BEND_CLUSTER_M * BEND_CLUSTER_M:
+                        clusters[-1].append(bi)
+                    else:
+                        clusters.append([bi])
+                break_indices = [0, len(scoords) - 1]
+                for cl in clusters:
+                    break_indices.append(cl[len(cl) // 2])
+                break_indices = sorted(set(break_indices))
+                for k in range(len(break_indices) - 1):
+                    i0 = break_indices[k]
+                    i1 = break_indices[k + 1]
                     try:
-                        seg = LineString([scoords[i], scoords[i+1]])
+                        seg = LineString(scoords[i0:i1 + 1])
                     except Exception:
                         continue
                     if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
