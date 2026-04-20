@@ -1769,18 +1769,24 @@ def _build_junction_polys_from_corners(
 RDP_SIMPLIFY_TOL_M = 1.0      # RDP tolerance after ref-merge
 MIN_SEGMENT_LEN_M = 15.0      # drop segments shorter than this
 SIGNIFICANT_BEND_DEG = 5.0    # only split parallels at bends this sharp
-BEND_CLUSTER_M = 40.0         # cluster consecutive bends within this
-                              # distance (a curve of many tiny bends
-                              # becomes ONE break point)
-CLOSE_INTERSECTION_M = 120.0  # intersections within this distance
+BEND_CLUSTER_M = 100.0        # cluster consecutive bends within this
+                              # distance.  100m because a taxi's
+                              # direction change at an intersection
+                              # area (e.g. V bends slightly around
+                              # V2's junction) may span 70-90m with
+                              # 2 small bends marking the start and
+                              # end of the transition.
+CLOSE_INTERSECTION_M = 200.0  # intersections within this distance
                               # on one centerline may merge into a
                               # single junction region (rects stop
                               # short; interval is junction, no rect).
-                              # The 60-120m zone is gated by a pav-
+                              # The 60-200m zone is gated by a pav-
                               # width midpoint check (combined
                               # junction only if midpoint is wider
                               # than narrow).  Measured parallel
                               # spacings: Q-R=95m, L-M=47m, V-U=74m.
+                              # OSM-fragmented V2/V3 junctions span
+                              # up to 180m on V's axis.
                               # (RDP keeps small wobbles; target subdivides
                               # only at chart-level direction changes)
 GAP_BRIDGE_MAX_M = 120.0       # bridge same-ref polyline gaps up to this
@@ -2401,7 +2407,7 @@ def _split_centerlines_at_points(
                     if pav_union is not None and narrow_hw > 0:
                         midp = (clusters[-1][-1] + p) / 2.0
                         mid_hw = _perp_hw(ls, midp)
-                        if mid_hw > 1.25 * narrow_hw:
+                        if mid_hw > 1.15 * narrow_hw:
                             clusters[-1].append(p)
                             continue
             clusters.append([p])
