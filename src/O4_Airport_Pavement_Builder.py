@@ -514,15 +514,13 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     # crossings" — split every centerline at each multi-ref
     # junction node along its path, so each straight section
     # between intersections emits as a single rect.
-    # NOTE: widening-aware split (skipping OSM multi-ref nodes
-    # where pav runs straight through) was tested with factor 1.05
-    # and 1.15; both regressed match count by 14-17 at SPJC because
-    # the target subdivides at some nodes that show only 1-4%
-    # widening.  Reverting to unconditional split; the merge-
-    # collinear-rects approach (Phase B2) remains open — it should
-    # happen AFTER rect building (merge adjacent same-ref rects
-    # whose axis angle differs by < 2° and whose joining edge sits
-    # on rect interior, not at a junction polygon).
+    # Split per user rules 1+4 (2026-04-20):
+    #   Rule 1: stop rects at intersections; cluster close
+    #           intersections into single junction region.
+    #   Rule 4: cover only narrowest straight sections; widened
+    #           pavement belongs to junctions.
+    # Uses OSM multi-ref nodes as intersection anchors, gated by
+    # gap + pav-width clustering at the midpoint.
     osm_centerlines = _split_centerlines_at_points(
         osm_centerlines, junction_points, pav_union=pav_union,
         approach_tol_m=25.0)
@@ -2095,6 +2093,82 @@ def _insert_points_on_boundary(
     except Exception:
         pass
     return poly
+
+
+def _split_by_width_profile(
+    centerlines: List[Tuple[LineString, str]],
+    pav_union: Polygon,
+    probe_step_m: float = 5.0,
+    wide_factor: float = 1.20,
+    min_rect_len_m: float = 30.0,
+) -> List[Tuple[LineString, str]]:
+    """Split each centerline into NARROW-CORRIDOR intervals per
+    user rule 4 (2026-04-20): rects cover only the narrowest
+    straight sections; any widening (around intersections or
+    terminal aprons) is junction territory and is skipped.
+
+    For each line:
+      1. Probe pav half-width at ``probe_step_m`` intervals.
+      2. narrow_hw = 10th-percentile probe (robust narrow baseline).
+      3. Interval flag per probe: NARROW if hw ≤ wide_factor × narrow_hw.
+      4. Emit contiguous NARROW intervals ≥ min_rect_len_m as rects.
+    """
+    if not centerlines or pav_union is None or pav_union.is_empty:
+        return centerlines
+    from shapely.ops import substring
+    pav_boundary = pav_union.boundary
+
+    result: List[Tuple[LineString, str]] = []
+    for ls, ref in centerlines:
+        if ls.length < min_rect_len_m:
+            result.append((ls, ref))
+            continue
+        n_probes = max(10, int(ls.length / probe_step_m))
+        # sample (param, hw) pairs along the line
+        samples: List[Tuple[float, float]] = []
+        for i in range(n_probes + 1):
+            t = i / n_probes * ls.length
+            pt = ls.interpolate(t)
+            hw = pt.distance(pav_boundary) if pav_union.contains(pt) else 0.0
+            samples.append((t, hw))
+        # narrow_hw = 10th-percentile of positive hw values
+        hws = sorted(h for _, h in samples if h > 0)
+        if not hws:
+            result.append((ls, ref))
+            continue
+        narrow_hw = hws[max(1, len(hws) // 10)]
+        wide_thresh = wide_factor * narrow_hw
+        # Flag each sample narrow or wide
+        is_narrow = [h > 0 and h <= wide_thresh for (_, h) in samples]
+        # Find contiguous narrow intervals
+        intervals: List[Tuple[float, float]] = []
+        i = 0
+        while i < len(samples):
+            if not is_narrow[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(samples) and is_narrow[j + 1]:
+                j += 1
+            start_t = samples[i][0]
+            end_t = samples[j][0]
+            if end_t - start_t >= min_rect_len_m:
+                intervals.append((start_t, end_t))
+            i = j + 1
+        if not intervals:
+            # Whole line is "wide" — probably an apron traverse.
+            # Drop it; user's target wouldn't emit a rect here.
+            continue
+        for (s, e) in intervals:
+            try:
+                seg = substring(ls, s, e)
+            except Exception:
+                continue
+            if (seg.geom_type == "LineString"
+                    and not seg.is_empty
+                    and seg.length >= min_rect_len_m):
+                result.append((seg, ref))
+    return result
 
 
 def _split_centerlines_at_points(
