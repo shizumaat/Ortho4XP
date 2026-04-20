@@ -66,6 +66,11 @@ ROLE_APRON = PS.ROLE_APRON
 ROLE_TERMINAL = "terminal"
 ROLE_JUNCTION = "junction"
 
+# TEMP 2026-04-20: when False, the builder only emits rects +
+# runways + terminals + aprons, suppressing all junction polygons.
+# User requested this while iterating on rect correctness.
+EMIT_JUNCTIONS = False
+
 AEROWAY_FOR_ROLE = {
     ROLE_RUNWAY: "runway",
     ROLE_PRIMARY_PARALLEL: "taxiway",
@@ -698,8 +703,11 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
         kept_junctions.append(jp)
     final_junctions = kept_junctions
 
-    for jp in final_junctions:
-        layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
+    # TEMP 2026-04-20: user requested junction emission be disabled
+    # while refining rects.  Re-enable once rect counts match target.
+    if EMIT_JUNCTIONS:
+        for jp in final_junctions:
+            layout.shapes.append(BuiltShape(polygon=jp, role=ROLE_JUNCTION))
 
     # ── Runway-taxiway junction: ONLY for widening stubs ────────
     # Per user rule 13 (2026-04-18): uniform-width stub (e.g. L1)
@@ -773,8 +781,9 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                 rwy_tj_polys.append(poly)
                 rwy_vertex_inserts.append((rp1.x, rp1.y))
                 rwy_vertex_inserts.append((rp2.x, rp2.y))
-        for rtp in rwy_tj_polys:
-            layout.shapes.append(BuiltShape(polygon=rtp, role=ROLE_JUNCTION))
+        if EMIT_JUNCTIONS:
+            for rtp in rwy_tj_polys:
+                layout.shapes.append(BuiltShape(polygon=rtp, role=ROLE_JUNCTION))
 
     # Insert runway-side projection points as vertices in the
     # runway polygons so taxi-stub junctions share exact vertex
@@ -833,8 +842,9 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                         or simp.geom_type != "Polygon"
                         or simp.area < 500.0):
                     continue
-                layout.shapes.append(BuiltShape(
-                    polygon=simp, role=ROLE_JUNCTION))
+                if EMIT_JUNCTIONS:
+                    layout.shapes.append(BuiltShape(
+                        polygon=simp, role=ROLE_JUNCTION))
 
     # Merge apron pieces split by thin rect strips (e.g. parallel
     # taxi cutting across the apron).  Target has aprons that wrap
@@ -1765,13 +1775,14 @@ BEND_CLUSTER_M = 40.0         # cluster consecutive bends within this
                               # distance (a curve of many tiny bends
                               # becomes ONE break point)
 CLOSE_INTERSECTION_M = 120.0  # intersections within this distance
-                              # on one centerline merge into a single
-                              # junction region (rects stop short of
-                              # the cluster on both sides; the cluster
-                              # interval is junction territory, no
-                              # rect is emitted between them).  Based
-                              # on measured parallel spacing at SPJC:
-                              # Q-R=95m, L-M=47m, V-U=74m.
+                              # on one centerline may merge into a
+                              # single junction region (rects stop
+                              # short; interval is junction, no rect).
+                              # The 60-120m zone is gated by a pav-
+                              # width midpoint check (combined
+                              # junction only if midpoint is wider
+                              # than narrow).  Measured parallel
+                              # spacings: Q-R=95m, L-M=47m, V-U=74m.
                               # (RDP keeps small wobbles; target subdivides
                               # only at chart-level direction changes)
 GAP_BRIDGE_MAX_M = 120.0       # bridge same-ref polyline gaps up to this
