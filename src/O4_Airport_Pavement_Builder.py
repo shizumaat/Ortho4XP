@@ -582,6 +582,20 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                 filtered.append((rect, axis, role, ref))
         taxi_rects = filtered
 
+    # ── Runway-end stubs for primary parallels ─────────────────────
+    # Per user (2026-04-21): primary parallels whose OSM path
+    # terminates INSIDE the runway polygon (i.e. the taxi merges
+    # onto runway pavement) should emit a wider-than-normal STUB
+    # at the transition — the "ramp" where A / F meet the runway
+    # short-edge.  Target A stub (688,1562) L=79 W=73 and F stub
+    # (2243,-1666) L=93 W=78 both sit ~100 m out from the runway
+    # polygon boundary.  Add an extra stub rect at the path vertex
+    # just OUTSIDE the runway along the path.
+    extra_stubs = _emit_primary_parallel_runway_stubs(
+        nodes, ways, to_m, layout.runway_union, pav_union,
+        apt_pav_vertices, taxi_rects)
+    taxi_rects.extend(extra_stubs)
+
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
     for rect, axis, role, ref in taxi_rects:
@@ -1883,6 +1897,192 @@ def _bridge_same_ref_polylines(lines: List[LineString]
             elif best_order == "append_start_rev":
                 cur = LineString(oc[::-1] + cur_coords)
     return merged_lines
+
+
+def _emit_primary_parallel_runway_stubs(
+    nodes: Dict[str, Tuple[float, float]],
+    ways: List[Tuple[str, List[str], Dict[str, str]]],
+    to_m,
+    runway_union: Optional[Polygon],
+    pav_union: Optional[Polygon],
+    apt_vertices: Optional[List[Tuple[float, float]]],
+    existing_taxi_rects: List[Tuple[Polygon, LineString, str, str]],
+) -> List[Tuple[Polygon, LineString, str, str]]:
+    """Emit an extra STUB rect at each primary parallel OSM path
+    endpoint that terminates INSIDE the runway polygon.
+
+    A / F / L OSM primary taxis at SPJC extend their polyline
+    onto the runway pavement itself (the endpoint vertex sits
+    inside the runway polygon).  The target hand-drawn OSM has
+    a short wide STUB at that transition — the RAMP where the
+    taxi meets the runway short-edge.  Detection:
+
+      1. Merge each primary-parallel ref's OSM ways
+         (linemerge + gap-bridge, same as the main extraction).
+      2. Check each merged polyline's 2 endpoints.
+         If an endpoint is INSIDE the runway polygon (or within
+         10 m of it), the taxi terminates on runway pavement.
+      3. Walk along the polyline from that endpoint toward the
+         interior, until the path vertex distance to runway
+         boundary exceeds ``STUB_EXIT_D_M`` (~80 m).  The
+         "exit" vertex is where the path leaves the runway-
+         apron ramp and enters normal taxi corridor.
+      4. Emit a STUB rect CENTERED on the exit vertex along the
+         local path direction, length ``STUB_LEN_M`` (~80 m).
+         The rect width is the perpendicular pav half-width
+         at the exit point × 2 (full pav width — the ramp is
+         wider than a normal taxi).
+
+    Returns a list of extra (rect, axis, role, ref) tuples to
+    append to the main ``taxi_rects`` list.
+    """
+    if runway_union is None or runway_union.is_empty:
+        return []
+    if pav_union is None or pav_union.is_empty:
+        return []
+
+    STUB_EXIT_D_M = 80.0    # path leaves runway-proximity at this d
+    STUB_LEN_M = 80.0       # target A/F stubs are 79–93 m
+    ENDPOINT_INSIDE_TOL_M = 10.0  # allow near-boundary endpoints
+
+    # Gather per-ref OSM lines, merge like the main extractor
+    by_ref: Dict[str, List[LineString]] = {}
+    for wid, nds, tags in ways:
+        if tags.get("aeroway") != "taxiway":
+            continue
+        ref = tags.get("ref", "")
+        if ref not in PARALLEL_REFS:
+            continue
+        pts = []
+        for n in nds:
+            if n in nodes:
+                lat, lon = nodes[n]
+                pts.append(to_m(lon, lat))
+        if len(pts) >= 2:
+            try:
+                by_ref.setdefault(ref, []).append(LineString(pts))
+            except Exception:
+                pass
+
+    # Pre-compute existing rect union for overlap detection
+    existing_rects_union = None
+    if existing_taxi_rects:
+        try:
+            existing_rects_union = unary_union(
+                [r for r, _, _, _ in existing_taxi_rects])
+        except Exception:
+            existing_rects_union = None
+
+    new_stubs: List[Tuple[Polygon, LineString, str, str]] = []
+    rwy_boundary = runway_union.boundary
+    for ref, lines in by_ref.items():
+        if len(lines) > 1:
+            try:
+                merged = linemerge(MultiLineString(lines))
+            except Exception:
+                merged = None
+            if merged is None or merged.is_empty:
+                merged_lines = lines
+            elif merged.geom_type == "LineString":
+                merged_lines = [merged]
+            else:
+                merged_lines = list(merged.geoms)
+            merged_lines = _bridge_same_ref_polylines(merged_lines)
+        else:
+            merged_lines = lines
+
+        for ml in merged_lines:
+            coords = list(ml.coords)
+            if len(coords) < 2:
+                continue
+            # Check both endpoints for runway-terminating condition
+            for end_idx in (0, -1):
+                ep_pt = Point(coords[end_idx])
+                d_ep = ep_pt.distance(rwy_boundary)
+                if not (runway_union.contains(ep_pt)
+                        or d_ep <= ENDPOINT_INSIDE_TOL_M):
+                    continue
+                # Walk from the endpoint toward the interior until
+                # d_rwy > STUB_EXIT_D_M.  step is vertex-by-vertex.
+                step = 1 if end_idx == 0 else -1
+                exit_idx = None
+                i = end_idx if end_idx >= 0 else len(coords) - 1
+                while 0 <= i < len(coords):
+                    d = Point(coords[i]).distance(rwy_boundary)
+                    inside = runway_union.contains(Point(coords[i]))
+                    if not inside and d > STUB_EXIT_D_M:
+                        exit_idx = i
+                        break
+                    i += step
+                if exit_idx is None:
+                    continue
+
+                # Center stub on the exit vertex, length STUB_LEN_M
+                # along local path direction (from prev to next).
+                prev_idx = max(0, exit_idx - 1)
+                next_idx = min(len(coords) - 1, exit_idx + 1)
+                dx = coords[next_idx][0] - coords[prev_idx][0]
+                dy = coords[next_idx][1] - coords[prev_idx][1]
+                mag = math.hypot(dx, dy)
+                if mag < 1e-6:
+                    continue
+                ux, uy = dx / mag, dy / mag
+                cx, cy = coords[exit_idx]
+                ax_start = (cx - ux * STUB_LEN_M / 2,
+                            cy - uy * STUB_LEN_M / 2)
+                ax_end = (cx + ux * STUB_LEN_M / 2,
+                          cy + uy * STUB_LEN_M / 2)
+                try:
+                    stub_axis = LineString([ax_start, ax_end])
+                except Exception:
+                    continue
+                # Width from pav probe at the exit point
+                _nat, _p90, narrow = _natural_half_width(
+                    stub_axis, pav_union)
+                if narrow < 3.5 or narrow > 50.0:
+                    continue
+                width = 2.0 * narrow
+                rect = _rect_from_axis_extended(
+                    stub_axis, width, pav_union,
+                    apt_vertices=apt_vertices)
+                if rect is None or rect.is_empty:
+                    continue
+                if not rect.is_valid:
+                    try:
+                        rect = rect.buffer(0)
+                    except Exception:
+                        continue
+                    if (rect.is_empty
+                            or rect.geom_type != "Polygon"):
+                        continue
+                # Skip if the stub would overlap an existing rect
+                # or a same-ref rect's 30 m buffer (duplicates the
+                # L SE stub that the main pipeline already emits).
+                skip = False
+                if existing_rects_union is not None:
+                    try:
+                        overlap = rect.intersection(
+                            existing_rects_union).area
+                        if overlap > rect.area * 0.2:
+                            skip = True
+                    except Exception:
+                        pass
+                if not skip:
+                    # Same-ref near-duplicate guard
+                    for er, _, _, eref in existing_taxi_rects:
+                        if eref != ref:
+                            continue
+                        try:
+                            if er.buffer(30.0).intersects(rect):
+                                skip = True
+                                break
+                        except Exception:
+                            pass
+                if skip:
+                    continue
+                new_stubs.append(
+                    (rect, stub_axis, ROLE_STUB, ref))
+    return new_stubs
 
 
 def _extract_osm_taxi_centerlines(

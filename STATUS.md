@@ -6,8 +6,9 @@ layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.
 
 **SESSION 6 ongoing (2026-04-21 resume):** JUNCTIONS + APRONS both
 DISABLED (`EMIT_JUNCTIONS = False`, `EMIT_APRONS = False`).  Full
-V-family + Q/R + diagonal-stub rect correctness achieved.  48/105
-matched, 0 spurious outside 1 secondary_parallel.
+V-family + Q/R + diagonal-stub rect correctness achieved.  **50/105
+matched at SPJC** with 100 % stub match (15/15) and 100 %
+cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
 
 ## Session 6 (2026-04-21) — Q/R splits + diagonal stubs + V1 width
 
@@ -68,6 +69,23 @@ matched, 0 spurious outside 1 secondary_parallel.
     excluded from the end-segment indexing so idx==0 / last
     is stable for the cross-connector 30 % rule.
 
+11. **Primary-parallel runway-end stubs**
+    (`_emit_primary_parallel_runway_stubs`): A / F / L OSM
+    primary taxis extend their polyline ONTO the runway
+    polygon at SPJC (the OSM endpoint is INSIDE the runway).
+    Target marks the transition as a wider-than-normal STUB
+    (A L=79 W=73, F L=93 W=78 — the runway-apron ramp).
+    Post-pass: for each primary parallel merged polyline
+    whose endpoint is inside the runway polygon (or within
+    10 m), walk the path toward the interior until the
+    vertex distance to runway boundary exceeds 80 m ("exit
+    point"), emit an 80 m STUB rect centered at the exit
+    along the local path direction, width = 2 × narrow-hw
+    probe at the exit.  Guards: overlap > 20 % with existing
+    rects, or same-ref rect within 30 m buffer → skip.
+    Recovered 15/15 stubs at SPJC (A, F added; L already
+    emitted as "L7" via the main pipeline).
+
 ### Results at SPJC (tol=0.5 m)
 
 | role | n_t | n_o | matched | spurious | avgIoU |
@@ -76,11 +94,11 @@ matched, 0 spurious outside 1 secondary_parallel.
 | primary_parallel | 30 | 21 | 21 | 0 | 0.67 |
 | secondary_parallel | 4 | 5 | 4 | 1 | 0.73 |
 | cross_connector | 6 | 6 | 6 | 0 | 0.73 |
-| stub | 15 | 13 | 13 | 0 | 0.72 |
+| stub | 15 | 15 | **15** ✓ | 0 | 0.73 |
 | terminal | 2 | 2 | 2 | 0 | 0.29 |
 | apron | 3 | 0 | 0 | 0 | — (disabled) |
 | junction | 43 | 0 | 0 | 0 | — (disabled) |
-| **TOTALS** | **105** | **49** | **48** | **1** | |
+| **TOTALS** | **105** | **51** | **50** | **1** | |
 
 **V-family final state:**
 
@@ -96,15 +114,10 @@ matched, 0 spurious outside 1 secondary_parallel.
 
 ### Open items for next session
 
-1. **A / F runway-end stubs** — target has A stub (688,1562)
-   L=79 W=73 and F stub (2243,-1666) L=93 W=78, both at the
-   primary parallel's runway-facing terminus.  A's OSM way
-   -696737 loops up to a wide ramp at (626..800, 1402..1574)
-   at RWY 16R's north end; target represents the ramp as a
-   short wide stub.  My A primary ends at (821,1474), missing
-   the NW loop.  Need either (a) extra stub emission at each
-   primary parallel's OSM endpoint within ~80 m of runway, or
-   (b) geometric ramp-loop detection.
+1. ~~A / F runway-end stubs~~ — **RESOLVED** via change #11
+   above.  A stub (687,1563) L=80 W=72 ≈ target (688,1562)
+   L=79 W=73.  F stub (2250,-1662) L=88 W=78 ≈ target
+   (2243,-1666) L=93 W=78.
 
 2. **Cross-connector middle rect IoU** — Q/R middle rects
    match position/length but avgIoU 0.73 could improve with
@@ -119,6 +132,13 @@ matched, 0 spurious outside 1 secondary_parallel.
    positions are fully approved.  The pav-width midpoint
    check + end-segment margin logic should NOT conflict
    with junction constructive builds.
+
+5. **Spurious secondary_parallel (1 at SPJC)** — M stub at
+   (943,160) L=78 W=18 is a degenerate rect with W=18 m,
+   far under normal taxi width.  Likely from a fragmented
+   M centerline at the V-Q-R meeting area.  Add a minimum-
+   width filter (e.g. reject rect if W < 30 m for
+   secondary/primary parallels).
 
 ### Current constants (session 6)
 
