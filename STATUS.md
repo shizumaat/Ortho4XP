@@ -4,94 +4,90 @@
 `src/O4_Airport_Pavement_Builder.py` reproducing hand-drawn target
 layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.
 
-**SESSION 5 (2026-04-20 ongoing): JUNCTIONS DISABLED for rect
-review (`EMIT_JUNCTIONS = False` at top of builder).  Focus is on
-getting V taxiway rects correct per user's detailed chart
-feedback, then moving to other taxis.**
+**SESSION 5 ongoing: JUNCTIONS DISABLED (`EMIT_JUNCTIONS = False`
+at top of builder).  V-taxiway rect refinement is active.**
 
-## Session 5 V-focused iteration — in progress
+## Session 5 simplified algorithm (2026-04-21)
 
-Switched from "rect width = narrowest pav probe" to user's
-simpler rule: **rect covers 70% of distance between intersections,
-centered**.  Added perpendicular ray-cast half-width probe
-(replaced distance-to-nearest-boundary which inflated narrow_hw
-at SPJC where V's centerline is surrounded by adjacent aprons).
+After multiple width-based iterations (perpendicular ray-cast
+probe, narrow-corridor selection, width-threshold clustering),
+user approved a **completely simpler approach**: abandon all
+pavement-width analysis for rect extraction.  Rects defined
+solely by:
 
-**V-family state (TGT vs OUT at SPJC):**
+  1. **OSM multi-ref intersection points** (`junction_points`).
+  2. **Sharp curves** (bend clusters ≥ `SIGNIFICANT_BEND_DEG`).
+  3. **Centerline endpoints** (parent-taxi / runway / apron).
+
+Between consecutive breaks, emit **70% centered rect**
+(15% margin on each junction-facing end).
+
+**Code simplification**: `_split_centerlines_at_points` went
+from ~200 lines to ~70.  Removed `_sub_ref_narrow_corridor`
+width-profile logic entirely.  Sub-refs now go through the
+SAME pipeline as primaries (both bend-split + 70% trim).
+
+**V-family state (TGT vs OUT at SPJC, after simplification):**
 
 | | Target | Output |
 |---|---|---|
-| V1 stub | 98 m | 107 m ✓ close |
-| V2 stub | 118 m | 126 m ✓ close |
-| V3 stub | 116 m | 225 m ✗ |
-| V5 stub | 103 m | 60 m ✗ |
-| V primary count | 5 | 6 |
+| V1 stub | 98 m | 86 m ✓ close |
+| V2 stub | 118 m | 78 m (short) |
+| V3 stub | 116 m | 159 m (over) |
+| V5 stub | 103 m | 48 m (short, structural) |
+| V primary count | 5 | 4 (missing south split) |
 
-Stubs V1/V2 are close to target.  V3 and V5 still wrong:
-- **V3**: OSM is a 483m gently-curved branch; my stub
-  curve-skip picks a 225m pre-curve segment.  Target's 116m
-  is a different portion (likely the narrow corridor between
-  two widening points).
-- **V5**: OSM is a 240m heavily-curved way (9 bends); my
-  bend-cluster eats most of it, leaving a 60m stub fragment.
-  Target's 103m is the runway-connector straight inside the
-  curve region.
-- **V primary extra** (6 vs 5): a 159m V primary remains in
-  the V-V3 intersection area.  User said "no V rect there"
-  — whole region should be junction.
+**Structural limits identified:**
 
-## Session 5 code changes in this iteration
+- **V5** target center (839, -1525) is OUTSIDE OSM V5 way's
+  extent (endpoints y=-1519 to -1435).  Target covers
+  pavement OSM doesn't tag.  Cannot match without chart
+  knowledge or apt.dat pavement-polygon analysis.
+- **V primary south split** between target -803810 (162m)
+  and -803811 (135m): no OSM intersection in that 639m gap.
+  Chart-level decision.
+- Aprons emit a big "V-Q-R meeting area" apron because with
+  junctions disabled, leftover pavement >25000 m² is
+  currently classified as apron.
 
-1. **`EMIT_JUNCTIONS = False`** at top of file — skip all
-   junction polygon emission.
-2. **Perpendicular ray-cast half-width probe** in
-   `_natural_half_width`, `_trim_to_narrow`, and
-   `_split_centerlines_at_points`.  Capped at 40 m to avoid
-   saturating across aprons.  Gives accurate taxi-local
-   half-width instead of distance-to-nearest-pav-edge.
-3. **70% gap trim**: `_split_centerlines_at_points` emits
-   each rect at 70% of inter-junction gap (15% margin on
-   each end).  Replaces width-based `_trim_to_narrow`.
-4. **No-junction lines still trim 15%** on each end
-   (endpoints are still junction-adjacent: runway / apron /
-   parent taxi).
-5. **Sub-ref stub curve-skip**: ref=V1/V2/V3/V5 etc. detect
-   bends-near-runway and keep only the LONGEST straight
-   pre-curve segment as the rect.
-6. **Sub-ref dedup**: OSM often has multiple disjoint ways
-   with the same sub-ref label (V2 has 3 OSM ways).  Keep
-   only the longest per label.
-7. **`BEND_CLUSTER_M` 40→100 m**: V has 2 small (9°) bends
-   76m apart in the V2 area; 40m threshold emitted a
-   spurious 76m rect between them.  100m clusters them as
-   one curve (junction territory).
-8. **`CLOSE_INTERSECTION_M` 120→200 m**: catch larger
-   junction regions where multiple sub-ref connections span
-   up to ~180m on the parent's axis.
-9. **`SAME_INTERSECTION_M = 60`**: always cluster
-   junction_points within 60m (likely OSM fragmentation).
-10. **Width-check factor 1.25→1.15**: looser at the 60-200m
-    zone to catch intersections where apt.dat widening is
-    modest.
-11. **Ignore unrefed OSM ways** in `_find_junction_points`:
-    tiny connectors / apron markings that don't represent
-    real taxiway intersections.
-12. **Gap-bridging enabled for all refs** (previously only
-    non-parallels): F/L have OSM fragmented across
-    intersections; gap-bridge restores the logical taxi.
+## Session 5 constants (for reference)
+
+- `SIGNIFICANT_BEND_DEG = 5.0`
+- `BEND_CLUSTER_M = 100.0` (groups small bends into one curve)
+- `CLOSE_INTERSECTION_M = 200.0` (merge close intersections)
+- `SAME_INTERSECTION_M = 60.0` (unconditional cluster below)
+- `GAP_MARGIN_FRAC = 0.15` (70% rect centered between breaks)
 
 ## Session 5 next priorities
 
-1. **Fix V3 sub-ref extraction**: pick the NARROW-corridor
-   portion of V3's 483m polyline, not the longest segment.
-   Probably requires width-profile analysis along V3.
-2. **Fix V5 stub selection**: target's 103m is in the
-   runway-connector area, not pre-curve.  Maybe emit the
-   LONGEST NARROW straight instead of pre-curve-only.
-3. **Eliminate V primary extra at V-V3 junction area**:
-   strengthen junction clustering there.
-4. **Then re-enable junctions** and apply the same refined
-   rules to L, F, A, M, U, etc.
+1. **Big apron at V-Q-R meeting area**: should be junction
+   territory, not apron.  Fix: raise MIN_APRON_AREA or
+   exclude apron emission in "junction-like" residue areas
+   when `EMIT_JUNCTIONS=False`.
+2. **V3 / V5 / V primary south split**: may be unachievable
+   without external signals (chart or apt.dat pavement
+   polygon analysis).  Accept structural limits for now.
+3. **Re-enable junctions** (`EMIT_JUNCTIONS = True`) once V
+   rects are visually approved.  Junctions emit via
+   `_build_junction_constructive` (corner + apt.dat-arc
+   polygons, max 4 arc vertices between corners).
+4. **Extend rules to L, F, A, M, U** after V approval.
+5. **Later**: apt.dat taxi route 1202 edges as supplemental
+   intersection signal (could help V primary south split
+   and V5/V3 stub placement).
+
+## Session 5 structural observations
+
+- Sub-refs often have OSM ways that span BOTH the stub's
+  narrow corridor AND the junction-widening/curve on either
+  side.  Target's sub-ref rects cover a CENTERED portion
+  that's narrower than the full OSM way.
+- OSM is fragmentary: V2 has 3 disjoint ways, V3 has 2,
+  etc.  Target consolidates; my sub-ref dedup picks the
+  longest rect per ref.
+- Target splits some primaries at positions with NO OSM
+  signal (chart convention).  These are structural-limit
+  shapes — ~5-10% of total.
 
 ---
 
