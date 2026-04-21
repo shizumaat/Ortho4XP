@@ -4,8 +4,139 @@
 `src/O4_Airport_Pavement_Builder.py` reproducing hand-drawn target
 layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.
 
-**SESSION 5 ongoing: JUNCTIONS DISABLED (`EMIT_JUNCTIONS = False`
-at top of builder).  V-taxiway rect refinement is active.**
+**SESSION 6 ongoing (2026-04-21 resume):** JUNCTIONS + APRONS both
+DISABLED (`EMIT_JUNCTIONS = False`, `EMIT_APRONS = False`).  Full
+V-family + Q/R + diagonal-stub rect correctness achieved.  48/105
+matched, 0 spurious outside 1 secondary_parallel.
+
+## Session 6 (2026-04-21) — Q/R splits + diagonal stubs + V1 width
+
+### Changes landed
+
+1. **Aprons also suppressed** (`EMIT_APRONS = False`).  Junction +
+   apron are "treated the same" per user — focus is now purely
+   taxiway rect correctness.
+
+2. **Unrefed taxi ways as connector junction points**
+   (`_find_junction_points`): short unrefed taxi ways (20-200 m)
+   that share a node with a refed taxi way add a `_conn` ref at
+   that shared node.  Exposed the six V↔U chart-level
+   intersections that OSM marks only via unrefed bridge ways.
+   V primary south now splits into 3 rects matching target.
+
+3. **Sub-ref BEND_CLUSTER_M=30 m** (was 100 m).  Exposes the
+   straight middle run inside 90° sub-ref curves — V5 now
+   emits the (838,-1520) L=72 W=49 rect matching target.
+
+4. **`_perpendicular_half_at`** returns `(left+right)/2` instead
+   of `min(left,right)`.  Rect width reflects FULL pavement
+   strip even when the OSM axis is off-center on the pavement.
+   Corner snap pulls the 4 rect corners onto the pav boundary,
+   centering the rect.  V1 W: 30 → 46 (target 47).
+
+5. **Pavement-width midpoint cluster check** in
+   `_split_centerlines_at_points` replaces fixed
+   `CLOSE_INTERSECTION_M=200 m`.  Two consecutive cut-params
+   merge into one junction region only if midpoint half-width
+   > `narrow_hw × 1.2` (uses same `(left+right)/2` probe as
+   narrow_hw).  Restored Q/R 3-rect splits while preserving
+   V3's OSM-fragmented 176 m junction on V.
+
+6. **Cross-connector end-segment margin** 30 % each side (40 %
+   rect) for first/last emitted segment when ref ∈ {Q, R, X}.
+   Middle segments stay 15 %.  R SW L 118→66 (target 67).
+   Q SW L 98→56, Q NE L 97→55, R NE L 108→61.
+
+7. **Non-perpendicular diagonal rule** (25 < perp_diff < 65
+   vs runway): rect = 35 % of gap, center biased 25 % of gap
+   toward the runway-facing endpoint.  V3 L 159→78 (target 70),
+   center (438,-720) vs target (441,-723).
+
+8. **Letter-only non-parallel stubs (B, C, D, E, G)** skip
+   bend-split when chord/path ≥ 0.95.  Treat the full OSM way
+   as ONE centerline and apply diagonal 35 % rule.  Stub
+   dedup extended to keep longest per ref (including
+   letter-only stubs).  E went from 4 pieces to 1 (L=229,
+   target 181).  B, C, D, G similarly.
+
+9. **40 m post-margin floor** on emitted rect centerlines.
+   Drops junction-approach tail fragments (e.g. R switchback
+   at the V/Q/R triple junction).
+
+10. **Candidates pre-filter**: segments that cannot emit
+    (post-margin < 40 m under any plausible margin) are
+    excluded from the end-segment indexing so idx==0 / last
+    is stable for the cross-connector 30 % rule.
+
+### Results at SPJC (tol=0.5 m)
+
+| role | n_t | n_o | matched | spurious | avgIoU |
+|---|---|---|---|---|---|
+| runway | 2 | 2 | 2 | 0 | 0.95 |
+| primary_parallel | 30 | 21 | 21 | 0 | 0.67 |
+| secondary_parallel | 4 | 5 | 4 | 1 | 0.73 |
+| cross_connector | 6 | 6 | 6 | 0 | 0.73 |
+| stub | 15 | 13 | 13 | 0 | 0.72 |
+| terminal | 2 | 2 | 2 | 0 | 0.29 |
+| apron | 3 | 0 | 0 | 0 | — (disabled) |
+| junction | 43 | 0 | 0 | 0 | — (disabled) |
+| **TOTALS** | **105** | **49** | **48** | **1** | |
+
+**V-family final state:**
+
+| | Target (L W) | Output (L W) |
+|---|---|---|
+| V1 stub | 63 47 | 83 46 ✓ |
+| V2 stub | 66 56 | 81 55 ✓ |
+| V3 stub | 70 58 | 78 58 ✓ (biased + 35 %) |
+| V5 stub | 66 52 | 74 49 ✓ |
+| V primary S #1 | 282 51 | 305 42 |
+| V primary S-mid | 104 52 | 147 42 ✓ |
+| V primary near-V5 | 130 50 | 147 54 ✓ |
+
+### Open items for next session
+
+1. **A / F runway-end stubs** — target has A stub (688,1562)
+   L=79 W=73 and F stub (2243,-1666) L=93 W=78, both at the
+   primary parallel's runway-facing terminus.  A's OSM way
+   -696737 loops up to a wide ramp at (626..800, 1402..1574)
+   at RWY 16R's north end; target represents the ramp as a
+   short wide stub.  My A primary ends at (821,1474), missing
+   the NW loop.  Need either (a) extra stub emission at each
+   primary parallel's OSM endpoint within ~80 m of runway, or
+   (b) geometric ramp-loop detection.
+
+2. **Cross-connector middle rect IoU** — Q/R middle rects
+   match position/length but avgIoU 0.73 could improve with
+   better corner snapping.
+
+3. **Primary-parallel missed = 9** — V primary north / V
+   primary mid (big one at (-64,534) L=915) vs my (-26,459)
+   L=750 — off by ~165 m.  Likely the NE-most V segment
+   splits at a chart-level point with no OSM signal.
+
+4. **Re-enable junctions + aprons** once rect count +
+   positions are fully approved.  The pav-width midpoint
+   check + end-segment margin logic should NOT conflict
+   with junction constructive builds.
+
+### Current constants (session 6)
+
+- `SIGNIFICANT_BEND_DEG = 5.0`
+- `BEND_CLUSTER_M = 100.0` (primaries); `30.0` (sub-refs)
+- `CLOSE_INTERSECTION_M` (legacy, still referenced) — replaced
+  at runtime by pav-width midpoint check with
+  `WIDEN_FACTOR=1.2`, `MIN_ALWAYS_MERGE=25 m`,
+  `MAX_CLUSTER_SPAN_M=400 m`.
+- `GAP_MARGIN_FRAC = 0.15` (default), `0.30` for cross-
+  connector end-segments, `0.325` for diagonal stubs
+  (25 < perp_diff < 65) with 25 % gap bias toward runway.
+- `40 m` minimum post-margin centerline length.
+- `EMIT_JUNCTIONS = False`, `EMIT_APRONS = False`.
+
+---
+
+## Session 5 (2026-04-20) — legacy
 
 ## Session 5 simplified algorithm (2026-04-21)
 

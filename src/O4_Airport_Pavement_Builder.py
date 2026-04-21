@@ -70,6 +70,10 @@ ROLE_JUNCTION = "junction"
 # runways + terminals + aprons, suppressing all junction polygons.
 # User requested this while iterating on rect correctness.
 EMIT_JUNCTIONS = False
+# TEMP 2026-04-21: when False, aprons are also suppressed so we can
+# focus exclusively on getting taxiway rects right.  Junctions and
+# aprons are treated interchangeably for now.
+EMIT_APRONS = False
 
 AEROWAY_FOR_ROLE = {
     ROLE_RUNWAY: "runway",
@@ -525,7 +529,9 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     # sharp curves define break points; 70% rect between
     # consecutive breaks.  No width analysis.
     osm_centerlines = _split_centerlines_at_points(
-        osm_centerlines, junction_points, approach_tol_m=25.0)
+        osm_centerlines, junction_points, approach_tol_m=25.0,
+        pav_union=pav_union, rwy_union=layout.runway_union,
+        rwy_centerlines=rwy_centerlines)
 
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
@@ -868,11 +874,12 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                            and p.area >= MIN_APRON_AREA_M2]
         except Exception:
             pass
-    for ap in apron_polys:
-        simp = ap.simplify(1.0, preserve_topology=True)
-        if simp.is_empty or simp.geom_type != "Polygon":
-            simp = ap
-        layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
+    if EMIT_APRONS:
+        for ap in apron_polys:
+            simp = ap.simplify(1.0, preserve_topology=True)
+            if simp.is_empty or simp.geom_type != "Polygon":
+                simp = ap
+            layout.shapes.append(BuiltShape(polygon=simp, role=ROLE_APRON))
 
     # NOTE: Consolidation of touching junctions was tested
     # (tol=1m) and regressed match count by 4 — target retains
@@ -1275,18 +1282,45 @@ def _find_junction_points(
     """
     from collections import defaultdict
     refs_at_node: Dict[str, set] = defaultdict(set)
+    refed_taxi_nodes: set = set()
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
             continue
         ref = tags.get("ref", "")
         if not ref:
-            # Unrefed OSM ways are often tiny connectors or apron
-            # markings that do NOT represent a real taxiway
-            # intersection.  Excluding them prevents spurious
-            # junction_points along long parallel taxis.
             continue
+        refed_taxi_nodes.update(nds)
         for n in nds:
             refs_at_node[n].add(ref)
+
+    # Second pass: unrefed taxi ways act as CONNECTORS between
+    # refed taxis at SPJC (e.g. 6 short unrefed ways bridge V to U,
+    # marking the chart-level V↔U intersection points that split V
+    # into multiple rects).  Only contribute a connector node when
+    # it's also on a refed taxi way — this filters pure apron-area
+    # markings (whose nodes touch only other unrefed ways).  Length
+    # cap filters the long apron-boundary unrefed ways.
+    for wid, nds, tags in ways:
+        if tags.get("aeroway") != "taxiway":
+            continue
+        if tags.get("ref", ""):
+            continue
+        # Compute unrefed way length
+        path_len = 0.0
+        prev = None
+        for n in nds:
+            if n not in nodes:
+                continue
+            lat, lon = nodes[n]
+            cur = to_m(lon, lat)
+            if prev is not None:
+                path_len += math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+            prev = cur
+        if path_len > 200.0 or path_len < 20.0:
+            continue
+        for n in nds:
+            if n in refed_taxi_nodes:
+                refs_at_node[n].add("_conn")
 
     candidates: List[Tuple[float, float]] = []
     for nid, refs in refs_at_node.items():
@@ -1936,6 +1970,25 @@ def _extract_osm_taxi_centerlines(
             scoords = list(simp.coords)
             if len(scoords) < 2:
                 continue
+            # Single-letter non-parallel stubs (B, C, D, E, G) are
+            # continuous diagonal taxis at SPJC — the target emits
+            # them as ONE long rect covering ~35 % of the full
+            # path.  Bend-splitting fragments them into junk.
+            # Detection: letter-only ref, not a primary/secondary
+            # parallel ref, and path is geometrically straight
+            # (chord/path > 0.95).  Emit as ONE centerline.
+            if (ref
+                    and len(ref) == 1
+                    and ref not in PARALLEL_REFS
+                    and ref not in {"Q", "R", "X"}):
+                path_len = ls.length
+                sc = list(simp.coords)
+                if len(sc) >= 2 and path_len > 1e-6:
+                    chord = math.hypot(sc[-1][0] - sc[0][0],
+                                       sc[-1][1] - sc[0][1])
+                    if chord / path_len > 0.95:
+                        out.append((simp, ref))
+                        continue
             # All refs (including sub-refs) split at significant
             # bends.  Per user (2026-04-20 refined): intersections
             # + sharp curves define rect break points; there's no
@@ -1975,11 +2028,23 @@ def _extract_osm_taxi_centerlines(
                 #   interval between them skipped.
                 # A single isolated bend (cluster of 1) gives only
                 # ONE break at itself.
+                # Sub-refs (letter+digit: V3, V5, L1, …) are usually
+                # short stub taxis whose straight portion is much
+                # less than the primary's junction-bend-transition
+                # span.  Using the primary's 100 m cluster distance
+                # swallows a true 90°-corner stub's straight middle
+                # run (e.g. V5 indices [13..15] are a 97 m straight
+                # between two tight curves).  For sub-refs we cluster
+                # bends far more conservatively so the straight run
+                # between two curves can survive as its own segment.
+                cluster_m = BEND_CLUSTER_M
+                if ref and any(c.isdigit() for c in ref):
+                    cluster_m = 30.0
                 clusters: List[List[int]] = []
                 for bi in candidate_bends:
                     if clusters and (scoords[bi][0] - scoords[clusters[-1][-1]][0])**2 + \
                             (scoords[bi][1] - scoords[clusters[-1][-1]][1])**2 \
-                            <= BEND_CLUSTER_M * BEND_CLUSTER_M:
+                            <= cluster_m * cluster_m:
                         clusters[-1].append(bi)
                     else:
                         clusters.append([bi])
@@ -2325,28 +2390,130 @@ def _split_centerlines_at_points(
     split_points: List[Tuple[float, float]],
     approach_tol_m: float = 25.0,
     endpoint_guard_m: float = 5.0,
+    pav_union: Optional[Polygon] = None,
+    rwy_union: Optional[Polygon] = None,
+    rwy_centerlines: Optional[List[LineString]] = None,
 ) -> List[Tuple[LineString, str]]:
-    """Split each centerline at intersection points; emit 70% of
-    the distance between consecutive intersections as a rect.
+    """Split each centerline at intersection points; emit between-
+    break rects (15 % margin normally, 30 % for non-perpendicular
+    taxis).
 
-    Per user (2026-04-20 refined): rects are defined by
-    intersections (and sharp curves already embedded in the
-    centerlines via upstream bend-splitting).  No pavement-
-    width analysis — just distance-based clustering of close
-    intersections (within CLOSE_INTERSECTION_M → combined
-    junction, no rect between).
+    Per user (2026-04-20 refined + 2026-04-21): rects are defined
+    by intersections + sharp curves.  Two consecutive cut params
+    merge into ONE junction region if the pavement at their
+    midpoint is WIDER than the centerline's own narrow half-width
+    (factor 1.2) — i.e. the pavement is widening in between
+    (intersection widening).  Otherwise they remain separate
+    junctions with a rect emitted between them.  This replaces
+    the previous fixed ``CLOSE_INTERSECTION_M`` distance
+    threshold, which was too coarse: 200 m was needed for
+    OSM-fragmented V3 on V but merged real Q/R 3-rect splits too.
 
-    Each centerline's 2 outer endpoints are treated as
-    junction-adjacent (parent taxi / runway / apron) so a
-    15% margin is trimmed at those ends too.
+    Non-perpendicular taxis (45° stubs like V3) use a GAP_MARGIN_FRAC
+    of 0.30 instead of 0.15 because the intersection point on the
+    primary and on the runway sit farther down the taxi's own axis
+    — without the larger margin the rect overlaps both junctions.
     """
     if not centerlines:
         return centerlines
     from shapely.ops import substring
 
+    pav_for_probe = pav_union
+    if pav_for_probe is not None and rwy_union is not None:
+        try:
+            pav_for_probe = pav_for_probe.union(rwy_union)
+        except Exception:
+            pass
+
+    def _avg_perp_halfwidth(ls: LineString, t: float) -> float:
+        """(left+right)/2 perpendicular half-width at axis param t,
+        so widening detection is comparable to narrow_hw (which is
+        also derived from (left+right)/2 per-probe averages)."""
+        if pav_for_probe is None or pav_for_probe.is_empty:
+            return 0.0
+        RAY_CAP_M = 40.0
+        RAY_STEP_M = 0.5
+        dt = min(2.0, ls.length * 0.05)
+        a = ls.interpolate(max(0.0, t - dt))
+        b = ls.interpolate(min(ls.length, t + dt))
+        tx, ty = b.x - a.x, b.y - a.y
+        mag = math.hypot(tx, ty)
+        if mag < 1e-6:
+            return 0.0
+        ux, uy = tx / mag, ty / mag
+        nx, ny = -uy, ux
+        pt = ls.interpolate(t)
+        sides: List[float] = []
+        for sign in (-1, 1):
+            side = RAY_CAP_M
+            d = 0.0
+            while d <= RAY_CAP_M:
+                qx = pt.x + sign * nx * d
+                qy = pt.y + sign * ny * d
+                if not pav_for_probe.contains(Point(qx, qy)):
+                    side = d
+                    break
+                d += RAY_STEP_M
+            sides.append(side)
+        return sum(sides) / 2.0 if sides else 0.0
+
+    def _rect_margin_frac_for(ls: LineString, ref: str) -> float:
+        # Stubs / cross-connectors oriented > 30° off perpendicular
+        # to the nearest runway get a larger margin because the
+        # intersection points (primary and runway) sit farther along
+        # the taxi's axis due to the oblique crossing.
+        if not rwy_centerlines:
+            return 0.15
+        c = list(ls.coords)
+        if len(c) < 2:
+            return 0.15
+        dx = c[-1][0] - c[0][0]
+        dy = c[-1][1] - c[0][1]
+        mag = math.hypot(dx, dy)
+        if mag < 1e-6:
+            return 0.15
+        axis_bearing = math.degrees(math.atan2(dx, dy)) % 180.0
+        # Nearest runway to centerline mid
+        mid = ls.interpolate(ls.length / 2)
+        best_r = None
+        best_d = float("inf")
+        for r in rwy_centerlines:
+            d = mid.distance(r)
+            if d < best_d:
+                best_d = d
+                best_r = r
+        if best_r is None:
+            return 0.15
+        rc = list(best_r.coords)
+        if len(rc) < 2:
+            return 0.15
+        rx = rc[-1][0] - rc[0][0]
+        ry = rc[-1][1] - rc[0][1]
+        rmag = math.hypot(rx, ry)
+        if rmag < 1e-6:
+            return 0.15
+        rwy_bearing = math.degrees(math.atan2(rx, ry)) % 180.0
+        delta = abs(axis_bearing - rwy_bearing)
+        delta = min(delta, 180.0 - delta)
+        # Perpendicular = 90°.  Use margin 0.30 when axis is 30–60°
+        # off perpendicular (60° < delta < 120° away from parallel,
+        # i.e. 30° < perp_diff < 60°).  Parallel taxis (delta near 0
+        # or 180) stay at 0.15; perpendicular taxis (delta near 90)
+        # stay at 0.15.
+        perp_diff = abs(delta - 90.0)
+        if 25.0 < perp_diff < 65.0:
+            return 0.30
+        return 0.15
+
     result: List[Tuple[LineString, str]] = []
-    GAP_MARGIN_FRAC = 0.15
     for ls, ref in centerlines:
+        gap_margin_frac = _rect_margin_frac_for(ls, ref)
+        # Estimate centerline's narrow half-width for midpoint check.
+        if pav_for_probe is not None and not pav_for_probe.is_empty:
+            _nat, _p90, narrow_hw = _natural_half_width(ls, pav_for_probe)
+        else:
+            narrow_hw = 0.0
+
         # Collect cut params for intersections that lie on this line.
         cut_params: List[float] = []
         for (sx, sy) in split_points or ():
@@ -2363,42 +2530,127 @@ def _split_centerlines_at_points(
                 continue
             cut_params.append(param)
 
-        # Cluster close intersections (within CLOSE_INTERSECTION_M)
-        # into a single junction region.
         cut_params.sort()
+        # Pav-width midpoint cluster: two consecutive cut_params
+        # merge when the midpoint half-width > narrow_hw × 1.2.
+        # Always merge when they're within 25 m (same-crossing
+        # multi-node noise).  Never merge past 400 m apart.
         clusters: List[List[float]] = []
+        WIDEN_FACTOR = 1.2
+        MIN_ALWAYS_MERGE = 25.0
+        MAX_CLUSTER_SPAN_M = 400.0
         for p in cut_params:
-            if clusters and p - clusters[-1][-1] <= CLOSE_INTERSECTION_M:
+            if not clusters:
+                clusters.append([p])
+                continue
+            prev = clusters[-1][-1]
+            gap = p - prev
+            merge = False
+            if gap <= MIN_ALWAYS_MERGE:
+                merge = True
+            elif gap > MAX_CLUSTER_SPAN_M:
+                merge = False
+            elif narrow_hw > 0:
+                try:
+                    mid_hw = _avg_perp_halfwidth(ls, (prev + p) / 2.0)
+                    if mid_hw > narrow_hw * WIDEN_FACTOR:
+                        merge = True
+                except Exception:
+                    pass
+            if merge:
                 clusters[-1].append(p)
             else:
                 clusters.append([p])
 
-        # Build break points: endpoints + cluster boundaries.
-        # Segment i is breaks[2i] → breaks[2i+1].
         breaks: List[float] = [0.0]
         for cl in clusters:
             breaks.append(cl[0])
             breaks.append(cl[-1])
         breaks.append(ls.length)
 
+        # Enumerate candidate segments and identify which are the
+        # first/last ones that would actually emit.  For cross-
+        # connector refs (Q/R/X), first and last emitted segments
+        # use 30 % margin each side (40 % rect) because the taxi
+        # terminates into a WIDER parallel taxi whose widening
+        # zone extends into the cross-connector's axis.  Middle
+        # segments between two cross-ref junctions use 15 %.
+        CROSS_CONNECTOR_REFS = {"Q", "R", "X"}
         n_breaks = len(breaks)
+        # Collect only segments that will actually emit (post-margin
+        # length >= 40 m under ANY margin we might apply, so first/
+        # last indexing is stable).  The 40 m floor matches the
+        # post-emit filter below.  Use smallest possible retained
+        # fraction (35 % for diagonal, 40 % for cross-connector
+        # ends) to test.
+        candidates: List[Tuple[float, float]] = []
         for i in range(0, n_breaks - 1, 2):
             p0, p1 = breaks[i], breaks[i + 1]
             gap = p1 - p0
             if gap < MIN_SEGMENT_LEN_M:
                 continue
-            margin = GAP_MARGIN_FRAC * gap
-            rect_p0 = p0 + margin
-            rect_p1 = p1 - margin
+            # Will this segment emit under any plausible margin?
+            min_retained_frac = 0.35
+            if gap * min_retained_frac < 40.0 and gap * (1 - 2 * gap_margin_frac) < 40.0:
+                # Won't emit — skip so it doesn't shift end-indexing.
+                continue
+            candidates.append((p0, p1))
+        is_cross = ref in CROSS_CONNECTOR_REFS
+        for idx, (p0, p1) in enumerate(candidates):
+            gap = p1 - p0
+            is_end_seg = (idx == 0 or idx == len(candidates) - 1)
+            if is_cross and is_end_seg:
+                m_start = 0.30 * gap
+                m_end = 0.30 * gap
+            elif gap_margin_frac >= 0.25:
+                # Non-perpendicular diagonal stub (V3-like): 32.5 %
+                # margin each side (35 % retained), biased 25 % of
+                # the gap toward the runway-facing axis endpoint.
+                retained = 0.35 * gap
+                remaining_margin = gap - retained
+                # Bias: shift the rect center 25 % of the gap toward
+                # the endpoint nearer the runway.
+                bias = 0.25 * gap
+                # Which endpoint is closer to a runway?
+                if rwy_centerlines:
+                    ep0 = ls.interpolate(p0)
+                    ep1 = ls.interpolate(p1)
+                    d0 = min(ep0.distance(r) for r in rwy_centerlines)
+                    d1 = min(ep1.distance(r) for r in rwy_centerlines)
+                    runway_is_p0_side = d0 < d1
+                else:
+                    runway_is_p0_side = True
+                if runway_is_p0_side:
+                    m_start = remaining_margin / 2.0 - bias
+                    m_end = remaining_margin / 2.0 + bias
+                else:
+                    m_start = remaining_margin / 2.0 + bias
+                    m_end = remaining_margin / 2.0 - bias
+                # Clamp margins to be non-negative
+                m_start = max(0.0, m_start)
+                m_end = max(0.0, m_end)
+                # Recompute retained so p0+m_start..p1-m_end fits
+                if gap - m_start - m_end < MIN_SEGMENT_LEN_M:
+                    continue
+            else:
+                m_start = gap_margin_frac * gap
+                m_end = gap_margin_frac * gap
+            rect_p0 = p0 + m_start
+            rect_p1 = p1 - m_end
             if rect_p1 - rect_p0 < MIN_SEGMENT_LEN_M:
                 continue
             try:
                 piece = substring(ls, rect_p0, rect_p1)
             except Exception:
                 continue
+            # Drop short between-junction fragments (< 40 m).  Target
+            # cross_connector smallest = 52 m, Q smallest = 59 m,
+            # so 40 m post-margin is a safe floor that still drops
+            # spurious junction-approach tails (e.g. R switchback
+            # tails at the V/Q/R triple junction).
             if (piece.geom_type == "LineString"
                     and not piece.is_empty
-                    and piece.length >= MIN_SEGMENT_LEN_M):
+                    and piece.length >= 40.0):
                 result.append((piece, ref))
     return result
 
@@ -2516,22 +2768,34 @@ def _build_taxi_rects(
     # topology (stubs touch parallels, cross_connector touches 2 parallels)
     _refine_roles(emitted, rwy_centerlines)
 
-    # Sub-ref dedup: OSM often has multiple disjoint ways with the
+    # Stub-ref dedup: OSM often has multiple disjoint ways with the
     # same sub-ref label (e.g. V2 has 3 separate OSM pieces, each
-    # contributing a rect).  Target emits ONE rect per sub-ref.
-    # Keep only the LONGEST rect per sub-ref.
-    sub_ref_best: Dict[str, int] = {}
+    # contributing a rect).  Target emits ONE rect per stub ref.
+    # Keep only the LONGEST rect per stub ref.  Applies to both
+    # sub-refs (letter+digit like V1, L3) AND letter-only stubs
+    # (B, C, E, G) which are single-stub taxis that must not
+    # fragment across internal bends.
+    def _should_dedup(ref_str: str, role_str: str) -> bool:
+        if not ref_str:
+            return False
+        if any(c.isdigit() for c in ref_str):
+            return True
+        # Letter-only: dedup when classified as stub (B, C, E, G, D).
+        if role_str == ROLE_STUB:
+            return True
+        return False
+    stub_ref_best: Dict[str, int] = {}
     for i, (rect, axis, role, ref) in enumerate(emitted):
-        if not ref or not any(c.isdigit() for c in ref):
+        if not _should_dedup(ref, role):
             continue
-        cur = sub_ref_best.get(ref)
+        cur = stub_ref_best.get(ref)
         if cur is None or axis.length > emitted[cur][1].length:
-            sub_ref_best[ref] = i
+            stub_ref_best[ref] = i
     keep: List[Tuple[Polygon, LineString, str, str]] = []
     for i, item in enumerate(emitted):
-        ref = item[3]
-        if ref and any(c.isdigit() for c in ref):
-            if sub_ref_best.get(ref) != i:
+        _rect, _axis, role, ref = item
+        if _should_dedup(ref, role):
+            if stub_ref_best.get(ref) != i:
                 continue
         keep.append(item)
     return keep
@@ -2769,7 +3033,15 @@ def _natural_half_width(axis: LineString, pav: Polygon,
         return 0.0, 0.0, 0.0
 
     def _perpendicular_half_at(t: float) -> float:
-        """Cast perpendicular rays left/right at axis param t."""
+        """Cast perpendicular rays left/right at axis param t.
+
+        Returns the AVERAGE of the two sides — (left + right) / 2 —
+        so the width reflects the full pavement strip centered on
+        the pavement (not a narrow corridor seen from an off-center
+        axis).  Corner snapping downstream pulls the 4 rect corners
+        onto the pav boundary, centering the rect on the actual
+        pavement regardless of the axis's offset.
+        """
         # Local tangent: use points slightly before/after t.
         dt = min(2.0, axis.length * 0.05)
         t0 = max(0.0, t - dt)
@@ -2784,18 +3056,19 @@ def _natural_half_width(axis: LineString, pav: Polygon,
         nx, ny = -uy, ux  # left-perp
         pt = axis.interpolate(t)
         ox, oy = pt.x, pt.y
-        best = RAY_CAP_M
+        sides: List[float] = []
         for sign in (-1, 1):
+            side = RAY_CAP_M
             d = 0.0
             while d <= RAY_CAP_M:
                 qx = ox + sign * nx * d
                 qy = oy + sign * ny * d
                 if not pav.contains(Point(qx, qy)):
-                    if d < best:
-                        best = d
+                    side = d
                     break
                 d += RAY_STEP_M
-        return best
+            sides.append(side)
+        return sum(sides) / 2.0 if sides else RAY_CAP_M
 
     dists: List[float] = []
     for k in range(n_probes):
