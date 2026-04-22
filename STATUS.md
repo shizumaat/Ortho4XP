@@ -150,6 +150,38 @@ cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
     filter.  Result: target (-293,-641) L=53 W=22 is now
     matched by output (-297,-635) L=90 W=32.
 
+17. **Reject stubs whose rect touches the runway polygon**
+    in the stub runway-connection filter (line ~580).  SPLP
+    has a short southernmost diagonal stub whose rect has
+    one corner exactly on the runway boundary — user
+    wanted "only a single stub at the south end" so this
+    runway-touching stub is dropped.  Keeps the
+    neighbouring "good" stub up and out.
+
+18. **Short parallel-oriented refless rects classified as
+    PRIMARY_PARALLEL** (not stub): `_classify_role` refless
+    branch lowered `length >= 80` to `length >= 50` for
+    parallel rects.  SPLP's 66–80 m parallel slice between
+    two diagonal stubs in the south chain now emits as a
+    primary_parallel.
+
+19. **Per-segment margin for short parallel slices of a
+    curving unrefed taxi**: inside
+    `_split_centerlines_at_points` the sub-segment's own
+    bearing is compared to the nearest runway when ref is
+    empty and gap < 150 m.  If the slice is nearly parallel
+    (perp_diff ≥ 75°), apply 22 % margin each side (56 %
+    retained) so the resulting primary is roughly half its
+    default 70 % length — avoids visual overlap with
+    neighbouring diagonal stubs.  Example SPLP:
+    (-500,-1054) L=81 W=37 → (-506,-1059) L=54 W=26.
+
+20. **Diagonal rule extended to short unrefed diagonals**
+    (< 250 m): SPLP's (-449,-1084) L=109 W=29 diagonal stub
+    (perp_diff=43°) now gets 35 % retained + 20 % bias
+    toward runway → (-435,-1110) L=54 W=29.  Long unrefed
+    centerlines (primary taxis) still return 0.15 margin.
+
 ### Results at SPJC (tol=0.5 m)
 
 | role | n_t | n_o | matched | spurious | avgIoU |

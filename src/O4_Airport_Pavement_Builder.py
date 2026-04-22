@@ -567,11 +567,24 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
             raw_endpoints_by_ref.setdefault(ref, []).append(pts[-1])
 
     if layout.runway_union is not None:
+        rwy_boundary = layout.runway_union.boundary
         filtered: List[Tuple[Polygon, LineString, str, str]] = []
         for rect, axis, role, ref in taxi_rects:
             if role != ROLE_STUB:
                 filtered.append((rect, axis, role, ref))
                 continue
+            # Reject stubs whose RECT touches (or sits inside) the
+            # runway polygon.  SPLP has a short unrefed taxi at the
+            # SW end whose rect at (-463,-1266) has one corner
+            # exactly on the runway boundary — user wants "only a
+            # single stub at the south end" so this one must go.
+            try:
+                if rect.distance(rwy_boundary) < 5.0 and (
+                        rect.intersects(layout.runway_union)
+                        or rect.distance(layout.runway_union) < 2.0):
+                    continue
+            except Exception:
+                pass
             reaches_runway = False
             for (px, py) in raw_endpoints_by_ref.get(ref, []):
                 if Point(px, py).distance(
@@ -2748,22 +2761,30 @@ def _split_centerlines_at_points(
         # the taxi's axis due to the oblique crossing.
         if not rwy_centerlines:
             return 0.15
-        # Only STUBS (letter-only non-parallel, or letter+digit
-        # sub-refs) and cross-connectors qualify for the diagonal
-        # rule.  PARALLEL_REFS (A, F, L, V, M, U) and UNREFED
-        # taxis (e.g. SPLP's main taxi which is unrefed but runs
-        # as a long primary at ~19° off runway) should always use
-        # the 15 % primary margin — otherwise SPLP's unrefed
-        # primary gets treated as a diagonal stub (perp_diff=71°)
-        # and shrinks to 35 % length.  The diagonal rule is
-        # intended for stubs that CONNECT primary-to-runway at
-        # an angle, not the primary itself.
-        if not ref:
-            return 0.15
+        # PARALLEL_REFS (A, F, L, V, M, U) and cross-connector
+        # refs (Q, R, X) always use the 15 % primary margin.
         if ref in PARALLEL_REFS:
             return 0.15
         if ref in {"Q", "R", "X"}:
             return 0.15
+        # Unrefed taxis: apply the diagonal-stub rule only for
+        # SHORT centerlines (< 250 m).  SPLP's main taxi runs
+        # long primaries at ~19° off runway (perp_diff=71°
+        # inside the 20-75 window) and must stay at 15 % margin
+        # to preserve the full primary-parallel length.  Only
+        # short unrefed diagonal connectors (e.g. SPLP's
+        # (-449,-1084) L=109) should get 35 % + bias
+        # shrinkage.  Refed non-parallel taxis (SPJC B/C/E/G,
+        # V1/V3/V5 sub-refs) always qualify for the diagonal
+        # check regardless of length.
+        if not ref and ls.length >= 250.0:
+            return 0.15
+        # Short unrefed parallel-to-runway rects (between two
+        # diagonal stubs on SPLP's south chain) need extra margin
+        # to avoid overlapping the neighbouring diagonal stubs.
+        # Detect: ref empty, length < 150 m, nearly parallel to
+        # runway (perp_diff > 75°) — emit as half-length primary
+        # by using 30 % margin each side (40 % retained).
         c = list(ls.coords)
         if len(c) < 2:
             return 0.15
@@ -2808,6 +2829,13 @@ def _split_centerlines_at_points(
         # perpendiculars.
         perp_diff = abs(delta - 90.0)
         if 20.0 < perp_diff < 75.0:
+            return 0.30
+        # Short unrefed parallel-to-runway rect (perp_diff >= 75°,
+        # length < 150 m) sitting between two diagonal stubs on
+        # SPLP's south chain — apply 30 % margin each side so the
+        # resulting primary rect is half its default length and
+        # doesn't overlap the adjacent diagonals.
+        if not ref and ls.length < 150.0 and perp_diff >= 75.0:
             return 0.30
         return 0.15
 
@@ -2905,7 +2933,53 @@ def _split_centerlines_at_points(
         for idx, (p0, p1) in enumerate(candidates):
             gap = p1 - p0
             is_end_seg = (idx == 0 or idx == len(candidates) - 1)
-            if is_cross and is_end_seg:
+            # Per-segment parallel check: a SHORT SLICE of a long
+            # unrefed curving taxi can be parallel-to-runway even
+            # when the full centerline's orientation is diagonal.
+            # Classify such a slice for the "short primary between
+            # diagonals" shrinkage (30 % margin each side, no bias)
+            # — fixes SPLP's (-500,-1054) which sits between two
+            # diagonal stubs and would otherwise overlap them.
+            is_short_parallel_slice = False
+            if (not ref and gap < 150.0 and rwy_centerlines):
+                try:
+                    seg_a = ls.interpolate(p0)
+                    seg_b = ls.interpolate(p1)
+                    sdx = seg_b.x - seg_a.x
+                    sdy = seg_b.y - seg_a.y
+                    smag = math.hypot(sdx, sdy)
+                    if smag > 1e-6:
+                        seg_bearing = math.degrees(
+                            math.atan2(sdx, sdy)) % 180.0
+                        rseg_best = min(
+                            rwy_centerlines,
+                            key=lambda r: ls.interpolate(
+                                (p0 + p1) / 2.0).distance(r))
+                        rseg = list(rseg_best.coords)
+                        rdx = rseg[-1][0] - rseg[0][0]
+                        rdy = rseg[-1][1] - rseg[0][1]
+                        rmag2 = math.hypot(rdx, rdy)
+                        if rmag2 > 1e-6:
+                            seg_rwy_bearing = math.degrees(
+                                math.atan2(rdx, rdy)) % 180.0
+                            seg_delta = abs(
+                                seg_bearing - seg_rwy_bearing)
+                            seg_delta = min(
+                                seg_delta, 180.0 - seg_delta)
+                            seg_perp = abs(seg_delta - 90.0)
+                            if seg_perp >= 75.0:
+                                is_short_parallel_slice = True
+                except Exception:
+                    pass
+            if is_short_parallel_slice:
+                # Shrink to half length, no bias (it's parallel,
+                # not diagonal).  Using 22 % margin each side
+                # (56 % retained) keeps the piece above the 40 m
+                # post-margin floor even for short 60-70 m slices
+                # of SPLP's main taxi.
+                m_start = 0.22 * gap
+                m_end = 0.22 * gap
+            elif is_cross and is_end_seg:
                 m_start = 0.30 * gap
                 m_end = 0.30 * gap
             elif gap_margin_frac >= 0.25:
@@ -3703,7 +3777,13 @@ def _classify_role(axis: LineString, width: float,
     length = axis.length
     # Parallel branch (bearing within 20° of a runway).
     if db < 20.0:
-        if length >= 80.0:
+        # Parallel-oriented rects are part of the primary-parallel
+        # chain even when short.  SPLP's main taxi has a 66-80 m
+        # parallel segment between runway-connecting diagonals
+        # that should emit as a primary_parallel rather than a
+        # stub (user feedback 2026-04-21: "the next piece should
+        # be a primary parallel, not a stub").
+        if length >= 50.0:
             # Close to runway → primary; far → secondary.
             if dist_rwy < 400.0:
                 return ROLE_PRIMARY_PARALLEL
