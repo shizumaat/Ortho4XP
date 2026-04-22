@@ -3596,10 +3596,16 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     from shapely.ops import substring
 
     # Symmetry tolerances: a proper rectangle has equal long sides
-    # and equal short sides (and 90° corners follow when the axis
-    # defines the perpendicular).
-    ASYM_WIDTH_TOL_M = 3.0
-    ASYM_LENGTH_TOL_M = 3.0
+    # and equal short sides.  Use a RATIO check so small rects
+    # aren't over-trimmed — a 5 m width delta on a 30 m-wide stub
+    # (17 %) reads as near-symmetric, while a 5 m delta on a
+    # 22 m-wide cross-connector (23 %) reads as a trapezoid.  User
+    # (2026-04-21): "I don't see why it should trim the second
+    # diagonal at the south end, which is already quite short and
+    # appears symmetrical" — that stub had width Δ = 5 m / max
+    # 29 m = 17 %, below threshold.
+    ASYM_WIDTH_RATIO_TOL = 0.20   # width Δ / max_width > 20 % → trim
+    ASYM_LENGTH_RATIO_TOL = 0.10  # length Δ / max_length > 10 % → trim
     # Per-iteration axis shrink per user (2026-04-21): trim BOTH
     # ends by 2.5 % of length each (5 % total) so the rect STAYS
     # CENTERED on its axis as it shrinks — trimming only the
@@ -3657,8 +3663,12 @@ def _rect_from_axis_extended(axis: LineString, width: float,
                              snapped[2][1] - snapped[3][1])
         width_asym = abs(w_end1 - w_end2)
         length_asym = abs(l_side1 - l_side2)
-        symmetric = (width_asym <= ASYM_WIDTH_TOL_M
-                     and length_asym <= ASYM_LENGTH_TOL_M)
+        max_w = max(w_end1, w_end2)
+        max_l = max(l_side1, l_side2)
+        width_ratio = (width_asym / max_w) if max_w > 1e-6 else 0.0
+        length_ratio = (length_asym / max_l) if max_l > 1e-6 else 0.0
+        symmetric = (width_ratio <= ASYM_WIDTH_RATIO_TOL
+                     and length_ratio <= ASYM_LENGTH_RATIO_TOL)
         if symmetric or attempt == MAX_ASYM_RETRIES:
             return Polygon(snapped)
 
