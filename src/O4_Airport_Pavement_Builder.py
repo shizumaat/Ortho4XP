@@ -595,6 +595,121 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                 trimmed_centerlines.append((ls, ref))
         osm_centerlines = trimmed_centerlines
 
+    # Trim PERPENDICULAR centerlines at a BUFFERED PARALLEL-
+    # CENTERLINE polygon.  Per user (2026-04-22): at SPLP
+    # (unrefed airport), perpendicular stubs come from long
+    # multipurpose taxis whose gap is bounded by a POINT
+    # crossing with the primary axis.  That crossing doesn't
+    # account for the primary's WIDTH — the 70 % rect then
+    # extends into the primary's rect zone, reading as
+    # "off-center toward the taxiway".  A 15 m buffer around
+    # each parallel-to-runway centerline (= primary half-width)
+    # pulls the perpendicular stub's primary-side endpoint
+    # out to the primary's physical edge.  SPJC doesn't need
+    # this because each sub-ref stub has its own dedicated OSM
+    # way — the geometry inherently excludes the primary
+    # width.
+    PARALLEL_BUFFER_M = 15.0
+    PARALLEL_MIN_LEN_M = 200.0
+    if rwy_centerlines:
+        parallel_polys = []
+        for ls, _ref in osm_centerlines:
+            if ls.length < PARALLEL_MIN_LEN_M:
+                continue
+            # Check if this centerline is PARALLEL to runway
+            # (perp_diff > 75°).
+            c = list(ls.coords)
+            if len(c) < 2:
+                continue
+            dx = c[-1][0] - c[0][0]
+            dy = c[-1][1] - c[0][1]
+            mag = math.hypot(dx, dy)
+            if mag < 1e-6:
+                continue
+            ax_bearing = math.degrees(
+                math.atan2(dx, dy)) % 180.0
+            mid = ls.interpolate(ls.length / 2)
+            best_r = min(rwy_centerlines,
+                         key=lambda r: mid.distance(r))
+            rc = list(best_r.coords)
+            rx = rc[-1][0] - rc[0][0]
+            ry = rc[-1][1] - rc[0][1]
+            rmag = math.hypot(rx, ry)
+            if rmag < 1e-6:
+                continue
+            rwy_bearing = math.degrees(
+                math.atan2(rx, ry)) % 180.0
+            delta = abs(ax_bearing - rwy_bearing)
+            delta = min(delta, 180.0 - delta)
+            perp_diff = abs(delta - 90.0)
+            if perp_diff > 75.0:
+                # Parallel to runway → create buffer polygon
+                try:
+                    parallel_polys.append(
+                        ls.buffer(PARALLEL_BUFFER_M))
+                except Exception:
+                    pass
+        if parallel_polys:
+            try:
+                parallel_union = unary_union(parallel_polys)
+            except Exception:
+                parallel_union = None
+            if parallel_union is not None and not parallel_union.is_empty:
+                def _perp_diff_to_rwy(ls):
+                    c = list(ls.coords)
+                    if len(c) < 2:
+                        return 90.0
+                    dx = c[-1][0] - c[0][0]
+                    dy = c[-1][1] - c[0][1]
+                    mag = math.hypot(dx, dy)
+                    if mag < 1e-6:
+                        return 90.0
+                    ax_b = math.degrees(
+                        math.atan2(dx, dy)) % 180.0
+                    mid_p = ls.interpolate(ls.length / 2)
+                    best = min(rwy_centerlines,
+                               key=lambda r: mid_p.distance(r))
+                    rc = list(best.coords)
+                    rx = rc[-1][0] - rc[0][0]
+                    ry = rc[-1][1] - rc[0][1]
+                    rmag = math.hypot(rx, ry)
+                    if rmag < 1e-6:
+                        return 90.0
+                    rw_b = math.degrees(
+                        math.atan2(rx, ry)) % 180.0
+                    dlt = abs(ax_b - rw_b)
+                    dlt = min(dlt, 180.0 - dlt)
+                    return abs(dlt - 90.0)
+
+                trimmed_perp: List[Tuple[LineString, str]] = []
+                for ls, ref in osm_centerlines:
+                    # Only trim perpendicular centerlines
+                    if _perp_diff_to_rwy(ls) >= 25.0:
+                        trimmed_perp.append((ls, ref))
+                        continue
+                    try:
+                        diff = ls.difference(parallel_union)
+                    except Exception:
+                        trimmed_perp.append((ls, ref))
+                        continue
+                    if diff.is_empty:
+                        trimmed_perp.append((ls, ref))
+                        continue
+                    if diff.geom_type == "LineString":
+                        if diff.length >= MIN_SEGMENT_LEN_M:
+                            trimmed_perp.append((diff, ref))
+                        else:
+                            trimmed_perp.append((ls, ref))
+                    elif diff.geom_type == "MultiLineString":
+                        # Multiple pieces — keep ALL so each stub
+                        # between parallels emits separately.
+                        for g in diff.geoms:
+                            if g.length >= MIN_SEGMENT_LEN_M:
+                                trimmed_perp.append((g, ref))
+                    else:
+                        trimmed_perp.append((ls, ref))
+                osm_centerlines = trimmed_perp
+
     # Per user rule (2026-04-18): "Implement splitting at cross ref
     # crossings" — split every centerline at each multi-ref
     # junction node along its path, so each straight section
