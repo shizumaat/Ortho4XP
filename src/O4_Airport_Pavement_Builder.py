@@ -3595,18 +3595,19 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     """
     from shapely.ops import substring
 
-    # 3 m width-diff tolerance: 2 m was too tight (forced a 34 m
-    # rect that's visually too small), 5 m left clear trapezoids.
-    # 3 m keeps minor snap jitter while still catching real
-    # junction intrusion.
+    # Symmetry tolerances: a proper rectangle has equal long sides
+    # and equal short sides (and 90° corners follow when the axis
+    # defines the perpendicular).
     ASYM_WIDTH_TOL_M = 3.0
-    # Trim 5 % of the axis length per iteration and retry until the
-    # rect becomes symmetric.  Iterative shrinkage (user 2026-04-21):
-    # "shrink by 5 % each iteration and retest for symmetry" — a
-    # single large trim can overshoot or still land in a widening,
-    # so small steps find the narrowest corridor edge.
-    ASYM_TRIM_FRAC = 0.05
-    MAX_ASYM_RETRIES = 15       # 15 * 5 % = up to 75 % shrink
+    ASYM_LENGTH_TOL_M = 3.0
+    # Per-iteration axis shrink per user (2026-04-21): trim BOTH
+    # ends by 2.5 % of length each (5 % total) so the rect STAYS
+    # CENTERED on its axis as it shrinks — trimming only the
+    # wider end shifts the rect toward the narrower side and
+    # leaves the problematic (wider) end snapped to the same
+    # widening zone on the next iteration.
+    ASYM_TRIM_EACH_END = 0.025     # 2.5 % off each end per iteration
+    MAX_ASYM_RETRIES = 15          # 15 * 5 % = up to 75 % shrink
 
     cur_axis = axis
     for attempt in range(MAX_ASYM_RETRIES + 1):
@@ -3644,25 +3645,28 @@ def _rect_from_axis_extended(axis: LineString, width: float,
         if degenerate:
             return None
 
-        # Check end-width symmetry
+        # Symmetry check: equal widths (end1 vs end2) AND equal
+        # lengths (side1 vs side2).
         w_end1 = math.hypot(snapped[0][0] - snapped[3][0],
                             snapped[0][1] - snapped[3][1])
         w_end2 = math.hypot(snapped[1][0] - snapped[2][0],
                             snapped[1][1] - snapped[2][1])
-        if (abs(w_end1 - w_end2) <= ASYM_WIDTH_TOL_M
-                or attempt == MAX_ASYM_RETRIES):
+        l_side1 = math.hypot(snapped[1][0] - snapped[0][0],
+                             snapped[1][1] - snapped[0][1])
+        l_side2 = math.hypot(snapped[2][0] - snapped[3][0],
+                             snapped[2][1] - snapped[3][1])
+        width_asym = abs(w_end1 - w_end2)
+        length_asym = abs(l_side1 - l_side2)
+        symmetric = (width_asym <= ASYM_WIDTH_TOL_M
+                     and length_asym <= ASYM_LENGTH_TOL_M)
+        if symmetric or attempt == MAX_ASYM_RETRIES:
             return Polygon(snapped)
 
-        # Asymmetric — trim the WIDER end and retry.  Use substring
-        # on the current axis: if end1 is wider, start farther along;
-        # if end2 is wider, end earlier.
-        trim = ASYM_TRIM_FRAC * cur_axis.length
-        if w_end1 > w_end2:
-            new_start = trim
-            new_end = cur_axis.length
-        else:
-            new_start = 0.0
-            new_end = cur_axis.length - trim
+        # Asymmetric — trim BOTH ends and retry, keeping the rect
+        # centered on its axis (per user 2026-04-21 feedback).
+        trim_each = ASYM_TRIM_EACH_END * cur_axis.length
+        new_start = trim_each
+        new_end = cur_axis.length - trim_each
         if new_end - new_start < MIN_SEGMENT_LEN_M:
             # Axis would become too short; accept current asymmetric
             # rect rather than discarding.
