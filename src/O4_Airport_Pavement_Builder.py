@@ -3595,9 +3595,18 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     """
     from shapely.ops import substring
 
-    ASYM_WIDTH_TOL_M = 5.0
-    ASYM_TRIM_FRAC = 0.15       # shorten 15 % of axis length
-    MAX_ASYM_RETRIES = 2
+    # 3 m width-diff tolerance: 2 m was too tight (forced a 34 m
+    # rect that's visually too small), 5 m left clear trapezoids.
+    # 3 m keeps minor snap jitter while still catching real
+    # junction intrusion.
+    ASYM_WIDTH_TOL_M = 3.0
+    # Trim 5 % of the axis length per iteration and retry until the
+    # rect becomes symmetric.  Iterative shrinkage (user 2026-04-21):
+    # "shrink by 5 % each iteration and retest for symmetry" — a
+    # single large trim can overshoot or still land in a widening,
+    # so small steps find the narrowest corridor edge.
+    ASYM_TRIM_FRAC = 0.05
+    MAX_ASYM_RETRIES = 15       # 15 * 5 % = up to 75 % shrink
 
     cur_axis = axis
     for attempt in range(MAX_ASYM_RETRIES + 1):
