@@ -683,8 +683,13 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
 
                 trimmed_perp: List[Tuple[LineString, str]] = []
                 for ls, ref in osm_centerlines:
-                    # Only trim perpendicular centerlines
-                    if _perp_diff_to_rwy(ls) >= 25.0:
+                    # Trim perpendicular AND diagonal centerlines
+                    # — both cross the parallel-parallel corridor
+                    # and benefit from starting at the primary
+                    # EDGE not axis.  Skip only near-parallel ones
+                    # (perp_diff >= 75°) which are themselves
+                    # primaries.
+                    if _perp_diff_to_rwy(ls) >= 75.0:
                         trimmed_perp.append((ls, ref))
                         continue
                     try:
@@ -2150,7 +2155,15 @@ def _emit_primary_parallel_runway_stubs(
     if pav_union is None or pav_union.is_empty:
         return []
 
-    STUB_EXIT_D_M = 80.0    # path leaves runway-proximity at this d
+    # SPJC A/F have loop ramps at runway ends — target stubs sit at
+    # the APEX of the loop where the ramp meets the normal taxi
+    # corridor (d_rwy ≈ 100 m).  80 m threshold lands us there.
+    # SPLP has no loops — the primary curves smoothly into the
+    # runway and target stubs sit MID-CURVE (d_rwy ≈ 50 m).
+    # 80 m threshold walks past the mid-curve into the straight
+    # section.  Use tighter threshold for unrefed ways.
+    STUB_EXIT_D_M_REFED = 80.0
+    STUB_EXIT_D_M_UNREFED = 50.0
     STUB_LEN_M = 80.0       # target A/F stubs are 79–93 m
     ENDPOINT_INSIDE_TOL_M = 10.0  # allow near-boundary endpoints
     OUTSIDE_NEAR_RWY_M = 135.0  # NE-end endpoint within 135 m of
@@ -2242,9 +2255,11 @@ def _emit_primary_parallel_runway_stubs(
 
                 if endpoint_inside:
                     # Walk from the endpoint toward the interior
-                    # until d_rwy > STUB_EXIT_D_M.  The "exit"
+                    # until d_rwy > exit threshold.  The "exit"
                     # vertex sits just outside the runway-apron
                     # ramp and becomes the stub center.
+                    exit_d = (STUB_EXIT_D_M_REFED if ref
+                              else STUB_EXIT_D_M_UNREFED)
                     step = 1 if end_idx == 0 else -1
                     exit_idx = None
                     i = end_idx if end_idx >= 0 else len(coords) - 1
@@ -2252,7 +2267,7 @@ def _emit_primary_parallel_runway_stubs(
                         d = Point(coords[i]).distance(rwy_boundary)
                         inside = runway_union.contains(
                             Point(coords[i]))
-                        if not inside and d > STUB_EXIT_D_M:
+                        if not inside and d > exit_d:
                             exit_idx = i
                             break
                         i += step
