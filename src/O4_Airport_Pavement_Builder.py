@@ -3724,6 +3724,44 @@ def _snap_corners_to_pavement(
                     snapped[j] = corners[j]
                 else:
                     snapped[i] = corners[i]
+
+    # Symmetry check: rect corners come in as [end1_side1, end2_side1,
+    # end2_side2, end1_side2] per _rect_from_axis_extended.  The two
+    # widths (end1_side1 → end1_side2 and end2_side1 → end2_side2)
+    # should be equal for a proper rectangle.  When snap pulls
+    # corners to apt.dat vertices at asymmetric offsets (one rect
+    # end near a wider pavement apron than the other), the widths
+    # diverge and the shape reads as a trapezoid.  Per user
+    # (2026-04-21): "the perpendicular stub is asymmetrical and
+    # looks like it's coming into the space of the primary
+    # parallel."  If the snapped widths differ by more than
+    # ``ASYM_WIDTH_TOL_M``, revert ONE corner on each side to
+    # its pre-snap coord so the rect stays symmetric.  We keep
+    # the NARROWER side's snap (matching the tighter pavement) and
+    # revert the wider side's corners to the pre-snap perpendicular
+    # offset.
+    ASYM_WIDTH_TOL_M = 5.0
+    if len(snapped) == 4 and len(corners) == 4:
+        # Corner indexing assumed from _rect_from_axis_extended:
+        # 0 = end1_side1, 1 = end2_side1, 2 = end2_side2, 3 = end1_side2
+        w_end1 = math.hypot(snapped[0][0] - snapped[3][0],
+                            snapped[0][1] - snapped[3][1])
+        w_end2 = math.hypot(snapped[1][0] - snapped[2][0],
+                            snapped[1][1] - snapped[2][1])
+        if abs(w_end1 - w_end2) > ASYM_WIDTH_TOL_M:
+            # Revert BOTH ends to pre-snap to keep the rect's
+            # width uniform end-to-end.  Independently snapping
+            # each corner to apt.dat vertices can produce a
+            # trapezoid when the pavement's width varies along
+            # the rect (e.g. SPLP's (-132,-128) perpendicular
+            # stub had w_end1=24 m while w_end2 extended to 31 m
+            # into a wider apron area).  The pre-snap corners
+            # are symmetric by construction (axis endpoints ±
+            # perpendicular half-width).
+            snapped[0] = corners[0]
+            snapped[1] = corners[1]
+            snapped[2] = corners[2]
+            snapped[3] = corners[3]
     return snapped
 
 
