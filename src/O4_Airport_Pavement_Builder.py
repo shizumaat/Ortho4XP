@@ -1944,14 +1944,28 @@ def _emit_primary_parallel_runway_stubs(
     STUB_EXIT_D_M = 80.0    # path leaves runway-proximity at this d
     STUB_LEN_M = 80.0       # target A/F stubs are 79–93 m
     ENDPOINT_INSIDE_TOL_M = 10.0  # allow near-boundary endpoints
+    OUTSIDE_NEAR_RWY_M = 135.0  # NE-end endpoint within 135 m of
+                                # runway but not inside (SPLP main
+                                # taxi ends at 127 m from runway).
+                                # SPJC L's internal endpoints sit
+                                # at 148-150 m so 135 m excludes
+                                # them while catching SPLP's
+                                # runway-facing taxi end.
+    UNREFED_MIN_LEN_M = 800.0   # unrefed ways that act as long
+                                # primary parallels (SPLP main taxi
+                                # is 2640 m unrefed)
 
-    # Gather per-ref OSM lines, merge like the main extractor
+    # Gather per-ref OSM lines (for parallel refs like A/F/L at
+    # SPJC), PLUS unrefed taxi ways (for SPLP whose primary taxis
+    # are all unrefed).  The unrefed ways are merged together and
+    # only very long (>UNREFED_MIN_LEN_M) merged polylines qualify
+    # as "primary parallels" for stub emission.
     by_ref: Dict[str, List[LineString]] = {}
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
             continue
         ref = tags.get("ref", "")
-        if ref not in PARALLEL_REFS:
+        if ref and ref not in PARALLEL_REFS:
             continue
         pts = []
         for n in nds:
@@ -1975,23 +1989,30 @@ def _emit_primary_parallel_runway_stubs(
 
     new_stubs: List[Tuple[Polygon, LineString, str, str]] = []
     rwy_boundary = runway_union.boundary
+    emitted_centers: List[Tuple[float, float]] = []
+    DEDUP_DIST_M = 50.0  # de-dup stub centers within 50 m
     for ref, lines in by_ref.items():
-        if len(lines) > 1:
-            try:
-                merged = linemerge(MultiLineString(lines))
-            except Exception:
-                merged = None
-            if merged is None or merged.is_empty:
-                merged_lines = lines
-            elif merged.geom_type == "LineString":
-                merged_lines = [merged]
-            else:
-                merged_lines = list(merged.geoms)
-            merged_lines = _bridge_same_ref_polylines(merged_lines)
+        # Process INDIVIDUAL OSM ways (not merged).  Shared
+        # endpoints between ways (e.g. SPLP -696729 and -696733
+        # both end at (226,1182) which is an internal junction
+        # to the runway-apron ramp) would become internal
+        # vertices after linemerge — and thus hidden from
+        # endpoint checking.  Per-way processing exposes each
+        # OSM endpoint; the ``emitted_centers`` dedup step
+        # coalesces identical runway-facing endpoints.
+        if ref == "":
+            # Unrefed airports: each individual way must be long
+            # enough to represent a primary-parallel taxi.
+            # SPLP main taxi (-696729) is 2640 m and -696733 is
+            # 1456 m; both exceed the 800 m threshold.
+            processed_lines = [ml for ml in lines
+                               if ml.length >= UNREFED_MIN_LEN_M]
         else:
-            merged_lines = lines
+            # Refed parallels: each way is already part of a
+            # named taxi.  Process all of them.
+            processed_lines = list(lines)
 
-        for ml in merged_lines:
+        for ml in processed_lines:
             coords = list(ml.coords)
             if len(coords) < 2:
                 continue
@@ -1999,23 +2020,44 @@ def _emit_primary_parallel_runway_stubs(
             for end_idx in (0, -1):
                 ep_pt = Point(coords[end_idx])
                 d_ep = ep_pt.distance(rwy_boundary)
-                if not (runway_union.contains(ep_pt)
-                        or d_ep <= ENDPOINT_INSIDE_TOL_M):
+                endpoint_inside = (
+                    runway_union.contains(ep_pt)
+                    or d_ep <= ENDPOINT_INSIDE_TOL_M
+                )
+                endpoint_outside_near = (
+                    not endpoint_inside
+                    and d_ep <= OUTSIDE_NEAR_RWY_M
+                )
+                if not (endpoint_inside or endpoint_outside_near):
                     continue
-                # Walk from the endpoint toward the interior until
-                # d_rwy > STUB_EXIT_D_M.  step is vertex-by-vertex.
-                step = 1 if end_idx == 0 else -1
-                exit_idx = None
-                i = end_idx if end_idx >= 0 else len(coords) - 1
-                while 0 <= i < len(coords):
-                    d = Point(coords[i]).distance(rwy_boundary)
-                    inside = runway_union.contains(Point(coords[i]))
-                    if not inside and d > STUB_EXIT_D_M:
-                        exit_idx = i
-                        break
-                    i += step
-                if exit_idx is None:
-                    continue
+
+                if endpoint_inside:
+                    # Walk from the endpoint toward the interior
+                    # until d_rwy > STUB_EXIT_D_M.  The "exit"
+                    # vertex sits just outside the runway-apron
+                    # ramp and becomes the stub center.
+                    step = 1 if end_idx == 0 else -1
+                    exit_idx = None
+                    i = end_idx if end_idx >= 0 else len(coords) - 1
+                    while 0 <= i < len(coords):
+                        d = Point(coords[i]).distance(rwy_boundary)
+                        inside = runway_union.contains(
+                            Point(coords[i]))
+                        if not inside and d > STUB_EXIT_D_M:
+                            exit_idx = i
+                            break
+                        i += step
+                    if exit_idx is None:
+                        continue
+                else:
+                    # Endpoint is OUTSIDE the runway but within
+                    # OUTSIDE_NEAR_RWY_M.  The taxi curves to
+                    # runway at this end but doesn't enter runway
+                    # pavement (SPLP NE end at 127 m).  Use the
+                    # endpoint itself as the stub center — target
+                    # rect sits at the ramp where the taxi
+                    # approaches runway.
+                    exit_idx = 0 if end_idx == 0 else len(coords) - 1
 
                 # Center stub on the exit vertex, length STUB_LEN_M
                 # along local path direction (from prev to next).
@@ -2067,8 +2109,11 @@ def _emit_primary_parallel_runway_stubs(
                             skip = True
                     except Exception:
                         pass
-                if not skip:
-                    # Same-ref near-duplicate guard
+                if not skip and ref:
+                    # Same-ref near-duplicate guard: applies only
+                    # when ref is non-empty (avoid dropping all
+                    # unrefed-airport stubs since every existing
+                    # rect has ref="" too).
                     for er, _, _, eref in existing_taxi_rects:
                         if eref != ref:
                             continue
@@ -2080,6 +2125,20 @@ def _emit_primary_parallel_runway_stubs(
                             pass
                 if skip:
                     continue
+                # Dedup by stub CENTER position — for unrefed
+                # airports, two ways can share the same runway-
+                # facing endpoint (e.g. SPLP -696729 and -696733
+                # both end at (226,1182)) and produce near-
+                # identical stubs.
+                c = rect.centroid
+                dup = False
+                for (ex, ey) in emitted_centers:
+                    if math.hypot(c.x - ex, c.y - ey) < DEDUP_DIST_M:
+                        dup = True
+                        break
+                if dup:
+                    continue
+                emitted_centers.append((c.x, c.y))
                 new_stubs.append(
                     (rect, stub_axis, ROLE_STUB, ref))
     return new_stubs
@@ -2189,6 +2248,31 @@ def _extract_osm_taxi_centerlines(
                     if chord / path_len > 0.95:
                         out.append((simp, ref))
                         continue
+            # SHORT UNREFED runway-connecting stubs: SPLP has short
+            # curvy unrefed taxis (e.g. way -696731, 165 m chord
+            # 144 m) that link runway to apron/primary.  Target
+            # emits a single rect in the middle of each.  Bend-
+            # splitting fragments them into pieces too small to
+            # survive the 40 m floor in `_split_centerlines_at_points`.
+            # Emit atomically when: ref="" (unrefed) AND path < 300 m
+            # AND one endpoint is inside the runway polygon.
+            if (not ref
+                    and ls.length < 300.0
+                    and rwy_centerlines):
+                try:
+                    sc = list(simp.coords)
+                    if len(sc) >= 2:
+                        ep0 = Point(sc[0])
+                        ep1 = Point(sc[-1])
+                        ep0_near = any(
+                            ep0.distance(r) < 30.0 for r in rwy_centerlines)
+                        ep1_near = any(
+                            ep1.distance(r) < 30.0 for r in rwy_centerlines)
+                        if ep0_near or ep1_near:
+                            out.append((simp, ref))
+                            continue
+                except Exception:
+                    pass
             # All refs (including sub-refs) split at significant
             # bends.  Per user (2026-04-20 refined): intersections
             # + sharp curves define rect break points; there's no
@@ -2664,6 +2748,22 @@ def _split_centerlines_at_points(
         # the taxi's axis due to the oblique crossing.
         if not rwy_centerlines:
             return 0.15
+        # Only STUBS (letter-only non-parallel, or letter+digit
+        # sub-refs) and cross-connectors qualify for the diagonal
+        # rule.  PARALLEL_REFS (A, F, L, V, M, U) and UNREFED
+        # taxis (e.g. SPLP's main taxi which is unrefed but runs
+        # as a long primary at ~19° off runway) should always use
+        # the 15 % primary margin — otherwise SPLP's unrefed
+        # primary gets treated as a diagonal stub (perp_diff=71°)
+        # and shrinks to 35 % length.  The diagonal rule is
+        # intended for stubs that CONNECT primary-to-runway at
+        # an angle, not the primary itself.
+        if not ref:
+            return 0.15
+        if ref in PARALLEL_REFS:
+            return 0.15
+        if ref in {"Q", "R", "X"}:
+            return 0.15
         c = list(ls.coords)
         if len(c) < 2:
             return 0.15
@@ -2814,9 +2914,12 @@ def _split_centerlines_at_points(
                 # the gap toward the runway-facing axis endpoint.
                 retained = 0.35 * gap
                 remaining_margin = gap - retained
-                # Bias: shift the rect center 25 % of the gap toward
-                # the endpoint nearer the runway.
-                bias = 0.25 * gap
+                # Bias: shift the rect center 20 % of the gap toward
+                # the endpoint nearer the runway.  User (2026-04-21):
+                # adjusted 5 % back from the original 25 % because
+                # biasing too close to the runway made diagonal stubs
+                # encroach on the runway-ramp widening zone.
+                bias = 0.20 * gap
                 # Which endpoint is closer to a runway?
                 if rwy_centerlines:
                     ep0 = ls.interpolate(p0)

@@ -108,6 +108,48 @@ cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
     is applied on bend-split segment, giving ~100-120 m
     rects with correct bias direction.
 
+13. **Diagonal bias 25 % → 20 %** per user (2026-04-21):
+    adjust "slightly away from the runway" — biasing the
+    rect center 25 % of the gap toward the runway-facing
+    endpoint was too aggressive; 20 % leaves more room
+    for the runway-ramp widening zone.
+
+14. **Diagonal rule scoped to REFED non-parallel taxis**:
+    `_rect_margin_frac_for` now early-returns 0.15 for
+    unrefed ways (`not ref`) and for PARALLEL_REFS / Q,R,X.
+    SPLP's primary taxis are UNREFED at 19° off runway
+    (perp_diff = 71° inside the 20-75 diagonal window) but
+    the full 35 % + bias rule shrinks them to junk and
+    they should stay at 15 % margin like any primary
+    parallel.  Only refed letter-only non-parallel stubs
+    (B/C/E/G) and digit-bearing sub-refs (V1, V3, V5, L1,
+    L3…) now get the diagonal treatment.
+
+15. **Runway-end stubs extended to unrefed long taxi ways**
+    (`_emit_primary_parallel_runway_stubs`): accepts
+    unrefed OSM ways whose path length ≥ 800 m and
+    processes individual ways (not linemerged) so that
+    shared junction endpoints like SPLP's (226,1182) stay
+    visible as endpoints.  Threshold for "outside but near
+    runway" tuned to 135 m (SPLP main taxi NE end is
+    127 m; SPJC L's internal endpoints at 148–150 m are
+    excluded).  Same-ref 30 m buffer dedup only applies
+    when `ref` is non-empty.  Stub centers within 50 m of
+    each other coalesce.  Recovered SPLP A-equivalent
+    stubs at (-449,-1084), (-507,-1176), and (226,1183)
+    — NE runway-facing ramp — without regressing SPJC.
+
+16. **Short unrefed runway-connecting stubs emitted
+    atomically** in `_extract_osm_taxi_centerlines`: when
+    ref is empty, way length < 300 m, and one endpoint is
+    within 30 m of a runway centerline, skip bend-splitting
+    and emit the simplified polyline as ONE centerline.
+    Recovers SPLP way -696731 (165 m chord 144 m, ratio
+    0.87) which was being bend-split into 16 m + 20 m
+    fragments that got dropped by the 40 m post-margin
+    filter.  Result: target (-293,-641) L=53 W=22 is now
+    matched by output (-297,-635) L=90 W=32.
+
 ### Results at SPJC (tol=0.5 m)
 
 | role | n_t | n_o | matched | spurious | avgIoU |
@@ -133,6 +175,23 @@ cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
 | V primary S #1 | 282 51 | 305 42 |
 | V primary S-mid | 104 52 | 147 42 ✓ |
 | V primary near-V5 | 130 50 | 147 54 ✓ |
+
+### Results at SPLP (tol=0.5 m)
+
+| role | n_t | n_o | matched | spurious | avgIoU |
+|---|---|---|---|---|---|
+| runway | 1 | 1 | 1 | 0 | 0.87 |
+| primary_parallel | 5 | 5 | 4 | 1 | 0.66 |
+| secondary_parallel | 0 | 1 | 0 | 1 | — |
+| cross_connector | 2 | 2 | 2 | 0 | 0.50 |
+| stub | 6 | 9 | 5 | 4 | 0.44 |
+| apron | 3 | 0 | 0 | 0 | — (disabled) |
+| junction | 13 | 0 | 0 | 0 | — (disabled) |
+| **TOTALS** | **30** | **18** | **12** | **6** | |
+
+SPLP (up from 10 → 12 matched this session).  All 6
+target stubs have a nearby output; compare-tool counts
+5 matches (one output didn't clear the IoU threshold).
 
 ### Open items for next session
 
