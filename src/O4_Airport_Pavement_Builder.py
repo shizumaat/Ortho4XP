@@ -715,6 +715,12 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
                         trimmed_perp.append((ls, ref))
                 osm_centerlines = trimmed_perp
 
+    # NOTE: pavement-edge-aware end-trim was attempted here but
+    # interacted badly with the diagonal centerline assembly
+    # (dropped a valid stub).  Revisit when we need finer-grained
+    # widening detection for diagonals not near any parallel
+    # centerline.
+
     # Per user rule (2026-04-18): "Implement splitting at cross ref
     # crossings" — split every centerline at each multi-ref
     # junction node along its path, so each straight section
@@ -2157,13 +2163,14 @@ def _emit_primary_parallel_runway_stubs(
 
     # SPJC A/F have loop ramps at runway ends — target stubs sit at
     # the APEX of the loop where the ramp meets the normal taxi
-    # corridor (d_rwy ≈ 100 m).  80 m threshold lands us there.
-    # SPLP has no loops — the primary curves smoothly into the
-    # runway and target stubs sit MID-CURVE (d_rwy ≈ 50 m).
-    # 80 m threshold walks past the mid-curve into the straight
-    # section.  Use tighter threshold for unrefed ways.
-    STUB_EXIT_D_M_REFED = 80.0
-    STUB_EXIT_D_M_UNREFED = 50.0
+    # corridor (d_rwy ≈ 100 m at a path vertex).  Vertex-based
+    # exit at threshold 80 m lands on that apex vertex.  SPLP has
+    # no loops — the primary curves smoothly into the runway and
+    # target stubs sit MID-CURVE BETWEEN vertices at d_rwy ≈ 75 m.
+    # Vertex-based exit over-shoots or under-shoots; interpolate
+    # to the exact target d-value.  Separate thresholds:
+    STUB_EXIT_D_M = 80.0
+    STUB_INTERP_TARGET_D_UNREFED = 75.0
     STUB_LEN_M = 80.0       # target A/F stubs are 79–93 m
     ENDPOINT_INSIDE_TOL_M = 10.0  # allow near-boundary endpoints
     OUTSIDE_NEAR_RWY_M = 135.0  # NE-end endpoint within 135 m of
@@ -2255,24 +2262,50 @@ def _emit_primary_parallel_runway_stubs(
 
                 if endpoint_inside:
                     # Walk from the endpoint toward the interior
-                    # until d_rwy > exit threshold.  The "exit"
+                    # until d_rwy > STUB_EXIT_D_M.  The "exit"
                     # vertex sits just outside the runway-apron
-                    # ramp and becomes the stub center.
-                    exit_d = (STUB_EXIT_D_M_REFED if ref
-                              else STUB_EXIT_D_M_UNREFED)
+                    # ramp.  For REFED taxis (SPJC A/F) use the
+                    # vertex directly as stub center — target
+                    # happens to sit at a vertex (apex of loop
+                    # ramp).  For UNREFED (SPLP curving primary)
+                    # INTERPOLATE back to ``STUB_INTERP_TARGET_D_UNREFED``
+                    # because the target sits BETWEEN vertices
+                    # in a smooth curve.
                     step = 1 if end_idx == 0 else -1
                     exit_idx = None
+                    prev_i = None
+                    prev_d = 0.0
                     i = end_idx if end_idx >= 0 else len(coords) - 1
                     while 0 <= i < len(coords):
                         d = Point(coords[i]).distance(rwy_boundary)
                         inside = runway_union.contains(
                             Point(coords[i]))
-                        if not inside and d > exit_d:
+                        if not inside and d > STUB_EXIT_D_M:
                             exit_idx = i
+                            exit_d_val = d
                             break
+                        prev_i = i
+                        prev_d = d
                         i += step
                     if exit_idx is None:
                         continue
+                    # Compute stub center (cx, cy)
+                    if (not ref and prev_i is not None
+                            and exit_d_val > prev_d
+                            and prev_d < STUB_INTERP_TARGET_D_UNREFED
+                            < exit_d_val):
+                        frac = ((STUB_INTERP_TARGET_D_UNREFED
+                                 - prev_d)
+                                / (exit_d_val - prev_d))
+                        interp_cx = (coords[prev_i][0]
+                                     + frac * (coords[exit_idx][0]
+                                               - coords[prev_i][0]))
+                        interp_cy = (coords[prev_i][1]
+                                     + frac * (coords[exit_idx][1]
+                                               - coords[prev_i][1]))
+                    else:
+                        interp_cx = coords[exit_idx][0]
+                        interp_cy = coords[exit_idx][1]
                 else:
                     # Endpoint is OUTSIDE the runway but within
                     # OUTSIDE_NEAR_RWY_M.  The taxi curves to
@@ -2282,9 +2315,12 @@ def _emit_primary_parallel_runway_stubs(
                     # rect sits at the ramp where the taxi
                     # approaches runway.
                     exit_idx = 0 if end_idx == 0 else len(coords) - 1
+                    interp_cx = coords[exit_idx][0]
+                    interp_cy = coords[exit_idx][1]
 
-                # Center stub on the exit vertex, length STUB_LEN_M
-                # along local path direction (from prev to next).
+                # Center stub on interpolated center (interp_cx,
+                # interp_cy), length STUB_LEN_M along local path
+                # direction (from prev to next of exit vertex).
                 prev_idx = max(0, exit_idx - 1)
                 next_idx = min(len(coords) - 1, exit_idx + 1)
                 dx = coords[next_idx][0] - coords[prev_idx][0]
@@ -2293,7 +2329,7 @@ def _emit_primary_parallel_runway_stubs(
                 if mag < 1e-6:
                     continue
                 ux, uy = dx / mag, dy / mag
-                cx, cy = coords[exit_idx]
+                cx, cy = interp_cx, interp_cy
                 ax_start = (cx - ux * STUB_LEN_M / 2,
                             cy - uy * STUB_LEN_M / 2)
                 ax_end = (cx + ux * STUB_LEN_M / 2,
