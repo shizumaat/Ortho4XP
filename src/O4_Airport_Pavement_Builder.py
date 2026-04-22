@@ -514,6 +514,87 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     junction_points = _find_junction_points(
         nodes, ways, to_m, osm_centerlines=osm_centerlines)
 
+    # Trim PERPENDICULAR-TO-RUNWAY centerlines at a BUFFERED runway
+    # polygon so the last rect on a taxi that crosses the runway
+    # stops short of the runway-junction approach.  The runway
+    # boundary IS an intersection (rule 70 % of gap between
+    # intersections), but the physical junction — where the taxi
+    # widens into the runway apron — extends some distance
+    # OUTSIDE the runway polygon too.  A 30 m buffer pulls the
+    # centerline end back from the approach widening for taxis
+    # that cross runway perpendicularly.  Per user (2026-04-21):
+    # "rects are encroaching into intersections".
+    #
+    # Only PERPENDICULAR taxis get buffered: diagonal stubs
+    # (e.g. SPLP's (-447,-1087) 45° stub) naturally approach
+    # runway at an angle and their pavement widens less
+    # dramatically; buffer-trimming them over-shrinks.
+    RWY_JUNCTION_BUFFER_M = 30.0
+    PERP_TRIM_MAX_DEG = 25.0   # perp_diff < 25° → treat as perpendicular
+    if (layout.runway_union is not None
+            and not layout.runway_union.is_empty
+            and rwy_centerlines):
+        try:
+            rwy_buffered = layout.runway_union.buffer(
+                RWY_JUNCTION_BUFFER_M)
+        except Exception:
+            rwy_buffered = layout.runway_union
+        # Nearest-runway bearing for angle check
+        def _perp_diff_to_runway(ls: LineString) -> float:
+            c = list(ls.coords)
+            if len(c) < 2:
+                return 90.0
+            dx = c[-1][0] - c[0][0]
+            dy = c[-1][1] - c[0][1]
+            mag = math.hypot(dx, dy)
+            if mag < 1e-6:
+                return 90.0
+            ax_bearing = math.degrees(
+                math.atan2(dx, dy)) % 180.0
+            mid = ls.interpolate(ls.length / 2)
+            best = min(rwy_centerlines,
+                       key=lambda r: mid.distance(r))
+            rc = list(best.coords)
+            rx = rc[-1][0] - rc[0][0]
+            ry = rc[-1][1] - rc[0][1]
+            rmag = math.hypot(rx, ry)
+            if rmag < 1e-6:
+                return 90.0
+            rwy_bearing = math.degrees(
+                math.atan2(rx, ry)) % 180.0
+            delta = abs(ax_bearing - rwy_bearing)
+            delta = min(delta, 180.0 - delta)
+            return abs(delta - 90.0)
+
+        trimmed_centerlines: List[Tuple[LineString, str]] = []
+        for ls, ref in osm_centerlines:
+            # Only buffer-trim PERPENDICULAR centerlines
+            if _perp_diff_to_runway(ls) >= PERP_TRIM_MAX_DEG:
+                trimmed_centerlines.append((ls, ref))
+                continue
+            try:
+                diff = ls.difference(rwy_buffered)
+            except Exception:
+                trimmed_centerlines.append((ls, ref))
+                continue
+            if diff.is_empty:
+                trimmed_centerlines.append((ls, ref))
+                continue
+            if diff.geom_type == "LineString":
+                if diff.length >= MIN_SEGMENT_LEN_M:
+                    trimmed_centerlines.append((diff, ref))
+                else:
+                    trimmed_centerlines.append((ls, ref))
+            elif diff.geom_type == "MultiLineString":
+                longest = max(diff.geoms, key=lambda g: g.length)
+                if longest.length >= MIN_SEGMENT_LEN_M:
+                    trimmed_centerlines.append((longest, ref))
+                else:
+                    trimmed_centerlines.append((ls, ref))
+            else:
+                trimmed_centerlines.append((ls, ref))
+        osm_centerlines = trimmed_centerlines
+
     # Per user rule (2026-04-18): "Implement splitting at cross ref
     # crossings" — split every centerline at each multi-ref
     # junction node along its path, so each straight section
