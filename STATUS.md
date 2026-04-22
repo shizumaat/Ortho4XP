@@ -86,6 +86,28 @@ cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
     Recovered 15/15 stubs at SPJC (A, F added; L already
     emitted as "L7" via the main pipeline).
 
+12. **Diagonal range widened to 20-75** (was 25-65) for
+    `_rect_margin_frac_for` perp_diff check.  B / C / E / G
+    at SPJC measure perp_diff ≈ 69° — just outside the old
+    25-65 window.  Per user (2026-04-21): letter-only
+    non-parallel taxis that "connect to the runway at an
+    angle" are in the same diagonal-stub family as V3 and
+    should get the same 35 % retained + 25 % gap bias
+    toward the runway-facing endpoint.  Result: B
+    (1214,392) L=116 W=43, C (1496,-197) L=114 W=50,
+    E (1719,-661) L=118 W=50, G (1821,-873) L=86 W=47 —
+    bias shifted each rect toward its segment's
+    runway-facing endpoint.  NOTE: each B/C/E/G centerline
+    is still bend-split at its A / L crossing partway
+    along, so the "gap" the rule applies to is the
+    POST-SPLIT segment (~320 m for B, not full 575 m OSM
+    path).  Target L=191 for B would require the FULL
+    merged path as gap (atomic emission) — attempted, but
+    rects then clip against pav_union-minus-runway and
+    regress match count 50→46.  Current compromise: rule
+    is applied on bend-split segment, giving ~100-120 m
+    rects with correct bias direction.
+
 ### Results at SPJC (tol=0.5 m)
 
 | role | n_t | n_o | matched | spurious | avgIoU |
@@ -94,7 +116,7 @@ cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
 | primary_parallel | 30 | 21 | 21 | 0 | 0.67 |
 | secondary_parallel | 4 | 5 | 4 | 1 | 0.73 |
 | cross_connector | 6 | 6 | 6 | 0 | 0.73 |
-| stub | 15 | 15 | **15** ✓ | 0 | 0.73 |
+| stub | 15 | 15 | **15** ✓ | 0 | 0.66 |
 | terminal | 2 | 2 | 2 | 0 | 0.29 |
 | apron | 3 | 0 | 0 | 0 | — (disabled) |
 | junction | 43 | 0 | 0 | 0 | — (disabled) |

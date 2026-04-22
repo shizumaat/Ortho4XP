@@ -2695,13 +2695,19 @@ def _split_centerlines_at_points(
         rwy_bearing = math.degrees(math.atan2(rx, ry)) % 180.0
         delta = abs(axis_bearing - rwy_bearing)
         delta = min(delta, 180.0 - delta)
-        # Perpendicular = 90°.  Use margin 0.30 when axis is 30–60°
-        # off perpendicular (60° < delta < 120° away from parallel,
-        # i.e. 30° < perp_diff < 60°).  Parallel taxis (delta near 0
-        # or 180) stay at 0.15; perpendicular taxis (delta near 90)
-        # stay at 0.15.
+        # Perpendicular = 90°.  Taxis that connect to the runway
+        # AT AN ANGLE (not parallel, not perpendicular) get the
+        # diagonal-stub treatment: 35 % rect length biased 25 %
+        # of the gap toward the runway-facing endpoint.  Primary
+        # parallels (delta ≈ 0°, perp_diff ≈ 90°) stay at 15 %;
+        # perpendicular cross-connectors (delta ≈ 90°,
+        # perp_diff ≈ 0°) stay at 15 %.  B/C/E/G at SPJC measure
+        # perp_diff ≈ 69° — just outside the old 25-65 window —
+        # so widen to 20-75 to cover the full "at an angle"
+        # band while still excluding pure parallels and
+        # perpendiculars.
         perp_diff = abs(delta - 90.0)
-        if 25.0 < perp_diff < 65.0:
+        if 20.0 < perp_diff < 75.0:
             return 0.30
         return 0.15
 
