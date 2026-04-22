@@ -3584,36 +3584,85 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     nearest pavement edge point within ``EDGE_SNAP_RADIUS_M``.
     This matches the snapped target convention where every non-
     runway vertex sits on an apt.dat pavement vertex.
+
+    Asymmetric-snap trim: when the two snapped end-widths differ
+    by more than ``ASYM_WIDTH_TOL_M``, the rect has extended into
+    a widening pavement area (apron or junction) on the wider end.
+    Per user (2026-04-21): "if we're getting an asymmetric rect,
+    most likely it's too long and needs to be shortened a bit so
+    it's not pulled into a junction."  Retry once with the axis
+    trimmed by ``ASYM_TRIM_FRAC`` of its length on the wider end.
     """
-    coords = list(axis.coords)
-    if len(coords) < 2:
-        return None
-    p1 = coords[0]
-    p2 = coords[-1]
-    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-    mag = math.hypot(dx, dy)
-    if mag < 1e-6:
-        return None
-    ux, uy = dx / mag, dy / mag
-    px, py = -uy, ux
-    half = width / 2.0
-    corners = [
-        (p1[0] + px * half, p1[1] + py * half),
-        (p2[0] + px * half, p2[1] + py * half),
-        (p2[0] - px * half, p2[1] - py * half),
-        (p1[0] - px * half, p1[1] - py * half),
-    ]
-    snapped = _snap_corners_to_pavement(corners, pav, apt_vertices)
-    # Reject degenerate rects where snap collapsed two corners onto
-    # the same apt.dat vertex (produces a zero-area or triangle-
-    # shaped polygon that breaks rule 7 "corners on pav boundary"
-    # by having 2 coincident corners).
-    for i in range(4):
-        for j in range(i + 1, 4):
-            if math.hypot(snapped[i][0] - snapped[j][0],
-                          snapped[i][1] - snapped[j][1]) < 1.0:
-                return None
-    return Polygon(snapped)
+    from shapely.ops import substring
+
+    ASYM_WIDTH_TOL_M = 5.0
+    ASYM_TRIM_FRAC = 0.15       # shorten 15 % of axis length
+    MAX_ASYM_RETRIES = 2
+
+    cur_axis = axis
+    for attempt in range(MAX_ASYM_RETRIES + 1):
+        coords = list(cur_axis.coords)
+        if len(coords) < 2:
+            return None
+        p1 = coords[0]
+        p2 = coords[-1]
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        mag = math.hypot(dx, dy)
+        if mag < 1e-6:
+            return None
+        ux, uy = dx / mag, dy / mag
+        px, py = -uy, ux
+        half = width / 2.0
+        corners = [
+            (p1[0] + px * half, p1[1] + py * half),   # 0: end1 side1
+            (p2[0] + px * half, p2[1] + py * half),   # 1: end2 side1
+            (p2[0] - px * half, p2[1] - py * half),   # 2: end2 side2
+            (p1[0] - px * half, p1[1] - py * half),   # 3: end1 side2
+        ]
+        snapped = _snap_corners_to_pavement(
+            corners, pav, apt_vertices)
+        # Reject degenerate rects where snap collapsed two corners
+        # onto the same apt.dat vertex.
+        degenerate = False
+        for i in range(4):
+            for j in range(i + 1, 4):
+                if math.hypot(snapped[i][0] - snapped[j][0],
+                              snapped[i][1] - snapped[j][1]) < 1.0:
+                    degenerate = True
+                    break
+            if degenerate:
+                break
+        if degenerate:
+            return None
+
+        # Check end-width symmetry
+        w_end1 = math.hypot(snapped[0][0] - snapped[3][0],
+                            snapped[0][1] - snapped[3][1])
+        w_end2 = math.hypot(snapped[1][0] - snapped[2][0],
+                            snapped[1][1] - snapped[2][1])
+        if (abs(w_end1 - w_end2) <= ASYM_WIDTH_TOL_M
+                or attempt == MAX_ASYM_RETRIES):
+            return Polygon(snapped)
+
+        # Asymmetric — trim the WIDER end and retry.  Use substring
+        # on the current axis: if end1 is wider, start farther along;
+        # if end2 is wider, end earlier.
+        trim = ASYM_TRIM_FRAC * cur_axis.length
+        if w_end1 > w_end2:
+            new_start = trim
+            new_end = cur_axis.length
+        else:
+            new_start = 0.0
+            new_end = cur_axis.length - trim
+        if new_end - new_start < MIN_SEGMENT_LEN_M:
+            # Axis would become too short; accept current asymmetric
+            # rect rather than discarding.
+            return Polygon(snapped)
+        try:
+            cur_axis = substring(cur_axis, new_start, new_end)
+        except Exception:
+            return Polygon(snapped)
+    return None
 
 
 VERTEX_SNAP_RADIUS_M = 8.0  # first-choice: snap to real apt.dat vertex
@@ -3740,28 +3789,6 @@ def _snap_corners_to_pavement(
     # the NARROWER side's snap (matching the tighter pavement) and
     # revert the wider side's corners to the pre-snap perpendicular
     # offset.
-    ASYM_WIDTH_TOL_M = 5.0
-    if len(snapped) == 4 and len(corners) == 4:
-        # Corner indexing assumed from _rect_from_axis_extended:
-        # 0 = end1_side1, 1 = end2_side1, 2 = end2_side2, 3 = end1_side2
-        w_end1 = math.hypot(snapped[0][0] - snapped[3][0],
-                            snapped[0][1] - snapped[3][1])
-        w_end2 = math.hypot(snapped[1][0] - snapped[2][0],
-                            snapped[1][1] - snapped[2][1])
-        if abs(w_end1 - w_end2) > ASYM_WIDTH_TOL_M:
-            # Revert BOTH ends to pre-snap to keep the rect's
-            # width uniform end-to-end.  Independently snapping
-            # each corner to apt.dat vertices can produce a
-            # trapezoid when the pavement's width varies along
-            # the rect (e.g. SPLP's (-132,-128) perpendicular
-            # stub had w_end1=24 m while w_end2 extended to 31 m
-            # into a wider apron area).  The pre-snap corners
-            # are symmetric by construction (axis endpoints ±
-            # perpendicular half-width).
-            snapped[0] = corners[0]
-            snapped[1] = corners[1]
-            snapped[2] = corners[2]
-            snapped[3] = corners[3]
     return snapped
 
 
