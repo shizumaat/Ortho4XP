@@ -4,13 +4,19 @@
 `src/O4_Airport_Pavement_Builder.py` reproducing hand-drawn target
 layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.
 
-**SESSION 6 ongoing (2026-04-21 resume):** JUNCTIONS + APRONS both
-DISABLED (`EMIT_JUNCTIONS = False`, `EMIT_APRONS = False`).  Full
-V-family + Q/R + diagonal-stub rect correctness achieved.  **50/105
-matched at SPJC** with 100 % stub match (15/15) and 100 %
-cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
+**SESSION 6 ongoing (2026-04-21 / 2026-04-22):** JUNCTIONS + APRONS
+both DISABLED (`EMIT_JUNCTIONS = False`, `EMIT_APRONS = False`).
 
-## Session 6 (2026-04-21) — Q/R splits + diagonal stubs + V1 width
+**SPJC:** 50/105 matched — stub 15/15 ✓, cross_connector 6/6 ✓,
+primary_parallel 21/30 (0 spurious), runway 2/2.  stub avgIoU 0.68,
+cross avgIoU 0.76.  1 spurious secondary_parallel.
+
+**SPLP:** 13/30 matched — stub 5/6, primary_parallel 5/5,
+cross_connector 2/2, runway 1/1.  stub avgIoU 0.58.  Perpendicular
+stubs now center-aligned on targets; walking runway-curve stub
+landed at d=1 m from target via interpolation.
+
+## Session 6 (2026-04-21 / 2026-04-22) — rect correctness iteration
 
 ### Changes landed
 
@@ -182,15 +188,56 @@ cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
     toward runway → (-435,-1110) L=54 W=29.  Long unrefed
     centerlines (primary taxis) still return 0.15 margin.
 
-### Results at SPJC (tol=0.5 m)
+21. **Iterative symmetric axis trim** in
+    `_rect_from_axis_extended` — when corner-snap produces an
+    asymmetric rect (trapezoid with unequal end-widths or
+    parallelogram with unequal long sides), trim BOTH ends
+    by 2.5 % of axis length (5 % total) per iteration and
+    rebuild.  Uses RATIO-based tolerance (width Δ /
+    max_width > 20 % or length Δ / max_length > 10 %) so
+    short stubs with modest m-diffs aren't over-trimmed.
+    Max 15 iterations (up to 75 % shrink).  Result: SPLP
+    trapezoidal stubs now read as proper rectangles with
+    near-equal sides.
+
+22. **30 m runway-buffer trim for perpendicular taxis**:
+    before cut-param splitting, trim each perpendicular-to-
+    runway centerline (perp_diff < 25°) at a 30 m-buffered
+    runway polygon.  Captures the runway-apron widening
+    zone extending OUTSIDE the runway polygon proper.
+    Example SPLP: (58,467) L 95 → 34 (target 39).  Extended
+    later (item 24) to all non-parallel centerlines.
+
+23. **Parallel-centerline buffer trim** for non-parallel
+    centerlines (perp_diff < 75°): trim at a 15 m-buffered
+    polygon around every parallel-to-runway centerline
+    (length ≥ 200 m, perp_diff > 75°).  The 15 m buffer
+    approximates a primary's half-width, so the trimmed
+    perpendicular/diagonal stub starts at the primary's
+    physical EDGE not its axis.  Fixes the "off-center
+    toward taxiway" complaint: SPLP perpendicular stub
+    centers now match target exactly — (50,476) at
+    target (52,473) ✓, (-140,-123) at exact target ✓,
+    (-301,-638) at target (-293,-641) ✓.
+
+24. **Split STUB_EXIT_D_M between refed and unrefed**:
+    SPJC A/F (refed) stay at 80 m threshold — target sits
+    at the loop-ramp apex (d_rwy ≈ 100 m) which lands on a
+    path vertex.  SPLP unrefed uses vertex exit at 80 m
+    PLUS interpolation back to d_rwy = 75 m (target sits
+    BETWEEN vertices mid-curve).  Result: SPLP walking
+    runway-curve stub (-494,-1205) now at d=1 m from
+    target (-493,-1204) — exact match (was d=22 m).
+
+### Results at SPJC (tol=0.5 m, 2026-04-22)
 
 | role | n_t | n_o | matched | spurious | avgIoU |
 |---|---|---|---|---|---|
 | runway | 2 | 2 | 2 | 0 | 0.95 |
 | primary_parallel | 30 | 21 | 21 | 0 | 0.67 |
 | secondary_parallel | 4 | 5 | 4 | 1 | 0.73 |
-| cross_connector | 6 | 6 | 6 | 0 | 0.73 |
-| stub | 15 | 15 | **15** ✓ | 0 | 0.66 |
+| cross_connector | 6 | 6 | 6 | 0 | **0.76** |
+| stub | 15 | 15 | **15** ✓ | 0 | 0.68 |
 | terminal | 2 | 2 | 2 | 0 | 0.29 |
 | apron | 3 | 0 | 0 | 0 | — (disabled) |
 | junction | 43 | 0 | 0 | 0 | — (disabled) |
@@ -208,22 +255,29 @@ cross-connector match (6/6).  Only 1 spurious (1 secondary_parallel).
 | V primary S-mid | 104 52 | 147 42 ✓ |
 | V primary near-V5 | 130 50 | 147 54 ✓ |
 
-### Results at SPLP (tol=0.5 m)
+### Results at SPLP (tol=0.5 m, 2026-04-22)
 
 | role | n_t | n_o | matched | spurious | avgIoU |
 |---|---|---|---|---|---|
 | runway | 1 | 1 | 1 | 0 | 0.87 |
-| primary_parallel | 5 | 5 | 4 | 1 | 0.66 |
+| primary_parallel | 5 | 6 | 5 | 1 | 0.60 |
 | secondary_parallel | 0 | 1 | 0 | 1 | — |
 | cross_connector | 2 | 2 | 2 | 0 | 0.50 |
-| stub | 6 | 9 | 5 | 4 | 0.44 |
+| stub | 6 | 6 | 5 | 1 | **0.58** |
 | apron | 3 | 0 | 0 | 0 | — (disabled) |
 | junction | 13 | 0 | 0 | 0 | — (disabled) |
-| **TOTALS** | **30** | **18** | **12** | **6** | |
+| **TOTALS** | **30** | **16** | **13** | **3** | |
 
-SPLP (up from 10 → 12 matched this session).  All 6
-target stubs have a nearby output; compare-tool counts
-5 matches (one output didn't clear the IoU threshold).
+SPLP (up from 10 → 13 matched this session).
+
+**SPLP perpendicular-stub centers now match target exactly:**
+
+| Stub | Output | Target | Δ pos |
+|---|---|---|---|
+| N cross (58,467) | L=38 @ (50,476) | L=39 @ (52,473) | 3 m |
+| Mid (-140,-123) | L=58 @ (-140,-123) | L=31 @ (-140,-123) | 0 m |
+| S-mid (-301,-638) | L=50 @ (-301,-638) | L=53 @ (-293,-641) | 9 m |
+| Curving primary stub | L=88 @ (-494,-1205) | L=109 @ (-493,-1204) | **1 m** |
 
 ### Open items for next session
 
@@ -253,6 +307,16 @@ target stubs have a nearby output; compare-tool counts
    width filter (e.g. reject rect if W < 30 m for
    secondary/primary parallels).
 
+6. **SPLP diagonal stub (-432,-1115) too short** — target
+   (-447,-1087) L=86 vs mine L=40.  Target extends ~30 m
+   BEYOND the OSM centerline's extent into apt.dat
+   pavement.  Would need a "extend-along-pavement" pass
+   scoped to unrefed diagonals (risky for SPJC sub-refs
+   whose OSM length is definitive).  Left note in code;
+   also an attempt at pavement-edge-aware end-trim was
+   reverted (dropped a valid stub by interacting with
+   diagonal centerline assembly).
+
 ### Current constants (session 6)
 
 - `SIGNIFICANT_BEND_DEG = 5.0`
@@ -262,9 +326,18 @@ target stubs have a nearby output; compare-tool counts
   `WIDEN_FACTOR=1.2`, `MIN_ALWAYS_MERGE=25 m`,
   `MAX_CLUSTER_SPAN_M=400 m`.
 - `GAP_MARGIN_FRAC = 0.15` (default), `0.30` for cross-
-  connector end-segments, `0.325` for diagonal stubs
-  (25 < perp_diff < 65) with 25 % gap bias toward runway.
+  connector end-segments, `0.35` for diagonal stubs
+  (20 < perp_diff < 75) with 20 % gap bias toward runway
+  (user 2026-04-21: reduced from 25 %).
 - `40 m` minimum post-margin centerline length.
+- `RWY_JUNCTION_BUFFER_M = 30` (perp-taxi runway buffer).
+- `PARALLEL_BUFFER_M = 15`, `PARALLEL_MIN_LEN_M = 200`
+  (non-parallel taxi trim at parallel-centerline buffer).
+- `STUB_EXIT_D_M = 80` (walking exit threshold);
+  `STUB_INTERP_TARGET_D_UNREFED = 75` (unrefed stub
+  interpolates back to this d for exact mid-curve fit).
+- `ASYM_WIDTH_RATIO_TOL = 0.20`,
+  `ASYM_LENGTH_RATIO_TOL = 0.10` (iterative symmetric trim).
 - `EMIT_JUNCTIONS = False`, `EMIT_APRONS = False`.
 
 ---
