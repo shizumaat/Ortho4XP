@@ -1391,74 +1391,25 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
             )
 
         # ── Generate the patch content ──────────────────────────────────
-        # Start from the legacy per-segment runway patch; the surface
-        # generator (Phase A-F) appends buildings, taxiways, aprons,
-        # triangle wedges, and boundary band on top.
-        #
-        # Load apt.dat row-100 runway geometry so per-segment rectangles
-        # align with the X-Plane rendered runway.  CIFP is still the
-        # sole elevation source (thresholds + displaced distances);
-        # apt.dat is used only for footprint lat/lon and width.
-        apt_runway_geom = {}
+        # Use the new O4_Airport_Pavement_Builder pipeline.  It produces
+        # segmented sloped runway rects, grade-compliant taxi rects,
+        # non-overlapping junction polygons, and terminal pads, all in
+        # one self-contained call from the same CIFP + apt.dat + OSM +
+        # DEM inputs the legacy pipeline used.
+        xp_root = xplane_root_from_cifp_path(cifp_path)
+        if xp_root is None:
+            UI.vprint(
+                1, "   Auto-patch: Skipping", icao,
+                "(cannot resolve X-Plane root from CIFP path).")
+            continue
         try:
-            xp_root = xplane_root_from_cifp_path(cifp_path)
-            if xp_root:
-                import O4_Apt_Dat_Reader as _APR
-                _apt_path = _APR.find_airport_apt_dat(xp_root, icao)
-                if _apt_path:
-                    _apt = _APR.load_airport(_apt_path, icao)
-                    if _apt is not None:
-                        def _norm(d):
-                            return d if d.startswith("RW") else "RW" + d
-                        for _r in _apt.runways:
-                            apt_runway_geom[_norm(_r.desig_a)] = (
-                                _r.lat_a, _r.lon_a, _r.width_m,
-                                _r.displaced_a_m, _r.blast_a_m)
-                            apt_runway_geom[_norm(_r.desig_b)] = (
-                                _r.lat_b, _r.lon_b, _r.width_m,
-                                _r.displaced_b_m, _r.blast_b_m)
+            from O4_Airport_Pavement_Builder import build_airport_pavement
+            layout = build_airport_pavement(icao, xp_root)
         except Exception as _e:
             UI.vprint(
-                2, "   Auto-patch: apt.dat runway geometry lookup "
-                "failed ({}); falling back to CIFP".format(_e))
-        osm_content, runway_segment_chain = generate_patch_osm(
-            icao, pairs, runway_widths=runway_widths, tile=tile,
-            apt_runways=apt_runway_geom,
-        )
-        num_surface_patches = 0
-
-        # Collect road data for this airport
-        airport_roads = None
-        if road_data:
-            airport_roads = (
-                road_data.get(icao)
-                or road_data.get(icao.upper())
-                or road_data.get(icao.lower())
-            )
-
-        # Surface generator requires building data to do anything useful
-        # (taxiways alone don't trigger it).
-        run_surface = has_dem and rwy_pairs_for_elev and airport_buildings
-        if run_surface:
-            (surface_lines, _) = generate_airport_surface_patches(
-                icao, airport_taxiways or [], airport_buildings or [],
-                rwy_pairs_for_elev, tile, dico_apt_entry,
-                start_node_id=-10000,
-                road_data=airport_roads,
-                xplane_root=xplane_root_from_cifp_path(cifp_path),
-                runway_segment_chain=runway_segment_chain,
-            )
-            if surface_lines:
-                num_surface_patches = sum(
-                    1 for l in surface_lines if "<way " in l
-                )
-                osm_content = osm_content.replace(
-                    "</osm>",
-                    "  <!-- Building/transition patches "
-                    "({} triangles) -->\n".format(num_surface_patches)
-                    + "\n".join(surface_lines) + "\n"
-                    + "</osm>\n",
-                )
+                1, "   Auto-patch: Pavement builder failed for",
+                icao, ":", str(_e))
+            continue
 
         # Write the auto-patch file
         if not os.path.exists(patch_dir):
@@ -1468,15 +1419,16 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
             patch_dir, "{}_auto.patch.osm".format(icao)
         )
         try:
-            with open(auto_patch_file, "w") as f:
-                f.write(osm_content)
-            parts = [icao, " ({} runway pairs".format(len(pairs))]
-            if num_surface_patches:
-                parts.append(
-                    ", {} surface shapes".format(num_surface_patches)
-                )
-            parts.append(")")
-            UI.vprint(1, "   Auto-patch: Generated", "".join(parts))
+            layout.to_osm(auto_patch_file)
+            # Classify shapes for the status line.
+            from collections import Counter as _Counter
+            counts = _Counter(s.role for s in layout.shapes)
+            summary = " + ".join(
+                "{} {}".format(n, r) for r, n in
+                sorted(counts.items(), key=lambda x: -x[1]))
+            UI.vprint(
+                1, "   Auto-patch: Generated", icao,
+                "(" + summary + ")")
             auto_patched.append(icao)
         except Exception as e:
             UI.vprint(

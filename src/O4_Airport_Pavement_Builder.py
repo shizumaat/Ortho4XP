@@ -185,15 +185,21 @@ class PavementLayout:
             nids.append(nids[0])
             return nids
 
-        # Ways and relations.  Way-only shapes stay plain ways;
-        # shapes with interior rings become a relation + N ways.
+        # Emit one simple way per shape (exterior ring only, with
+        # all tags on that way).  Interior rings — which appear
+        # on junction polygons that wrap around rect-shaped holes
+        # — are dropped for X-Plane patch compatibility: the
+        # Ortho4XP patch parser ([O4_Vector_Map.include_patches])
+        # iterates ways only, so tags on an OSM multipolygon
+        # relation never reach the outer way.  A junction ring
+        # emitted without its holes will slightly overlap the
+        # rects that used to punch those holes — X-Plane
+        # triangulator handles the overlap by seed-region
+        # processing; the rects' altitude_high/low tags prevail
+        # where they cover.
         way_blocks: List[Tuple[int, List[int], Dict[str, str]]] = []
-        rel_blocks: List[Tuple[int, List[Tuple[int, str]],
-                               Dict[str, str]]] = []
         next_wid = [-10001]
-        next_rid = [-20001]
         for s in self.shapes:
-            interiors = list(s.polygon.interiors)
             ext_nids = _ring_to_nids(s.polygon.exterior.coords)
             if ext_nids is None:
                 continue
@@ -203,31 +209,21 @@ class PavementLayout:
             }
             if s.ref:
                 tags["ref"] = s.ref
-            # Phase-2 elevation tags.
+            # Phase-2 elevation tags.  Sloped rects also carry
+            # cell_size + profile so X-Plane uses spline
+            # interpolation between the high and low short
+            # edges, matching the legacy auto-patch format.
             if s.altitude_high is not None and s.altitude_low is not None:
                 tags["altitude_high"] = f"{s.altitude_high:.1f}"
                 tags["altitude_low"] = f"{s.altitude_low:.1f}"
+                tags["cell_size"] = "2"
+                tags["profile"] = "spline"
             elif s.altitude is not None:
                 tags["altitude"] = f"{s.altitude:.1f}"
-            if not interiors:
-                way_blocks.append((next_wid[0], ext_nids, tags))
-                next_wid[0] -= 1
-                continue
-            # Multipolygon: outer way + N inner ways + relation.
-            outer_wid = next_wid[0]; next_wid[0] -= 1
-            way_blocks.append((outer_wid, ext_nids, {}))
-            members: List[Tuple[int, str]] = [(outer_wid, "outer")]
-            for ring in interiors:
-                nids = _ring_to_nids(ring.coords)
-                if nids is None:
-                    continue
-                inner_wid = next_wid[0]; next_wid[0] -= 1
-                way_blocks.append((inner_wid, nids, {}))
-                members.append((inner_wid, "inner"))
-            rel_tags = dict(tags)
-            rel_tags["type"] = "multipolygon"
-            rel_blocks.append((next_rid[0], members, rel_tags))
-            next_rid[0] -= 1
+            way_blocks.append((next_wid[0], ext_nids, tags))
+            next_wid[0] -= 1
+        rel_blocks: List[Tuple[int, List[Tuple[int, str]],
+                               Dict[str, str]]] = []
 
         lines = [
             "<?xml version='1.0' encoding='UTF-8'?>",
