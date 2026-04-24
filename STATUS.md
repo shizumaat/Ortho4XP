@@ -1,24 +1,114 @@
 # Auto-Patch Refactor — Status
 
-**Current state:** Phase 1 emitter
-`src/O4_Airport_Pavement_Builder.py` reproducing hand-drawn target
-layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.
+**Current state:** The new pavement builder
+`src/O4_Airport_Pavement_Builder.py` is **WIRED INTO Ortho4XP's
+main pipeline** — `O4_Auto_Patch.generate_auto_patches` now
+calls `build_airport_pavement(icao, xplane_root)` and writes
+the output via `layout.to_osm()` directly to the tile's
+`Patches/` directory.  Phase-1 geometry + Phase-2 elevations
+both produced in one pass; the legacy surface generator
+(buildings, aprons, drainage, boundary band, tunnels) is no
+longer called.
 
-**SESSION 7 (2026-04-22 / 2026-04-23):** Major pivot —
-junctions and aprons are now geometrically identical and both
-emit as `role=junction`.  Every connected pavement region not
-covered by a rect or terminal is emitted as ONE polygon (with
-rect-shaped holes as multipolygon interior rings), seamed to
-neighbouring shapes via rect + terminal + runway corner
-injection.  **Zero overlap pairs** at SPJC / SPLP.  Coverage
-99.96 % of apt.dat pavement.
+**SESSION 7 (2026-04-22 → 2026-04-24):** Sequence of changes:
 
-**SPJC:** 72 target-matches (target's subdivision-rich layout
-doesn't match the simplest-polygons approach; visual coverage
-is complete).  junction IoU 0.73, 0 overlaps, 0 unmatched rect
-or terminal corners.
+1. Residue-driven junctions (simplest polygons, no overlaps).
+2. Graph-based grade-compliant elevation network.
+3. Runway / taxi / terminal elevation tags, X-Plane convention
+   (altitude_high/low on corners 0,3 of the ring, cell_size +
+   profile spline tags on sloped rects).
+4. Multipolygon relations DROPPED — X-Plane's patch parser
+   iterates ways only, so junction tags wouldn't reach the
+   outer way.  Junctions now emit as simple closed rings.
+5. Junction vertices no longer land mid-edge of any taxi rect
+   (2 m gap to runway + vertex-level snap/push for other taxis).
 
-**SPLP:** 25 target-matches.  junction IoU 0.58.
+**SPJC:** 155 shapes (73 runway + 33 junction + 47 taxi rects
++ 2 terminals); 0 overlaps; 0 mid-edge junction-vertex inserts
+on any rect; grade compliance verified on V1 / A / F stubs.
+
+**SPLP:** 57 shapes; 0 overlaps.
+
+## Session 7 iteration 2026-04-24 (late) — Ortho4XP integration + slope-rect fixes
+
+Five commits on 2026-04-24:
+
+- **`c0e1b24`** Graph-based elevation network + runway multi-
+  polygon clip fix.
+- **`5cca53a`** Corner ordering for altitude_high/low tags —
+  rebuild rect ring from 4 raw corner positions in the X-Plane
+  patch convention `[hi_left, lo_left, lo_right, hi_right]`.
+  Runway segment construction also reorders when B is higher.
+  Result at SPJC: 47 / 47 sloped taxi rects + 67 / 67 runway
+  segments correctly oriented.
+- **`98628db`** Wired `build_airport_pavement` into
+  `O4_Auto_Patch.generate_auto_patches`.  Removed multipolygon
+  relations from `to_osm()` output (X-Plane patch parser can't
+  route tags from relations to their outer ways).  Added
+  `cell_size=2` + `profile=spline` tags on sloped rects to
+  match legacy patch format.  `Ortho4XP_AutoPatch` naming kept
+  so manual-patch priority still works.
+- **`039ad60`** Post-runway-clip with a 2 m outward buffer on
+  the new segmented runway union, subtracted from every
+  junction — fixes 15 junction vertices that were landing
+  mid-edge on runway short edges (would have split the
+  runway's 4-corner slope rect at render time).
+- **`e9dc9aa`** Vertex-level junction-vs-taxi-rect pass.  For
+  each junction vertex: if within 2 m of a taxi rect corner,
+  snap exactly to that corner; if within 0.5 m of a rect edge
+  (not near a corner), push 1 m perpendicular-outward (tested
+  via rect containment for the correct side).  Fixes G stub
+  and F primary "junction wrapping around both sides" report.
+  11 → 0 mid-edge inserts at SPJC.
+
+### Ortho4XP wiring
+
+[O4_Auto_Patch.py:1393-1440](src/O4_Auto_Patch.py) now:
+
+```
+xp_root = xplane_root_from_cifp_path(cifp_path)
+from O4_Airport_Pavement_Builder import build_airport_pavement
+layout = build_airport_pavement(icao, xp_root)
+layout.to_osm(auto_patch_file)
+```
+
+Replaces the legacy `generate_patch_osm` + `generate_airport_
+surface_patches` chain.  Manual patches still take priority via
+the `manual_patches` set in `generate_auto_patches`.  Input
+fields (`taxiway_data`, `building_data`, `dico_airports`,
+`road_data`) are still accepted for API compatibility but
+ignored by the new path — the new builder pulls taxiways,
+terminals, runway geometry, and CIFP elevations directly from
+disk via `_load_osm_airports`, `_extract_osm_terminals`,
+`O4_Apt_Dat_Reader`, and `parse_cifp_file`.
+
+### Out-of-scope this session / known-work-ahead
+
+- **Junction / apron elevations.**  Currently un-elevated —
+  X-Plane renders them against the DEM.  User plan: junctions
+  will triangulate multi-directionally using shared-vertex
+  elevations from adjacent rects.  **Next session.**
+- **Building / hangar footprints.**  Only terminals emit as
+  role=terminal pads.  General buildings + hangars removed in
+  the earlier revert.  Later.
+- **Legacy drainage / boundary band / tunnels.**  Not
+  reproduced in the new builder.  Later.
+- **Runway 1 % / 305 m vertical curve rule.**  Currently only
+  the 1.5 % longitudinal cap is enforced; the curvature rule
+  would require a second-derivative smoothing pass.  Not
+  visible at SPJC / SPLP given the segment lengths used.
+
+### Current constants (post-2026-04-24)
+
+- `NETWORK_DENSIFY_M = 30.0`; `NETWORK_BRIDGE_MAX_M = 60.0`.
+- `TAXI_MAX_GRADE = 0.015`; `_RWY_HALF_WIDTH_M = 22.5`.
+- Runway-vs-junction clip: 2.0 m buffer on new runway union.
+- Junction-vertex-vs-taxi-rect: snap within 2.0 m of a corner;
+  push 1.0 m perpendicular-outward if within 0.5 m of an edge.
+- Sloped rect tags: `altitude_high`, `altitude_low`,
+  `cell_size=2`, `profile=spline`.
+
+---
 
 ## Session 7 iteration 2026-04-24 — graph-based elevation network
 
