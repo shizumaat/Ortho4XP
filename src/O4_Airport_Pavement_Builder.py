@@ -1275,24 +1275,44 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             length = math.hypot(bx - ax, by - ay)
             if length < 1.0:
                 continue
-            # Perpendicular half-width offset
+            # Perpendicular half-width offset — always compute
+            # relative to the direction from A to B.
             ux = (bx - ax) / length
             uy = (by - ay) / length
             px = -uy * width_m / 2.0
             py = ux * width_m / 2.0
-            corners = [
-                (ax + px, ay + py),
-                (bx + px, by + py),
-                (bx - px, by - py),
-                (ax - px, ay - py),
-            ]
+            # X-Plane patch convention: a way's short edge from
+            # the last to the first node (way[-2:]) is interpreted
+            # as the ``altitude_high`` side; the short edge from
+            # way[1] to way[2] is the ``altitude_low`` side.  So
+            # corners 0 and 3 must be at the HIGH-elevation end.
+            # If B is the higher end, start the ring from B.
+            if float(elev_a) >= float(elev_b):
+                # A is HIGH: ring starts at A-side corners.
+                corners = [
+                    (ax + px, ay + py),   # 0: A-left  (HIGH side)
+                    (bx + px, by + py),   # 1: B-left  (LOW side)
+                    (bx - px, by - py),   # 2: B-right (LOW side)
+                    (ax - px, ay - py),   # 3: A-right (HIGH side)
+                ]
+                eh, el = float(elev_a), float(elev_b)
+            else:
+                # B is HIGH: reverse — start the ring at B-side.
+                # The perpendicular flips sign when direction
+                # reverses, so B-left in the reversed walk is the
+                # original B-right (and similarly A).
+                corners = [
+                    (bx - px, by - py),   # 0: B-left  (HIGH side)
+                    (ax - px, ay - py),   # 1: A-left  (LOW side)
+                    (ax + px, ay + py),   # 2: A-right (LOW side)
+                    (bx + px, by + py),   # 3: B-right (HIGH side)
+                ]
+                eh, el = float(elev_b), float(elev_a)
             poly = Polygon(corners)
             if not poly.is_valid:
                 poly = poly.buffer(0)
             if poly.is_empty or poly.geom_type != "Polygon":
                 continue
-            eh = max(float(elev_a), float(elev_b))
-            el = min(float(elev_a), float(elev_b))
             shape = BuiltShape(
                 polygon=poly, role=ROLE_RUNWAY, ref=ref_fallback)
             if abs(eh - el) >= 0.1:
@@ -1434,6 +1454,12 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             if abs(eh - el) >= 0.1:
                 shape.altitude_high = round(eh, 1)
                 shape.altitude_low = round(el, 1)
+                # Earlier pipeline stages may have permuted the
+                # polygon ring.  Always re-derive the ring order
+                # from the 4 raw corner positions so that the
+                # X-Plane patch convention (corners 0,3 = high
+                # short edge, 1,2 = low short edge) holds.
+                _orient_rect_for_altitude(shape, p1, p2, e1, e2)
             else:
                 shape.altitude = round((eh + el) / 2.0, 1)
 
@@ -1462,6 +1488,83 @@ def _latlon_to_m_local(lat: float, lon: float,
     x = math.radians(lon - lon0) * R_EARTH * cos0
     y = math.radians(lat - lat0) * R_EARTH
     return x, y
+
+
+def _orient_rect_for_altitude(shape: "BuiltShape",
+                              p1: Tuple[float, float],
+                              p2: Tuple[float, float],
+                              e1: float, e2: float) -> None:
+    """Rewrite a 4-corner rect polygon's ring in the X-Plane
+    patch convention:
+
+        [n0 high-left, n1 low-left, n2 low-right, n3 high-right]
+
+    where "high" is whichever of ``p1`` / ``p2`` has the larger
+    elevation (``e1`` / ``e2``) and "left" / "right" are
+    relative to the high→low axis direction.  The way's short
+    edges are then:
+
+        way[-2:] = [n3, n0]  = altitude_high short edge
+        way[1:3] = [n1, n2]  = altitude_low  short edge
+
+    Earlier pipeline stages (corner snap to pav vertices,
+    shared-vertex enforcement) may have permuted the polygon's
+    ring order, so this function re-derives the ordering from
+    the 4 raw corner positions by classifying each by nearest
+    axis endpoint and by left/right of the axis perpendicular.
+    Non-4-corner polygons are left alone.
+    """
+    try:
+        coords = list(shape.polygon.exterior.coords)
+    except Exception:
+        return
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) != 4:
+        return
+    # Classify each corner by nearest axis endpoint.
+    p1_corners: List[Tuple[float, float]] = []
+    p2_corners: List[Tuple[float, float]] = []
+    for c in coords:
+        d1 = (c[0] - p1[0]) ** 2 + (c[1] - p1[1]) ** 2
+        d2 = (c[0] - p2[0]) ** 2 + (c[1] - p2[1]) ** 2
+        (p1_corners if d1 <= d2 else p2_corners).append(c)
+    if len(p1_corners) != 2 or len(p2_corners) != 2:
+        return
+    # Perpendicular for the HIGH→LOW walk direction.
+    if e1 >= e2:
+        hi_p, lo_p = p1, p2
+        hi_corners, lo_corners = p1_corners, p2_corners
+    else:
+        hi_p, lo_p = p2, p1
+        hi_corners, lo_corners = p2_corners, p1_corners
+    dx = lo_p[0] - hi_p[0]
+    dy = lo_p[1] - hi_p[1]
+    ax_len = math.hypot(dx, dy)
+    if ax_len < 0.1:
+        return
+    ux, uy = dx / ax_len, dy / ax_len
+    # Left perp when walking high→low = (-uy, ux).
+    def _side(c, ref):
+        """Positive = left of axis from HIGH end looking LOW."""
+        rx, ry = c[0] - ref[0], c[1] - ref[1]
+        return rx * (-uy) + ry * ux
+    # Sort each endpoint's 2 corners: left first.
+    hi_corners = sorted(hi_corners, key=lambda c: -_side(c, hi_p))
+    lo_corners = sorted(lo_corners, key=lambda c: -_side(c, lo_p))
+    hi_left, hi_right = hi_corners[0], hi_corners[1]
+    lo_left, lo_right = lo_corners[0], lo_corners[1]
+    # Build ring in legacy convention: high-left → low-left → low-right → high-right.
+    new_ring = [hi_left, lo_left, lo_right, hi_right, hi_left]
+    try:
+        new_poly = Polygon(new_ring, list(shape.polygon.interiors))
+        if not new_poly.is_valid:
+            new_poly = new_poly.buffer(0)
+        if (new_poly.geom_type == "Polygon"
+                and not new_poly.is_empty):
+            shape.polygon = new_poly
+    except Exception:
+        pass
 
 
 # ── Elevation network ────────────────────────────────────────────
