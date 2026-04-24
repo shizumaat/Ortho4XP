@@ -1498,6 +1498,111 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         median = samples[len(samples) // 2]
         shape.altitude = round(median, 1)
 
+    # ── Keep junction polygons off taxi rect edges ──────────────
+    # User rule (2026-04-24): a junction may join an
+    # altitude_high/altitude_low rect only at the 4 rect corners.
+    # Any junction vertex landing mid-edge of a rect would be
+    # split into the rect's ring at render time and break the
+    # rect's 4-corner slope convention.
+    #
+    # Implementation: walk each junction's ring; for each vertex
+    # that's within ``TAXI_EDGE_TOL_M`` of a taxi rect edge but
+    # NOT within ``TAXI_CORNER_TOL_M`` of one of that rect's four
+    # corners, push the vertex outward by ``TAXI_EDGE_GAP_M``
+    # perpendicular to the offending edge.  Vertices near a
+    # corner snap exactly to the corner instead, preserving
+    # shared-vertex connectivity at rect ends.
+    TAXI_EDGE_TOL_M = 0.5
+    TAXI_CORNER_TOL_M = 2.0
+    TAXI_EDGE_GAP_M = 1.0
+    taxi_roles_set = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+                      ROLE_STUB, ROLE_CROSS_CONNECTOR}
+    # Collect (polygon, 4 corner tuples) for each taxi rect.
+    taxi_rect_info: List[Tuple[Polygon, List[Tuple[float, float]]]] = []
+    for s in layout.shapes:
+        if s.role not in taxi_roles_set:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+            if coords and coords[0] == coords[-1]:
+                coords = coords[:-1]
+        except Exception:
+            continue
+        if len(coords) != 4:
+            continue
+        taxi_rect_info.append((s.polygon, coords))
+
+    def _fix_junction_vertex(x: float, y: float) -> Tuple[float, float]:
+        """If (x,y) is close to a taxi rect edge but not close to
+        one of its 4 corners, return a pushed-outward position."""
+        for rect_poly, corners in taxi_rect_info:
+            # Check corners first — if close, snap exactly.
+            for cx, cy in corners:
+                if (x - cx) ** 2 + (y - cy) ** 2 <= (
+                        TAXI_CORNER_TOL_M ** 2):
+                    return (cx, cy)
+            # For each of 4 edges, check mid-edge proximity.
+            for i in range(4):
+                ax, ay = corners[i]
+                bx, by = corners[(i + 1) % 4]
+                dx = bx - ax; dy = by - ay
+                seg_len_sq = dx * dx + dy * dy
+                if seg_len_sq <= 0.01:
+                    continue
+                t = ((x - ax) * dx + (y - ay) * dy) / seg_len_sq
+                if t <= 0.001 or t >= 0.999:
+                    continue  # at an endpoint, handled by corner check
+                cx_proj = ax + t * dx
+                cy_proj = ay + t * dy
+                d = math.hypot(x - cx_proj, y - cy_proj)
+                if d > TAXI_EDGE_TOL_M:
+                    continue
+                # Perpendicular to edge, pointing AWAY from the
+                # rect interior.  Try both ±perp and pick the one
+                # whose (proj + perp) is outside the rect polygon.
+                seg_len = math.sqrt(seg_len_sq)
+                perp_x = -dy / seg_len
+                perp_y = dx / seg_len
+                # Test which side is outside: move a tiny step in
+                # each direction and check containment.
+                test_x = cx_proj + perp_x * 0.1
+                test_y = cy_proj + perp_y * 0.1
+                if rect_poly.contains(Point(test_x, test_y)):
+                    perp_x = -perp_x
+                    perp_y = -perp_y
+                return (cx_proj + perp_x * TAXI_EDGE_GAP_M,
+                        cy_proj + perp_y * TAXI_EDGE_GAP_M)
+        return (x, y)
+
+    if taxi_rect_info:
+        for shape in layout.shapes:
+            if shape.role != ROLE_JUNCTION:
+                continue
+            try:
+                ring = list(shape.polygon.exterior.coords)
+            except Exception:
+                continue
+            changed = False
+            new_ring = []
+            for (vx, vy) in ring:
+                nx, ny = _fix_junction_vertex(vx, vy)
+                if (nx, ny) != (vx, vy):
+                    changed = True
+                new_ring.append((nx, ny))
+            if not changed:
+                continue
+            # Rebuild polygon.
+            try:
+                new_poly = Polygon(new_ring,
+                                    list(shape.polygon.interiors))
+                if not new_poly.is_valid:
+                    new_poly = new_poly.buffer(0)
+                if (new_poly.geom_type == "Polygon"
+                        and not new_poly.is_empty):
+                    shape.polygon = new_poly
+            except Exception:
+                pass
+
 
 def _latlon_to_m_local(lat: float, lon: float,
                        lat0: float, lon0: float, cos0: float
