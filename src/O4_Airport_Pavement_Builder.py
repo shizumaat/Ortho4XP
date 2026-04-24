@@ -98,12 +98,24 @@ class BuiltShape:
     Polygons live in meter space anchored at the layout's origin.
     ``ref`` is optional (runway designator, taxi ref from OSM, or
     generated label).  ``source_axis`` is kept on taxi rects for
-    later use (elevation phase) but isn't emitted.
+    elevation sampling along their axis.
+
+    Phase-2 elevation: exactly one of these options is set at any
+    time:
+      * all three None (no elevation yet — junctions / aprons)
+      * only ``altitude`` set (flat polygon at that elevation, m)
+      * ``altitude_high`` + ``altitude_low`` set (linearly sloped
+        between the two parallel edges).  Rects use this.
+    Runway segments carry altitude_high/low per the legacy patch
+    convention.
     """
     polygon: Polygon
     role: str
     ref: str = ""
     source_axis: Optional[LineString] = None
+    altitude: Optional[float] = None
+    altitude_high: Optional[float] = None
+    altitude_low: Optional[float] = None
 
 
 @dataclass
@@ -191,6 +203,12 @@ class PavementLayout:
             }
             if s.ref:
                 tags["ref"] = s.ref
+            # Phase-2 elevation tags.
+            if s.altitude_high is not None and s.altitude_low is not None:
+                tags["altitude_high"] = f"{s.altitude_high:.1f}"
+                tags["altitude_low"] = f"{s.altitude_low:.1f}"
+            elif s.altitude is not None:
+                tags["altitude"] = f"{s.altitude:.1f}"
             if not interiors:
                 way_blocks.append((next_wid[0], ext_nids, tags))
                 next_wid[0] -= 1
@@ -448,11 +466,25 @@ def _runway_rect_m(runway, to_m) -> Polygon:
 # Top-level builder
 # ──────────────────────────────────────────────────────────────────
 
-def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
+def build_airport_pavement(icao: str, xplane_root: str,
+                            compute_elevations: bool = True
+                            ) -> PavementLayout:
     """Build the complete role-classified layout for ``icao``.
 
     The layout is ready to compare against a target OSM via
     ``tools/compare_target.py``.
+
+    When ``compute_elevations`` is True (default), a Phase-2
+    elevation pass runs at the end:
+      * Single runway shapes are replaced with per-100m segmented
+        runway rects produced by the legacy CIFP+DEM generator.
+      * Taxi rects get ``altitude_high``/``altitude_low`` tags
+        from DEM sampling at axis endpoints, anchored to the
+        adjacent runway segment when within 30 m.
+      * Terminal pads get ``altitude`` from the DEM at centroid.
+      * Junctions, buildings, aprons are left un-elevated (X-Plane
+        triangulator interpolates them from neighbouring shared
+        vertices).
     """
     apt_path = APR.find_airport_apt_dat(xplane_root, icao)
     if apt_path is None:
@@ -1020,7 +1052,846 @@ def build_airport_pavement(icao: str, xplane_root: str) -> PavementLayout:
     _validate_shared_vertex_invariant(layout,
                                       tol=SHARED_VERTEX_CLUSTER_TOL_M)
 
+    # ── Phase-2 elevations ──────────────────────────────────────
+    if compute_elevations:
+        _compute_elevations(
+            layout, icao, xplane_root, apt,
+            osm_nodes=nodes, osm_ways=ways, to_m=to_m)
+
     return layout
+
+
+# ══════════════════════════════════════════════════════════════════
+# Phase-2: elevations
+# ══════════════════════════════════════════════════════════════════
+
+# FAA AC 150/5300-13B, Design Group III+ (commercial jetport):
+#   Taxiway longitudinal: max 1.5 % grade.
+#   Apron: max 1.0 % any direction.
+#   Runway longitudinal: max 1.5 % grade (handled by legacy).
+TAXI_MAX_GRADE = 0.015
+TAXI_ANCHOR_DIST_M = 30.0   # snap taxi rect end to runway segment
+                             # elevation when within this distance
+DEM_SUFFIX = ".hgt"
+_DEM_CACHE: Dict[Tuple[int, int], object] = {}
+
+
+def _load_airport_dem(lat0: float, lon0: float):
+    """Return an ``O4_DEM_Utils.DEM`` covering the 1° tile that
+    contains (lat0, lon0).  Falls back to None if the .hgt file is
+    missing."""
+    tile_lat = int(math.floor(lat0))
+    tile_lon = int(math.floor(lon0))
+    key = (tile_lat, tile_lon)
+    if key in _DEM_CACHE:
+        return _DEM_CACHE[key]
+    hem_ns = "S" if tile_lat < 0 else "N"
+    hem_ew = "W" if tile_lon < 0 else "E"
+    fname = f"{hem_ns}{abs(tile_lat):02d}{hem_ew}{abs(tile_lon):03d}{DEM_SUFFIX}"
+    # Ortho4XP lays out by 10° group.
+    group_lat = (tile_lat // 10) * 10
+    group_lon = (tile_lon // 10) * 10
+    group_dir = (f"{'+' if group_lat >= 0 else '-'}{abs(group_lat):02d}"
+                 f"{'+' if group_lon >= 0 else '-'}{abs(group_lon):03d}")
+    dem_path = os.path.join("Elevation_data", group_dir, fname)
+    if not os.path.isfile(dem_path):
+        _DEM_CACHE[key] = None
+        return None
+    try:
+        import O4_DEM_Utils as _DEM
+        dem = _DEM.DEM(tile_lat, tile_lon, source=dem_path)
+    except Exception:
+        _DEM_CACHE[key] = None
+        return None
+    _DEM_CACHE[key] = dem
+    return dem
+
+
+def _sample_dem(dem, tile_lat: int, tile_lon: int,
+                lat: float, lon: float) -> Optional[float]:
+    """Sample DEM elevation at (lat, lon).  Returns None if DEM is
+    unavailable or out-of-tile."""
+    if dem is None:
+        return None
+    try:
+        return float(dem.alt((lon - tile_lon, lat - tile_lat)))
+    except Exception:
+        return None
+
+
+def _find_cifp_path(xplane_root: str, icao: str) -> Optional[str]:
+    """Locate the CIFP .dat file for an ICAO under the X-Plane
+    root.  Returns None if not found."""
+    cifp_dir = os.path.join(xplane_root, "Custom Data", "CIFP")
+    p = os.path.join(cifp_dir, f"{icao.upper()}.dat")
+    if os.path.isfile(p):
+        return p
+    return None
+
+
+def _runway_segment_elev_lookup(
+    runway_segment_chain, layout: "PavementLayout"
+):
+    """Return a callable ``elev_at(x_m, y_m)`` that returns the
+    runway surface elevation at a meter-space point, or None if the
+    point is farther than ``TAXI_ANCHOR_DIST_M`` from any runway
+    segment centerline.  Used to anchor taxi rect endpoints to the
+    matching runway elevation.
+    """
+    anchor = layout.anchor
+    lat0, lon0 = anchor
+    cos0 = math.cos(math.radians(lat0))
+
+    def _ll_to_m(lat, lon):
+        x = math.radians(lon - lon0) * R_EARTH * cos0
+        y = math.radians(lat - lat0) * R_EARTH
+        return x, y
+
+    # Convert chain to meter-space segments for fast nearest lookup.
+    seg_lines: List[Tuple[LineString, float, float]] = []
+    for seg in runway_segment_chain:
+        lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, _w = seg
+        a = _ll_to_m(lat_a, lon_a)
+        b = _ll_to_m(lat_b, lon_b)
+        if math.hypot(b[0] - a[0], b[1] - a[1]) < 0.5:
+            continue
+        seg_lines.append(
+            (LineString([a, b]), float(elev_a), float(elev_b)))
+
+    def elev_at(x: float, y: float) -> Optional[float]:
+        if not seg_lines:
+            return None
+        p = Point(x, y)
+        best = None
+        best_d = TAXI_ANCHOR_DIST_M
+        for line, ea, eb in seg_lines:
+            d = line.distance(p)
+            if d < best_d:
+                best_d = d
+                # Interpolate along segment.
+                total = line.length
+                if total <= 0:
+                    interp = ea
+                else:
+                    t = line.project(p) / total
+                    interp = ea + (eb - ea) * t
+                best = float(interp)
+        return best
+
+    return elev_at
+
+
+def _compute_elevations(layout: "PavementLayout", icao: str,
+                        xplane_root: str, apt,
+                        osm_nodes=None, osm_ways=None,
+                        to_m=None) -> None:
+    """Phase-2: add altitude tags to runways (segmented), taxi
+    rects, and terminal pads.  Junctions / aprons / buildings are
+    left un-elevated this iteration.
+
+    Taxi rect elevations come from a grade-compliant elevation
+    network built over OSM taxiway centerlines (densified to
+    ≤ 30 m edges), anchored at CIFP runway thresholds, and
+    post-pass smoothed for rate-of-change compliance
+    (FAA 1 %/30 m).  Per user (2026-04-24): real airports
+    heavily modify the land, so DEM is a soft preference, not a
+    constraint — nodes free from runway anchors follow DEM
+    only when no grade-compliance rule forces otherwise.
+    """
+    lat0, lon0 = layout.anchor
+    tile_lat = int(math.floor(lat0))
+    tile_lon = int(math.floor(lon0))
+    dem = _load_airport_dem(lat0, lon0)
+
+    # Meter-space projection (local — the layout's to_m is not
+    # exposed, so reconstruct).
+    cos0 = math.cos(math.radians(lat0))
+
+    def m_to_ll(x: float, y: float):
+        lon = lon0 + math.degrees(x / (R_EARTH * cos0))
+        lat = lat0 + math.degrees(y / R_EARTH)
+        return lat, lon
+
+    # ── Segmented runway rectangles (legacy CIFP + DEM) ─────────
+    cifp_path = _find_cifp_path(xplane_root, icao)
+    runway_segment_chain = []
+    if cifp_path is not None and dem is not None:
+        try:
+            import O4_Auto_Patch as _AP
+            cifp_runways = _AP.parse_cifp_file(cifp_path)
+            if cifp_runways:
+                pairs = _AP.pair_runways(cifp_runways)
+
+                # apt.dat runway geometry (sole source of truth for
+                # footprint lat/lon + width) — per legacy contract.
+                apt_runway_geom = {}
+                for r in apt.runways:
+                    key_a = r.desig_a if r.desig_a.startswith("RW") \
+                        else "RW" + r.desig_a
+                    key_b = r.desig_b if r.desig_b.startswith("RW") \
+                        else "RW" + r.desig_b
+                    apt_runway_geom[key_a] = (
+                        r.lat_a, r.lon_a, r.width_m,
+                        r.displaced_a_m, r.blast_a_m)
+                    apt_runway_geom[key_b] = (
+                        r.lat_b, r.lon_b, r.width_m,
+                        r.displaced_b_m, r.blast_b_m)
+                runway_widths = {}
+                for r in apt.runways:
+                    runway_widths[r.desig_a] = r.width_m
+                    runway_widths[r.desig_b] = r.width_m
+
+                class _TileStub:
+                    pass
+                tile = _TileStub()
+                tile.lat = tile_lat
+                tile.lon = tile_lon
+                tile.dem = dem
+
+                _xml, runway_segment_chain = _AP.generate_patch_osm(
+                    icao, pairs, runway_widths=runway_widths,
+                    tile=tile, apt_runways=apt_runway_geom)
+        except Exception:
+            runway_segment_chain = []
+
+    new_runway_polys: List[Polygon] = []
+    if runway_segment_chain:
+        # Drop the single-rect runway shapes; replace with segments.
+        old_runways = [s for s in layout.shapes if s.role == ROLE_RUNWAY]
+        layout.shapes = [s for s in layout.shapes if s.role != ROLE_RUNWAY]
+        ref_fallback = "/".join(sorted(set(
+            f"{r.desig_a}/{r.desig_b}" for r in apt.runways)))
+        # Legacy generate_patch_osm pads each side by
+        # RUNWAY_MARGIN=3 m for imagery coverage; strip that so
+        # the segmented runways match the apt.dat width that our
+        # Phase-1 junctions/rects were built against.  Keeps the
+        # post-elevation layout overlap-free.
+        _LEGACY_RUNWAY_MARGIN = 3.0
+        for i, seg in enumerate(runway_segment_chain):
+            lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m = seg
+            width_m = max(1.0, width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
+            ax, ay = _latlon_to_m_local(lat_a, lon_a, lat0, lon0, cos0)
+            bx, by = _latlon_to_m_local(lat_b, lon_b, lat0, lon0, cos0)
+            length = math.hypot(bx - ax, by - ay)
+            if length < 1.0:
+                continue
+            # Perpendicular half-width offset
+            ux = (bx - ax) / length
+            uy = (by - ay) / length
+            px = -uy * width_m / 2.0
+            py = ux * width_m / 2.0
+            corners = [
+                (ax + px, ay + py),
+                (bx + px, by + py),
+                (bx - px, by - py),
+                (ax - px, ay - py),
+            ]
+            poly = Polygon(corners)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty or poly.geom_type != "Polygon":
+                continue
+            eh = max(float(elev_a), float(elev_b))
+            el = min(float(elev_a), float(elev_b))
+            shape = BuiltShape(
+                polygon=poly, role=ROLE_RUNWAY, ref=ref_fallback)
+            if abs(eh - el) >= 0.1:
+                shape.altitude_high = round(eh, 1)
+                shape.altitude_low = round(el, 1)
+            else:
+                shape.altitude = round((eh + el) / 2.0, 1)
+            layout.shapes.append(shape)
+            new_runway_polys.append(poly)
+
+        # Segmented runway boundaries can drift sub-metre from the
+        # original single-rect runway that junctions / rects were
+        # built against, leaving tiny overlap slivers.  Subtract
+        # the new runway union from junctions (and rects, defensively)
+        # to eliminate them.
+        if new_runway_polys:
+            try:
+                new_rwy_union = unary_union(
+                    [p.buffer(0) for p in new_runway_polys]
+                ).buffer(0)
+            except Exception:
+                new_rwy_union = None
+            if new_rwy_union is not None and not new_rwy_union.is_empty:
+                # Tiny positive buffer so floating-point kisses
+                # at segment boundaries count as overlap.
+                try:
+                    clip_region = new_rwy_union.buffer(0.05)
+                except Exception:
+                    clip_region = new_rwy_union
+                # Rebuild layout.shapes in-place: when the clip
+                # produces a MultiPolygon (e.g. a junction that
+                # straddled the old runway ends up as two pieces
+                # after the new segmented runway with overruns
+                # replaces the old single rect), emit EVERY
+                # sub-polygon above MIN_JUNCTION_AREA_M2 so no
+                # pavement is lost (fixes the missing F/RW34R
+                # gap junction, user 2026-04-24).
+                from dataclasses import replace as _dc_replace
+                new_shapes: List[BuiltShape] = []
+                for shape in layout.shapes:
+                    if shape.role in (ROLE_RUNWAY, ROLE_TERMINAL):
+                        new_shapes.append(shape)
+                        continue
+                    # Clean sub-polygon before difference — apt.dat
+                    # unions can produce polygons with self-kissing
+                    # boundaries that trigger "side location" errors
+                    # in shapely's overlay.
+                    src = shape.polygon
+                    if not src.is_valid:
+                        try: src = src.buffer(0)
+                        except Exception: pass
+                    try:
+                        clipped = src.difference(clip_region)
+                    except Exception:
+                        try:
+                            clipped = src.buffer(0).difference(clip_region)
+                        except Exception:
+                            new_shapes.append(shape)
+                            continue
+                    if clipped.is_empty:
+                        continue
+                    pieces = ([clipped]
+                              if clipped.geom_type == "Polygon"
+                              else list(getattr(clipped, "geoms", [])))
+                    pieces = [p for p in pieces
+                              if p.geom_type == "Polygon"
+                              and p.area >= 50.0]
+                    if not pieces:
+                        continue
+                    # Keep the shape metadata on the largest piece,
+                    # emit any other pieces as new shapes with the
+                    # same role/tags.  For junctions this splits
+                    # the residue polygon; for rects this almost
+                    # never splits (their snap keeps them whole).
+                    pieces.sort(key=lambda g: -g.area)
+                    shape.polygon = pieces[0]
+                    new_shapes.append(shape)
+                    for extra in pieces[1:]:
+                        new_shapes.append(_dc_replace(
+                            shape, polygon=extra, source_axis=None))
+                layout.shapes = new_shapes
+
+    # ── Taxi rect elevations via grade-compliant network ────────
+    # Build a graph of OSM taxi centerlines + runway segment
+    # endpoints, densified to ≤ 30 m edges.  CIFP runway
+    # thresholds anchor the graph; bounds propagation + Laplacian
+    # smoothing produce a grade-compliant elevation surface over
+    # the network.  Each rect's two short edges take their
+    # altitude from sampling that network at the rect's axis
+    # endpoints.
+    graph = _build_elevation_network(
+        osm_nodes, osm_ways, to_m,
+        runway_segment_chain, layout.anchor, dem, tile_lat, tile_lon)
+    if graph is not None:
+        graph.propagate_bounds()
+        graph.choose_values()
+        graph.smooth_rate_of_change(iters=30)
+        taxi_roles = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+                      ROLE_STUB, ROLE_CROSS_CONNECTOR}
+        for shape in layout.shapes:
+            if shape.role not in taxi_roles:
+                continue
+            if shape.source_axis is None:
+                continue
+            coords = list(shape.source_axis.coords)
+            if len(coords) < 2:
+                continue
+            p1, p2 = coords[0], coords[-1]
+            e1 = graph.elevation_at(p1[0], p1[1])
+            e2 = graph.elevation_at(p2[0], p2[1])
+            # DEM fallback when network couldn't serve a point
+            # (e.g. walking-exit stubs whose axis sits off-network).
+            if e1 is None:
+                lat, lon = m_to_ll(p1[0], p1[1])
+                e1 = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+            if e2 is None:
+                lat, lon = m_to_ll(p2[0], p2[1])
+                e2 = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+            if e1 is None and e2 is None:
+                continue
+            if e1 is None:
+                e1 = e2
+            if e2 is None:
+                e2 = e1
+            # Defensive within-rect grade cap (should already be
+            # satisfied by network but catches the DEM-fallback
+            # and mixed cases).
+            axis_len = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            if axis_len > 1.0:
+                dmax = axis_len * TAXI_MAX_GRADE
+                diff = e1 - e2
+                if abs(diff) > dmax:
+                    mean = (e1 + e2) / 2.0
+                    sign = 1 if diff > 0 else -1
+                    e1 = mean + (dmax / 2.0) * sign
+                    e2 = mean - (dmax / 2.0) * sign
+            eh = max(e1, e2)
+            el = min(e1, e2)
+            if abs(eh - el) >= 0.1:
+                shape.altitude_high = round(eh, 1)
+                shape.altitude_low = round(el, 1)
+            else:
+                shape.altitude = round((eh + el) / 2.0, 1)
+
+    # ── Terminal pad elevations (flat, DEM median) ──────────────
+    for shape in layout.shapes:
+        if shape.role != ROLE_TERMINAL:
+            continue
+        samples: List[float] = []
+        for x, y in [
+            (shape.polygon.centroid.x, shape.polygon.centroid.y)
+        ] + list(shape.polygon.exterior.coords)[:-1]:
+            lat, lon = m_to_ll(x, y)
+            e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+            if e is not None:
+                samples.append(e)
+        if not samples:
+            continue
+        samples.sort()
+        median = samples[len(samples) // 2]
+        shape.altitude = round(median, 1)
+
+
+def _latlon_to_m_local(lat: float, lon: float,
+                       lat0: float, lon0: float, cos0: float
+                       ) -> Tuple[float, float]:
+    x = math.radians(lon - lon0) * R_EARTH * cos0
+    y = math.radians(lat - lat0) * R_EARTH
+    return x, y
+
+
+# ── Elevation network ────────────────────────────────────────────
+#
+# Node-based graph representing the taxiway centerline network in
+# meter space, densified to enforce FAA grade rules.  Runway
+# segment endpoints act as hard anchors.  The full pipeline is:
+#
+#   1. ``_build_elevation_network()`` constructs the graph from
+#      OSM taxi ways + runway_segment_chain, densified to ≤ 30 m.
+#   2. ``ElevationGraph.propagate_bounds()`` runs Dijkstra from
+#      each anchor with edge weight = length × TAXI_MAX_GRADE,
+#      producing a feasibility interval per node.
+#   3. ``ElevationGraph.choose_values()`` picks each node's
+#      elevation: DEM sample clipped into the interval (unbounded
+#      interval → DEM sample as-is).
+#   4. ``ElevationGraph.smooth_rate_of_change()`` applies a
+#      Laplacian-style smoothing pass to tame the rate-of-change
+#      (target 1 % / 30 m, FAA curvature rule), with anchors and
+#      hard grade caps re-applied each iteration.
+#   5. ``ElevationGraph.elevation_at(x, y)`` samples the network
+#      surface at an arbitrary meter-space point — used to map
+#      rect axis endpoints onto the network.
+NETWORK_DENSIFY_M = 30.0            # max edge length
+NETWORK_BRIDGE_MAX_M = 60.0         # max dist for taxi→rwy bridge edge.
+                                     # Tight enough that interior nodes
+                                     # of parallel taxis (typically > 100 m
+                                     # from the runway) aren't bridged;
+                                     # wide enough to catch perpendicular
+                                     # stub endpoints (V1 ~55 m at SPJC).
+NETWORK_RUNWAY_ANCHOR_RADIUS_M = 5.0  # a taxi node within this of
+                                       # rwy segment gets anchored
+
+
+class ElevationGraph:
+    """Sparse undirected graph of (x, y, elevation) nodes."""
+
+    __slots__ = ("nodes", "edges_adj", "anchor_elev", "dem_elev",
+                 "elev", "interval_lo", "interval_hi",
+                 "lat0", "lon0", "cos0", "tile_lat", "tile_lon",
+                 "dem")
+
+    def __init__(self, lat0, lon0, cos0, tile_lat, tile_lon, dem):
+        self.nodes: List[Tuple[float, float]] = []
+        self.edges_adj: List[List[Tuple[int, float]]] = []
+        self.anchor_elev: List[Optional[float]] = []
+        self.dem_elev: List[Optional[float]] = []
+        self.elev: List[float] = []
+        self.interval_lo: List[float] = []
+        self.interval_hi: List[float] = []
+        self.lat0 = lat0
+        self.lon0 = lon0
+        self.cos0 = cos0
+        self.tile_lat = tile_lat
+        self.tile_lon = tile_lon
+        self.dem = dem
+
+    def add_node(self, x: float, y: float,
+                 anchor: Optional[float] = None) -> int:
+        idx = len(self.nodes)
+        self.nodes.append((x, y))
+        self.edges_adj.append([])
+        self.anchor_elev.append(anchor)
+        # DEM sample (None if DEM unavailable)
+        lat, lon = self._m_to_ll(x, y)
+        self.dem_elev.append(
+            _sample_dem(self.dem, self.tile_lat, self.tile_lon,
+                        lat, lon))
+        return idx
+
+    def add_edge(self, i: int, j: int, length: float) -> None:
+        if i == j:
+            return
+        self.edges_adj[i].append((j, length))
+        self.edges_adj[j].append((i, length))
+
+    def _m_to_ll(self, x, y):
+        lon = self.lon0 + math.degrees(x / (R_EARTH * self.cos0))
+        lat = self.lat0 + math.degrees(y / R_EARTH)
+        return lat, lon
+
+    def propagate_bounds(self) -> None:
+        """Compute per-node feasibility interval [lo, hi] as the
+        intersection of (anchor ± dist × TAXI_MAX_GRADE) over all
+        reachable anchors.  Unreachable nodes get (-inf, +inf)."""
+        import heapq
+        n = len(self.nodes)
+        INF = float("inf")
+        lo = [-INF] * n
+        hi = [INF] * n
+        anchors = [i for i, a in enumerate(self.anchor_elev) if a is not None]
+        for aidx in anchors:
+            a_val = self.anchor_elev[aidx]
+            # Dijkstra from aidx; dist[k] = shortest graph distance
+            dist = [INF] * n
+            dist[aidx] = 0.0
+            heap = [(0.0, aidx)]
+            while heap:
+                d, u = heapq.heappop(heap)
+                if d > dist[u]:
+                    continue
+                for v, length in self.edges_adj[u]:
+                    nd = d + length
+                    if nd < dist[v]:
+                        dist[v] = nd
+                        heapq.heappush(heap, (nd, v))
+            # Apply this anchor's cone to every reachable node.
+            for k in range(n):
+                if dist[k] < INF:
+                    band = dist[k] * TAXI_MAX_GRADE
+                    node_lo = a_val - band
+                    node_hi = a_val + band
+                    if node_lo > lo[k]: lo[k] = node_lo
+                    if node_hi < hi[k]: hi[k] = node_hi
+        self.interval_lo = lo
+        self.interval_hi = hi
+
+    def choose_values(self) -> None:
+        """Pick each node's elevation: anchor value if pinned,
+        otherwise DEM clipped into [lo, hi].  Intervals that came
+        out empty (conflicting anchors) fall back to the interval
+        midpoint."""
+        n = len(self.nodes)
+        out: List[float] = [0.0] * n
+        for i in range(n):
+            if self.anchor_elev[i] is not None:
+                out[i] = self.anchor_elev[i]
+                continue
+            lo = self.interval_lo[i]
+            hi = self.interval_hi[i]
+            if lo > hi:
+                # Conflicting anchors — pick midpoint for
+                # least-squares-like compromise.
+                out[i] = 0.5 * (lo + hi)
+                continue
+            d = self.dem_elev[i]
+            if d is None:
+                # No DEM, no anchors: pick 0 if unbounded, midpoint
+                # otherwise.
+                if lo == float("-inf") and hi == float("inf"):
+                    out[i] = 0.0
+                elif lo == float("-inf"):
+                    out[i] = hi
+                elif hi == float("inf"):
+                    out[i] = lo
+                else:
+                    out[i] = 0.5 * (lo + hi)
+                continue
+            out[i] = max(lo, min(hi, d))
+        self.elev = out
+
+    def smooth_rate_of_change(self, iters: int = 30,
+                              damping: float = 0.4,
+                              tol: float = 0.01) -> None:
+        """Laplacian-style smoothing to tame rate-of-change while
+        respecting anchors and the hard 1.5 % grade cap on every
+        edge.  Each iteration: each non-anchor node moves toward
+        its neighbours' mean by ``damping`` × (mean - self).  Then
+        for each edge, if |Δ|/length > 1.5 %, split the excess
+        evenly between both non-anchored endpoints."""
+        n = len(self.nodes)
+        if n == 0:
+            return
+        anchor = [self.anchor_elev[i] is not None for i in range(n)]
+        for _ in range(iters):
+            max_change = 0.0
+            # Neighbour mean move
+            new_elev = list(self.elev)
+            for i in range(n):
+                if anchor[i]:
+                    continue
+                nbrs = self.edges_adj[i]
+                if not nbrs:
+                    continue
+                mean_n = sum(self.elev[j] for j, _l in nbrs) / len(nbrs)
+                delta = (mean_n - self.elev[i]) * damping
+                new_elev[i] = self.elev[i] + delta
+                if abs(delta) > max_change:
+                    max_change = abs(delta)
+            # Clip back into feasibility intervals.
+            for i in range(n):
+                if anchor[i]:
+                    continue
+                lo = self.interval_lo[i]
+                hi = self.interval_hi[i]
+                if new_elev[i] < lo: new_elev[i] = lo
+                if new_elev[i] > hi: new_elev[i] = hi
+            self.elev = new_elev
+            # Hard-cap each edge at TAXI_MAX_GRADE.
+            for i in range(n):
+                for j, length in self.edges_adj[i]:
+                    if j <= i:
+                        continue
+                    diff = self.elev[i] - self.elev[j]
+                    dmax = length * TAXI_MAX_GRADE
+                    if abs(diff) <= dmax:
+                        continue
+                    excess = abs(diff) - dmax
+                    # Push both ends toward each other by half the
+                    # excess (or one end fully if the other is
+                    # anchored).
+                    if anchor[i] and anchor[j]:
+                        continue  # can't fix, both pinned
+                    if anchor[i]:
+                        self.elev[j] += excess * (1 if diff > 0 else -1)
+                    elif anchor[j]:
+                        self.elev[i] -= excess * (1 if diff > 0 else -1)
+                    else:
+                        half = 0.5 * excess * (1 if diff > 0 else -1)
+                        self.elev[i] -= half
+                        self.elev[j] += half
+            if max_change < tol:
+                break
+
+    def elevation_at(self, x: float, y: float) -> Optional[float]:
+        """Sample the network elevation at an arbitrary
+        meter-space point.  Returns the interpolated elevation
+        along the nearest graph edge when the point is close
+        enough (≤ 50 m from the edge).  Returns None when the
+        point is far from any network edge."""
+        if not self.nodes:
+            return None
+        # Find nearest node — cheap first approximation.
+        best_i = -1
+        best_d2 = 1e18
+        for i, (nx, ny) in enumerate(self.nodes):
+            d2 = (nx - x) ** 2 + (ny - y) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+        if best_i < 0:
+            return None
+        # Search adjacent edges; pick the closest edge by
+        # perpendicular distance, then interpolate along it.
+        px, py = x, y
+        best_edge_d = math.sqrt(best_d2)
+        best_elev = self.elev[best_i]
+        candidates = [(best_i, best_i)]  # self-segment fallback
+        for nb, _length in self.edges_adj[best_i]:
+            candidates.append((best_i, nb))
+        for i, j in candidates:
+            if i == j:
+                continue
+            ax, ay = self.nodes[i]
+            bx, by = self.nodes[j]
+            dx = bx - ax
+            dy = by - ay
+            seg_len2 = dx * dx + dy * dy
+            if seg_len2 <= 0:
+                continue
+            t = ((px - ax) * dx + (py - ay) * dy) / seg_len2
+            t = max(0.0, min(1.0, t))
+            closest_x = ax + t * dx
+            closest_y = ay + t * dy
+            d = math.hypot(px - closest_x, py - closest_y)
+            if d < best_edge_d:
+                best_edge_d = d
+                ea, eb = self.elev[i], self.elev[j]
+                best_elev = ea + (eb - ea) * t
+        if best_edge_d > 50.0:
+            return None
+        return best_elev
+
+
+def _build_elevation_network(
+    osm_nodes, osm_ways, to_m,
+    runway_segment_chain, anchor, dem, tile_lat, tile_lon,
+) -> Optional[ElevationGraph]:
+    """Construct the elevation network from OSM taxi centerlines
+    + runway segment endpoints, densified to NETWORK_DENSIFY_M.
+    Runway segment endpoints become hard anchors."""
+    if osm_nodes is None or osm_ways is None or to_m is None:
+        return None
+    lat0, lon0 = anchor
+    cos0 = math.cos(math.radians(lat0))
+    g = ElevationGraph(lat0, lon0, cos0, tile_lat, tile_lon, dem)
+
+    def _add_segment(a, b, anchor_a=None, anchor_b=None):
+        """Add nodes at endpoints a, b and connect with densified
+        intermediate nodes so no edge exceeds NETWORK_DENSIFY_M."""
+        ax, ay = a
+        bx, by = b
+        dx = bx - ax; dy = by - ay
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 0.5:
+            return None, None
+        n_sub = max(1, int(math.ceil(seg_len / NETWORK_DENSIFY_M)))
+        step = seg_len / n_sub
+        # Add endpoint nodes
+        i_a = g.add_node(ax, ay, anchor=anchor_a)
+        prev = i_a
+        for k in range(1, n_sub):
+            t = k / n_sub
+            ix = ax + t * dx
+            iy = ay + t * dy
+            i_mid = g.add_node(ix, iy)
+            g.add_edge(prev, i_mid, step)
+            prev = i_mid
+        i_b = g.add_node(bx, by, anchor=anchor_b)
+        g.add_edge(prev, i_b, step)
+        return i_a, i_b
+
+    # ── OSM taxi ways → graph ────────────────────────────────────
+    # Track node indices by OSM node id so ways that share a node
+    # share a graph node (crossings / junction topology).
+    osm_node_to_graph: Dict[str, int] = {}
+    for wid, nds, tags in osm_ways:
+        if tags.get("aeroway") != "taxiway":
+            continue
+        pts: List[Tuple[str, Tuple[float, float]]] = []
+        for nid in nds:
+            if nid not in osm_nodes:
+                continue
+            lat, lon = osm_nodes[nid]
+            pts.append((nid, to_m(lon, lat)))
+        if len(pts) < 2:
+            continue
+        prev_nid, prev_xy = pts[0]
+        if prev_nid not in osm_node_to_graph:
+            osm_node_to_graph[prev_nid] = g.add_node(prev_xy[0], prev_xy[1])
+        prev_idx = osm_node_to_graph[prev_nid]
+        for nid, xy in pts[1:]:
+            if nid not in osm_node_to_graph:
+                osm_node_to_graph[nid] = g.add_node(xy[0], xy[1])
+            cur_idx = osm_node_to_graph[nid]
+            # Densified chain between prev_idx and cur_idx.
+            dx = xy[0] - prev_xy[0]; dy = xy[1] - prev_xy[1]
+            seg_len = math.hypot(dx, dy)
+            if seg_len < 0.5:
+                prev_nid, prev_xy, prev_idx = nid, xy, cur_idx
+                continue
+            n_sub = max(1, int(math.ceil(seg_len / NETWORK_DENSIFY_M)))
+            step = seg_len / n_sub
+            last = prev_idx
+            for k in range(1, n_sub):
+                t = k / n_sub
+                ix = prev_xy[0] + t * dx
+                iy = prev_xy[1] + t * dy
+                mid = g.add_node(ix, iy)
+                g.add_edge(last, mid, step)
+                last = mid
+            g.add_edge(last, cur_idx, step)
+            prev_nid, prev_xy, prev_idx = nid, xy, cur_idx
+
+    # ── Runway segment endpoints as hard anchors ────────────────
+    # Each runway segment's endpoints get their CIFP-derived
+    # elevations as hard anchors.  Consecutive segments share
+    # endpoint lat/lon, so dedupe by rounded coord key.
+    rwy_node_key_to_idx: Dict[Tuple[int, int], int] = {}
+    def _rwy_key(x, y):
+        return (int(round(x * 10)), int(round(y * 10)))
+    for seg in runway_segment_chain:
+        lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, _w = seg
+        ax, ay = _latlon_to_m_local(lat_a, lon_a, lat0, lon0, cos0)
+        bx, by = _latlon_to_m_local(lat_b, lon_b, lat0, lon0, cos0)
+        ka, kb = _rwy_key(ax, ay), _rwy_key(bx, by)
+        if ka not in rwy_node_key_to_idx:
+            rwy_node_key_to_idx[ka] = g.add_node(
+                ax, ay, anchor=float(elev_a))
+        else:
+            # Ensure anchor is set (later seg sharing the key).
+            idx = rwy_node_key_to_idx[ka]
+            if g.anchor_elev[idx] is None:
+                g.anchor_elev[idx] = float(elev_a)
+        if kb not in rwy_node_key_to_idx:
+            rwy_node_key_to_idx[kb] = g.add_node(
+                bx, by, anchor=float(elev_b))
+        else:
+            idx = rwy_node_key_to_idx[kb]
+            if g.anchor_elev[idx] is None:
+                g.anchor_elev[idx] = float(elev_b)
+        # Edge length = segment length in meters
+        seg_len = math.hypot(bx - ax, by - ay)
+        if seg_len > 0:
+            # Densify too so intermediate runway surface is in the
+            # graph (helps bridge edges from taxis mid-runway).
+            n_sub = max(1, int(math.ceil(seg_len / NETWORK_DENSIFY_M)))
+            step = seg_len / n_sub
+            ia = rwy_node_key_to_idx[ka]
+            ib = rwy_node_key_to_idx[kb]
+            last = ia
+            for k in range(1, n_sub):
+                t = k / n_sub
+                ix = ax + t * (bx - ax)
+                iy = ay + t * (by - ay)
+                # Interpolated anchor elevation
+                interp_e = float(elev_a) + t * (
+                    float(elev_b) - float(elev_a))
+                mid = g.add_node(ix, iy, anchor=interp_e)
+                g.add_edge(last, mid, step)
+                last = mid
+            g.add_edge(last, ib, step)
+
+    # ── Bridge edges: taxi nodes close to runway → runway ──────
+    # Connect every taxi graph node within NETWORK_BRIDGE_MAX_M of
+    # a runway graph node, representing the junction / widening
+    # that physically bridges them.  OSM splits continuous taxi
+    # centerlines into multiple way chains, so a "degree 1" end
+    # test is unreliable — we use a distance threshold instead.
+    # NETWORK_BRIDGE_MAX_M is kept tight enough that interior
+    # nodes of parallel taxis (typically > 100 m from the runway
+    # at SPJC) don't get falsely anchored.
+    if rwy_node_key_to_idx:
+        rwy_indices = list(rwy_node_key_to_idx.values())
+        # Effective bridge length = (taxi→runway-centerline distance)
+        # MINUS the runway half-width, because a runway is flat
+        # across its width (no grade budget accrues crossing the
+        # width) and a taxi really joins the runway at its boundary,
+        # not its centerline.  Floor at 0.5 m so bridges never have
+        # zero/negative length.
+        _RWY_HALF_WIDTH_M = 22.5  # SPJC / SPLP runways are 45 m
+        for g_idx in range(len(g.nodes)):
+            if g.anchor_elev[g_idx] is not None:
+                continue  # runway anchor — skip
+            nx, ny = g.nodes[g_idx]
+            best = None
+            best_d = NETWORK_BRIDGE_MAX_M
+            for ri in rwy_indices:
+                rx, ry = g.nodes[ri]
+                d = math.hypot(nx - rx, ny - ry)
+                if d < best_d:
+                    best_d = d
+                    best = ri
+            if best is not None:
+                edge_len = max(0.5, best_d - _RWY_HALF_WIDTH_M)
+                g.add_edge(g_idx, best, edge_len)
+
+    if not g.nodes:
+        return None
+    return g
 
 
 SHARED_VERTEX_CLUSTER_TOL_M = 1.5

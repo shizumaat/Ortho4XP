@@ -20,6 +20,213 @@ or terminal corners.
 
 **SPLP:** 25 target-matches.  junction IoU 0.58.
 
+## Session 7 iteration 2026-04-24 — graph-based elevation network
+
+### User-reviewed issues from 2026-04-23 iteration
+
+1. **Missing junction at F stub / runway-34R end.**  A ~7400 m²
+   pavement region between the F walking-exit stub and the new
+   runway-34R blast-pad segment was uncovered.  Root cause: the
+   Phase-2 runway-clip code subtracted the new (segmented, with
+   overruns) runway union from each pre-existing junction
+   polygon, then kept only the largest resulting sub-polygon.
+   For junctions that straddle the new runway's east edge, the
+   clip returns a MultiPolygon — the piece east of the runway
+   (where the gap is) was dropped as "not the largest".
+2. **Stubs' elevations differed 2-5 m from the runway they
+   meet.**  V1 / A / F stubs measured +0.8, +4.2, +2.4 m above
+   the runway they join, violating the FAA 1.5 % taxi grade cap
+   by wide margins.  Root cause: the per-rect elevation logic
+   anchored to runway elevation only when the axis endpoint was
+   within 30 m of a runway segment.  Perpendicular stubs' axes
+   end 40-150 m off runway (the junction fills the gap), so no
+   anchor snap applied and the stubs used raw DEM which diverges
+   from the actual airport ground plane.
+
+### Changes
+
+1. **Multi-polygon runway clip fix.**  [_compute_elevations
+   runway-replacement block]: after clipping each non-runway /
+   non-terminal shape against the new runway union, emit EVERY
+   sub-polygon above a 50 m² floor (not just the largest).
+   Preserves the original shape's metadata on the largest piece
+   and uses `dataclasses.replace` to spawn extra shapes for the
+   remaining pieces.  Fixes the F/34R gap immediately (uncovered
+   pavement 8447 → 1025 m² at SPJC; F/34R-specific uncovered:
+   4848 → 3 m²).
+
+2. **Graph-based elevation network.**  Replaced the per-rect DEM
+   sampling with a shared elevation graph.  The pipeline:
+
+   - **`_build_elevation_network`** constructs a densified-to-
+     30 m graph from OSM taxi centerlines + CIFP-anchored runway
+     segment endpoints, plus **bridge edges** connecting any
+     non-anchor taxi graph node to the nearest runway graph node
+     if within 60 m (tight enough that interior nodes of parallel
+     taxis, typically > 100 m off runway at SPJC, don't get
+     falsely anchored).  Bridge-edge length is the straight-line
+     distance **minus the 22.5 m runway half-width** since grade
+     doesn't accrue crossing the flat runway surface width.
+   - **`ElevationGraph.propagate_bounds`**: Dijkstra from each
+     hard anchor (CIFP threshold + densified runway centerline
+     nodes) with edge weight = length × 0.015, producing a
+     per-node feasibility interval = ∩ of (anchor ± distance ×
+     0.015) across all reachable anchors.
+   - **`ElevationGraph.choose_values`**: pick each node's
+     elevation as DEM clipped into its interval (per user
+     2026-04-24, DEM is a soft preference — real airports
+     excavate / build up, so a node free of runway anchors
+     follows DEM only when no grade-compliance rule forces
+     otherwise).
+   - **`ElevationGraph.smooth_rate_of_change`** (up to 30
+     iterations): Laplacian-style moving each non-anchor node
+     toward neighbours' mean by damping factor 0.4, re-clipping
+     into the feasibility interval, and hard-capping each edge
+     at 1.5 % afterward.  Addresses the FAA 1 %/30 m
+     rate-of-change rule (curvature) as a follow-up to the
+     first-derivative grade cap.
+   - **`ElevationGraph.elevation_at(x, y)`** samples the network
+     surface at arbitrary meter-space points — used for each
+     rect's two axis endpoints.
+
+### Results at SPJC
+
+Graph-based path-distance grade compliance for the three stubs
+that were previously badly out:
+
+| stub | stub elev | runway anchor | taxi-path dist | Δ | FAA allowed | |
+|---|---|---|---|---|---|---|
+| V1 | 6.32 m | 5.88 m | 52 m | 0.44 m | 0.79 m | ✓ |
+| A  | 14.28 m | 13.41 m | 66 m | 0.87 m | 0.99 m | ✓ |
+| F  | 33.37 m | 32.19 m | 87 m | 1.19 m | 1.30 m | ✓ |
+
+All three now within the FAA 1.5 % cap along their actual
+graph-network path to the runway anchor.  Overlap count
+remains 0 at both SPJC and SPLP.  Coverage 0.04 % uncovered.
+
+### Still-pending / known
+
+- **Terminals**: still DEM-median.  SPJC terminal1 at 31.1 m
+  may still be high vs the airport's 13 m reference — the
+  terminal pad's apt.dat polygon extends into hilly ground
+  east of the apron, and the DEM median picks that up.  Will
+  need a building-pad grade constraint later (pulled toward
+  adjacent taxi elevations via a similar graph approach).
+- **Junctions / aprons / buildings** still un-elevated per user
+  instruction.  When later enabled, each junction vertex
+  inherits elevation from the adjacent taxi/runway/terminal
+  shapes that share that vertex.
+- **Bridge-edge threshold at 60 m** works for SPJC/SPLP where
+  no parallel taxi passes closer than ~100 m to the runway.
+  If future airports have tighter geometry (parallel within
+  60 m), the threshold may need per-airport tuning.
+- **Runway half-width hard-coded at 22.5 m** (SPJC/SPLP are
+  both 45 m runways).  Should use the actual width from
+  apt.dat per runway when we touch airports with non-45 m
+  runways.
+
+### Constants (elevation graph)
+
+- `NETWORK_DENSIFY_M = 30.0` (max edge length, matches FAA
+  rate-of-change rule 1 % / 30 m).
+- `NETWORK_BRIDGE_MAX_M = 60.0` (max dist for taxi→runway
+  bridge).
+- `TAXI_MAX_GRADE = 0.015` (FAA taxi cap).
+- `_RWY_HALF_WIDTH_M = 22.5` (offset in bridge-edge length).
+- Smoothing: 30 iters, damping 0.4, convergence tol 1 cm.
+
+---
+
+## Session 7 iteration 2026-04-23 (phase 2 — elevations)
+
+User instruction:
+- Add elevations to **terminal pads** (flat).
+- Re-enable the existing segmented, sloped runway generation.
+- Add elevations to **all taxi rects**.
+- Leave junctions / aprons un-elevated this iteration.
+
+### Changes
+
+1. **BuiltShape** extended with optional ``altitude``,
+   ``altitude_high``, ``altitude_low`` floats.  ``to_osm`` writes
+   them as tags (single ``altitude`` when flat; high+low pair
+   when sloped).
+
+2. **New `_compute_elevations(layout, icao, xplane_root, apt)`**
+   runs as the final pass of ``build_airport_pavement`` when
+   ``compute_elevations=True``.  It:
+   - Loads the tile DEM from ``Elevation_data/{group}/{hgt}``
+     via ``O4_DEM_Utils.DEM``.
+   - Parses CIFP via ``O4_Auto_Patch.parse_cifp_file`` and
+     calls the legacy ``pair_runways`` + ``generate_patch_osm``
+     with a ``Tile`` stub carrying the DEM.
+   - Takes the ``runway_segment_chain`` output (list of
+     ``(lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m)``
+     tuples), **strips the 3 m per-side ``RUNWAY_MARGIN``** so
+     the segmented runways match the apt.dat width our Phase-1
+     junctions were built against, and builds per-segment
+     BuiltShape rects with ``altitude_high``/``altitude_low``
+     (or flat ``altitude`` when |Δ| < 0.1 m).  Replaces the
+     original single-rect runway shape.
+   - Taxi rects (primary / secondary / stub / cross_connector):
+     sample DEM at axis endpoints, snap to the nearest runway
+     segment elevation when within ``TAXI_ANCHOR_DIST_M = 30 m``,
+     cap longitudinal grade at FAA ``1.5 %`` taxi limit, emit
+     ``altitude_high/low`` or flat ``altitude``.
+   - Terminal pads: sample DEM at centroid + perimeter,
+     emit median as flat ``altitude``.
+   - Junctions untouched (no altitude tags).
+   - Final **runway-vs-other clip** using
+     ``new_runway_union.buffer(0.05)`` removes floating-point
+     slivers (e.g. the flat overrun segments extending past the
+     original runway endpoints into existing junctions).
+
+3. **Defensive geometry cleanup** in the elevation pass: calls
+   ``buffer(0)`` on each polygon before ``difference`` to
+   avoid shapely's "side location conflict" errors at
+   self-kissing boundaries produced by `_enforce_shared_vertices`.
+
+### Results (2026-04-23 phase 2)
+
+| metric | SPJC | SPLP |
+|---|---|---|
+| runway shapes | **73** (67 sloped + 6 flat) | **24** (21 sloped + 3 flat) |
+| taxi rects elevated | 47 / 47 ✓ | 15 / 15 ✓ |
+| terminal pads elevated | 2 / 2 ✓ | 0 (none in target) |
+| junctions elevated | 0 (by design) | 0 (by design) |
+| overlap pairs (> 1 m²) | **0** ✓ | **0** ✓ |
+| runway elevation range | 5.9 – 32.2 m | 65.3 – 77.1 m |
+
+### Deferred / known-quirks
+
+- Per-rect DEM sampling is independent; **cross-rect grade-change
+  relaxation (FAA 1 %/30 m vertical curve)** is not applied —
+  shared vertices between adjacent taxi rects may carry different
+  computed altitudes, X-Plane triangulator will smooth.  If
+  visible artefacts appear, a post-pass graph relaxation is the
+  fix.
+- Terminal elevation is DEM-median — SPJC terminal1 lands at
+  31.1 m, terminal2 at 22.9 m.  These look high vs the airport
+  reference (~13 m at the N threshold); the SPJC site sits on a
+  NW-SE slope and the DEM (SRTM-derived) may include
+  building-top returns.  Flag for visual review.
+- Junctions / aprons / buildings will get elevations in a later
+  iteration.
+- ``_validate_shared_vertex_invariant`` is still ACTIVE — pre-
+  elevation shapes pass it; runway segments are added AFTER so
+  the check runs before the new runways exist.
+
+### Current constants (elevation-related)
+
+- ``TAXI_MAX_GRADE = 0.015`` (FAA taxiway longitudinal cap).
+- ``TAXI_ANCHOR_DIST_M = 30.0``.
+- Legacy ``RUNWAY_MARGIN = 3.0`` stripped from segmented runway
+  width to match apt.dat.
+- DEM source: ``Elevation_data/{±NN±NNN}/{S|N}NN{E|W}NNN.hgt``.
+- CIFP source: ``{xplane_root}/Custom Data/CIFP/{ICAO}.dat``.
+
+---
+
 ## Session 7 iteration 2026-04-23 (late) — pivot to simplest-polygons
 
 ### Strategic pivot (user 2026-04-23)
