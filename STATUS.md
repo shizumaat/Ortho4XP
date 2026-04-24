@@ -4,17 +4,304 @@
 `src/O4_Airport_Pavement_Builder.py` reproducing hand-drawn target
 layouts at `tests/fixtures/{SPJC,SPLP}_target.osm`.
 
-**SESSION 6 ongoing (2026-04-21 / 2026-04-22):** JUNCTIONS + APRONS
-both DISABLED (`EMIT_JUNCTIONS = False`, `EMIT_APRONS = False`).
+**SESSION 7 (2026-04-22 / 2026-04-23):** Major pivot —
+junctions and aprons are now geometrically identical and both
+emit as `role=junction`.  Every connected pavement region not
+covered by a rect or terminal is emitted as ONE polygon (with
+rect-shaped holes as multipolygon interior rings), seamed to
+neighbouring shapes via rect + terminal + runway corner
+injection.  **Zero overlap pairs** at SPJC / SPLP.  Coverage
+99.96 % of apt.dat pavement.
 
-**SPJC:** 50/105 matched — stub 15/15 ✓, cross_connector 6/6 ✓,
-primary_parallel 21/30 (0 spurious), runway 2/2.  stub avgIoU 0.68,
-cross avgIoU 0.76.  1 spurious secondary_parallel.
+**SPJC:** 72 target-matches (target's subdivision-rich layout
+doesn't match the simplest-polygons approach; visual coverage
+is complete).  junction IoU 0.73, 0 overlaps, 0 unmatched rect
+or terminal corners.
 
-**SPLP:** 13/30 matched — stub 5/6, primary_parallel 5/5,
-cross_connector 2/2, runway 1/1.  stub avgIoU 0.58.  Perpendicular
-stubs now center-aligned on targets; walking runway-curve stub
-landed at d=1 m from target via interpolation.
+**SPLP:** 25 target-matches.  junction IoU 0.58.
+
+## Session 7 iteration 2026-04-23 (late) — pivot to simplest-polygons
+
+### Strategic pivot (user 2026-04-23)
+
+Junctions and aprons will be treated identically at elevation
+time: both will triangulate and slope multi-directionally
+(unlike rects, which slope only along their axis).  So the
+distinction no longer exists geometrically.  New rule: emit the
+**simplest polygon that covers all remaining pavement and
+connects to neighbouring rects + terminals**.  Don't try to
+match target's hand-drawn subdivision any more — it was
+over-subdivided for a different elevation model.
+
+### Changes
+
+1. **Cluster-based constructive junction builder DELETED from
+   the emission path.**  Seed-driven clusters produced
+   overlapping, partial junctions when adjacent clusters each
+   captured a different subset of rect corners.  Now residue-
+   driven only.
+
+2. **Residue = `pav_union - rect_union - terminal_union -
+   runway_union`.**  Each connected component is emitted as
+   one junction.  No area threshold needed beyond slivers
+   (`MIN_JUNCTION_AREA_M2 = 50`).
+
+3. **Rect + terminal + runway corners injected as shared
+   boundary vertices** on every junction.  Uses extended
+   `_insert_points_on_boundary` that now preserves interior
+   rings (critical for junctions that wrap around interior
+   rects, creating holes).
+
+4. **OSM writer supports multipolygon relations** for
+   polygons with interior rings.  Junction outer + each inner
+   ring emit as separate ways; a relation ties them with
+   role=outer / role=inner.  [tools/compare_target.py](tools/compare_target.py)
+   updated to parse multipolygons correctly.
+
+5. **OSM writer bucket snapping fixed** to use the first
+   vertex's actual coordinates (not bucket center).  Bucket
+   centers were up to 0.25 m off the real vertex, creating
+   sub-metre overlaps after OSM round-trip.  Now zero.
+
+### Results (2026-04-23 late)
+
+| metric | SPJC | SPLP |
+|---|---|---|
+| shapes total | 82 | 33 |
+| junctions (incl. multipolygons) | 31 | 17 |
+| overlap pairs (>1 m²) | **0** ✓ | **0** ✓ |
+| uncovered pavement | 0.04 % | similar |
+| unmatched rect corners | 0 ✓ | 0 ✓ |
+| unmatched terminal corners | 0 ✓ | 0 ✓ |
+
+Target match-counts are lower than previous iterations because
+target hand-draws finer subdivisions.  This is expected under
+the new approach.
+
+### Next steps
+
+1. **Elevations (Phase 2).**  With the geometry now clean and
+   seamless, the next phase is adding elevations to each
+   shape.  Rects slope along their axis; junctions / terminals
+   triangulate and slope multi-directionally.
+2. **Re-enable building outlines** (currently only terminal
+   pads emit).  The building emission path already exists via
+   `_extract_osm_terminals` but is limited to pad polygons.
+3. **SPLP refinement**: 5 spurious junction pieces (small
+   slivers where rects don't perfectly snap).
+
+### Current constants
+
+- `EMIT_JUNCTIONS = True`; `EMIT_APRONS = False` (the latter
+  is dead code — no path emits aprons any more).
+- `MIN_JUNCTION_AREA_M2 = 50.0`.
+- `SIMPLIFY_TOL_M = 1.0`.
+- `RECT_CORNER_TOL_M = 2.0` (corner-to-boundary injection
+  range).
+- `_snap_corners_to_pavement`: filters apt.dat vertices to
+  those within 0.5 m of `pav_union.boundary`.
+
+---
+
+## Session 7 iteration 2026-04-23 (early) — V-chain review + Q/R end junctions
+
+### User-reviewed issues (SPJC, V-chain N→S)
+
+1. **Duplicate runway-stub trapezoid** at every widening-stub →
+   runway location.  Two overlapping junctions per runway end —
+   one 4-vert trapezoid, one boundary-tracing residue junction.
+   Fixed: dropped trapezoid path at `_build_airport_pavement`
+   line ~955; kept `rwy_vertex_inserts` collection so runway
+   polygons still pick up shared vertices with the residue
+   junction.  Overlap pairs 13 → 1 at SPJC.
+
+2. **V1 rect corner 5.88 m off pav boundary.**  Corner snap
+   picked an apt.dat vertex that sits INSIDE the pav_union
+   interior (where two pavement polygons overlap).  Fixed:
+   `_snap_corners_to_pavement` now pre-filters `apt_vertices`
+   to those within 0.5 m of `pav_union.boundary`.  All V-chain
+   rects (V, V1, V2, V3, V5) now have all 4 corners exactly on
+   boundary.
+
+3. **V2 + V-south rect snap** — same fix as #2.
+
+4. **V/Q/R missing NW extent + mid-edge R connection.**
+   Constructive cluster at (327,-149) only captured SE rect
+   corners (Q, R) — V-primary-north rect end was >120 m from
+   cluster centroid, beyond `max_corner_dist_m`.  **See Q/R
+   end radius fix below.**
+
+5. **V3 mega-junction (-803794, 35v, 74668 m²)** not emitted.
+   Root cause: L primary isn't subdivided at apron vertices,
+   so no rect ends seed a cluster in this region.  Same
+   root cause as 9 missed primaries (open item #3 from session
+   6).  **Deferred** — needs apron-vertex-based primary split.
+
+6. **V-apron junction (-803796)** extends east past U.
+   Tried: chord-bulge cap, residue-hull cap — both regressed
+   match count by 4 without cleanly fixing the visual issue.
+   Reverted.  Still oversized by ~2× (IoU 0.27).  **Deferred**
+   — probably needs proper apron emission to bound the east
+   side.
+
+### Q/R end junctions fix (user 2026-04-23)
+
+Target junctions at the N and S ends of Q and R each connect
+5 rects.  Their rect ends span 300-450 m diagonally.  The
+previous `max_corner_dist_m` default of 80 m (sometimes 120 m
+with extent slack) only reached the closest 2-3 rects, so the
+junction polygons under-covered.
+
+Changes:
+
+- **Corner radius `CORNER_RADIUS_BASE_M = 220 m`** (was 80)
+  at `_build_airport_pavement` cluster-build loop.  Allows
+  the constructive builder to project rect corners up to 220 m
+  from the cluster centroid — enough for the 5-rect junctions.
+- **Local disc `local_radius = corner_radius + 60 m`** so the
+  boundary walk has a slightly larger window than the corners.
+- **`CLUSTER_MERGE_DIST_M: 40 → 80`** so adjacent seed points
+  at a single physical junction merge into ONE cluster rather
+  than producing 2-3 overlapping junction builds.
+- **Dedup overlap threshold `0.8 → 0.3`** at `_polys_overlap_heavily`
+  so bigger clusters producing variant polygons around the
+  same target junction consolidate to the largest.
+
+### Results (2026-04-23)
+
+| Target | Before | After (IoU) |
+|---|---|---|
+| -803800 L/M/Q/R (N end, 5 rects) | 0.24 | **0.75** ✓ |
+| -803799 V/Q/R (S end, 5 rects) | 0.31 | **0.57** |
+| -803801 Q/R N-mid | ~0.40 | **0.88** ✓ |
+| -803802 Q/R S-mid | ~0.40 | **0.89** ✓ |
+
+| | junctions matched | missed | spurious | avgIoU |
+|---|---|---|---|---|
+| SPJC before | 31/43 | 12 | 18 | 0.54 |
+| SPJC after | **38/43** | 5 | 18 | 0.56 |
+| SPLP before | 12/13 | 1 | 12 | 0.59 |
+| SPLP after | 12/13 | 1 | 5 | 0.58 |
+
+### Still-pending at session-7 close
+
+1. **V-apron overflow** (issue 6).  Needs apron emission or a
+   better apron-symmetry cap.
+2. **V3 mega missing** (issue 5).  Needs L-primary split at
+   apt.dat apron-boundary vertices.
+3. **18 spurious SPJC junctions.**  Big clusters now produce
+   multiple variants that don't dedup at 0.3 threshold.  Next
+   step: either tighter dedup on the dominant-area pair, or
+   cluster-consolidation pass after build.
+
+### Current session-7 constants
+
+- `EMIT_JUNCTIONS = True`; `EMIT_APRONS = False`.
+- `MIN_JUNCTION_AREA_M2 = 1000.0`.
+- `CLUSTER_MERGE_DIST_M = 80.0` (was 40).
+- `CORNER_RADIUS_BASE_M = 220.0` (was implicit 80).
+- `LOCAL_DISC_EXTRA_M = 60.0`.
+- Dedup threshold `0.3` (was 0.8).
+- Arc-vertex limit per arc: 4 (unchanged).
+- `_snap_corners_to_pavement`: pre-filters apt.dat vertices
+  to those within 0.5 m of `pav_union.boundary`.
+
+---
+
+## Session 7 original (2026-04-22) — junction re-enable
+
+### Changes landed
+
+1. **`EMIT_JUNCTIONS = True`** (line 72).  Rects judged within
+   tolerance at session 6 close; junction emission re-opened for
+   iteration.  Aprons stay off.
+
+2. **Area floor `MIN_JUNCTION_AREA_M2: 80 → 1000`** (line 835) +
+   residue-fallback floor `500 → MIN_JUNCTION_AREA_M2` (line 1075).
+   Observed target minimums: SPJC 2030 m², SPLP 1069 m².  Dropping
+   sub-1000 m² fragments removes 4 SPJC + 5 SPLP spurious without
+   touching any real target junction.
+
+3. **Apron-symmetry cap in `_build_junction_constructive`**
+   (~line 1896).  Per user (2026-04-22) — when an arc between
+   consecutive rect corners crosses an apron-exposed side of the
+   cluster, the apt.dat pav boundary balloons into apron
+   territory because aprons are part of `pav_union`.  Compute
+   `rect_bounded_radius = max(dist from cluster centroid to any
+   rect corner)`.  For arcs where chord length >
+   `rect_bounded_radius × 1.2` (apron-exposed), drop arc vertices
+   whose distance to centroid exceeds `radius × 1.3`.  Factor
+   tuned via sweep; trigger-only variant avoids regressing the
+   normal rect-to-rect arcs.  Result: spurious 21→18 at SPJC
+   with matched count preserved at 31.
+
+### Audit findings
+
+- **Rect corners sit on pav boundary correctly**: 65% of SPJC
+  rect corners and 48% of SPLP corners are ≤0.5 m from
+  `pav_union.boundary`.  Outliers >10 m are all expected —
+  walking-exit stubs (A/F) extending onto runway apron (rule-
+  sanctioned widening stubs) and a handful of primary-parallel
+  corners at irregular pav edges.  The constructive emitter's
+  20 m projection filter accepts ≥94%.
+
+- **Target junction inventory**:
+
+  | | count | vertex-count | area (m²) |
+  |---|---|---|---|
+  | SPJC | 43 | 4-35 (p50=9) | 2030-74668 (p50=6487) |
+  | SPLP | 13 | 5-17 (p50=7) | 1069-7671 (p50=2805) |
+
+  Zero target junctions have zero shared nodes; every one shares
+  vertices with neighbours (308 incidences at SPJC, 81 at SPLP).
+
+### Remaining gaps at session-7 close
+
+1. **10 of 12 SPJC missed junctions are "no output nearby"** —
+   all apron-adjacent, all have primary_parallel=2 in
+   neighbours.  Root cause: target subdivides the L primary at
+   apron-boundary points that have no OSM bend or junction-node
+   signal.  Without the L-subdivisions, no pair of rect ends
+   seeds these junction clusters.  Same root cause as the 9
+   missed primary_parallels (open item #3 from session 6).
+
+2. **avgIoU 0.54 at SPJC** — emitted junctions have approximately
+   right position/area but shape drifts.  Likely from 4-arc-
+   vertex limit being too aggressive on large junctions (p90
+   target = 17 vertices) and/or from the apron-symmetry cap
+   cutting shapes on the tight side.
+
+3. **Runway-stub trapezoid** at line 987 is still 4-vertex-only;
+   target runway-stub junctions have 6-7 vertices (boundary-arc
+   walk between stub corners + runway projections).  Not wired
+   to use the constructive builder.
+
+### Next-session candidates
+
+1. **Split primary parallels at apt.dat pav-boundary vertices
+   where an apron meets the rect long edge.**  Without enabling
+   `EMIT_APRONS`, scan `apt_pav_vertices` for points within 20 m
+   of a primary-parallel rect edge that also sit on the
+   apt.dat boundary between pavement polygons; add those as
+   split points.  Unblocks the 10 apron-adjacent missed
+   junctions + recovers ~9 missed primaries.
+
+2. **Apply the constructive builder to runway-stub trapezoids**
+   so they get boundary-arc walks (~2-3 extra vertices each).
+
+3. **Re-enable `EMIT_APRONS`**, then evaluate the 3 SPJC + 3
+   SPLP missed aprons as a separate workstream.
+
+### Current session-7 constants
+
+- `EMIT_JUNCTIONS = True`; `EMIT_APRONS = False`.
+- `MIN_JUNCTION_AREA_M2 = 1000.0` (was 80).
+- `CLUSTER_MERGE_DIST_M = 40.0` (unchanged).
+- Constructive builder: `ARC_CAP_FACTOR = 1.3`,
+  `ARC_CHORD_TRIGGER = 1.2`.
+- Arc-vertex limit: 4 per arc (session-6 user rule).
+
+---
 
 ## Session 6 (2026-04-21 / 2026-04-22) — rect correctness iteration
 

@@ -56,24 +56,60 @@ _NODE_RE = re.compile(
     r"<node id='(-?\d+)'[^>]*lat='([^']+)'[^>]*lon='([^']+)'"
 )
 _WAY_RE = re.compile(r"<way id='(-?\d+)'[^>]*>(.*?)</way>", re.S)
+_REL_RE = re.compile(r"<relation id='(-?\d+)'[^>]*>(.*?)</relation>", re.S)
+_MEMBER_RE = re.compile(r"<member type='way' ref='(-?\d+)' role='(\w+)'")
 _ND_RE = re.compile(r"<nd ref='(-?\d+)'")
 _TAG_RE = re.compile(r"<tag k='([^']+)' v='([^']+)'")
 
 
 def _parse_osm(path: Path) -> Tuple[Dict[str, Tuple[float, float]],
                                     List[Tuple[str, List[str], Dict[str, str]]]]:
+    """Parse OSM file.  Returns (nodes, shape_specs) where each
+    shape_spec is (id, list_of_ring_node_id_lists, tags).  Simple
+    polygons have one ring (the exterior); multipolygon relations
+    have [outer_ring, inner_ring_1, inner_ring_2, ...]."""
     txt = path.read_text()
     nodes: Dict[str, Tuple[float, float]] = {}
     for m in _NODE_RE.finditer(txt):
         nodes[m.group(1)] = (float(m.group(2)), float(m.group(3)))
-    ways = []
+    way_nds: Dict[str, List[str]] = {}
+    way_tags: Dict[str, Dict[str, str]] = {}
     for m in _WAY_RE.finditer(txt):
-        wid = m.group(1)
-        body = m.group(2)
-        nds = _ND_RE.findall(body)
+        wid = m.group(1); body = m.group(2)
+        way_nds[wid] = _ND_RE.findall(body)
+        way_tags[wid] = dict(_TAG_RE.findall(body))
+    # Find ways that are referenced as members of a multipolygon
+    # relation — those should NOT be emitted as standalone shapes.
+    rel_member_wids: set = set()
+    rel_shapes: List[Tuple[str, List[List[str]], Dict[str, str]]] = []
+    for m in _REL_RE.finditer(txt):
+        rid = m.group(1); body = m.group(2)
+        members = _MEMBER_RE.findall(body)
         tags = dict(_TAG_RE.findall(body))
-        ways.append((wid, nds, tags))
-    return nodes, ways
+        if tags.get("type") != "multipolygon":
+            continue
+        outer_rings: List[List[str]] = []
+        inner_rings: List[List[str]] = []
+        for wid, role in members:
+            rel_member_wids.add(wid)
+            if wid not in way_nds:
+                continue
+            nds = way_nds[wid]
+            if role == "outer":
+                outer_rings.append(nds)
+            elif role == "inner":
+                inner_rings.append(nds)
+        # A valid multipolygon has at least one outer ring.
+        for outer in outer_rings:
+            rel_shapes.append((rid, [outer] + inner_rings, tags))
+    # Simple ways: ones not part of any multipolygon.
+    shapes: List[Tuple[str, List[List[str]], Dict[str, str]]] = []
+    for wid, nds in way_nds.items():
+        if wid in rel_member_wids:
+            continue
+        shapes.append((wid, [nds], way_tags[wid]))
+    shapes.extend(rel_shapes)
+    return nodes, shapes
 
 
 def _ll_to_m(lat: float, lon: float, lat0: float, lon0: float) -> Tuple[float, float]:
@@ -84,28 +120,38 @@ def _ll_to_m(lat: float, lon: float, lat0: float, lon0: float) -> Tuple[float, f
 
 
 def load_shapes(path: Path, anchor: Tuple[float, float], source: str) -> List[OsmShape]:
-    nodes, ways = _parse_osm(path)
+    nodes, shape_specs = _parse_osm(path)
     lat0, lon0 = anchor
     shapes: List[OsmShape] = []
-    for wid, nds, tags in ways:
+    for wid, rings, tags in shape_specs:
         role = tags.get("role")
         if not role:
             continue
-        if len(nds) < 4:
+        if not rings:
             continue
-        coords = []
-        for nid in nds:
-            if nid not in nodes:
-                continue
-            lat, lon = nodes[nid]
-            coords.append(_ll_to_m(lat, lon, lat0, lon0))
-        if len(coords) < 4:
+        # First ring = exterior; remaining = interior rings (holes).
+        def _ring_coords(nds):
+            cc = []
+            for nid in nds:
+                if nid not in nodes:
+                    continue
+                lat, lon = nodes[nid]
+                cc.append(_ll_to_m(lat, lon, lat0, lon0))
+            if len(cc) < 4:
+                return None
+            if cc[0] != cc[-1]:
+                cc.append(cc[0])
+            return cc
+        ext = _ring_coords(rings[0])
+        if ext is None:
             continue
-        # Close if not already closed
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
+        interiors = []
+        for ring_nds in rings[1:]:
+            ic = _ring_coords(ring_nds)
+            if ic is not None:
+                interiors.append(ic)
         try:
-            poly = Polygon(coords)
+            poly = Polygon(ext, interiors)
         except Exception:
             continue
         if poly.is_empty or not poly.is_valid:
