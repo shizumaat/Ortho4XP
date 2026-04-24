@@ -1332,12 +1332,30 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             except Exception:
                 new_rwy_union = None
             if new_rwy_union is not None and not new_rwy_union.is_empty:
-                # Tiny positive buffer so floating-point kisses
-                # at segment boundaries count as overlap.
+                # Two clip regions:
+                #
+                #   `taxi_clip` — tiny buffer (0.05 m).  For taxi
+                #   rects, only kills sub-metre sliver overlap with
+                #   the runway while keeping the 4-corner rect
+                #   shape intact.
+                #
+                #   `junction_clip` — 2.0 m outward buffer.  For
+                #   junction polygons, shrinks them away from the
+                #   runway edge by 2 m (user 2026-04-24: "taxiway
+                #   shapes should stop just short of the runway").
+                #   Prevents junction boundary vertices from
+                #   landing mid-edge on a runway short edge, which
+                #   X-Plane's mesh builder would interpret as
+                #   splitting the runway's 4-corner slope rect
+                #   and break the altitude_high/low rendering.
                 try:
-                    clip_region = new_rwy_union.buffer(0.05)
+                    taxi_clip = new_rwy_union.buffer(0.05)
                 except Exception:
-                    clip_region = new_rwy_union
+                    taxi_clip = new_rwy_union
+                try:
+                    junction_clip = new_rwy_union.buffer(2.0)
+                except Exception:
+                    junction_clip = new_rwy_union
                 # Rebuild layout.shapes in-place: when the clip
                 # produces a MultiPolygon (e.g. a junction that
                 # straddled the old runway ends up as two pieces
@@ -1360,6 +1378,9 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     if not src.is_valid:
                         try: src = src.buffer(0)
                         except Exception: pass
+                    clip_region = (junction_clip
+                                   if shape.role == ROLE_JUNCTION
+                                   else taxi_clip)
                     try:
                         clipped = src.difference(clip_region)
                     except Exception:
