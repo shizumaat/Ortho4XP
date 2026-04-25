@@ -102,10 +102,15 @@ class BuiltShape:
 
     Phase-2 elevation: exactly one of these options is set at any
     time:
-      * all three None (no elevation yet — junctions / aprons)
+      * all four None (no elevation yet)
       * only ``altitude`` set (flat polygon at that elevation, m)
       * ``altitude_high`` + ``altitude_low`` set (linearly sloped
         between the two parallel edges).  Rects use this.
+      * ``node_altitudes`` set (per-vertex elevation list, one
+        value per ring vertex INCLUDING the closing repeat —
+        i.e. len(node_altitudes) == len(closed_ring_nids)).
+        Used for triangulated junction polygons that slope in
+        more than one direction.
     Runway segments carry altitude_high/low per the legacy patch
     convention.
     """
@@ -116,6 +121,7 @@ class BuiltShape:
     altitude: Optional[float] = None
     altitude_high: Optional[float] = None
     altitude_low: Optional[float] = None
+    node_altitudes: Optional[List[float]] = None
 
 
 @dataclass
@@ -218,6 +224,14 @@ class PavementLayout:
                 tags["altitude_low"] = f"{s.altitude_low:.1f}"
                 tags["cell_size"] = "2"
                 tags["profile"] = "spline"
+            elif (s.node_altitudes is not None
+                  and len(s.node_altitudes) == len(ext_nids)):
+                # Per-vertex elevation: comma-separated list, one
+                # value per ring nid (including the closing repeat).
+                # X-Plane mesh builder triangulates the polygon and
+                # interpolates linearly between vertex elevations.
+                tags["node_altitudes"] = ",".join(
+                    f"{e:.1f}" for e in s.node_altitudes)
             elif s.altitude is not None:
                 tags["altitude"] = f"{s.altitude:.1f}"
             way_blocks.append((next_wid[0], ext_nids, tags))
@@ -1424,6 +1438,11 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         osm_nodes, osm_ways, to_m,
         runway_segment_chain, layout.anchor, dem, tile_lat, tile_lon)
     if graph is not None:
+        # Add cross-junction bridges so smoothing enforces 1.5 %
+        # grade across junction diagonals — not just along
+        # centerline routes.  Must run BEFORE propagate_bounds so
+        # the new edges contribute to per-node feasibility cones.
+        _add_junction_bridges(graph, layout)
         graph.propagate_bounds()
         graph.choose_values()
         graph.smooth_rate_of_change(iters=30)
@@ -1602,6 +1621,17 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     shape.polygon = new_poly
             except Exception:
                 pass
+
+    # ── Junction triangulation ──────────────────────────────────
+    # Each junction polygon is replaced with N-2 ear-clip
+    # triangles, each carrying a per-vertex elevation list
+    # (``node_altitudes``).  Vertex elevations come from the
+    # corner-elevation bucket map (rect/runway/terminal corners
+    # share node ids with junction boundary vertices), with
+    # graph and DEM fallbacks for boundary-trace vertices.  X-Plane
+    # interpolates linearly across each triangle, giving the
+    # multi-directional slope behaviour the user requested.
+    _triangulate_junctions(layout, graph, dem, tile_lat, tile_lon, m_to_ll)
 
 
 def _latlon_to_m_local(lat: float, lon: float,
@@ -2117,6 +2147,511 @@ def _build_elevation_network(
     if not g.nodes:
         return None
     return g
+
+
+# ── Junction-diagonal bridges ────────────────────────────────────
+#
+# The elevation network is built along OSM taxiway centerlines +
+# runway centerlines.  Two graph nodes that are close in straight
+# line through a junction may be FAR apart along the network (e.g.
+# centerlines that loop around the junction).  Without bridging,
+# their post-smoothing elevations can violate the 1.5 % grade
+# rule across the junction's diagonal.
+#
+# For each junction polygon, find the graph nodes nearest each
+# boundary vertex and add pairwise bridge edges with length =
+# straight-line distance.  Re-running propagate_bounds /
+# choose_values / smooth afterwards then enforces grade compliance
+# across the junction diagonals — so by the time rect altitudes
+# are sampled, junction triangulation needs no further refinement.
+JUNCTION_BRIDGE_MAX_M = 100.0
+JUNCTION_BRIDGE_NODE_DIST_M = 30.0  # max boundary-vertex → graph
+                                     # node distance to consider
+                                     # the boundary vertex bridged.
+
+
+def _add_junction_bridges(g: "ElevationGraph",
+                          layout: "PavementLayout") -> int:
+    """Add cross-junction bridge edges to the elevation graph.
+
+    Returns the number of bridges added (informational).
+    """
+    if not g.nodes:
+        return 0
+    added = 0
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            continue
+        try:
+            coords = list(shape.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            continue
+        # Find the nearest graph node for each boundary vertex.
+        nbrs: List[int] = []
+        for (vx, vy) in coords:
+            best_i = -1
+            best_d2 = JUNCTION_BRIDGE_NODE_DIST_M ** 2
+            for i, (nx, ny) in enumerate(g.nodes):
+                d2 = (nx - vx) * (nx - vx) + (ny - vy) * (ny - vy)
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_i = i
+            if best_i >= 0:
+                nbrs.append(best_i)
+        if len(nbrs) < 2:
+            continue
+        # Dedup while preserving order.
+        seen: set = set()
+        uniq: List[int] = []
+        for ni in nbrs:
+            if ni not in seen:
+                seen.add(ni)
+                uniq.append(ni)
+        # Pairwise bridges (capped by JUNCTION_BRIDGE_MAX_M).
+        for a in range(len(uniq)):
+            for b in range(a + 1, len(uniq)):
+                ia, ib = uniq[a], uniq[b]
+                ax, ay = g.nodes[ia]
+                bx, by = g.nodes[ib]
+                d = math.hypot(ax - bx, ay - by)
+                if 0.5 < d <= JUNCTION_BRIDGE_MAX_M:
+                    g.add_edge(ia, ib, d)
+                    added += 1
+    return added
+
+
+# ── Corner elevation lookup ──────────────────────────────────────
+#
+# Junction boundary vertices share node ids with adjacent rect
+# corners, runway corners, and terminal corners (the
+# SHARED_VERTEX_TOL_M bucket invariant enforced before to_osm).
+# Build a bucket → elevation map so each junction triangulation
+# vertex can read its elevation directly from its neighbour.
+
+
+def _corner_elevation_bucket(x: float, y: float,
+                             tol: float = SHARED_VERTEX_TOL_M
+                             ) -> Tuple[int, int]:
+    return (int(round(x / tol)), int(round(y / tol)))
+
+
+def _corner_elev_map(layout: "PavementLayout"
+                     ) -> Dict[Tuple[int, int], float]:
+    """Return a bucket-keyed elevation lookup for every corner of
+    every elevation-bearing non-junction shape.  Uses the same
+    bucket size as ``to_osm`` so junction vertices that share a
+    node id with a corner will hit the same bucket.
+
+    For sloped rect/runway shapes (altitude_high+altitude_low),
+    ring indices 0,3 are the HIGH short edge and 1,2 are the LOW
+    short edge — see ``_orient_rect_for_altitude``.  For flat
+    polygons (altitude only), every corner gets the single value.
+    """
+    rect_like_roles = {ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL,
+                       ROLE_STUB, ROLE_CROSS_CONNECTOR}
+    out: Dict[Tuple[int, int], float] = {}
+    for s in layout.shapes:
+        if s.role == ROLE_JUNCTION:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        # Sloped 4-corner rect/runway in patch convention.
+        if (s.role in rect_like_roles
+                and s.altitude_high is not None
+                and s.altitude_low is not None
+                and len(coords) == 4):
+            elevs = [s.altitude_high, s.altitude_low,
+                     s.altitude_low, s.altitude_high]
+            for (cx, cy), e in zip(coords, elevs):
+                out.setdefault(
+                    _corner_elevation_bucket(cx, cy), float(e))
+            continue
+        # Flat polygon (terminal, flat rect, or flat runway).
+        if s.altitude is not None:
+            for (cx, cy) in coords:
+                out.setdefault(
+                    _corner_elevation_bucket(cx, cy),
+                    float(s.altitude))
+    return out
+
+
+# ── Ear-clip triangulation ───────────────────────────────────────
+#
+# Pure-Python ear-clipping for simple polygons (no holes).  Returns
+# index triples (i,j,k) into the input vertex list.  For an N-vertex
+# simple polygon, exactly N-2 triangles are produced — the proven
+# minimum count when no Steiner points are added.
+
+
+def _ear_clip(coords: Sequence[Tuple[float, float]]
+              ) -> List[Tuple[int, int, int]]:
+    n = len(coords)
+    if n < 3:
+        return []
+    if n == 3:
+        return [(0, 1, 2)]
+    # Determine winding via shoelace; force CCW for the algorithm.
+    s = 0.0
+    for i in range(n):
+        x1, y1 = coords[i]
+        x2, y2 = coords[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    is_ccw = s > 0
+    indices = list(range(n)) if is_ccw else list(range(n - 1, -1, -1))
+
+    def _cross(o: int, a: int, b: int) -> float:
+        ox, oy = coords[o]
+        ax, ay = coords[a]
+        bx, by = coords[b]
+        return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+
+    def _pt_in_tri(p: int, a: int, b: int, c: int) -> bool:
+        px, py = coords[p]
+        ax, ay = coords[a]
+        bx, by = coords[b]
+        cx, cy = coords[c]
+        d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by)
+        d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy)
+        d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay)
+        has_neg = d1 < 0 or d2 < 0 or d3 < 0
+        has_pos = d1 > 0 or d2 > 0 or d3 > 0
+        return not (has_neg and has_pos)
+
+    triangles: List[Tuple[int, int, int]] = []
+    guard = 4 * n  # bail-out in pathological cases
+    while len(indices) > 3 and guard > 0:
+        guard -= 1
+        m = len(indices)
+        for i in range(m):
+            prev_i = indices[(i - 1) % m]
+            cur_i = indices[i]
+            next_i = indices[(i + 1) % m]
+            # Convex (left turn for CCW polygon).
+            if _cross(prev_i, cur_i, next_i) <= 0:
+                continue
+            # No other vertex inside the candidate ear.
+            ok = True
+            for k in indices:
+                if k in (prev_i, cur_i, next_i):
+                    continue
+                if _pt_in_tri(k, prev_i, cur_i, next_i):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            triangles.append((prev_i, cur_i, next_i))
+            del indices[i]
+            break
+        else:
+            # No ear found this pass — fan from indices[0] and bail.
+            for i in range(1, len(indices) - 1):
+                triangles.append(
+                    (indices[0], indices[i], indices[i + 1]))
+            return triangles
+    if len(indices) == 3:
+        triangles.append((indices[0], indices[1], indices[2]))
+    return triangles
+
+
+# ── Junction triangulation pass ──────────────────────────────────
+
+
+def _triangulate_junctions(
+    layout: "PavementLayout",
+    graph: Optional["ElevationGraph"],
+    dem,
+    tile_lat: int,
+    tile_lon: int,
+    m_to_ll,
+) -> int:
+    """Replace each junction shape with its ear-clip triangulation,
+    setting per-triangle ``node_altitudes`` from the corner-elevation
+    map (with neighbour-corner, elevation-graph, and DEM fallbacks).
+
+    Returns the number of triangle shapes produced (informational).
+    """
+    corner_elev = _corner_elev_map(layout)
+
+    # Flat list of (cx, cy, elev) for nearest-corner search beyond
+    # the 0.5 m bucket.  Catches boundary vertices that landed close
+    # to but not exactly on a neighbour corner (e.g. apt.dat
+    # boundary-trace points that abut a terminal pad edge).
+    rect_like_roles = {ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL,
+                       ROLE_STUB, ROLE_CROSS_CONNECTOR}
+    NEAR_CORNER_M = 6.0  # search radius for off-bucket matches
+    near_corner_list: List[Tuple[float, float, float]] = []
+    for s in layout.shapes:
+        if s.role == ROLE_JUNCTION:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        if (s.role in rect_like_roles
+                and s.altitude_high is not None
+                and s.altitude_low is not None
+                and len(coords) == 4):
+            elevs = [s.altitude_high, s.altitude_low,
+                     s.altitude_low, s.altitude_high]
+            for (cx, cy), e in zip(coords, elevs):
+                near_corner_list.append((cx, cy, float(e)))
+        elif s.altitude is not None:
+            for (cx, cy) in coords:
+                near_corner_list.append((cx, cy, float(s.altitude)))
+
+    def _vertex_elev_anchored(x: float, y: float
+                              ) -> Tuple[Optional[float], bool]:
+        """Return ``(elev, is_anchor)``.  ``is_anchor`` is True if
+        the elevation came from a shared neighbour corner (must
+        not be moved by junction-local smoothing); False otherwise
+        (graph / DEM sample, free to smooth)."""
+        # Bucket lookup — exact shared-vertex match.
+        e = corner_elev.get(_corner_elevation_bucket(x, y))
+        if e is not None:
+            return e, True
+        # Wider linear search for off-bucket near-corner matches.
+        best_e: Optional[float] = None
+        best_d2 = NEAR_CORNER_M * NEAR_CORNER_M
+        for cx, cy, ce in near_corner_list:
+            d2 = (cx - x) * (cx - x) + (cy - y) * (cy - y)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_e = ce
+        if best_e is not None:
+            return best_e, True
+        # Free sample (will be smoothed in junction-local pass).
+        if graph is not None:
+            ev = graph.elevation_at(x, y)
+            if ev is not None:
+                return ev, False
+        if dem is not None:
+            lat, lon = m_to_ll(x, y)
+            ev = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+            if ev is not None:
+                return ev, False
+        return None, False
+
+    def _smooth_junction_boundary(
+        ring: List[Tuple[float, float]],
+        elev: List[float],
+        is_anchor: List[bool],
+    ) -> List[float]:
+        """Bounds-propagation smoothing: each anchor vertex
+        constrains every other vertex's elevation to lie within
+        ``anchor ± dist × TAXI_MAX_GRADE`` (straight-line distance
+        through the junction).  Non-anchor vertices clip to the
+        intersection of these bands; anchor vertices stay put.
+
+        Then a Laplacian pass smooths non-anchor elevations toward
+        their neighbours' average, re-clipped to the bands so
+        anchor compliance is preserved.
+        """
+        n = len(ring)
+        e = list(elev)
+        if n < 2:
+            return e
+        INF = float("inf")
+        lo = [-INF] * n
+        hi = [INF] * n
+        # Anchors lock themselves and contribute bands to others.
+        for i in range(n):
+            if is_anchor[i]:
+                lo[i] = e[i]
+                hi[i] = e[i]
+        anchor_idx = [i for i in range(n) if is_anchor[i]]
+        for i in range(n):
+            if is_anchor[i]:
+                continue
+            xi, yi = ring[i]
+            for ai in anchor_idx:
+                xa, ya = ring[ai]
+                d = math.hypot(xi - xa, yi - ya)
+                band = d * TAXI_MAX_GRADE
+                lo_i = e[ai] - band
+                hi_i = e[ai] + band
+                if lo_i > lo[i]:
+                    lo[i] = lo_i
+                if hi_i < hi[i]:
+                    hi[i] = hi_i
+        # Initial clip into feasibility intervals.
+        for i in range(n):
+            if is_anchor[i]:
+                continue
+            if lo[i] > hi[i]:
+                # Conflicting anchors — fall back to midpoint of
+                # the conflicting bounds.  Will pull this vertex
+                # closer to the closest anchor in practice.
+                e[i] = 0.5 * (lo[i] + hi[i])
+            else:
+                if e[i] < lo[i]:
+                    e[i] = lo[i]
+                if e[i] > hi[i]:
+                    e[i] = hi[i]
+        # Laplacian-style smoothing pass between non-anchor
+        # neighbours, clipped to bands each iteration so the band
+        # constraint stays satisfied.  Convergence in ~20 iters
+        # for our junction sizes.
+        damping = 0.4
+        for _ in range(20):
+            new_e = list(e)
+            max_change = 0.0
+            for i in range(n):
+                if is_anchor[i]:
+                    continue
+                # Mean of all OTHER non-anchor + anchor neighbours,
+                # weighted by inverse distance (closer pulls more).
+                xi, yi = ring[i]
+                num = 0.0
+                den = 0.0
+                for j in range(n):
+                    if j == i:
+                        continue
+                    xj, yj = ring[j]
+                    d = math.hypot(xi - xj, yi - yj)
+                    if d < 0.5:
+                        continue
+                    w = 1.0 / d
+                    num += e[j] * w
+                    den += w
+                if den <= 0:
+                    continue
+                mean = num / den
+                target = e[i] + (mean - e[i]) * damping
+                if target < lo[i]:
+                    target = lo[i]
+                if target > hi[i]:
+                    target = hi[i]
+                if abs(target - e[i]) > max_change:
+                    max_change = abs(target - e[i])
+                new_e[i] = target
+            e = new_e
+            if max_change < 1e-3:
+                break
+        return e
+
+    new_shapes: List[BuiltShape] = []
+    triangle_count = 0
+    grade_violations = 0
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            new_shapes.append(shape)
+            continue
+        try:
+            ring = list(shape.polygon.exterior.coords)
+        except Exception:
+            new_shapes.append(shape)
+            continue
+        if ring and ring[0] == ring[-1]:
+            ring = ring[:-1]
+        if len(ring) < 3:
+            continue  # degenerate junction; drop
+        # Vertex elevations + anchor flags.
+        ev_pairs = [_vertex_elev_anchored(x, y) for (x, y) in ring]
+        vert_elev_raw: List[Optional[float]] = [p[0] for p in ev_pairs]
+        is_anchor_list: List[bool] = [p[1] for p in ev_pairs]
+        # Fill any None gaps with the average of known neighbours
+        # (or 0.0 if all are unknown — should not happen).
+        known = [e for e in vert_elev_raw if e is not None]
+        fallback = sum(known) / len(known) if known else 0.0
+        vert_elev = [e if e is not None else fallback
+                     for e in vert_elev_raw]
+        # Junction-local smoothing: pull non-anchored vertex
+        # elevations into pairwise grade compliance with their
+        # neighbours.  Anchored (corner-derived) vertices are
+        # untouchable so the shared-vertex invariant with rect /
+        # runway / terminal corners is preserved.
+        vert_elev = _smooth_junction_boundary(
+            ring, vert_elev, is_anchor_list)
+
+        triples = _ear_clip(ring)
+        if not triples:
+            continue
+
+        for (i, j, k) in triples:
+            tri_coords = [ring[i], ring[j], ring[k]]
+            tri_poly = Polygon(tri_coords)
+            if not tri_poly.is_valid:
+                tri_poly = tri_poly.buffer(0)
+            if (tri_poly.is_empty
+                    or tri_poly.geom_type != "Polygon"
+                    or tri_poly.area < 0.5):
+                continue
+            ea, eb, ec = vert_elev[i], vert_elev[j], vert_elev[k]
+            # Grade check (informational; the bridge enrichment
+            # before smoothing should keep these in tolerance).
+            for (p, q, ep, eq) in (
+                (tri_coords[0], tri_coords[1], ea, eb),
+                (tri_coords[1], tri_coords[2], eb, ec),
+                (tri_coords[2], tri_coords[0], ec, ea),
+            ):
+                d = math.hypot(p[0] - q[0], p[1] - q[1])
+                if d < 0.5:
+                    continue
+                if abs(ep - eq) / d > TAXI_MAX_GRADE + 1e-4:
+                    grade_violations += 1
+                    break
+            # node_altitudes spans the closed ring (4 entries for
+            # a triangle: e_i, e_j, e_k, e_i).  Match the order
+            # produced by Polygon(tri_coords).exterior.coords.
+            try:
+                tri_ring = list(tri_poly.exterior.coords)
+            except Exception:
+                continue
+            # Re-derive elevations in the actual ring order: each
+            # ring coord matches one of (i, j, k) up to rounding,
+            # so map by nearest tri_coord.
+            elev_for_ring: List[float] = []
+            for (rx, ry) in tri_ring:
+                best_e = ea
+                best_d2 = 1e18
+                for (tx, ty), te in zip(tri_coords, (ea, eb, ec)):
+                    d2 = (rx - tx) * (rx - tx) + (ry - ty) * (ry - ty)
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_e = te
+                elev_for_ring.append(round(float(best_e), 1))
+
+            new_shape = BuiltShape(
+                polygon=tri_poly,
+                role=ROLE_JUNCTION,
+                ref=shape.ref)
+            # Flat triangle → emit single altitude tag (cleaner).
+            if (max(elev_for_ring) - min(elev_for_ring)) < 0.05:
+                new_shape.altitude = round(
+                    sum(elev_for_ring[:-1]) / 3.0, 1)
+            else:
+                new_shape.node_altitudes = elev_for_ring
+            new_shapes.append(new_shape)
+            triangle_count += 1
+
+    layout.shapes = new_shapes
+    if grade_violations:
+        # Surfaced via stderr so the user sees it during the test
+        # tool run; not a hard failure.
+        try:
+            import sys
+            sys.stderr.write(
+                f"  [pav-builder] WARN: {grade_violations} junction "
+                f"triangle(s) exceed {TAXI_MAX_GRADE * 100:.1f}% grade.\n")
+        except Exception:
+            pass
+    return triangle_count
 
 
 SHARED_VERTEX_CLUSTER_TOL_M = 1.5
