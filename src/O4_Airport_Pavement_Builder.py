@@ -2451,6 +2451,60 @@ def _splice_one_hole(ring: List[Tuple[float, float]],
 # minimum count when no Steiner points are added.
 
 
+COLINEAR_DROP_M = 0.5  # max perpendicular distance to neighbours
+                        # for a non-anchor vertex to be removed
+                        # (loose enough to thin apt.dat boundary
+                        # traces, tight enough to preserve genuine
+                        # bends).
+
+
+def _drop_colinear_boundary_vertices(
+    ring: List[Tuple[float, float]],
+    corner_elev: Dict[Tuple[int, int], float],
+    shared_junction_buckets: set,
+) -> List[Tuple[float, float]]:
+    """Remove vertices whose perpendicular distance to the line
+    through their immediate neighbours is below COLINEAR_DROP_M,
+    EXCEPT vertices that are shared corners (rect/runway/terminal
+    or cross-junction shared buckets) — those carry topological
+    meaning and must not be dropped.
+
+    Eliminates the "ear-clip can only emit a sliver here" geometry
+    that produces visible step artefacts on long thin apron strips.
+    """
+    if len(ring) < 4:
+        return ring
+    # Iterate to fixed point: dropping one vertex may make a
+    # neighbour droppable too.
+    for _ in range(8):
+        n = len(ring)
+        if n < 4:
+            break
+        keep = [True] * n
+        for i in range(n):
+            bucket = _corner_elevation_bucket(*ring[i])
+            if bucket in corner_elev or bucket in shared_junction_buckets:
+                continue  # anchor — keep no matter what
+            ax, ay = ring[(i - 1) % n]
+            bx, by = ring[(i + 1) % n]
+            cx, cy = ring[i]
+            # Perpendicular distance from C to line AB.
+            dx = bx - ax
+            dy = by - ay
+            seg_len = math.hypot(dx, dy)
+            if seg_len < 0.1:
+                continue
+            # Cross-product / line-length = perpendicular distance.
+            perp = abs((cx - ax) * dy - (cy - ay) * dx) / seg_len
+            if perp < COLINEAR_DROP_M:
+                keep[i] = False
+        new_ring = [c for c, k in zip(ring, keep) if k]
+        if len(new_ring) == n:
+            break
+        ring = new_ring
+    return ring
+
+
 def _ear_clip(coords: Sequence[Tuple[float, float]]
               ) -> List[Tuple[int, int, int]]:
     """Best-ear ear-clipping: at every step, find ALL valid ears
@@ -2894,6 +2948,21 @@ def _triangulate_junctions(
                 continue
         if len(ring) < 3:
             continue  # degenerate junction; drop
+        # Drop non-shared, non-corner-anchored vertices whose
+        # perpendicular distance to the line through their two
+        # neighbours is below COLINEAR_DROP_M.  Without this, a
+        # long apt.dat boundary trace with closely-spaced near-
+        # colinear vertices forces ear-clipping to emit slivers
+        # whose plane gradient perpendicular to the long axis can
+        # exceed 50 % even when no triangle EDGE violates grade.
+        # Preserved vertices: anything in the corner-elev bucket
+        # (rect/runway/terminal corner) or any cross-junction
+        # shared bucket — those carry topological meaning beyond
+        # boundary tracing and must not be removed.
+        ring = _drop_colinear_boundary_vertices(
+            ring, corner_elev, shared_junction_buckets)
+        if len(ring) < 3:
+            continue
         # Vertex elevations + anchor flags.
         ev_pairs = [_vertex_elev_anchored(x, y) for (x, y) in ring]
         vert_elev_raw: List[Optional[float]] = [p[0] for p in ev_pairs]
