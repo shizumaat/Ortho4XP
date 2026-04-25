@@ -3121,6 +3121,13 @@ def _enforce_shared_vertices(layout: "PavementLayout",
                                dedup_ext[0][1] - dedup_ext[-1][1]) < 0.05):
             dedup_ext = dedup_ext[:-1]
         if len(dedup_ext) < 3:
+            # Shape collapsed to a degenerate sliver after cluster
+            # rewrite (e.g. a thin grid-decomposition sliver whose
+            # vertices got pulled together).  Empty the polygon so
+            # the un-clustered original isn't left behind to
+            # violate the shared-vertex invariant.  Empty polygons
+            # are skipped by the validator and ``to_osm``.
+            shape.polygon = Polygon()
             continue
         # Rebuild interiors.
         new_interiors: List[List[Tuple[float, float]]] = []

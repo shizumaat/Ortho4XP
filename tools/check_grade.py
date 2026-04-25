@@ -279,6 +279,77 @@ ELEV_ROUNDING_NOISE_M = 0.1  # patch elevations are stored at 1
                               # between any two elevs is 0.1 m
 
 
+def _check_plane_gradient(ways: List[Way],
+                          nodes: Dict[str, Tuple[float, float]],
+                          ll_to_m,
+                          max_grade: float) -> List[Violation]:
+    """For each 3-vertex polygon (a triangle, which X-Plane renders
+    as a planar surface), compute the plane's elevation gradient
+    and flag if its magnitude exceeds ``max_grade``.
+
+    A triangle can pass every vertex-PAIR grade check yet still
+    have a steep perpendicular gradient: for (A=20, B=19, C=19.5)
+    placed with A 300 m from B (edge grades ~0.3 %), the plane's
+    gradient perpendicular to BC may be several %.  This shows up
+    as a visible slope inside the triangle even though no vertex
+    pair is "too steep".
+    """
+    out: List[Violation] = []
+    for w in ways:
+        pts: List[Tuple[float, float, float]] = []
+        for k, nid in enumerate(w.nids[:-1] if (len(w.nids) > 1
+                                and w.nids[0] == w.nids[-1])
+                                else w.nids):
+            if nid not in nodes:
+                continue
+            lat, lon = nodes[nid]
+            x, y = ll_to_m(lat, lon)
+            e = w.elevs[k]
+            if e is None:
+                continue
+            pts.append((x, y, e))
+        if len(pts) != 3:
+            continue  # only check triangles
+        (x1, y1, z1), (x2, y2, z2), (x3, y3, z3) = pts
+        # Plane normal via cross product of two in-plane vectors.
+        ux, uy, uz = x2 - x1, y2 - y1, z2 - z1
+        vx, vy, vz = x3 - x1, y3 - y1, z3 - z1
+        nx = uy * vz - uz * vy
+        ny = uz * vx - ux * vz
+        nz = ux * vy - uy * vx
+        if abs(nz) < 1e-6:
+            continue  # degenerate triangle in xy plane
+        # Plane: nx*X + ny*Y + nz*Z = d; dz/dx = -nx/nz, dz/dy = -ny/nz.
+        gx = -nx / nz
+        gy = -ny / nz
+        grad = math.hypot(gx, gy)
+        if grad > max_grade + 1e-5:
+            # Pick two vertices along the gradient direction for
+            # the report: project all three onto the gradient axis,
+            # take the max/min-elevation pair.
+            gnorm = math.hypot(gx, gy)
+            if gnorm < 1e-9:
+                continue
+            ghx, ghy = gx / gnorm, gy / gnorm  # unit gradient
+            proj = [(p[0] * ghx + p[1] * ghy, p[2], p)
+                    for p in pts]
+            proj.sort()
+            lo_p, lo_z, lo_pt = proj[0]
+            hi_p, hi_z, hi_pt = proj[-1]
+            dist_along_grad = hi_p - lo_p
+            out.append(Violation(
+                grade_pct=grad * 100,
+                excess_pct=(grad - max_grade) * 100,
+                distance_m=dist_along_grad if dist_along_grad > 0.5
+                           else 1.0,
+                de_m=abs(hi_z - lo_z),
+                way_a=w, way_b=w,
+                pt_a=(lo_pt[0], lo_pt[1]),
+                pt_b=(hi_pt[0], hi_pt[1]),
+                elev_a=lo_z, elev_b=hi_z))
+    return out
+
+
 def _check_within_shape(ways: List[Way],
                         nodes: Dict[str, Tuple[float, float]],
                         ll_to_m,
@@ -473,6 +544,95 @@ def _check_vertex_to_edge_step(
     return out
 
 
+def _check_edge_midpoint_step(
+    edges: List[Edge],
+    ways: List[Way],
+    edge_search_m: float,
+    edge_step_m: float,
+    samples_per_edge: int = 5,
+) -> List[EdgeStep]:
+    """For every edge, sample at ``samples_per_edge`` points
+    (including the midpoint), compute the edge's interpolated
+    elevation at that sample, then find the closest edge of any
+    OTHER way and compare its interpolated elevation at the
+    projected point.
+
+    This catches the "two parallel edges drift apart in elevation"
+    case that vertex-only checks miss: endpoints may agree but a
+    mid-edge sample can still have a visible step if the two
+    edges aren't exactly coincident (e.g. a junction edge running
+    0.3 m alongside a sloped rect's long edge, with the junction's
+    other endpoint dragging the midpoint elevation off the rect's
+    slope at that point).
+    """
+    out: List[EdgeStep] = []
+    cell = max(edge_search_m, 1.0)
+    edge_grid = _bucket_edges(edges, cell)
+    for e1 in edges:
+        ax, ay = e1.a
+        bx, by = e1.b
+        dx = bx - ax
+        dy = by - ay
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1.0:
+            continue
+        # Sample at interior t = 1/(N+1), 2/(N+1), ... N/(N+1).
+        for k in range(1, samples_per_edge + 1):
+            t = k / (samples_per_edge + 1)
+            sx = ax + t * dx
+            sy = ay + t * dy
+            s_elev = e1.ea + t * (e1.eb - e1.ea)
+            # Find closest OTHER-way edge to this sample.
+            cx = int(math.floor(sx / cell))
+            cy = int(math.floor(sy / cell))
+            best_d2 = edge_search_m * edge_search_m
+            best: Optional[Tuple[Edge, float, float, float]] = None
+            for dcx in (-1, 0, 1):
+                for dcy in (-1, 0, 1):
+                    bucket = edge_grid.get((cx + dcx, cy + dcy))
+                    if not bucket:
+                        continue
+                    for e2_idx in bucket:
+                        e2 = edges[e2_idx]
+                        if e2.way_idx == e1.way_idx:
+                            continue
+                        e2ax, e2ay = e2.a
+                        e2bx, e2by = e2.b
+                        e2dx = e2bx - e2ax
+                        e2dy = e2by - e2ay
+                        e2seg2 = e2dx * e2dx + e2dy * e2dy
+                        if e2seg2 < 0.04:
+                            continue
+                        tt = ((sx - e2ax) * e2dx
+                              + (sy - e2ay) * e2dy) / e2seg2
+                        if tt < 0.0:
+                            tt = 0.0
+                        elif tt > 1.0:
+                            tt = 1.0
+                        px = e2ax + tt * e2dx
+                        py = e2ay + tt * e2dy
+                        d2 = (sx - px) * (sx - px) + (sy - py) * (sy - py)
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best = (e2, tt, px, py)
+            if best is None:
+                continue
+            e2, tt, px, py = best
+            e2_elev = e2.ea + tt * (e2.eb - e2.ea)
+            step = abs(s_elev - e2_elev)
+            if step > edge_step_m + 1e-5:
+                out.append(EdgeStep(
+                    step_m=step,
+                    distance_m=math.sqrt(best_d2),
+                    way_v=ways[e1.way_idx],
+                    way_e=ways[e2.way_idx],
+                    vert_pt=(sx, sy),
+                    proj_pt=(px, py),
+                    elev_v=s_elev,
+                    elev_proj=e2_elev))
+    return out
+
+
 # ── Reporting ───────────────────────────────────────────────────
 
 def _label(w: Way) -> str:
@@ -545,8 +705,14 @@ def run_checks(
 
     within = _check_within_shape(ways, nodes, ll_to_m, max_grade)
     _print_violations(
-        f"WITHIN-SHAPE grade > {max_grade_pct}%",
+        f"WITHIN-SHAPE vertex-pair grade > {max_grade_pct}%",
         within, top_n)
+
+    plane = _check_plane_gradient(ways, nodes, ll_to_m, max_grade)
+    _print_violations(
+        f"PLANE GRADIENT (triangle surface) > {max_grade_pct}%",
+        plane, top_n)
+    within = within + plane
 
     cross = _check_cross_shape_proximity(
         vertices, ways, proximity_m, max_grade)
@@ -562,7 +728,14 @@ def run_checks(
         f"another shape)",
         steps, top_n, edge_step_m)
 
-    return within, cross, steps
+    mid_steps = _check_edge_midpoint_step(
+        edges, ways, edge_search_m, edge_step_m)
+    _print_steps(
+        f"MID-EDGE step (sample along each edge, compare to "
+        f"nearest other-shape edge)",
+        mid_steps, top_n, edge_step_m)
+
+    return within, cross, steps + mid_steps
 
 
 def main(argv=None) -> int:
