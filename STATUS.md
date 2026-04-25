@@ -1,6 +1,43 @@
 # Auto-Patch Refactor — Status
 
-**Current state:** The new pavement builder
+## NEXT-SESSION PRIORITY (2026-04-25)
+
+**SPJC is still crashing X-Plane** despite the metrics being
+clean (0 plane-gradient, 0 cross-shape, 0 mid-edge step).  All
+known-bad-polygon classes (spike vertices, duplicate nids,
+self-intersection at .11f precision) have defensive guards in
+place, but something else is still upsetting the X-Plane mesh
+builder.  Debug SPJC first — re-check the staged
+`Patches/-20-080/-13-078/SPJC_auto.patch.osm` for any
+remaining structural issues we haven't accounted for.
+
+**THEN:** use **HECA (+30+031)** as the next test airport.
+HECA is complex (273 shapes, 86 m elevation spread across
+pavement, 11 terminals, 117 runway segments) and exposes
+classes of issue invisible at SPJC/SPLP:
+
+- **Adjacent-but-not-shared junctions** at HECA: 110 junctions
+  vs 38 at SPJC; many are 1.5–5 m apart with no shared vertices
+  (just outside the 1.5 m clustering tolerance), producing 6–7 m
+  visible cliffs in the steeply-sloped airport.
+- **HECA metrics:** 532 within-shape, 71 vertex-to-edge, 406
+  mid-edge step.  Cross-shape proximity still 0 (shared corners
+  agree where they DO share).
+
+The system has to gracefully handle ALL airports.  Three fix
+paths to investigate (in order of risk):
+
+1. **Loosen `_enforce_shared_vertices` tolerance** 1.5 m → 2.5 m.
+2. **Post-emission "stitch nearby junctions" pass** that merges
+   polygons separated by < ε.
+3. **Reconsider why residue → multi-fragment junctions** at
+   complex airports — the apt.dat pavement should naturally
+   tile when we subtract rects/terminals/runway.  Investigate
+   what splits it at HECA.
+
+## Current state
+
+The new pavement builder
 `src/O4_Airport_Pavement_Builder.py` is **WIRED INTO Ortho4XP's
 main pipeline** — `O4_Auto_Patch.generate_auto_patches` now
 calls `build_airport_pavement(icao, xplane_root)` and writes
@@ -9,6 +46,169 @@ the output via `layout.to_osm()` directly to the tile's
 both produced in one pass; the legacy surface generator
 (buildings, aprons, drainage, boundary band, tunnels) is no
 longer called.
+
+## Session 8 iteration 2026-04-25 — robustness, simplification, defence
+
+**28 commits ahead of origin/dev.**  Big refactor session driven
+by user X-Plane-render observations and reduction of accidental
+complexity.
+
+### Summary of changes (in commit order)
+
+| Commit | Subject |
+|---|---|
+| 4928e3f | Best-ear ear-clipping (highest min-angle, no slivers from polygon-shape) |
+| dd03576 | Drop near-colinear non-anchor vertices before ear-clip |
+| 1fda826 | Anchor terminal pads in elevation graph; pull apron up to grade |
+| e30ce80 | Convex-hull terminal extraction for fragmented multipolygon relations |
+| d46a5be | Min-spacing simplification: drop polygon vertices closer than 2 m |
+| 25a62ef | Surface-complexity classifier: flat/planar polygons skip triangulation |
+| be3f4ec | Plateau detection during smoothing; rects/junctions inherit flatness |
+| 91c1d18 | Plateau detection: total-range cap; per-edge 0.3 % is the empirical cap |
+| 022fd11 | Tier 1 sliver reduction: bump COLINEAR_DROP_M 0.5 m → 3.0 m |
+| a7ea80b | Tier 1: Delaunay-on-boundary triangulation (no Steiners) |
+| 9925f4d | Tier 2: plateau iteration with grade verification |
+| 7177a73 | Tier 4: validated centroid-Steiner subdivision (no-op in practice) |
+| c85ba18 | Tier 3: thin-strip absorption infrastructure (no-op at SPJC/SPLP) |
+| a9b4ad4 | **Remove no-op code** (-420 lines: ear-clip, Delaunay-Steiner, etc.) |
+| eafa8ad | **Single-polygon junction emission**; defer triangulation to Triangle4XP |
+| 204679d | Densify long junction-polygon edges with neighbour-aware midpoints |
+| ffbb110 | Defensive polygon-validity gate in to_osm — prevent X-Plane crash |
+| 8850ffd | Drop spike vertices at the source instead of dropping the polygon |
+
+### Key architectural shift: single-polygon junctions
+
+Old: each junction was pre-triangulated by my code (ear-clip /
+Delaunay-on-boundary), each output triangle a separate patch.osm
+way with `node_altitudes` of length 4.
+
+**New (eafa8ad):** the entire junction polygon emits as ONE
+patch.osm way with `node_altitudes` listing all per-vertex
+elevations.  Triangle4XP (downstream of patch-parsing) then
+adds interior Steiner points via its `-pq` quality refinement —
+exactly how the legacy Ortho4XP pavement smoothing avoided
+cliffs without explicit grade enforcement.
+
+This obsoleted ear-clipping, Delaunay-on-boundary, and several
+Tier 3/4 helpers — `a9b4ad4` removed 420 lines of triangulation
+code.
+
+### Long-edge densification (204679d)
+
+To give Triangle4XP more boundary anchors per long polygon edge
+(especially cuts from hole-decomposition that span 200 m+),
+inject linearly-interpolated midpoints every 30 m along any
+boundary segment.
+
+Each midpoint's elevation: if a neighbour rect/runway/terminal
+edge passes within 5 m, use the neighbour's edge-interpolated
+elevation (handles segmented runways correctly); else linear
+interp between segment endpoints.
+
+Includes safety: revert to pre-densification ring if densifying
+would create a self-touch (rare; densification midpoints can
+land on a non-adjacent ring edge in concave polygons).
+
+### Polygon-validity guards in `to_osm` (ffbb110, 8850ffd)
+
+Three classes of bad polygon found that crashed X-Plane:
+
+1. **Duplicate consecutive nids** (zero-length edge) — two ring
+   vertices clustering to the same SHARED_VERTEX_TOL_M bucket.
+   Fix: dedup nids in `_ring_to_nids`, keep `node_altitudes`
+   aligned.
+
+2. **Duplicate non-consecutive nids** (figure-8) — same root
+   cause but separated in the ring.  Same dedup catches both.
+
+3. **Spike vertex on non-adjacent edge** — polygon valid at
+   full float precision; `.11f` OSM truncation rounds the
+   spike onto the edge → self-intersection in the file.
+
+   Two-tier defence:
+   - **Source fix (8850ffd):** `_drop_spike_vertices` walks each
+     junction ring before emission, drops any vertex within
+     5 mm of a non-adjacent edge of the same ring.  Eliminates
+     the SPJC WARN.
+   - **Safety net (ffbb110):** in `to_osm`, build a polygon
+     from the .11f-truncated coords and validate; if invalid,
+     drop the shape with a stderr WARN.
+
+### SPJC final metrics (post-Session 8)
+
+| Metric | Value |
+|---|---|
+| Total ways | 161 |
+| Junction shapes | 39 (was 545 triangles pre-experiment) |
+| Plane-gradient violations | 0 |
+| Cross-shape proximity | 0 |
+| Mid-edge step > 0.5 m | 0 |
+| Vertex-to-edge step > 0.5 m | 0 |
+| Within-shape (boundary edges) | 11 |
+| Test suite | 141/141 pass |
+
+### HECA (+30+031) test (2026-04-25, end of session)
+
+**Build succeeds**, no errors, no WARNs.  But quality metrics:
+
+| Metric | SPJC | HECA |
+|---|---|---|
+| Total ways | 161 | 273 |
+| Junctions | 39 | 110 |
+| Plane-gradient | 0 | 0 |
+| Cross-shape | 0 | 0 |
+| Mid-edge step | 0 | **406** |
+| Vertex-to-edge step | 0 | **71** |
+| Within-shape | 11 | **532** |
+| Pavement elevation spread | ~10 m | **86 m** |
+
+Investigated worst case at HECA: junctions -10047 (FLAT at 96.0)
+and -10048 (sloped 99-101) are 1.56 m apart in xy but **share
+zero vertices** — `_enforce_shared_vertices` tolerance is 1.5 m.
+The almost-shared boundary becomes a 6 m visible cliff in
+X-Plane.
+
+Densification compounds it (5233 → 2292 vertices when off; 532
+→ 178 within-shape; 406 → 262 mid-edge), but the underlying
+issue is the gap between junction polygons.
+
+**Recommendation deferred:** don't load HECA in X-Plane yet.
+SPJC/SPLP path is the validated foundation; HECA exposes
+airport-specific assumptions that need investigation in the
+next session.
+
+### Outstanding bug (next session)
+
+User reports **SPJC still crashes X-Plane** even after
+8850ffd + ffbb110.  All metrics clean, all known-bad-polygon
+classes guarded.  Something else is upsetting the mesh builder.
+First task next session: re-investigate the staged
+`Patches/-20-080/-13-078/SPJC_auto.patch.osm`.
+
+### Files changed this session
+
+- `src/O4_Airport_Pavement_Builder.py` — bulk of changes (~1500
+  lines net change; many additions, ~420 deletions for the
+  cleanup commit)
+- `tests/test_pavement_grade.py` — caps tightened (500/200 →
+  30/30 for within-shape)
+- `tools/check_grade.py` — added plane-gradient + mid-edge step
+  + boundary-edge-only within-shape checks; SHARED_NID_TOLERANCE
+  for rounding noise
+
+### Out of scope, on the wishlist
+
+- **Width-based rect extension** (replace 15 % gap-margin with
+  width-trim) attempted in this session, **reverted** — creates
+  cross-shape elevation steps because rect altitudes shift when
+  axis endpoints move.  User suggested geometric junction-carve
+  alternative: walk junction boundary, detect long straight
+  stretches alongside rects, carve into separate flat polygons.
+  Not started.
+- **Anchor-pair-driven plane gradient violations** at SPJC
+  (137 → 0 after switching to single-polygon junctions; latent
+  in within-shape grade if/when we add Steiner points).
+- **Fix HECA** (see priority above).
 
 **SESSION 7 (2026-04-22 → 2026-04-24):** Sequence of changes:
 
