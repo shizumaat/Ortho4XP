@@ -2600,6 +2600,76 @@ def _drop_colinear_boundary_vertices(
     return ring
 
 
+def _planar_fit_residuals(ring: List[Tuple[float, float]],
+                          elev: List[float]
+                          ) -> Optional[List[float]]:
+    """Fit a plane ``z = a*x + b*y + c`` to (x, y, z) by least
+    squares and return the per-vertex residuals (|actual - plane|).
+    Returns None if the fit is degenerate (colinear xy).
+
+    Used to detect "uniformly sloped" junction polygons that can
+    emit as a single polygon with ``node_altitudes`` instead of
+    being triangulated — X-Plane interpolates linearly across the
+    ring and the render is identical to our triangulated mesh.
+    """
+    n = len(ring)
+    if n < 3 or len(elev) != n:
+        return None
+    # Normal equations: A^T A x = A^T b where A rows are [x, y, 1].
+    sxx = sxy = sxc = syy = syc = scc = 0.0
+    sxz = syz = szc = 0.0
+    for (x, y), z in zip(ring, elev):
+        sxx += x * x
+        sxy += x * y
+        sxc += x
+        syy += y * y
+        syc += y
+        scc += 1.0
+        sxz += x * z
+        syz += y * z
+        szc += z
+    # 3×3 system:
+    #   [sxx sxy sxc] [a]   [sxz]
+    #   [sxy syy syc] [b] = [syz]
+    #   [sxc syc scc] [c]   [szc]
+    # Solve via Cramer's rule.
+    det = (sxx * (syy * scc - syc * syc)
+           - sxy * (sxy * scc - syc * sxc)
+           + sxc * (sxy * syc - syy * sxc))
+    if abs(det) < 1e-9:
+        return None
+    det_a = (sxz * (syy * scc - syc * syc)
+             - sxy * (syz * scc - syc * szc)
+             + sxc * (syz * syc - syy * szc))
+    det_b = (sxx * (syz * scc - syc * szc)
+             - sxz * (sxy * scc - syc * sxc)
+             + sxc * (sxy * szc - syz * sxc))
+    det_c = (sxx * (syy * szc - syz * syc)
+             - sxy * (sxy * szc - syz * sxc)
+             + sxz * (sxy * syc - syy * sxc))
+    a = det_a / det
+    b = det_b / det
+    c = det_c / det
+    return [abs(z - (a * x + b * y + c))
+            for (x, y), z in zip(ring, elev)]
+
+
+def _match_elev(rx: float, ry: float,
+                ring: List[Tuple[float, float]],
+                elev: List[float]) -> float:
+    """Find the elevation in ``elev`` whose corresponding ring
+    vertex is closest to (rx, ry).  Used to map shapely-emitted
+    closed-ring coords back to our smoothed elevation array."""
+    best_e = elev[0]
+    best_d2 = float("inf")
+    for (x, y), e in zip(ring, elev):
+        d2 = (rx - x) * (rx - x) + (ry - y) * (ry - y)
+        if d2 < best_d2:
+            best_d2 = d2
+            best_e = e
+    return best_e
+
+
 def _ear_clip(coords: Sequence[Tuple[float, float]]
               ) -> List[Tuple[int, int, int]]:
     """Best-ear ear-clipping: at every step, find ALL valid ears
@@ -3075,6 +3145,87 @@ def _triangulate_junctions(
         # runway / terminal corners is preserved.
         vert_elev = _smooth_junction_boundary(
             ring, vert_elev, is_anchor_list)
+
+        # ── Surface-complexity classification ───────────────────
+        # User 2026-04-25: only triangulate where the surface has
+        # a compound slope.  Flat or planar regions can stay as a
+        # single polygon — fewer shapes, cleaner OSM output, less
+        # work for X-Plane's mesh builder.
+        #
+        #   * FLAT       — vertex elevations vary by < 0.2 % of the
+        #                  polygon's bbox extent (with a floor of
+        #                  ``FLAT_ABS_FLOOR_M``).  Emit one polygon
+        #                  with a single ``altitude`` tag.
+        #   * PLANAR     — every vertex sits within
+        #                  ``PLANAR_RESIDUAL_M`` of the best-fit
+        #                  plane through them.  Emit one polygon
+        #                  with ``node_altitudes`` (X-Plane
+        #                  triangulates internally; since the
+        #                  surface is planar the result is identical
+        #                  to our pre-triangulated mesh).
+        #   * COMPOUND   — triangulate as before.
+        FLAT_GRADE_THRESHOLD = 0.002      # 0.2 % (per user)
+        FLAT_ABS_FLOOR_M = 0.1            # 10 cm
+        PLANAR_RESIDUAL_M = 0.30          # 30 cm — vertices
+                                           # within this of best-fit
+                                           # plane render virtually
+                                           # identical to a
+                                           # triangulated mesh
+        # Polygon bbox extent.
+        xs = [p[0] for p in ring]
+        ys = [p[1] for p in ring]
+        extent = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        flat_thresh = max(FLAT_ABS_FLOOR_M,
+                          FLAT_GRADE_THRESHOLD * extent)
+        elev_range = max(vert_elev) - min(vert_elev)
+        if elev_range < flat_thresh:
+            # FLAT — single polygon, single altitude tag.
+            try:
+                flat_poly = Polygon(ring)
+                if not flat_poly.is_valid:
+                    flat_poly = flat_poly.buffer(0)
+                if (flat_poly.geom_type == "Polygon"
+                        and not flat_poly.is_empty
+                        and flat_poly.area >= 0.5):
+                    new_shape = BuiltShape(
+                        polygon=flat_poly,
+                        role=ROLE_JUNCTION,
+                        ref=shape.ref)
+                    new_shape.altitude = round(
+                        sum(vert_elev) / len(vert_elev), 1)
+                    new_shapes.append(new_shape)
+                    continue
+            except Exception:
+                pass  # fall through to triangulation
+        # Best-fit plane: solve ax + by + c = z via 3×3 normal eqns.
+        residuals = _planar_fit_residuals(ring, vert_elev)
+        if (residuals is not None
+                and max(residuals) < PLANAR_RESIDUAL_M):
+            # PLANAR — single polygon, per-vertex altitudes.
+            try:
+                planar_poly = Polygon(ring)
+                if not planar_poly.is_valid:
+                    planar_poly = planar_poly.buffer(0)
+                if (planar_poly.geom_type == "Polygon"
+                        and not planar_poly.is_empty
+                        and planar_poly.area >= 0.5):
+                    # node_altitudes spans the closed ring; match
+                    # the order Polygon(ring).exterior.coords
+                    # produced (which is ring + closing first).
+                    closed_ring = list(planar_poly.exterior.coords)
+                    closed_elev = [
+                        round(float(_match_elev(rx, ry, ring,
+                                                vert_elev)), 1)
+                        for (rx, ry) in closed_ring]
+                    new_shape = BuiltShape(
+                        polygon=planar_poly,
+                        role=ROLE_JUNCTION,
+                        ref=shape.ref)
+                    new_shape.node_altitudes = closed_elev
+                    new_shapes.append(new_shape)
+                    continue
+            except Exception:
+                pass  # fall through to triangulation
 
         triples = _ear_clip(ring)
         if not triples:
