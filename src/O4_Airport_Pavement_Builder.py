@@ -1009,8 +1009,28 @@ def build_airport_pavement(icao: str, xplane_root: str,
             simp = _insert_points_on_boundary(
                 simp, seam_points, tol=RECT_CORNER_TOL_M)
             if EMIT_JUNCTIONS:
-                layout.shapes.append(BuiltShape(
-                    polygon=simp, role=ROLE_JUNCTION))
+                # If the residue polygon wraps a fully-enclosed
+                # rect (holes in the polygon), decompose it into
+                # multiple simple polygons that join AROUND the
+                # rect instead.  Cleaner human-editable output and
+                # avoids hole-splicing artefacts in triangulation.
+                pieces = _decompose_polygon_with_holes(
+                    simp, min_area_m2=MIN_JUNCTION_AREA_M2)
+                for piece in pieces:
+                    # Re-inject seam points: cut lines added by
+                    # the decomposition split may have introduced
+                    # new boundary vertices that DON'T align with
+                    # any rect/terminal corner; we still need
+                    # corners that lie on this piece's boundary.
+                    piece = _insert_points_on_boundary(
+                        piece, seam_points,
+                        tol=RECT_CORNER_TOL_M)
+                    if (piece.is_empty
+                            or piece.geom_type != "Polygon"
+                            or piece.area < MIN_JUNCTION_AREA_M2):
+                        continue
+                    layout.shapes.append(BuiltShape(
+                        polygon=piece, role=ROLE_JUNCTION))
 
     # ── Runway-taxiway shared-vertex sync ──
     # Stubs that widen into the runway apron (V1-style) need the
@@ -2286,6 +2306,143 @@ def _corner_elev_map(layout: "PavementLayout"
     return out
 
 
+# ── Junction polygon decomposition ───────────────────────────────
+#
+# When the residue polygon (pavement minus rects/terminals/runway)
+# wraps around a fully-enclosed rect, the result has interior
+# holes.  Triangulating a polygon-with-holes is messy — the
+# cleanest approach (per user 2026-04-24) is to split the polygon
+# into multiple simple polygons that JOIN AROUND the hole instead.
+#
+# ``_decompose_polygon_with_holes`` recursively cuts the polygon
+# with horizontal lines through each hole's centroid until every
+# remaining piece is a simple (no-hole) polygon.  Each piece
+# becomes its own junction shape — humans can edit them
+# independently, and triangulation runs without hole-splicing.
+
+
+def _decompose_polygon_with_holes(polygon: Polygon,
+                                  min_area_m2: float = 50.0,
+                                  max_depth: int = 8
+                                  ) -> List[Polygon]:
+    """Return a list of simple (no-hole) polygons that tile the
+    same area as ``polygon``.  Cuts horizontally through each
+    hole's centroid using shapely.ops.split, recursing on each
+    side."""
+    from shapely.ops import split as _shp_split
+    from shapely.geometry import LineString as _LS
+
+    if (polygon.is_empty or polygon.geom_type != "Polygon"):
+        return []
+    if not polygon.interiors:
+        return [polygon]
+    if max_depth <= 0:
+        # Recursion guard — emit the exterior with holes dropped
+        # rather than retry forever.  Should never trigger for
+        # realistic airport geometry.
+        return [Polygon(polygon.exterior.coords)]
+    # Pick the largest remaining hole and slice horizontally
+    # through its centroid.
+    interiors = list(polygon.interiors)
+    interiors.sort(key=lambda h: -Polygon(h).area)
+    hole = interiors[0]
+    cy = float(hole.centroid.y)
+    minx, miny, maxx, maxy = polygon.bounds
+    cut = _LS([(minx - 1.0, cy), (maxx + 1.0, cy)])
+    try:
+        result = _shp_split(polygon, cut)
+    except Exception:
+        # Fallback: emit the exterior with holes dropped.  Should
+        # not occur for valid simple geometries.
+        return [Polygon(polygon.exterior.coords)]
+    pieces: List[Polygon] = []
+    geoms = (list(getattr(result, "geoms", []))
+             if result.geom_type != "Polygon" else [result])
+    for g in geoms:
+        if g.geom_type != "Polygon" or g.is_empty:
+            continue
+        if g.area < min_area_m2:
+            continue
+        pieces.extend(_decompose_polygon_with_holes(
+            g, min_area_m2=min_area_m2, max_depth=max_depth - 1))
+    return pieces
+
+
+# ── Hole splicing ────────────────────────────────────────────────
+#
+# Defensive fallback for any polygon with holes that slips through
+# decomposition (e.g. shapely.ops.split failed).  Splices each
+# hole into the exterior via a zero-width bridge so ear-clipping
+# can operate on a single ring; sliver triangles along the bridge
+# are filtered downstream by the area threshold.
+
+
+def _splice_holes(polygon: Polygon) -> List[Tuple[float, float]]:
+    """Return the vertex list of the spliced single-ring polygon
+    (without closing repeat).  Holes are inserted one at a time by
+    finding the closest exterior vertex / hole vertex pair and
+    threading the hole into the exterior at that bridge.
+    """
+    ext = list(polygon.exterior.coords)
+    if ext and ext[0] == ext[-1]:
+        ext = ext[:-1]
+    holes_list: List[List[Tuple[float, float]]] = []
+    for h in polygon.interiors:
+        h_coords = list(h.coords)
+        if h_coords and h_coords[0] == h_coords[-1]:
+            h_coords = h_coords[:-1]
+        if len(h_coords) >= 3:
+            holes_list.append(h_coords)
+    if not holes_list:
+        return ext
+    # Process holes from largest to smallest so big holes get the
+    # "best" bridge slots; small holes thread into the still-clean
+    # remainder.
+    holes_list.sort(key=lambda h: -_polygon_area(h))
+    ring = list(ext)
+    for hole in holes_list:
+        ring = _splice_one_hole(ring, hole)
+    return ring
+
+
+def _polygon_area(coords: Sequence[Tuple[float, float]]) -> float:
+    s = 0.0
+    n = len(coords)
+    for i in range(n):
+        x1, y1 = coords[i]
+        x2, y2 = coords[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) * 0.5
+
+
+def _splice_one_hole(ring: List[Tuple[float, float]],
+                     hole: List[Tuple[float, float]]
+                     ) -> List[Tuple[float, float]]:
+    """Find the closest (ring_vertex, hole_vertex) pair and splice
+    the hole into the ring at that bridge.  Hole is walked in its
+    native (CW relative to a CCW exterior) direction so the spliced
+    ring stays simple."""
+    best_i = best_j = 0
+    best_d2 = float("inf")
+    for i, (rx, ry) in enumerate(ring):
+        for j, (hx, hy) in enumerate(hole):
+            d2 = (rx - hx) * (rx - hx) + (ry - hy) * (ry - hy)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i, best_j = i, j
+    # Spliced ring:
+    #   ring[0..best_i] + hole[best_j..end] + hole[0..best_j]
+    #   + ring[best_i..end]
+    # The boundary touches ring[best_i] and hole[best_j] twice —
+    # this is the bridge corridor.
+    spliced: List[Tuple[float, float]] = []
+    spliced.extend(ring[: best_i + 1])
+    spliced.extend(hole[best_j:])
+    spliced.extend(hole[: best_j + 1])
+    spliced.extend(ring[best_i:])
+    return spliced
+
+
 # ── Ear-clip triangulation ───────────────────────────────────────
 #
 # Pure-Python ear-clipping for simple polygons (no holes).  Returns
@@ -2383,6 +2540,44 @@ def _triangulate_junctions(
     """
     corner_elev = _corner_elev_map(layout)
 
+    # Cross-junction shared-vertex anchoring.  When two adjacent
+    # junction polygons share a boundary point (e.g. either side of
+    # a decomposition cut, or both edges of a former hole), they
+    # MUST agree on its elevation.  Independent per-junction
+    # smoothing can otherwise drift them apart, producing a
+    # vertical step at the shared edge.
+    #
+    # Approach: count how many junction polygons reference each
+    # SHARED_VERTEX_TOL_M bucket.  Any bucket touched by ≥ 2
+    # junctions is "shared"; we anchor those vertices to a
+    # deterministic value (the first junction's graph-sampled or
+    # corner-derived elevation) so all junctions read the same
+    # value when looking up that bucket.
+    junction_bucket_count: Dict[Tuple[int, int], int] = {}
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            continue
+        try:
+            ring = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if ring and ring[0] == ring[-1]:
+            ring = ring[:-1]
+        seen: set = set()
+        for (x, y) in ring:
+            key = _corner_elevation_bucket(x, y)
+            if key in seen:
+                continue
+            seen.add(key)
+            junction_bucket_count[key] = (
+                junction_bucket_count.get(key, 0) + 1)
+    shared_junction_buckets = {
+        k for k, c in junction_bucket_count.items() if c >= 2}
+    # Computed lazily and cached: the first junction to look up a
+    # shared-bucket vertex computes its elevation; subsequent
+    # junctions read the same value.
+    shared_junction_elev: Dict[Tuple[int, int], float] = {}
+
     # Flat list of (cx, cy, elev) for nearest-corner search beyond
     # the 0.5 m bucket.  Catches boundary vertices that landed close
     # to but not exactly on a neighbour corner (e.g. apt.dat
@@ -2474,15 +2669,25 @@ def _triangulate_junctions(
     def _vertex_elev_anchored(x: float, y: float
                               ) -> Tuple[Optional[float], bool]:
         """Return ``(elev, is_anchor)``.  ``is_anchor`` is True if
-        the elevation came from a corner OR rect-edge interpolation
-        (must not be moved by junction-local smoothing).  False
-        means a graph / DEM sample that the smoothing pass is free
-        to pull into grade compliance."""
-        # 1. Bucket lookup — exact shared-vertex match.
-        e = corner_elev.get(_corner_elevation_bucket(x, y))
+        the elevation came from a corner, rect-edge interpolation,
+        or another junction's prior smoothed value at this same
+        bucket (must not be moved by junction-local smoothing).
+        False means a graph / DEM sample that the smoothing pass is
+        free to pull into grade compliance."""
+        bucket = _corner_elevation_bucket(x, y)
+        # 1. Bucket lookup — exact shared-vertex match against
+        # rect / runway / terminal corners.
+        e = corner_elev.get(bucket)
         if e is not None:
             return e, True
-        # 2. Wider linear search for off-bucket near-corner matches.
+        # 2. Cross-junction shared bucket — if another junction
+        # has already locked this bucket's elevation, reuse it so
+        # both junctions render at the same height at the shared
+        # boundary point.
+        e_shared = shared_junction_elev.get(bucket)
+        if e_shared is not None:
+            return e_shared, True
+        # 3. Wider linear search for off-bucket near-corner matches.
         best_e: Optional[float] = None
         best_d2 = NEAR_CORNER_M * NEAR_CORNER_M
         for cx, cy, ce in near_corner_list:
@@ -2491,25 +2696,33 @@ def _triangulate_junctions(
                 best_d2 = d2
                 best_e = ce
         if best_e is not None:
+            if bucket in shared_junction_buckets:
+                shared_junction_elev[bucket] = best_e
             return best_e, True
-        # 3. Rect-edge interpolation — pulls junction vertices
+        # 4. Rect-edge interpolation — pulls junction vertices
         # pushed 1m off a long edge (or any boundary-trace vertex
         # within NEAR_EDGE_M of a rect/runway/terminal edge) onto
         # the rect's slope at the projected position.
         e_edge = _edge_interp_elev(x, y)
         if e_edge is not None:
+            if bucket in shared_junction_buckets:
+                shared_junction_elev[bucket] = e_edge
             return e_edge, True
-        # 4. Free sample (will be smoothed in junction-local pass).
+        # 5. Free sample.  Anchor it if it's shared between
+        # junctions (deterministic graph value -> same anchor
+        # for both junctions).
+        e_free: Optional[float] = None
         if graph is not None:
-            ev = graph.elevation_at(x, y)
-            if ev is not None:
-                return ev, False
-        if dem is not None:
+            e_free = graph.elevation_at(x, y)
+        if e_free is None and dem is not None:
             lat, lon = m_to_ll(x, y)
-            ev = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-            if ev is not None:
-                return ev, False
-        return None, False
+            e_free = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+        if e_free is None:
+            return None, False
+        if bucket in shared_junction_buckets:
+            shared_junction_elev[bucket] = e_free
+            return e_free, True
+        return e_free, False
 
     def _smooth_junction_boundary(
         ring: List[Tuple[float, float]],
@@ -2616,13 +2829,23 @@ def _triangulate_junctions(
         if shape.role != ROLE_JUNCTION:
             new_shapes.append(shape)
             continue
+        # Splice any interior holes into the exterior so triangulation
+        # incorporates hole-boundary vertices (typically rect corners
+        # for rects fully enclosed by an apron-style junction).
+        # Without splicing, the triangulation covers the holes too
+        # and the included rect's corners never become triangle
+        # vertices — producing visible elevation steps along the
+        # rect's long edge inside the apron.
         try:
-            ring = list(shape.polygon.exterior.coords)
+            ring = _splice_holes(shape.polygon)
         except Exception:
-            new_shapes.append(shape)
-            continue
-        if ring and ring[0] == ring[-1]:
-            ring = ring[:-1]
+            try:
+                ring = list(shape.polygon.exterior.coords)
+                if ring and ring[0] == ring[-1]:
+                    ring = ring[:-1]
+            except Exception:
+                new_shapes.append(shape)
+                continue
         if len(ring) < 3:
             continue  # degenerate junction; drop
         # Vertex elevations + anchor flags.
