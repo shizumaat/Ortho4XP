@@ -48,7 +48,7 @@ pytestmark = pytest.mark.skipif(
 # more than 1.5 % across its surface).  Most are long-thin and
 # sliver-triangle artefacts of ear-clipping the apron; cap is
 # calibrated to the current background so regressions trip the test.
-WITHIN_SHAPE_CAP = {"SPJC": 500, "SPLP": 200}
+WITHIN_SHAPE_CAP = {"SPJC": 30, "SPLP": 30}
 # Mid-edge step cap: every triangle plane should match its
 # neighbours' surface along shared boundaries.  Samples along each
 # edge and compares to the nearest other-shape edge's interpolation.

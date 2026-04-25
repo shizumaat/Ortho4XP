@@ -2802,208 +2802,6 @@ def _match_elev(rx: float, ry: float,
     return best_e
 
 
-DELAUNAY_COVERAGE_TOL_FRAC = 0.02  # accept up to 2 % polygon-area
-                                    # gap in the Delaunay output
-                                    # before falling back to ear-clip
-
-
-def _delaunay_triangulate_polygon(
-    ring: List[Tuple[float, float]],
-    vert_elev: List[float],
-    polygon: Polygon,
-) -> Optional[List[Tuple[Polygon, List[float]]]]:
-    """Triangulate ``polygon`` via Delaunay over its boundary
-    vertices.  Maximises minimum interior angle vs ear-clip's
-    first-valid-ear → fatter triangles, fewer slivers.
-
-    Returns a list of (triangle_polygon, [e0, e1, e2]) for triangles
-    inside the polygon, or None if Delaunay coverage misses more
-    than DELAUNAY_COVERAGE_TOL_FRAC of the polygon's area (caller
-    should fall back to ear-clip).
-    """
-    try:
-        from shapely.geometry import MultiPoint
-        from shapely.ops import triangulate as _tri
-    except Exception:
-        return None
-    if polygon.is_empty or polygon.geom_type != "Polygon":
-        return None
-    if len(ring) < 3 or len(vert_elev) != len(ring):
-        return None
-    try:
-        mp = MultiPoint(ring)
-        tris = _tri(mp)
-    except Exception:
-        return None
-    inside_tris: List[Tuple[Polygon, List[float]]] = []
-    covered = 0.0
-    # Build a coord-bucket -> elevation map for vertex lookup.
-    coord_to_elev: Dict[Tuple[int, int], float] = {}
-    for (px, py), pe in zip(ring, vert_elev):
-        coord_to_elev[(int(round(px / 0.1)),
-                       int(round(py / 0.1)))] = pe
-    for t in tris:
-        if t.is_empty or t.geom_type != "Polygon":
-            continue
-        # Strict containment: triangle's centroid must be inside
-        # the original polygon (handles concave polygons by
-        # discarding triangles spanning the concave gap).
-        try:
-            if not polygon.contains(t.centroid):
-                continue
-        except Exception:
-            continue
-        try:
-            tc = list(t.exterior.coords)
-        except Exception:
-            continue
-        if tc and tc[0] == tc[-1]:
-            tc = tc[:-1]
-        if len(tc) != 3:
-            continue
-        elevs = []
-        for (cx, cy) in tc:
-            key = (int(round(cx / 0.1)), int(round(cy / 0.1)))
-            e = coord_to_elev.get(key)
-            if e is None:
-                # Search nearby buckets (rounding noise).
-                for dx in (-1, 0, 1):
-                    for dy in (-1, 0, 1):
-                        e2 = coord_to_elev.get(
-                            (key[0] + dx, key[1] + dy))
-                        if e2 is not None:
-                            e = e2
-                            break
-                    if e is not None:
-                        break
-            if e is None:
-                e = 0.0
-            elevs.append(float(e))
-        inside_tris.append((t, elevs))
-        covered += t.area
-    if not inside_tris:
-        return None
-    # Coverage check: did Delaunay cover the polygon?
-    gap = abs(polygon.area - covered) / polygon.area
-    if gap > DELAUNAY_COVERAGE_TOL_FRAC:
-        return None  # caller falls back to ear-clip
-    return inside_tris
-
-
-def _ear_clip(coords: Sequence[Tuple[float, float]]
-              ) -> List[Tuple[int, int, int]]:
-    """Best-ear ear-clipping: at every step, find ALL valid ears
-    and clip the one with the highest minimum interior angle.
-
-    Greedy first-ear selection produces sliver triangles when the
-    polygon has near-colinear boundary segments — the slivers'
-    planes can have huge gradients perpendicular to their thin
-    dimension even if the 3 vertices' pairwise grades are modest.
-    Best-ear keeps every triangle as "fat" as the polygon's
-    geometry allows, eliminating the bulk of sliver-induced step
-    artefacts.
-    """
-    n = len(coords)
-    if n < 3:
-        return []
-    if n == 3:
-        return [(0, 1, 2)]
-    # Determine winding via shoelace; force CCW for the algorithm.
-    s = 0.0
-    for i in range(n):
-        x1, y1 = coords[i]
-        x2, y2 = coords[(i + 1) % n]
-        s += x1 * y2 - x2 * y1
-    is_ccw = s > 0
-    indices = list(range(n)) if is_ccw else list(range(n - 1, -1, -1))
-
-    def _cross(o: int, a: int, b: int) -> float:
-        ox, oy = coords[o]
-        ax, ay = coords[a]
-        bx, by = coords[b]
-        return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
-
-    def _pt_in_tri(p: int, a: int, b: int, c: int) -> bool:
-        px, py = coords[p]
-        ax, ay = coords[a]
-        bx, by = coords[b]
-        cx, cy = coords[c]
-        d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by)
-        d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy)
-        d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay)
-        has_neg = d1 < 0 or d2 < 0 or d3 < 0
-        has_pos = d1 > 0 or d2 > 0 or d3 > 0
-        return not (has_neg and has_pos)
-
-    def _min_angle(a: int, b: int, c: int) -> float:
-        """Minimum interior angle of triangle (a, b, c) in radians.
-        Higher = fatter triangle.  Returns 0 for degenerate."""
-        ax, ay = coords[a]
-        bx, by = coords[b]
-        cx, cy = coords[c]
-        # Side vectors at each vertex.
-        abx, aby = bx - ax, by - ay
-        acx, acy = cx - ax, cy - ay
-        bax, bay = -abx, -aby
-        bcx, bcy = cx - bx, cy - by
-        cax, cay = -acx, -acy
-        cbx, cby = -bcx, -bcy
-        ab = math.hypot(abx, aby)
-        ac = math.hypot(acx, acy)
-        bc = math.hypot(bcx, bcy)
-        if ab < 1e-6 or ac < 1e-6 or bc < 1e-6:
-            return 0.0
-        cos_a = (abx * acx + aby * acy) / (ab * ac)
-        cos_b = (bax * bcx + bay * bcy) / (ab * bc)
-        cos_c = (cax * cbx + cay * cby) / (ac * bc)
-        # Clamp to [-1, 1] for numerical safety.
-        cos_a = max(-1.0, min(1.0, cos_a))
-        cos_b = max(-1.0, min(1.0, cos_b))
-        cos_c = max(-1.0, min(1.0, cos_c))
-        return min(math.acos(cos_a),
-                   math.acos(cos_b),
-                   math.acos(cos_c))
-
-    triangles: List[Tuple[int, int, int]] = []
-    guard = 4 * n
-    while len(indices) > 3 and guard > 0:
-        guard -= 1
-        m = len(indices)
-        # Score every valid ear by its min-angle; clip the best.
-        best_score = -1.0
-        best_i = -1
-        best_triple: Tuple[int, int, int] = (0, 0, 0)
-        for i in range(m):
-            prev_i = indices[(i - 1) % m]
-            cur_i = indices[i]
-            next_i = indices[(i + 1) % m]
-            if _cross(prev_i, cur_i, next_i) <= 0:
-                continue  # not convex → not an ear
-            ok = True
-            for k in indices:
-                if k in (prev_i, cur_i, next_i):
-                    continue
-                if _pt_in_tri(k, prev_i, cur_i, next_i):
-                    ok = False
-                    break
-            if not ok:
-                continue
-            score = _min_angle(prev_i, cur_i, next_i)
-            if score > best_score:
-                best_score = score
-                best_i = i
-                best_triple = (prev_i, cur_i, next_i)
-        if best_i < 0:
-            # No valid ear — fan-fallback for pathological input.
-            for i in range(1, len(indices) - 1):
-                triangles.append(
-                    (indices[0], indices[i], indices[i + 1]))
-            return triangles
-        triangles.append(best_triple)
-        del indices[best_i]
-    if len(indices) == 3:
-        triangles.append((indices[0], indices[1], indices[2]))
-    return triangles
 
 
 # ── Junction triangulation pass ──────────────────────────────────
@@ -3463,119 +3261,61 @@ def _triangulate_junctions(
             except Exception:
                 pass  # fall through to triangulation
 
-        # Delaunay triangulation over the boundary vertices.
-        # Maximises minimum interior angle vs ear-clip's first-
-        # valid-ear → fatter triangles, fewer slivers.  Falls
-        # through to ear-clip if coverage gaps in concave
-        # polygons exceed DELAUNAY_COVERAGE_TOL_FRAC.
-        delaunay_result = _delaunay_triangulate_polygon(
-            ring, vert_elev, shape.polygon)
-        if delaunay_result is not None:
-            for tri_poly, tri_elevs in delaunay_result:
-                # Grade check (informational).
-                tcs = list(tri_poly.exterior.coords)
-                if tcs and tcs[0] == tcs[-1]:
-                    tcs = tcs[:-1]
-                if len(tcs) == 3 and len(tri_elevs) >= 3:
-                    for (p, q, ep, eq) in (
-                        (tcs[0], tcs[1], tri_elevs[0], tri_elevs[1]),
-                        (tcs[1], tcs[2], tri_elevs[1], tri_elevs[2]),
-                        (tcs[2], tcs[0], tri_elevs[2], tri_elevs[0]),
-                    ):
-                        d = math.hypot(p[0] - q[0], p[1] - q[1])
-                        if d < 0.5:
-                            continue
-                        if abs(ep - eq) / d > TAXI_MAX_GRADE + 1e-4:
-                            grade_violations += 1
-                            break
-                new_shape = BuiltShape(
-                    polygon=tri_poly,
-                    role=ROLE_JUNCTION,
-                    ref=shape.ref)
-                # Build closed-ring elevations matching shapely's
-                # vertex order.
-                closed = list(tri_poly.exterior.coords)
-                elev_for_ring = []
-                for (rx, ry) in closed:
-                    best_e = tri_elevs[0]
-                    best_d2 = float("inf")
-                    for (tx, ty), te in zip(tcs, tri_elevs[:3]):
-                        d2 = (rx - tx) * (rx - tx) + (ry - ty) * (ry - ty)
-                        if d2 < best_d2:
-                            best_d2 = d2
-                            best_e = te
-                    elev_for_ring.append(round(float(best_e), 1))
-                if max(elev_for_ring) - min(elev_for_ring) < 0.05:
-                    new_shape.altitude = round(
-                        sum(elev_for_ring[:-1]) / 3.0, 1)
-                else:
-                    new_shape.node_altitudes = elev_for_ring
-                new_shapes.append(new_shape)
-                triangle_count += 1
-            continue
-
-        # Fall-back: ear-clip (concave polygons where Delaunay
-        # leaves gaps, or polygons too small for Steiner grid).
-        triples = _ear_clip(ring)
-        if not triples:
-            continue
-
-        for (i, j, k) in triples:
-            tri_coords = [ring[i], ring[j], ring[k]]
-            tri_poly = Polygon(tri_coords)
-            if not tri_poly.is_valid:
-                tri_poly = tri_poly.buffer(0)
-            if (tri_poly.is_empty
-                    or tri_poly.geom_type != "Polygon"
-                    or tri_poly.area < 0.5):
+        # ── Compound-slope: emit as a single polygon with per-
+        # vertex node_altitudes; defer triangulation to Triangle4XP.
+        #
+        # Earlier versions ear-clipped or Delaunay-triangulated
+        # the junction here, emitting one patch.osm way per output
+        # triangle.  Each triangle was geometrically determined
+        # (3 vertices), giving Triangle4XP nothing to refine —
+        # any sliver / steep-plane triangle from our triangulator
+        # made it into the rendered mesh untouched.
+        #
+        # Submitting the WHOLE polygon as a single constraint
+        # boundary lets Triangle4XP's quality-refinement pass
+        # ([O4_Mesh_Utils.py:670] flag ``-pq``) insert interior
+        # Steiners with min-angle ≥ 20°.  Steiner elevations are
+        # bilinear-interpolated from the polygon's boundary
+        # ``node_altitudes`` at mesh time — exactly how the legacy
+        # Ortho4XP pavement smoothing avoided cliffs without any
+        # explicit grade enforcement.
+        try:
+            poly_for_emit = Polygon(ring)
+            if not poly_for_emit.is_valid:
+                poly_for_emit = poly_for_emit.buffer(0)
+            if (poly_for_emit.is_empty
+                    or poly_for_emit.geom_type != "Polygon"
+                    or poly_for_emit.area < 0.5):
                 continue
-            ea, eb, ec = vert_elev[i], vert_elev[j], vert_elev[k]
-            # Grade check (informational; the bridge enrichment
-            # before smoothing should keep these in tolerance).
-            for (p, q, ep, eq) in (
-                (tri_coords[0], tri_coords[1], ea, eb),
-                (tri_coords[1], tri_coords[2], eb, ec),
-                (tri_coords[2], tri_coords[0], ec, ea),
-            ):
-                d = math.hypot(p[0] - q[0], p[1] - q[1])
-                if d < 0.5:
-                    continue
-                if abs(ep - eq) / d > TAXI_MAX_GRADE + 1e-4:
-                    grade_violations += 1
-                    break
-            # node_altitudes spans the closed ring (4 entries for
-            # a triangle: e_i, e_j, e_k, e_i).  Match the order
-            # produced by Polygon(tri_coords).exterior.coords.
-            try:
-                tri_ring = list(tri_poly.exterior.coords)
-            except Exception:
-                continue
-            # Re-derive elevations in the actual ring order: each
-            # ring coord matches one of (i, j, k) up to rounding,
-            # so map by nearest tri_coord.
-            elev_for_ring: List[float] = []
-            for (rx, ry) in tri_ring:
-                best_e = ea
-                best_d2 = 1e18
-                for (tx, ty), te in zip(tri_coords, (ea, eb, ec)):
-                    d2 = (rx - tx) * (rx - tx) + (ry - ty) * (ry - ty)
-                    if d2 < best_d2:
-                        best_d2 = d2
-                        best_e = te
-                elev_for_ring.append(round(float(best_e), 1))
-
-            new_shape = BuiltShape(
-                polygon=tri_poly,
-                role=ROLE_JUNCTION,
-                ref=shape.ref)
-            # Flat triangle → emit single altitude tag (cleaner).
-            if (max(elev_for_ring) - min(elev_for_ring)) < 0.05:
-                new_shape.altitude = round(
-                    sum(elev_for_ring[:-1]) / 3.0, 1)
-            else:
-                new_shape.node_altitudes = elev_for_ring
-            new_shapes.append(new_shape)
-            triangle_count += 1
+        except Exception:
+            continue
+        # node_altitudes spans the closed ring (one value per
+        # vertex including the closing-repeat).  Build it from the
+        # smoothed vert_elev in shapely's emitted ring order.
+        closed = list(poly_for_emit.exterior.coords)
+        elev_for_ring: List[float] = []
+        for (rx, ry) in closed:
+            best_e = vert_elev[0]
+            best_d2 = float("inf")
+            for (tx, ty), te in zip(ring, vert_elev):
+                d2 = (rx - tx) * (rx - tx) + (ry - ty) * (ry - ty)
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_e = te
+            elev_for_ring.append(round(float(best_e), 1))
+        new_shape = BuiltShape(
+            polygon=poly_for_emit,
+            role=ROLE_JUNCTION,
+            ref=shape.ref)
+        if (max(elev_for_ring) - min(elev_for_ring)) < 0.05:
+            # Pre-classifier missed; emit flat.
+            new_shape.altitude = round(
+                sum(elev_for_ring[:-1]) / len(elev_for_ring[:-1]),
+                1)
+        else:
+            new_shape.node_altitudes = elev_for_ring
+        new_shapes.append(new_shape)
+        triangle_count += 1
 
     layout.shapes = new_shapes
     if grade_violations:

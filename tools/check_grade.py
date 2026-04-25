@@ -354,7 +354,17 @@ def _check_within_shape(ways: List[Way],
                         nodes: Dict[str, Tuple[float, float]],
                         ll_to_m,
                         max_grade: float) -> List[Violation]:
-    """Pairwise grade between every two vertices on the same way.
+    """Grade check between vertex pairs on the same way.
+
+    For 3-vertex polygons (triangles), every pair IS a triangle
+    edge X-Plane will render — check all 3 pairs.
+
+    For 4+-vertex polygons, only ADJACENT (consecutive ring)
+    pairs are guaranteed to be edges in the rendered mesh; the
+    interior triangulation is decided later by Triangle4XP, which
+    inserts Steiner points and connects vertices freely.  Far-pair
+    checks here would be false positives — Triangle4XP may never
+    create those edges.
 
     A violation requires ``|de| > grade × dist + ELEV_ROUNDING_NOISE_M``
     so single-decimal rounding doesn't produce spurious flags at
@@ -363,7 +373,6 @@ def _check_within_shape(ways: List[Way],
     """
     out: List[Violation] = []
     for w in ways:
-        # Build (x, y, elev) list for this way.
         pts: List[Tuple[float, float, float]] = []
         for k, nid in enumerate(w.nids[:-1] if (len(w.nids) > 1
                                 and w.nids[0] == w.nids[-1])
@@ -377,26 +386,33 @@ def _check_within_shape(ways: List[Way],
                 continue
             pts.append((x, y, e))
         n = len(pts)
-        for i in range(n):
+        if n < 3:
+            continue
+        # Build the pairs to check.
+        if n == 3:
+            pairs = [(0, 1), (1, 2), (2, 0)]  # all 3 triangle edges
+        else:
+            # Only consecutive ring vertices = boundary edges.
+            pairs = [(i, (i + 1) % n) for i in range(n)]
+        for i, j in pairs:
             xi, yi, ei = pts[i]
-            for j in range(i + 1, n):
-                xj, yj, ej = pts[j]
-                d = math.hypot(xi - xj, yi - yj)
-                if d < 0.5:
-                    continue
-                de = abs(ei - ej)
-                allowance = max_grade * d + ELEV_ROUNDING_NOISE_M
-                if de <= allowance:
-                    continue
-                grade = de / d
-                out.append(Violation(
-                    grade_pct=grade * 100,
-                    excess_pct=(grade - max_grade) * 100,
-                    distance_m=d,
-                    de_m=de,
-                    way_a=w, way_b=w,
-                    pt_a=(xi, yi), pt_b=(xj, yj),
-                    elev_a=ei, elev_b=ej))
+            xj, yj, ej = pts[j]
+            d = math.hypot(xi - xj, yi - yj)
+            if d < 0.5:
+                continue
+            de = abs(ei - ej)
+            allowance = max_grade * d + ELEV_ROUNDING_NOISE_M
+            if de <= allowance:
+                continue
+            grade = de / d
+            out.append(Violation(
+                grade_pct=grade * 100,
+                excess_pct=(grade - max_grade) * 100,
+                distance_m=d,
+                de_m=de,
+                way_a=w, way_b=w,
+                pt_a=(xi, yi), pt_b=(xj, yj),
+                elev_a=ei, elev_b=ej))
     return out
 
 
