@@ -1700,6 +1700,18 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             except Exception:
                 pass
 
+    # ── Tier 3: thin-strip absorption ───────────────────────────
+    # Junction polygons whose minimum perpendicular width is below
+    # THIN_STRIP_MIN_WIDTH_M are physically too thin to ramp the
+    # ambient elevation difference at 1.5 % grade — the resulting
+    # triangles would have steep planes regardless of triangulation
+    # strategy.  Absorb them into an adjacent terminal pad (the
+    # high-elev neighbour) so the terminal grows by a few metres
+    # and X-Plane renders the natural DEM cliff beyond the new
+    # pavement edge instead of forcing a steep ramp inside the
+    # pavement.
+    _absorb_thin_junction_strips(layout)
+
     # ── Junction triangulation ──────────────────────────────────
     # Each junction polygon is replaced with N-2 ear-clip
     # triangles, each carrying a per-vertex elevation list
@@ -2782,6 +2794,83 @@ def _drop_colinear_boundary_vertices(
             break
         ring = new_ring
     return ring
+
+
+# ── Tier 3: thin-strip absorption ───────────────────────────────
+#
+# A junction polygon whose minimum perpendicular width is below
+# ``THIN_STRIP_MIN_WIDTH_M`` cannot ramp its anchored boundary
+# elevation difference at the 1.5 % FAA grade — any triangulation
+# of the strip produces steep-planed triangles by physical
+# necessity.  The user 2026-04-25 fix: absorb the strip into an
+# adjacent TERMINAL pad (the high-elev neighbour).  The terminal's
+# polygon grows by a few metres, the strip vanishes, and X-Plane
+# renders the natural DEM cliff beyond the new pavement edge
+# instead of forcing a too-steep ramp inside the pavement.
+
+THIN_STRIP_MIN_WIDTH_M = 5.0
+
+
+def _absorb_thin_junction_strips(layout: "PavementLayout") -> int:
+    """Detect junction polygons whose ``polygon.buffer(-w/2)`` is
+    empty (i.e. min width < ``THIN_STRIP_MIN_WIDTH_M``), and
+    absorb each into the highest-elevation adjacent terminal pad.
+
+    Returns the number of strips absorbed.
+    """
+    drop_idx: set = set()
+    absorbed = 0
+    half = THIN_STRIP_MIN_WIDTH_M * 0.5
+    for ji, j_shape in enumerate(layout.shapes):
+        if j_shape.role != ROLE_JUNCTION:
+            continue
+        try:
+            shrunk = j_shape.polygon.buffer(-half)
+        except Exception:
+            continue
+        if not shrunk.is_empty:
+            continue  # not a thin strip
+        # Find the highest-altitude adjacent terminal that touches
+        # this strip's boundary.
+        best_t = None
+        best_alt = float("-inf")
+        for t_shape in layout.shapes:
+            if t_shape is j_shape:
+                continue
+            if t_shape.role != ROLE_TERMINAL:
+                continue
+            if t_shape.altitude is None:
+                continue
+            try:
+                touches = t_shape.polygon.intersects(j_shape.polygon)
+            except Exception:
+                touches = False
+            if touches and t_shape.altitude > best_alt:
+                best_t = t_shape
+                best_alt = t_shape.altitude
+        if best_t is None:
+            continue  # no terminal neighbour — can't absorb
+        # Absorb: union strip into terminal.
+        try:
+            merged = unary_union(
+                [best_t.polygon, j_shape.polygon]).buffer(0)
+            if merged.geom_type == "Polygon":
+                best_t.polygon = merged
+            elif merged.geom_type == "MultiPolygon":
+                # Pick the largest connected piece (shouldn't
+                # happen if they truly intersect; guard anyway).
+                best_t.polygon = max(merged.geoms,
+                                     key=lambda g: g.area)
+            else:
+                continue
+        except Exception:
+            continue
+        drop_idx.add(ji)
+        absorbed += 1
+    if drop_idx:
+        layout.shapes = [s for i, s in enumerate(layout.shapes)
+                         if i not in drop_idx]
+    return absorbed
 
 
 # ── Tier 4: validated centroid-Steiner subdivision ──────────────
