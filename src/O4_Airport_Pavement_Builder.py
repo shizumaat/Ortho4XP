@@ -1523,6 +1523,25 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         graph.propagate_bounds()
         graph.choose_values()
         graph.smooth_rate_of_change(iters=30)
+        # ── Plateau detection + snap ───────────────────────────
+        # User 2026-04-25: identify shallow regions of the
+        # smoothed surface (edges with grade < PLATEAU_FLATNESS_GRADE)
+        # and snap each connected component to its median elevation.
+        # The result: most of the apron sits at a few discrete
+        # plateau elevations connected by short ramp segments,
+        # rather than continuously varying.  Rects entirely within
+        # a plateau emit as FLAT (single altitude tag); junctions
+        # within a plateau pass the existing FLAT classifier
+        # automatically (vertex elevations all match the plateau).
+        # Triangulation is reserved for compound-slope regions
+        # crossing multiple plateaus.
+        _snap_plateaus(graph)
+        # Re-smooth ramps between plateaus.  Plateau nodes are
+        # now hard anchors; this run enforces 1.5 % grade on the
+        # transition ramps between them.
+        graph.propagate_bounds()
+        graph.choose_values()
+        graph.smooth_rate_of_change(iters=30)
         taxi_roles = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
                       ROLE_STUB, ROLE_CROSS_CONNECTOR}
         for shape in layout.shapes:
@@ -2038,6 +2057,99 @@ class ElevationGraph:
         if best_edge_d > 50.0:
             return None
         return best_elev
+
+
+# ── Plateau detection + snap ────────────────────────────────────
+#
+# After the initial graph smoothing settles every node to a
+# grade-compliant elevation, we cluster nodes into "shallow
+# plateaus" (BFS over edges where ``|Δelev| / length`` is below
+# PLATEAU_FLATNESS_GRADE) and snap each plateau's nodes to a
+# single shared elevation (the median of the cluster).  The
+# plateau nodes then become hard anchors for the second smoothing
+# pass that fits 1.5 % ramps between them.
+#
+# Effect: the elevation surface becomes a series of discrete
+# level zones connected by short transition ramps — matching how
+# real airport pavement is actually shaped — rather than a
+# continuous sub-1.5 % gradient everywhere.  Downstream:
+#
+#   * A taxi rect whose two axis endpoints land in the same
+#     plateau auto-emits as FLAT (altitude tag, no slope).
+#   * A junction polygon whose anchored boundary vertices are all
+#     in one plateau passes the existing FLAT classifier without
+#     any rect adjustment closure.
+#   * Compound-slope junctions (spanning multiple plateaus) still
+#     triangulate.
+
+PLATEAU_FLATNESS_GRADE = 0.003   # max edge grade to be in a
+                                  # plateau (0.3 %, well below the
+                                  # 1.5 % FAA cap so a plateau is
+                                  # genuinely "flat" by any
+                                  # practical measure)
+PLATEAU_MIN_NODES = 4             # ignore micro-plateaus that are
+                                  # smaller than this many nodes
+PLATEAU_MIN_EXTENT_M = 30.0       # ignore plateaus whose bounding
+                                  # extent is smaller than this
+
+
+def _detect_plateaus(g: "ElevationGraph") -> List[List[int]]:
+    """Cluster graph nodes via BFS where each step is across an
+    edge with grade < PLATEAU_FLATNESS_GRADE.  Returns a list of
+    plateau clusters; each cluster is a list of node indices.
+    Singletons and clusters smaller than the minimum size are
+    dropped.
+    """
+    n = len(g.nodes)
+    if n == 0:
+        return []
+    visited = [False] * n
+    plateaus: List[List[int]] = []
+    for start in range(n):
+        if visited[start]:
+            continue
+        cluster: List[int] = [start]
+        stack = [start]
+        visited[start] = True
+        while stack:
+            u = stack.pop()
+            for v, length in g.edges_adj[u]:
+                if visited[v] or length < 1e-3:
+                    continue
+                d = abs(g.elev[u] - g.elev[v]) / length
+                if d <= PLATEAU_FLATNESS_GRADE:
+                    visited[v] = True
+                    cluster.append(v)
+                    stack.append(v)
+        if len(cluster) < PLATEAU_MIN_NODES:
+            continue
+        # Bounding extent in xy.
+        xs = [g.nodes[i][0] for i in cluster]
+        ys = [g.nodes[i][1] for i in cluster]
+        extent = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if extent < PLATEAU_MIN_EXTENT_M:
+            continue
+        plateaus.append(cluster)
+    return plateaus
+
+
+def _snap_plateaus(g: "ElevationGraph") -> int:
+    """Detect plateaus and snap every member node to the plateau's
+    median elevation.  Each snapped node becomes a hard anchor
+    (its elevation can't move in subsequent smoothing).
+
+    Returns the number of plateaus snapped (informational).
+    """
+    plateaus = _detect_plateaus(g)
+    if not plateaus:
+        return 0
+    for cluster in plateaus:
+        elevs = sorted(g.elev[i] for i in cluster)
+        median = elevs[len(elevs) // 2]
+        for i in cluster:
+            g.elev[i] = float(median)
+            g.anchor_elev[i] = float(median)
+    return len(plateaus)
 
 
 def _build_elevation_network(
@@ -3169,8 +3281,24 @@ def _triangulate_junctions(
         #                  surface is planar the result is identical
         #                  to our pre-triangulated mesh).
         #   * COMPOUND   — triangulate as before.
-        FLAT_GRADE_THRESHOLD = 0.002      # 0.2 % (per user)
-        FLAT_ABS_FLOOR_M = 0.1            # 10 cm
+        FLAT_GRADE_THRESHOLD = 0.001      # 0.1 % (so 0.05 m at 50 m
+                                           # bbox) — tightened to keep
+                                           # the FLAT mean within
+                                           # check_grade's
+                                           # SHARED_NID_TOLERANCE_M
+                                           # (0.15 m) of every anchor.
+                                           # Plateau snapping makes
+                                           # most flat regions
+                                           # already fit this; what
+                                           # doesn't falls to PLANAR
+                                           # which emits per-vertex
+                                           # elevations matching each
+                                           # anchor exactly.
+        FLAT_ABS_FLOOR_M = 0.05           # 5 cm — half of one stored
+                                           # decimal, so the rounded
+                                           # mean can't differ from
+                                           # any vertex by more than
+                                           # rounding noise.
         PLANAR_RESIDUAL_M = 0.30          # 30 cm — vertices
                                            # within this of best-fit
                                            # plane render virtually
