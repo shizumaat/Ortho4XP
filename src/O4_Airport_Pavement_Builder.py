@@ -2784,6 +2784,173 @@ def _drop_colinear_boundary_vertices(
     return ring
 
 
+# ── Tier 4: validated centroid-Steiner subdivision ──────────────
+#
+# After triangulation, walk each fat-steep junction triangle
+# (aspect ≤ TIER4_ASPECT_CAP, plane gradient > TAXI_MAX_GRADE)
+# and try centroid-Steiner subdivision with several candidate
+# elevations.  Apply only if the max sub-triangle gradient is
+# STRICTLY LESS than the parent's gradient — otherwise leave the
+# parent alone.  Slivers (aspect > cap) are never subdivided
+# because centroid-Steiner of a sliver always produces thinner
+# sub-slivers.
+
+TIER4_ASPECT_CAP = 10.0    # only refine triangles with aspect ≤ this
+TIER4_MAX_PASSES = 2        # cap blow-up at 9× per offender
+
+
+def _tier4_plane_gradient(coords: List[Tuple[float, float]],
+                          elevs: List[float]) -> float:
+    """Plane gradient magnitude for triangle (3 vertices).
+    Returns 0 for degenerate triangles."""
+    (x1, y1), (x2, y2), (x3, y3) = coords
+    z1, z2, z3 = elevs
+    ux, uy, uz = x2 - x1, y2 - y1, z2 - z1
+    vx, vy, vz = x3 - x1, y3 - y1, z3 - z1
+    nx_ = uy * vz - uz * vy
+    ny_ = uz * vx - ux * vz
+    nz_ = ux * vy - uy * vx
+    if abs(nz_) < 1e-6:
+        return 0.0
+    return math.hypot(nx_ / nz_, ny_ / nz_)
+
+
+def _tier4_aspect(coords: List[Tuple[float, float]]) -> float:
+    """Sliver-ness: longest_edge² / (4 × area).  > 10 = sliver."""
+    (x1, y1), (x2, y2), (x3, y3) = coords
+    cross = abs((x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1))
+    area = 0.5 * cross
+    if area < 0.5:
+        return float("inf")
+    max_edge = max(
+        math.hypot(coords[i][0] - coords[(i + 1) % 3][0],
+                   coords[i][1] - coords[(i + 1) % 3][1])
+        for i in range(3))
+    return (max_edge * max_edge) / (4.0 * area)
+
+
+def _refine_fat_steep_triangles(
+    shapes: List[BuiltShape]
+) -> Tuple[List[BuiltShape], int]:
+    """Subdivide fat-but-steep junction triangles via centroid
+    Steiner with elevation chosen to STRICTLY reduce the parent's
+    plane gradient.  Iterates up to TIER4_MAX_PASSES.
+
+    Returns (new_shapes, refinement_count).
+    """
+    current = list(shapes)
+    total_refined = 0
+    for _ in range(TIER4_MAX_PASSES):
+        next_shapes: List[BuiltShape] = []
+        any_refined = False
+        for s in current:
+            if s.role != ROLE_JUNCTION:
+                next_shapes.append(s)
+                continue
+            try:
+                ring = list(s.polygon.exterior.coords)
+            except Exception:
+                next_shapes.append(s)
+                continue
+            if ring and ring[0] == ring[-1]:
+                ring = ring[:-1]
+            if len(ring) != 3:
+                next_shapes.append(s)
+                continue
+            # Decode per-vertex elevations.
+            if (s.node_altitudes is not None
+                    and len(s.node_altitudes) >= 4):
+                elevs = list(s.node_altitudes[:3])
+            elif s.altitude is not None:
+                elevs = [s.altitude] * 3
+            else:
+                next_shapes.append(s)
+                continue
+            grade = _tier4_plane_gradient(ring, elevs)
+            if grade <= TAXI_MAX_GRADE:
+                next_shapes.append(s)
+                continue
+            aspect = _tier4_aspect(ring)
+            if aspect > TIER4_ASPECT_CAP:
+                next_shapes.append(s)  # sliver, skip
+                continue
+            # Try multiple Steiner elevations; pick the one that
+            # MOST reduces the max sub-triangle gradient.
+            cx = (ring[0][0] + ring[1][0] + ring[2][0]) / 3.0
+            cy = (ring[0][1] + ring[1][1] + ring[2][1]) / 3.0
+            mean_e = sum(elevs) / 3.0
+            min_e, max_e = min(elevs), max(elevs)
+            candidates = [
+                mean_e,
+                mean_e - 0.5, mean_e + 0.5,
+                mean_e - 1.0, mean_e + 1.0,
+                min_e, max_e,
+                (min_e + mean_e) / 2.0,
+                (max_e + mean_e) / 2.0,
+            ]
+            best_zS: Optional[float] = None
+            best_max_grade = grade  # baseline: refuse to make worse
+            for zS in candidates:
+                max_sub = 0.0
+                for a, b in ((0, 1), (1, 2), (2, 0)):
+                    sub = _tier4_plane_gradient(
+                        [ring[a], ring[b], (cx, cy)],
+                        [elevs[a], elevs[b], zS])
+                    if sub > max_sub:
+                        max_sub = sub
+                if max_sub < best_max_grade - 1e-4:
+                    best_max_grade = max_sub
+                    best_zS = zS
+            if best_zS is None:
+                # No candidate strictly improves — keep the
+                # parent (better than mangling).
+                next_shapes.append(s)
+                continue
+            # Apply subdivision.
+            any_refined = True
+            total_refined += 1
+            zS = best_zS
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                sub_pts = [ring[a], ring[b], (cx, cy)]
+                try:
+                    sub_poly = Polygon(sub_pts)
+                    if not sub_poly.is_valid:
+                        sub_poly = sub_poly.buffer(0)
+                except Exception:
+                    continue
+                if (sub_poly.is_empty
+                        or sub_poly.geom_type != "Polygon"
+                        or sub_poly.area < 0.5):
+                    continue
+                sub_elevs = [elevs[a], elevs[b], zS]
+                new_s = BuiltShape(
+                    polygon=sub_poly,
+                    role=ROLE_JUNCTION,
+                    ref=s.ref)
+                # node_altitudes in shapely-emitted ring order.
+                closed = list(sub_poly.exterior.coords)
+                elev_for_ring: List[float] = []
+                for (rx, ry) in closed:
+                    best_e = sub_elevs[0]
+                    best_d2 = float("inf")
+                    for (tx, ty), te in zip(sub_pts, sub_elevs):
+                        d2 = (rx - tx) * (rx - tx) + (ry - ty) * (ry - ty)
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_e = te
+                    elev_for_ring.append(round(float(best_e), 1))
+                if max(elev_for_ring) - min(elev_for_ring) < 0.05:
+                    new_s.altitude = round(
+                        sum(elev_for_ring[:-1]) / 3.0, 1)
+                else:
+                    new_s.node_altitudes = elev_for_ring
+                next_shapes.append(new_s)
+        current = next_shapes
+        if not any_refined:
+            break
+    return current, total_refined
+
+
 def _planar_fit_residuals(ring: List[Tuple[float, float]],
                           elev: List[float]
                           ) -> Optional[List[float]]:
@@ -3652,6 +3819,10 @@ def _triangulate_junctions(
             new_shapes.append(new_shape)
             triangle_count += 1
 
+    # ── Tier 4: validated centroid-Steiner subdivision of fat-
+    # but-steep junction triangles.  Strictly improves max sub-
+    # triangle gradient or leaves the parent alone.
+    new_shapes, _refined = _refine_fat_steep_triangles(new_shapes)
     layout.shapes = new_shapes
     if grade_violations:
         # Surfaced via stderr so the user sees it during the test
