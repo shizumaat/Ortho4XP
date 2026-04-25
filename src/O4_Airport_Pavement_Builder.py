@@ -2812,6 +2812,111 @@ def _match_elev(rx: float, ry: float,
     return best_e
 
 
+DELAUNAY_COVERAGE_TOL_FRAC = 0.02  # accept up to 2 % polygon-area
+                                    # gap in the Delaunay output
+                                    # before falling back to ear-clip
+
+# NOTE 2026-04-25: tried adding interior Steiner vertices on a
+# 30 m grid before Delaunay (Tier 1 plan).  Steiner elevations
+# from boundary IDW disagreed with rect-corner anchors near the
+# polygon edge by enough to PRODUCE NEW gradient violations
+# (252 vs 149 baseline at SPJC).  Steiner elevations from the
+# elevation graph were even worse (442) — graph samples differ
+# from rect.altitude_high/low at off-axis corners.  Delaunay-on-
+# boundary alone (no Steiners) is the small but reliable win
+# kept here.
+
+
+def _delaunay_with_steiners(
+    ring: List[Tuple[float, float]],
+    vert_elev: List[float],
+    polygon: Polygon,
+    graph: Optional["ElevationGraph"],
+    dem,
+    tile_lat: int,
+    tile_lon: int,
+    m_to_ll,
+) -> Optional[List[Tuple[Polygon, List[float]]]]:
+    """Triangulate ``polygon`` via Delaunay over its boundary
+    vertices.  Maximises minimum interior angle vs ear-clip's
+    first-valid-ear → fatter triangles, fewer slivers.
+
+    Returns a list of (triangle_polygon, [e0, e1, e2]) for triangles
+    inside the polygon, or None if Delaunay coverage misses more
+    than DELAUNAY_COVERAGE_TOL_FRAC of the polygon's area (caller
+    should fall back to ear-clip).
+    """
+    try:
+        from shapely.geometry import MultiPoint
+        from shapely.ops import triangulate as _tri
+    except Exception:
+        return None
+    if polygon.is_empty or polygon.geom_type != "Polygon":
+        return None
+    if len(ring) < 3 or len(vert_elev) != len(ring):
+        return None
+    all_pts = list(ring)
+    all_elevs = list(vert_elev)
+    try:
+        mp = MultiPoint(all_pts)
+        tris = _tri(mp)
+    except Exception:
+        return None
+    inside_tris: List[Tuple[Polygon, List[float]]] = []
+    covered = 0.0
+    # Build a coord-bucket -> elevation map for vertex lookup.
+    coord_to_elev: Dict[Tuple[int, int], float] = {}
+    for (px, py), pe in zip(all_pts, all_elevs):
+        coord_to_elev[(int(round(px / 0.1)),
+                       int(round(py / 0.1)))] = pe
+    for t in tris:
+        if t.is_empty or t.geom_type != "Polygon":
+            continue
+        # Strict containment: triangle's centroid must be inside
+        # the original polygon (handles concave polygons by
+        # discarding triangles spanning the concave gap).
+        try:
+            if not polygon.contains(t.centroid):
+                continue
+        except Exception:
+            continue
+        try:
+            tc = list(t.exterior.coords)
+        except Exception:
+            continue
+        if tc and tc[0] == tc[-1]:
+            tc = tc[:-1]
+        if len(tc) != 3:
+            continue
+        elevs = []
+        for (cx, cy) in tc:
+            key = (int(round(cx / 0.1)), int(round(cy / 0.1)))
+            e = coord_to_elev.get(key)
+            if e is None:
+                # Search nearby buckets (rounding noise).
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        e2 = coord_to_elev.get(
+                            (key[0] + dx, key[1] + dy))
+                        if e2 is not None:
+                            e = e2
+                            break
+                    if e is not None:
+                        break
+            if e is None:
+                e = 0.0
+            elevs.append(float(e))
+        inside_tris.append((t, elevs))
+        covered += t.area
+    if not inside_tris:
+        return None
+    # Coverage check: did Delaunay cover the polygon?
+    gap = abs(polygon.area - covered) / polygon.area
+    if gap > DELAUNAY_COVERAGE_TOL_FRAC:
+        return None  # caller falls back to ear-clip
+    return inside_tris
+
+
 def _ear_clip(coords: Sequence[Tuple[float, float]]
               ) -> List[Tuple[int, int, int]]:
     """Best-ear ear-clipping: at every step, find ALL valid ears
@@ -3385,6 +3490,65 @@ def _triangulate_junctions(
             except Exception:
                 pass  # fall through to triangulation
 
+        # ── Tier 1: Delaunay triangulation with interior Steiners ─
+        # For polygons large enough to benefit (> DELAUNAY_MIN_AREA_M2),
+        # add a regular grid of interior Steiner points with
+        # elevations sampled from the smoothed elevation graph,
+        # then triangulate via Delaunay (shapely.ops.triangulate).
+        # Delaunay maximizes minimum interior angle by construction
+        # → produces fat triangles, eliminating most ear-clip
+        # slivers.  Falls through to ear-clip if Delaunay leaves
+        # gaps (rare; typically only happens in concave polygons
+        # that defeat the centroid-in-polygon filter).
+        delaunay_result = _delaunay_with_steiners(
+            ring, vert_elev, shape.polygon, graph, dem,
+            tile_lat, tile_lon, m_to_ll)
+        if delaunay_result is not None:
+            for tri_poly, tri_elevs in delaunay_result:
+                # Grade check (informational).
+                tcs = list(tri_poly.exterior.coords)
+                if tcs and tcs[0] == tcs[-1]:
+                    tcs = tcs[:-1]
+                if len(tcs) == 3 and len(tri_elevs) >= 3:
+                    for (p, q, ep, eq) in (
+                        (tcs[0], tcs[1], tri_elevs[0], tri_elevs[1]),
+                        (tcs[1], tcs[2], tri_elevs[1], tri_elevs[2]),
+                        (tcs[2], tcs[0], tri_elevs[2], tri_elevs[0]),
+                    ):
+                        d = math.hypot(p[0] - q[0], p[1] - q[1])
+                        if d < 0.5:
+                            continue
+                        if abs(ep - eq) / d > TAXI_MAX_GRADE + 1e-4:
+                            grade_violations += 1
+                            break
+                new_shape = BuiltShape(
+                    polygon=tri_poly,
+                    role=ROLE_JUNCTION,
+                    ref=shape.ref)
+                # Build closed-ring elevations matching shapely's
+                # vertex order.
+                closed = list(tri_poly.exterior.coords)
+                elev_for_ring = []
+                for (rx, ry) in closed:
+                    best_e = tri_elevs[0]
+                    best_d2 = float("inf")
+                    for (tx, ty), te in zip(tcs, tri_elevs[:3]):
+                        d2 = (rx - tx) * (rx - tx) + (ry - ty) * (ry - ty)
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_e = te
+                    elev_for_ring.append(round(float(best_e), 1))
+                if max(elev_for_ring) - min(elev_for_ring) < 0.05:
+                    new_shape.altitude = round(
+                        sum(elev_for_ring[:-1]) / 3.0, 1)
+                else:
+                    new_shape.node_altitudes = elev_for_ring
+                new_shapes.append(new_shape)
+                triangle_count += 1
+            continue
+
+        # Fall-back: ear-clip (concave polygons where Delaunay
+        # leaves gaps, or polygons too small for Steiner grid).
         triples = _ear_clip(ring)
         if not triples:
             continue
