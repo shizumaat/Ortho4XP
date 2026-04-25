@@ -2901,6 +2901,68 @@ COLINEAR_DROP_M = 3.0  # max perpendicular distance to neighbours
                         # and any vertex shared between junctions.
 
 
+SPIKE_VERTEX_TOL_M = 0.005  # max perpendicular distance from a
+                             # ring vertex to a non-adjacent edge
+                             # of the same polygon for the vertex
+                             # to count as a "spike" — the ring
+                             # ventured out and returned to (or
+                             # very near) itself.  Sub-mm spikes
+                             # are valid in shapely's eyes but
+                             # become hard self-intersections
+                             # after .11f OSM-format truncation,
+                             # which would crash X-Plane.
+
+
+def _drop_spike_vertices(
+    ring: List[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Drop any ring vertex that lies within ``SPIKE_VERTEX_TOL_M``
+    of a NON-adjacent edge of the same ring.
+
+    Such a vertex represents a degenerate "stick-out-and-return"
+    in the polygon boundary — the ring went away from a straight
+    section and returned right onto it, leaving a near-zero-area
+    lobe that's a self-touch / self-intersection in any reasonable
+    coordinate precision.
+
+    Iterates to a fixed point (dropping one spike can expose
+    another).  Capped at 8 passes against pathological inputs.
+    """
+    if len(ring) < 4:
+        return ring
+    for _ in range(8):
+        n = len(ring)
+        if n < 4:
+            break
+        keep = [True] * n
+        for i in range(n):
+            vx, vy = ring[i]
+            for j in range(n):
+                if abs(i - j) <= 1 or (i == 0 and j == n - 1) or (j == 0 and i == n - 1):
+                    continue
+                ax, ay = ring[j]
+                bx, by = ring[(j + 1) % n]
+                dx = bx - ax
+                dy = by - ay
+                seg2 = dx * dx + dy * dy
+                if seg2 < 1e-6:
+                    continue
+                t = ((vx - ax) * dx + (vy - ay) * dy) / seg2
+                if t < 0.0 or t > 1.0:
+                    continue
+                cx = ax + t * dx
+                cy = ay + t * dy
+                d2 = (vx - cx) * (vx - cx) + (vy - cy) * (vy - cy)
+                if d2 < SPIKE_VERTEX_TOL_M * SPIKE_VERTEX_TOL_M:
+                    keep[i] = False
+                    break
+        new_ring = [r for r, k in zip(ring, keep) if k]
+        if len(new_ring) == n:
+            break
+        ring = new_ring
+    return ring
+
+
 def _drop_colinear_boundary_vertices(
     ring: List[Tuple[float, float]],
     corner_elev: Dict[Tuple[int, int], float],
@@ -3360,6 +3422,19 @@ def _triangulate_junctions(
         # boundary tracing and must not be removed.
         ring = _drop_colinear_boundary_vertices(
             ring, corner_elev, shared_junction_buckets)
+        if len(ring) < 3:
+            continue
+        # Drop spike vertices: any ring vertex that lies on (or
+        # within sub-mm of) a NON-adjacent edge of the same ring.
+        # Source: residue / decomposition / seam-injection passes
+        # can occasionally produce a "stick-out-and-return"
+        # boundary where the ring ventures away from a straight
+        # section and returns onto it.  Such polygons are valid in
+        # shapely's eyes at full float precision but become hard
+        # self-intersections after the .11f OSM truncation —
+        # crash X-Plane's mesh builder.  Drop the spike vertex
+        # (eliminates the near-zero-area lobe).
+        ring = _drop_spike_vertices(ring)
         if len(ring) < 3:
             continue
         # Vertex elevations + anchor flags.
