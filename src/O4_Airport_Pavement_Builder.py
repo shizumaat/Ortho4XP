@@ -2390,8 +2390,19 @@ def _triangulate_junctions(
     rect_like_roles = {ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
                        ROLE_SECONDARY_PARALLEL,
                        ROLE_STUB, ROLE_CROSS_CONNECTOR}
-    NEAR_CORNER_M = 6.0  # search radius for off-bucket matches
+    NEAR_CORNER_M = 6.0  # search radius for off-bucket corner matches
+    NEAR_EDGE_M = 5.0    # search radius for rect-edge interpolation
     near_corner_list: List[Tuple[float, float, float]] = []
+    # Each ``neighbour_edges`` entry is one polygon edge of a non-
+    # junction shape, paired with the elevations at its two ends:
+    # ``(ax, ay, bx, by, e_a, e_b)``.  Junction vertices that fall
+    # close to such an edge are anchored to the linearly-interpolated
+    # elevation along the edge — guaranteeing the junction triangle
+    # meets a sloped rect's long edge at the same height the rect is
+    # rendering at, rather than at the centerline-graph value (which
+    # is offset by the rect's half-width).
+    neighbour_edges: List[Tuple[float, float, float, float,
+                                float, float]] = []
     for s in layout.shapes:
         if s.role == ROLE_JUNCTION:
             continue
@@ -2403,29 +2414,75 @@ def _triangulate_junctions(
             coords = coords[:-1]
         if not coords:
             continue
+        # Per-corner elevations.
         if (s.role in rect_like_roles
                 and s.altitude_high is not None
                 and s.altitude_low is not None
                 and len(coords) == 4):
             elevs = [s.altitude_high, s.altitude_low,
                      s.altitude_low, s.altitude_high]
-            for (cx, cy), e in zip(coords, elevs):
-                near_corner_list.append((cx, cy, float(e)))
         elif s.altitude is not None:
-            for (cx, cy) in coords:
-                near_corner_list.append((cx, cy, float(s.altitude)))
+            elevs = [float(s.altitude)] * len(coords)
+        else:
+            continue
+        for (cx, cy), e in zip(coords, elevs):
+            near_corner_list.append((cx, cy, float(e)))
+        # Edge list (closed ring).
+        m = len(coords)
+        for i in range(m):
+            ax, ay = coords[i]
+            bx, by = coords[(i + 1) % m]
+            ea = float(elevs[i])
+            eb = float(elevs[(i + 1) % m])
+            neighbour_edges.append((ax, ay, bx, by, ea, eb))
+
+    def _edge_interp_elev(x: float, y: float,
+                          max_dist: float = NEAR_EDGE_M
+                          ) -> Optional[float]:
+        """Return the elevation interpolated along the closest
+        non-junction polygon edge within ``max_dist`` of (x, y),
+        or None if no edge is within range.
+
+        Projects the query point onto each edge's segment, clamps
+        to [0, 1], and linearly interpolates between the edge's
+        two endpoint elevations.  This matches the elevation X-Plane
+        renders for a sloped rect at any point along its long edge
+        — so junction triangles abutting a sloped rect at this
+        point will meet it without a step.
+        """
+        best_e: Optional[float] = None
+        best_d2 = max_dist * max_dist
+        for ax, ay, bx, by, ea, eb in neighbour_edges:
+            dx = bx - ax
+            dy = by - ay
+            seg_len2 = dx * dx + dy * dy
+            if seg_len2 < 0.04:  # < 0.2 m segment, skip
+                continue
+            t = ((x - ax) * dx + (y - ay) * dy) / seg_len2
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+            cx = ax + t * dx
+            cy = ay + t * dy
+            d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_e = ea + t * (eb - ea)
+        return best_e
 
     def _vertex_elev_anchored(x: float, y: float
                               ) -> Tuple[Optional[float], bool]:
         """Return ``(elev, is_anchor)``.  ``is_anchor`` is True if
-        the elevation came from a shared neighbour corner (must
-        not be moved by junction-local smoothing); False otherwise
-        (graph / DEM sample, free to smooth)."""
-        # Bucket lookup — exact shared-vertex match.
+        the elevation came from a corner OR rect-edge interpolation
+        (must not be moved by junction-local smoothing).  False
+        means a graph / DEM sample that the smoothing pass is free
+        to pull into grade compliance."""
+        # 1. Bucket lookup — exact shared-vertex match.
         e = corner_elev.get(_corner_elevation_bucket(x, y))
         if e is not None:
             return e, True
-        # Wider linear search for off-bucket near-corner matches.
+        # 2. Wider linear search for off-bucket near-corner matches.
         best_e: Optional[float] = None
         best_d2 = NEAR_CORNER_M * NEAR_CORNER_M
         for cx, cy, ce in near_corner_list:
@@ -2435,7 +2492,14 @@ def _triangulate_junctions(
                 best_e = ce
         if best_e is not None:
             return best_e, True
-        # Free sample (will be smoothed in junction-local pass).
+        # 3. Rect-edge interpolation — pulls junction vertices
+        # pushed 1m off a long edge (or any boundary-trace vertex
+        # within NEAR_EDGE_M of a rect/runway/terminal edge) onto
+        # the rect's slope at the projected position.
+        e_edge = _edge_interp_elev(x, y)
+        if e_edge is not None:
+            return e_edge, True
+        # 4. Free sample (will be smoothed in junction-local pass).
         if graph is not None:
             ev = graph.elevation_at(x, y)
             if ev is not None:
