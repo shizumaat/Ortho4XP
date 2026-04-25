@@ -2453,6 +2453,17 @@ def _splice_one_hole(ring: List[Tuple[float, float]],
 
 def _ear_clip(coords: Sequence[Tuple[float, float]]
               ) -> List[Tuple[int, int, int]]:
+    """Best-ear ear-clipping: at every step, find ALL valid ears
+    and clip the one with the highest minimum interior angle.
+
+    Greedy first-ear selection produces sliver triangles when the
+    polygon has near-colinear boundary segments — the slivers'
+    planes can have huge gradients perpendicular to their thin
+    dimension even if the 3 vertices' pairwise grades are modest.
+    Best-ear keeps every triangle as "fat" as the polygon's
+    geometry allows, eliminating the bulk of sliver-induced step
+    artefacts.
+    """
     n = len(coords)
     if n < 3:
         return []
@@ -2485,19 +2496,50 @@ def _ear_clip(coords: Sequence[Tuple[float, float]]
         has_pos = d1 > 0 or d2 > 0 or d3 > 0
         return not (has_neg and has_pos)
 
+    def _min_angle(a: int, b: int, c: int) -> float:
+        """Minimum interior angle of triangle (a, b, c) in radians.
+        Higher = fatter triangle.  Returns 0 for degenerate."""
+        ax, ay = coords[a]
+        bx, by = coords[b]
+        cx, cy = coords[c]
+        # Side vectors at each vertex.
+        abx, aby = bx - ax, by - ay
+        acx, acy = cx - ax, cy - ay
+        bax, bay = -abx, -aby
+        bcx, bcy = cx - bx, cy - by
+        cax, cay = -acx, -acy
+        cbx, cby = -bcx, -bcy
+        ab = math.hypot(abx, aby)
+        ac = math.hypot(acx, acy)
+        bc = math.hypot(bcx, bcy)
+        if ab < 1e-6 or ac < 1e-6 or bc < 1e-6:
+            return 0.0
+        cos_a = (abx * acx + aby * acy) / (ab * ac)
+        cos_b = (bax * bcx + bay * bcy) / (ab * bc)
+        cos_c = (cax * cbx + cay * cby) / (ac * bc)
+        # Clamp to [-1, 1] for numerical safety.
+        cos_a = max(-1.0, min(1.0, cos_a))
+        cos_b = max(-1.0, min(1.0, cos_b))
+        cos_c = max(-1.0, min(1.0, cos_c))
+        return min(math.acos(cos_a),
+                   math.acos(cos_b),
+                   math.acos(cos_c))
+
     triangles: List[Tuple[int, int, int]] = []
-    guard = 4 * n  # bail-out in pathological cases
+    guard = 4 * n
     while len(indices) > 3 and guard > 0:
         guard -= 1
         m = len(indices)
+        # Score every valid ear by its min-angle; clip the best.
+        best_score = -1.0
+        best_i = -1
+        best_triple: Tuple[int, int, int] = (0, 0, 0)
         for i in range(m):
             prev_i = indices[(i - 1) % m]
             cur_i = indices[i]
             next_i = indices[(i + 1) % m]
-            # Convex (left turn for CCW polygon).
             if _cross(prev_i, cur_i, next_i) <= 0:
-                continue
-            # No other vertex inside the candidate ear.
+                continue  # not convex → not an ear
             ok = True
             for k in indices:
                 if k in (prev_i, cur_i, next_i):
@@ -2507,15 +2549,19 @@ def _ear_clip(coords: Sequence[Tuple[float, float]]
                     break
             if not ok:
                 continue
-            triangles.append((prev_i, cur_i, next_i))
-            del indices[i]
-            break
-        else:
-            # No ear found this pass — fan from indices[0] and bail.
+            score = _min_angle(prev_i, cur_i, next_i)
+            if score > best_score:
+                best_score = score
+                best_i = i
+                best_triple = (prev_i, cur_i, next_i)
+        if best_i < 0:
+            # No valid ear — fan-fallback for pathological input.
             for i in range(1, len(indices) - 1):
                 triangles.append(
                     (indices[0], indices[i], indices[i + 1]))
             return triangles
+        triangles.append(best_triple)
+        del indices[best_i]
     if len(indices) == 3:
         triangles.append((indices[0], indices[1], indices[2]))
     return triangles
