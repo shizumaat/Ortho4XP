@@ -3471,7 +3471,27 @@ def _extract_osm_terminals(
         if p is not None and p.area >= 100.0:
             out.append(p)
 
-    # Relation terminals — union all outer rings
+    # Relation terminals — emit ONE simplified polygon per
+    # aeroway=terminal relation that captures the full building
+    # extent without per-jet-bridge fine detail.
+    #
+    # Previously the code took only the largest connected component
+    # of the union of all outer rings.  That works when the largest
+    # piece dominates (e.g. SPJC rel -222: 28,883 m² largest covers
+    # the bulk of the terminal-between-runways).  It FAILS when the
+    # building is fragmented into many comparable pieces (e.g. SPJC
+    # rel -221: largest 6,557 m² is only 49 % of the total
+    # 13,500 m² building footprint — missing the satellite concourses).
+    #
+    # Strategy (user 2026-04-24): take the convex hull of the union
+    # of all "significant" components (≥ ``MIN_TERMINAL_COMPONENT_M2``).
+    # If the largest component is already > LARGEST_DOMINATES_FRAC of
+    # the total significant area, use it as-is (preserves the
+    # well-shaped output for dominant-piece terminals).  Otherwise
+    # use the convex hull (captures full multi-piece extent in a
+    # single simplified polygon).
+    MIN_TERMINAL_COMPONENT_M2 = 500.0
+    LARGEST_DOMINATES_FRAC = 0.7
     for rid, outer_wids, tags in relations:
         if tags.get("aeroway") != "terminal":
             continue
@@ -3483,12 +3503,37 @@ def _extract_osm_terminals(
             p = _ring_polygon(nds)
             if p is not None:
                 rings.append(p)
-        if rings:
-            merged = unary_union(rings).buffer(0)
-            if merged.geom_type == "MultiPolygon":
-                merged = max(merged.geoms, key=lambda g: g.area)
-            if merged.geom_type == "Polygon" and merged.area >= 100.0:
-                out.append(merged)
+        if not rings:
+            continue
+        merged = unary_union(rings).buffer(0)
+        # Collect significant components.
+        if merged.geom_type == "Polygon":
+            components = [merged] if merged.area >= 100.0 else []
+        elif merged.geom_type == "MultiPolygon":
+            components = [g for g in merged.geoms
+                          if g.geom_type == "Polygon"
+                          and g.area >= MIN_TERMINAL_COMPONENT_M2]
+        else:
+            continue
+        if not components:
+            continue
+        components.sort(key=lambda g: -g.area)
+        total = sum(g.area for g in components)
+        # Single dominant component → use directly.
+        if components[0].area / total >= LARGEST_DOMINATES_FRAC:
+            out.append(components[0])
+            continue
+        # Multi-piece terminal → emit the convex hull as a single
+        # simplified polygon spanning the full footprint.
+        try:
+            hull = unary_union(components).convex_hull
+        except Exception:
+            out.append(components[0])
+            continue
+        if hull.geom_type == "Polygon" and hull.area >= 100.0:
+            out.append(hull)
+        else:
+            out.append(components[0])
     return out
 
 
