@@ -2082,23 +2082,37 @@ class ElevationGraph:
 #   * Compound-slope junctions (spanning multiple plateaus) still
 #     triangulate.
 
-PLATEAU_FLATNESS_GRADE = 0.003   # max edge grade to be in a
-                                  # plateau (0.3 %, well below the
-                                  # 1.5 % FAA cap so a plateau is
-                                  # genuinely "flat" by any
-                                  # practical measure)
-PLATEAU_MIN_NODES = 4             # ignore micro-plateaus that are
-                                  # smaller than this many nodes
-PLATEAU_MIN_EXTENT_M = 30.0       # ignore plateaus whose bounding
-                                  # extent is smaller than this
+PLATEAU_MAX_RANGE_M = 0.5         # max elevation range from
+                                   # min-to-max across an entire
+                                   # plateau cluster.  Outer bound
+                                   # — runaway-cluster guard.
+PLATEAU_EDGE_SANITY_GRADE = 0.003 # max per-edge grade allowed
+                                   # within a plateau (0.3 %).  This
+                                   # is the EFFECTIVE flatness
+                                   # criterion: the snapped plateau
+                                   # boundary's transition to
+                                   # surrounding ramps must still
+                                   # satisfy the 1.5 % FAA cap, and
+                                   # snapping a 0.5-1.5 % gradient
+                                   # cluster forces ramp grades
+                                   # ABOVE 1.5 % at the boundary —
+                                   # tested empirically (user 2026-
+                                   # 04-25): looser 1.5 % per-edge
+                                   # made plane-gradient violations
+                                   # WORSE (149 → 163 at SPJC).
+PLATEAU_MIN_NODES = 4              # ignore micro-plateaus that are
+                                   # smaller than this many nodes
+PLATEAU_MIN_EXTENT_M = 30.0        # ignore plateaus whose bounding
+                                   # extent is smaller than this
 
 
 def _detect_plateaus(g: "ElevationGraph") -> List[List[int]]:
-    """Cluster graph nodes via BFS where each step is across an
-    edge with grade < PLATEAU_FLATNESS_GRADE.  Returns a list of
-    plateau clusters; each cluster is a list of node indices.
-    Singletons and clusters smaller than the minimum size are
-    dropped.
+    """Cluster graph nodes via BFS where the cluster's total
+    elevation range stays below ``PLATEAU_MAX_RANGE_M`` and each
+    edge crossed has grade ≤ ``PLATEAU_EDGE_SANITY_GRADE``.
+
+    Returns plateau clusters (lists of node indices) larger than
+    ``PLATEAU_MIN_NODES`` and ``PLATEAU_MIN_EXTENT_M`` of xy span.
     """
     n = len(g.nodes)
     if n == 0:
@@ -2109,6 +2123,8 @@ def _detect_plateaus(g: "ElevationGraph") -> List[List[int]]:
         if visited[start]:
             continue
         cluster: List[int] = [start]
+        cluster_min = g.elev[start]
+        cluster_max = g.elev[start]
         stack = [start]
         visited[start] = True
         while stack:
@@ -2116,14 +2132,23 @@ def _detect_plateaus(g: "ElevationGraph") -> List[List[int]]:
             for v, length in g.edges_adj[u]:
                 if visited[v] or length < 1e-3:
                     continue
-                d = abs(g.elev[u] - g.elev[v]) / length
-                if d <= PLATEAU_FLATNESS_GRADE:
-                    visited[v] = True
-                    cluster.append(v)
-                    stack.append(v)
+                # Per-edge sanity: don't cross cliffs.
+                edge_grade = abs(g.elev[u] - g.elev[v]) / length
+                if edge_grade > PLATEAU_EDGE_SANITY_GRADE:
+                    continue
+                # Total-range cap: would adding v push the cluster
+                # past PLATEAU_MAX_RANGE_M?
+                new_min = min(cluster_min, g.elev[v])
+                new_max = max(cluster_max, g.elev[v])
+                if new_max - new_min > PLATEAU_MAX_RANGE_M:
+                    continue
+                visited[v] = True
+                cluster.append(v)
+                cluster_min = new_min
+                cluster_max = new_max
+                stack.append(v)
         if len(cluster) < PLATEAU_MIN_NODES:
             continue
-        # Bounding extent in xy.
         xs = [g.nodes[i][0] for i in cluster]
         ys = [g.nodes[i][1] for i in cluster]
         extent = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
