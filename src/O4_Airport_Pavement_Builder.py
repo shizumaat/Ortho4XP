@@ -2673,6 +2673,101 @@ def _splice_one_hole(ring: List[Tuple[float, float]],
 # minimum count when no Steiner points are added.
 
 
+MAX_BOUNDARY_EDGE_M = 30.0  # max length of any junction-polygon
+                             # boundary segment.  Long segments
+                             # (e.g. cuts from hole-decomposition)
+                             # leave Triangle4XP's quality refinement
+                             # unable to fit small triangles between
+                             # the cut endpoints; interior Steiners
+                             # span the full distance and produce
+                             # steep local gradients.  Densifying
+                             # the boundary with linearly-interpolated
+                             # midpoints gives Triangle4XP closer
+                             # boundary anchors to connect to.
+
+
+SHARED_NEIGHBOUR_EDGE_TOL_M = 5.0  # max distance from a midpoint
+                                    # to a neighbour-shape edge to
+                                    # treat the midpoint as on a
+                                    # shared boundary; matches
+                                    # check_grade's edge-step
+                                    # search radius
+
+
+def _densify_long_boundary_edges(
+    ring: List[Tuple[float, float]],
+    vert_elev: List[float],
+    neighbour_edges: List[Tuple[float, float, float, float,
+                                 float, float]],
+) -> Tuple[List[Tuple[float, float]], List[float]]:
+    """Insert interpolated midpoints along long ring segments.
+
+    For each candidate midpoint, check distance to the nearest
+    rect/runway/terminal edge.  If within
+    ``SHARED_NEIGHBOUR_EDGE_TOL_M``, the midpoint sits on a
+    shared boundary; use the NEIGHBOUR'S edge-interpolated
+    elevation (matches whatever the neighbour renders at that
+    point — including segmented-runway piecewise profiles).
+    Otherwise use linear interpolation between the segment's
+    endpoint elevations.
+
+    This guarantees no shared-boundary step is introduced and
+    handles both the simple "junction-on-rect-edge" case (linear
+    interp matches) and the "junction-on-segmented-runway-edge"
+    case (use the runway segment's interp).
+    """
+    n = len(ring)
+    if n < 3 or len(vert_elev) != n:
+        return ring, vert_elev
+
+    def _interp_at(mx: float, my: float, fallback: float) -> float:
+        """Return neighbour-edge interpolation at (mx, my) if a
+        neighbour edge passes within tolerance; else fallback."""
+        best_d2 = SHARED_NEIGHBOUR_EDGE_TOL_M * SHARED_NEIGHBOUR_EDGE_TOL_M
+        best_e: Optional[float] = None
+        for ax, ay, bx, by, ea, eb in neighbour_edges:
+            dx = bx - ax
+            dy = by - ay
+            seg2 = dx * dx + dy * dy
+            if seg2 < 0.04:
+                continue
+            t = ((mx - ax) * dx + (my - ay) * dy) / seg2
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+            cx = ax + t * dx
+            cy = ay + t * dy
+            d2 = (mx - cx) * (mx - cx) + (my - cy) * (my - cy)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_e = ea + t * (eb - ea)
+        return best_e if best_e is not None else fallback
+
+    new_ring: List[Tuple[float, float]] = []
+    new_elev: List[float] = []
+    for i in range(n):
+        a = ring[i]
+        b = ring[(i + 1) % n]
+        ea = vert_elev[i]
+        eb = vert_elev[(i + 1) % n]
+        new_ring.append(a)
+        new_elev.append(ea)
+        d = math.hypot(b[0] - a[0], b[1] - a[1])
+        if d <= MAX_BOUNDARY_EDGE_M:
+            continue
+        n_subs = int(math.ceil(d / MAX_BOUNDARY_EDGE_M))
+        for k in range(1, n_subs):
+            t = k / n_subs
+            mx = a[0] + t * (b[0] - a[0])
+            my = a[1] + t * (b[1] - a[1])
+            linear_me = ea + t * (eb - ea)
+            me = _interp_at(mx, my, linear_me)
+            new_ring.append((mx, my))
+            new_elev.append(me)
+    return new_ring, new_elev
+
+
 COLINEAR_DROP_M = 3.0  # max perpendicular distance to neighbours
                         # for a non-anchor vertex to be removed.
                         # Bumped from 0.5 m → 3.0 m (user 2026-04-25)
@@ -3163,6 +3258,22 @@ def _triangulate_junctions(
         # runway / terminal corners is preserved.
         vert_elev = _smooth_junction_boundary(
             ring, vert_elev, is_anchor_list)
+
+        # Densify long boundary edges (user 2026-04-25): for any
+        # ring segment longer than MAX_BOUNDARY_EDGE_M, insert
+        # interpolated midpoints.  Each midpoint's elevation is
+        # the linear interpolation between the edge's endpoints,
+        # so the rendered surface along the edge is unchanged ON
+        # THE EDGE — adjacent shapes that share this edge (rect
+        # boundaries) interpolate to the same value at the midpoint
+        # so no step is introduced.  The benefit is INTERIOR
+        # triangulation: Triangle4XP's quality refinement can
+        # connect interior Steiners to the new closer boundary
+        # vertices, producing smaller triangles and gentler
+        # gradients within the polygon (especially helpful for
+        # long cut edges from hole-decomposition).
+        ring, vert_elev = _densify_long_boundary_edges(
+            ring, vert_elev, neighbour_edges)
 
         # ── Surface-complexity classification ───────────────────
         # User 2026-04-25: only triangulate where the surface has
