@@ -1183,58 +1183,6 @@ def _find_cifp_path(xplane_root: str, icao: str) -> Optional[str]:
     return None
 
 
-def _runway_segment_elev_lookup(
-    runway_segment_chain, layout: "PavementLayout"
-):
-    """Return a callable ``elev_at(x_m, y_m)`` that returns the
-    runway surface elevation at a meter-space point, or None if the
-    point is farther than ``TAXI_ANCHOR_DIST_M`` from any runway
-    segment centerline.  Used to anchor taxi rect endpoints to the
-    matching runway elevation.
-    """
-    anchor = layout.anchor
-    lat0, lon0 = anchor
-    cos0 = math.cos(math.radians(lat0))
-
-    def _ll_to_m(lat, lon):
-        x = math.radians(lon - lon0) * R_EARTH * cos0
-        y = math.radians(lat - lat0) * R_EARTH
-        return x, y
-
-    # Convert chain to meter-space segments for fast nearest lookup.
-    seg_lines: List[Tuple[LineString, float, float]] = []
-    for seg in runway_segment_chain:
-        lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, _w = seg
-        a = _ll_to_m(lat_a, lon_a)
-        b = _ll_to_m(lat_b, lon_b)
-        if math.hypot(b[0] - a[0], b[1] - a[1]) < 0.5:
-            continue
-        seg_lines.append(
-            (LineString([a, b]), float(elev_a), float(elev_b)))
-
-    def elev_at(x: float, y: float) -> Optional[float]:
-        if not seg_lines:
-            return None
-        p = Point(x, y)
-        best = None
-        best_d = TAXI_ANCHOR_DIST_M
-        for line, ea, eb in seg_lines:
-            d = line.distance(p)
-            if d < best_d:
-                best_d = d
-                # Interpolate along segment.
-                total = line.length
-                if total <= 0:
-                    interp = ea
-                else:
-                    t = line.project(p) / total
-                    interp = ea + (eb - ea) * t
-                best = float(interp)
-        return best
-
-    return elev_at
-
-
 def _compute_elevations(layout: "PavementLayout", icao: str,
                         xplane_root: str, apt,
                         osm_nodes=None, osm_ways=None,
@@ -1699,18 +1647,6 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     shape.polygon = new_poly
             except Exception:
                 pass
-
-    # ── Tier 3: thin-strip absorption ───────────────────────────
-    # Junction polygons whose minimum perpendicular width is below
-    # THIN_STRIP_MIN_WIDTH_M are physically too thin to ramp the
-    # ambient elevation difference at 1.5 % grade — the resulting
-    # triangles would have steep planes regardless of triangulation
-    # strategy.  Absorb them into an adjacent terminal pad (the
-    # high-elev neighbour) so the terminal grows by a few metres
-    # and X-Plane renders the natural DEM cliff beyond the new
-    # pavement edge instead of forcing a steep ramp inside the
-    # pavement.
-    _absorb_thin_junction_strips(layout)
 
     # ── Junction triangulation ──────────────────────────────────
     # Each junction polygon is replaced with N-2 ear-clip
@@ -2796,250 +2732,6 @@ def _drop_colinear_boundary_vertices(
     return ring
 
 
-# ── Tier 3: thin-strip absorption ───────────────────────────────
-#
-# A junction polygon whose minimum perpendicular width is below
-# ``THIN_STRIP_MIN_WIDTH_M`` cannot ramp its anchored boundary
-# elevation difference at the 1.5 % FAA grade — any triangulation
-# of the strip produces steep-planed triangles by physical
-# necessity.  The user 2026-04-25 fix: absorb the strip into an
-# adjacent TERMINAL pad (the high-elev neighbour).  The terminal's
-# polygon grows by a few metres, the strip vanishes, and X-Plane
-# renders the natural DEM cliff beyond the new pavement edge
-# instead of forcing a too-steep ramp inside the pavement.
-
-THIN_STRIP_MIN_WIDTH_M = 5.0
-
-
-def _absorb_thin_junction_strips(layout: "PavementLayout") -> int:
-    """Detect junction polygons whose ``polygon.buffer(-w/2)`` is
-    empty (i.e. min width < ``THIN_STRIP_MIN_WIDTH_M``), and
-    absorb each into the highest-elevation adjacent terminal pad.
-
-    Returns the number of strips absorbed.
-    """
-    drop_idx: set = set()
-    absorbed = 0
-    half = THIN_STRIP_MIN_WIDTH_M * 0.5
-    for ji, j_shape in enumerate(layout.shapes):
-        if j_shape.role != ROLE_JUNCTION:
-            continue
-        try:
-            shrunk = j_shape.polygon.buffer(-half)
-        except Exception:
-            continue
-        if not shrunk.is_empty:
-            continue  # not a thin strip
-        # Find the highest-altitude adjacent terminal that touches
-        # this strip's boundary.
-        best_t = None
-        best_alt = float("-inf")
-        for t_shape in layout.shapes:
-            if t_shape is j_shape:
-                continue
-            if t_shape.role != ROLE_TERMINAL:
-                continue
-            if t_shape.altitude is None:
-                continue
-            try:
-                touches = t_shape.polygon.intersects(j_shape.polygon)
-            except Exception:
-                touches = False
-            if touches and t_shape.altitude > best_alt:
-                best_t = t_shape
-                best_alt = t_shape.altitude
-        if best_t is None:
-            continue  # no terminal neighbour — can't absorb
-        # Absorb: union strip into terminal.
-        try:
-            merged = unary_union(
-                [best_t.polygon, j_shape.polygon]).buffer(0)
-            if merged.geom_type == "Polygon":
-                best_t.polygon = merged
-            elif merged.geom_type == "MultiPolygon":
-                # Pick the largest connected piece (shouldn't
-                # happen if they truly intersect; guard anyway).
-                best_t.polygon = max(merged.geoms,
-                                     key=lambda g: g.area)
-            else:
-                continue
-        except Exception:
-            continue
-        drop_idx.add(ji)
-        absorbed += 1
-    if drop_idx:
-        layout.shapes = [s for i, s in enumerate(layout.shapes)
-                         if i not in drop_idx]
-    return absorbed
-
-
-# ── Tier 4: validated centroid-Steiner subdivision ──────────────
-#
-# After triangulation, walk each fat-steep junction triangle
-# (aspect ≤ TIER4_ASPECT_CAP, plane gradient > TAXI_MAX_GRADE)
-# and try centroid-Steiner subdivision with several candidate
-# elevations.  Apply only if the max sub-triangle gradient is
-# STRICTLY LESS than the parent's gradient — otherwise leave the
-# parent alone.  Slivers (aspect > cap) are never subdivided
-# because centroid-Steiner of a sliver always produces thinner
-# sub-slivers.
-
-TIER4_ASPECT_CAP = 10.0    # only refine triangles with aspect ≤ this
-TIER4_MAX_PASSES = 2        # cap blow-up at 9× per offender
-
-
-def _tier4_plane_gradient(coords: List[Tuple[float, float]],
-                          elevs: List[float]) -> float:
-    """Plane gradient magnitude for triangle (3 vertices).
-    Returns 0 for degenerate triangles."""
-    (x1, y1), (x2, y2), (x3, y3) = coords
-    z1, z2, z3 = elevs
-    ux, uy, uz = x2 - x1, y2 - y1, z2 - z1
-    vx, vy, vz = x3 - x1, y3 - y1, z3 - z1
-    nx_ = uy * vz - uz * vy
-    ny_ = uz * vx - ux * vz
-    nz_ = ux * vy - uy * vx
-    if abs(nz_) < 1e-6:
-        return 0.0
-    return math.hypot(nx_ / nz_, ny_ / nz_)
-
-
-def _tier4_aspect(coords: List[Tuple[float, float]]) -> float:
-    """Sliver-ness: longest_edge² / (4 × area).  > 10 = sliver."""
-    (x1, y1), (x2, y2), (x3, y3) = coords
-    cross = abs((x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1))
-    area = 0.5 * cross
-    if area < 0.5:
-        return float("inf")
-    max_edge = max(
-        math.hypot(coords[i][0] - coords[(i + 1) % 3][0],
-                   coords[i][1] - coords[(i + 1) % 3][1])
-        for i in range(3))
-    return (max_edge * max_edge) / (4.0 * area)
-
-
-def _refine_fat_steep_triangles(
-    shapes: List[BuiltShape]
-) -> Tuple[List[BuiltShape], int]:
-    """Subdivide fat-but-steep junction triangles via centroid
-    Steiner with elevation chosen to STRICTLY reduce the parent's
-    plane gradient.  Iterates up to TIER4_MAX_PASSES.
-
-    Returns (new_shapes, refinement_count).
-    """
-    current = list(shapes)
-    total_refined = 0
-    for _ in range(TIER4_MAX_PASSES):
-        next_shapes: List[BuiltShape] = []
-        any_refined = False
-        for s in current:
-            if s.role != ROLE_JUNCTION:
-                next_shapes.append(s)
-                continue
-            try:
-                ring = list(s.polygon.exterior.coords)
-            except Exception:
-                next_shapes.append(s)
-                continue
-            if ring and ring[0] == ring[-1]:
-                ring = ring[:-1]
-            if len(ring) != 3:
-                next_shapes.append(s)
-                continue
-            # Decode per-vertex elevations.
-            if (s.node_altitudes is not None
-                    and len(s.node_altitudes) >= 4):
-                elevs = list(s.node_altitudes[:3])
-            elif s.altitude is not None:
-                elevs = [s.altitude] * 3
-            else:
-                next_shapes.append(s)
-                continue
-            grade = _tier4_plane_gradient(ring, elevs)
-            if grade <= TAXI_MAX_GRADE:
-                next_shapes.append(s)
-                continue
-            aspect = _tier4_aspect(ring)
-            if aspect > TIER4_ASPECT_CAP:
-                next_shapes.append(s)  # sliver, skip
-                continue
-            # Try multiple Steiner elevations; pick the one that
-            # MOST reduces the max sub-triangle gradient.
-            cx = (ring[0][0] + ring[1][0] + ring[2][0]) / 3.0
-            cy = (ring[0][1] + ring[1][1] + ring[2][1]) / 3.0
-            mean_e = sum(elevs) / 3.0
-            min_e, max_e = min(elevs), max(elevs)
-            candidates = [
-                mean_e,
-                mean_e - 0.5, mean_e + 0.5,
-                mean_e - 1.0, mean_e + 1.0,
-                min_e, max_e,
-                (min_e + mean_e) / 2.0,
-                (max_e + mean_e) / 2.0,
-            ]
-            best_zS: Optional[float] = None
-            best_max_grade = grade  # baseline: refuse to make worse
-            for zS in candidates:
-                max_sub = 0.0
-                for a, b in ((0, 1), (1, 2), (2, 0)):
-                    sub = _tier4_plane_gradient(
-                        [ring[a], ring[b], (cx, cy)],
-                        [elevs[a], elevs[b], zS])
-                    if sub > max_sub:
-                        max_sub = sub
-                if max_sub < best_max_grade - 1e-4:
-                    best_max_grade = max_sub
-                    best_zS = zS
-            if best_zS is None:
-                # No candidate strictly improves — keep the
-                # parent (better than mangling).
-                next_shapes.append(s)
-                continue
-            # Apply subdivision.
-            any_refined = True
-            total_refined += 1
-            zS = best_zS
-            for a, b in ((0, 1), (1, 2), (2, 0)):
-                sub_pts = [ring[a], ring[b], (cx, cy)]
-                try:
-                    sub_poly = Polygon(sub_pts)
-                    if not sub_poly.is_valid:
-                        sub_poly = sub_poly.buffer(0)
-                except Exception:
-                    continue
-                if (sub_poly.is_empty
-                        or sub_poly.geom_type != "Polygon"
-                        or sub_poly.area < 0.5):
-                    continue
-                sub_elevs = [elevs[a], elevs[b], zS]
-                new_s = BuiltShape(
-                    polygon=sub_poly,
-                    role=ROLE_JUNCTION,
-                    ref=s.ref)
-                # node_altitudes in shapely-emitted ring order.
-                closed = list(sub_poly.exterior.coords)
-                elev_for_ring: List[float] = []
-                for (rx, ry) in closed:
-                    best_e = sub_elevs[0]
-                    best_d2 = float("inf")
-                    for (tx, ty), te in zip(sub_pts, sub_elevs):
-                        d2 = (rx - tx) * (rx - tx) + (ry - ty) * (ry - ty)
-                        if d2 < best_d2:
-                            best_d2 = d2
-                            best_e = te
-                    elev_for_ring.append(round(float(best_e), 1))
-                if max(elev_for_ring) - min(elev_for_ring) < 0.05:
-                    new_s.altitude = round(
-                        sum(elev_for_ring[:-1]) / 3.0, 1)
-                else:
-                    new_s.node_altitudes = elev_for_ring
-                next_shapes.append(new_s)
-        current = next_shapes
-        if not any_refined:
-            break
-    return current, total_refined
-
-
 def _planar_fit_residuals(ring: List[Tuple[float, float]],
                           elev: List[float]
                           ) -> Optional[List[float]]:
@@ -3114,26 +2806,11 @@ DELAUNAY_COVERAGE_TOL_FRAC = 0.02  # accept up to 2 % polygon-area
                                     # gap in the Delaunay output
                                     # before falling back to ear-clip
 
-# NOTE 2026-04-25: tried adding interior Steiner vertices on a
-# 30 m grid before Delaunay (Tier 1 plan).  Steiner elevations
-# from boundary IDW disagreed with rect-corner anchors near the
-# polygon edge by enough to PRODUCE NEW gradient violations
-# (252 vs 149 baseline at SPJC).  Steiner elevations from the
-# elevation graph were even worse (442) — graph samples differ
-# from rect.altitude_high/low at off-axis corners.  Delaunay-on-
-# boundary alone (no Steiners) is the small but reliable win
-# kept here.
 
-
-def _delaunay_with_steiners(
+def _delaunay_triangulate_polygon(
     ring: List[Tuple[float, float]],
     vert_elev: List[float],
     polygon: Polygon,
-    graph: Optional["ElevationGraph"],
-    dem,
-    tile_lat: int,
-    tile_lon: int,
-    m_to_ll,
 ) -> Optional[List[Tuple[Polygon, List[float]]]]:
     """Triangulate ``polygon`` via Delaunay over its boundary
     vertices.  Maximises minimum interior angle vs ear-clip's
@@ -3153,10 +2830,8 @@ def _delaunay_with_steiners(
         return None
     if len(ring) < 3 or len(vert_elev) != len(ring):
         return None
-    all_pts = list(ring)
-    all_elevs = list(vert_elev)
     try:
-        mp = MultiPoint(all_pts)
+        mp = MultiPoint(ring)
         tris = _tri(mp)
     except Exception:
         return None
@@ -3164,7 +2839,7 @@ def _delaunay_with_steiners(
     covered = 0.0
     # Build a coord-bucket -> elevation map for vertex lookup.
     coord_to_elev: Dict[Tuple[int, int], float] = {}
-    for (px, py), pe in zip(all_pts, all_elevs):
+    for (px, py), pe in zip(ring, vert_elev):
         coord_to_elev[(int(round(px / 0.1)),
                        int(round(py / 0.1)))] = pe
     for t in tris:
@@ -3788,19 +3463,13 @@ def _triangulate_junctions(
             except Exception:
                 pass  # fall through to triangulation
 
-        # ── Tier 1: Delaunay triangulation with interior Steiners ─
-        # For polygons large enough to benefit (> DELAUNAY_MIN_AREA_M2),
-        # add a regular grid of interior Steiner points with
-        # elevations sampled from the smoothed elevation graph,
-        # then triangulate via Delaunay (shapely.ops.triangulate).
-        # Delaunay maximizes minimum interior angle by construction
-        # → produces fat triangles, eliminating most ear-clip
-        # slivers.  Falls through to ear-clip if Delaunay leaves
-        # gaps (rare; typically only happens in concave polygons
-        # that defeat the centroid-in-polygon filter).
-        delaunay_result = _delaunay_with_steiners(
-            ring, vert_elev, shape.polygon, graph, dem,
-            tile_lat, tile_lon, m_to_ll)
+        # Delaunay triangulation over the boundary vertices.
+        # Maximises minimum interior angle vs ear-clip's first-
+        # valid-ear → fatter triangles, fewer slivers.  Falls
+        # through to ear-clip if coverage gaps in concave
+        # polygons exceed DELAUNAY_COVERAGE_TOL_FRAC.
+        delaunay_result = _delaunay_triangulate_polygon(
+            ring, vert_elev, shape.polygon)
         if delaunay_result is not None:
             for tri_poly, tri_elevs in delaunay_result:
                 # Grade check (informational).
@@ -3908,10 +3577,6 @@ def _triangulate_junctions(
             new_shapes.append(new_shape)
             triangle_count += 1
 
-    # ── Tier 4: validated centroid-Steiner subdivision of fat-
-    # but-steep junction triangles.  Strictly improves max sub-
-    # triangle gradient or leaves the parent alone.
-    new_shapes, _refined = _refine_fat_steep_triangles(new_shapes)
     layout.shapes = new_shapes
     if grade_violations:
         # Surfaced via stderr so the user sees it during the test
@@ -3927,81 +3592,6 @@ def _triangulate_junctions(
 
 
 SHARED_VERTEX_CLUSTER_TOL_M = 1.5
-
-
-def _consolidate_touching_junctions(layout: "PavementLayout",
-                                    tol: float = 1.0) -> None:
-    """Union adjacent (touching within ``tol``) junction polygons.
-
-    Target files sometimes use ONE large junction polygon where my
-    pipeline emits multiple smaller fragments (one per OSM multi-
-    ref cluster + residue gap-fill).  Physically touching junctions
-    should be one shape.
-    """
-    junctions = [(i, s) for i, s in enumerate(layout.shapes)
-                 if s.role == ROLE_JUNCTION
-                 and s.polygon is not None
-                 and not s.polygon.is_empty
-                 and s.polygon.geom_type == "Polygon"]
-    if len(junctions) < 2:
-        return
-
-    # Single-link cluster: junctions within tol of each other merge.
-    n = len(junctions)
-    parent = list(range(n))
-
-    def _find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def _union(a, b):
-        ra, rb = _find(a), _find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            pi = junctions[i][1].polygon
-            pj = junctions[j][1].polygon
-            try:
-                if pi.distance(pj) <= tol:
-                    _union(i, j)
-            except Exception:
-                pass
-
-    clusters: Dict[int, List[int]] = {}
-    for i in range(n):
-        clusters.setdefault(_find(i), []).append(i)
-
-    # For each cluster > 1 member, union polygons; drop originals.
-    drop_shape_ids: set = set()
-    for root, members in clusters.items():
-        if len(members) < 2:
-            continue
-        try:
-            polys = [junctions[m][1].polygon for m in members]
-            merged = unary_union(polys)
-        except Exception:
-            continue
-        if merged.geom_type == "MultiPolygon":
-            # Rare — distance check said they touch but union is
-            # still multi-poly (shared only at a point).  Keep
-            # each piece separate.
-            continue
-        if merged.geom_type != "Polygon" or merged.is_empty:
-            continue
-        # Replace the first member's polygon with the union; mark
-        # others for removal.
-        first_shape_idx = junctions[members[0]][0]
-        layout.shapes[first_shape_idx].polygon = merged
-        for m in members[1:]:
-            drop_shape_ids.add(junctions[m][0])
-
-    if drop_shape_ids:
-        layout.shapes[:] = [s for i, s in enumerate(layout.shapes)
-                            if i not in drop_shape_ids]
 
 
 def _enforce_shared_vertices(layout: "PavementLayout",
