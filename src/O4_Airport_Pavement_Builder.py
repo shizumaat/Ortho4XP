@@ -1446,6 +1446,32 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                             shape, polygon=extra, source_axis=None))
                 layout.shapes = new_shapes
 
+    # ── Terminal pad elevations (flat, DEM median) ──────────────
+    # Computed BEFORE the elevation graph so terminal corners can be
+    # anchored in the graph as hard 1.5 %-grade constraints on the
+    # surrounding apron.  The DEM-median terminal elevation pulls
+    # the network UP along the apron-to-terminal interface so the
+    # surrounding pavement maintains grade with the (often-elevated)
+    # terminal pad — letting X-Plane render a real cliff between
+    # the apron's edge and the natural DEM beyond, rather than
+    # forcing a 100 %-slope drop INSIDE the pavement (user 2026-04-24).
+    for shape in layout.shapes:
+        if shape.role != ROLE_TERMINAL:
+            continue
+        samples: List[float] = []
+        for x, y in [
+            (shape.polygon.centroid.x, shape.polygon.centroid.y)
+        ] + list(shape.polygon.exterior.coords)[:-1]:
+            lat, lon = m_to_ll(x, y)
+            e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+            if e is not None:
+                samples.append(e)
+        if not samples:
+            continue
+        samples.sort()
+        median = samples[len(samples) // 2]
+        shape.altitude = round(median, 1)
+
     # ── Taxi rect elevations via grade-compliant network ────────
     # Build a graph of OSM taxi centerlines + runway segment
     # endpoints, densified to ≤ 30 m edges.  CIFP runway
@@ -1458,6 +1484,13 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         osm_nodes, osm_ways, to_m,
         runway_segment_chain, layout.anchor, dem, tile_lat, tile_lon)
     if graph is not None:
+        # Anchor terminal pad corners in the elevation graph so the
+        # surrounding apron is forced grade-compliant w.r.t. the
+        # terminal level.  Each corner becomes a graph node
+        # connected to its nearest existing graph node by a bridge
+        # of length = straight-line distance, capping per-edge
+        # elev diff at 1.5 % × bridge length.
+        _add_terminal_anchors(graph, layout)
         # Add cross-junction bridges so smoothing enforces 1.5 %
         # grade across junction diagonals — not just along
         # centerline routes.  Must run BEFORE propagate_bounds so
@@ -1518,24 +1551,6 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 _orient_rect_for_altitude(shape, p1, p2, e1, e2)
             else:
                 shape.altitude = round((eh + el) / 2.0, 1)
-
-    # ── Terminal pad elevations (flat, DEM median) ──────────────
-    for shape in layout.shapes:
-        if shape.role != ROLE_TERMINAL:
-            continue
-        samples: List[float] = []
-        for x, y in [
-            (shape.polygon.centroid.x, shape.polygon.centroid.y)
-        ] + list(shape.polygon.exterior.coords)[:-1]:
-            lat, lon = m_to_ll(x, y)
-            e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-            if e is not None:
-                samples.append(e)
-        if not samples:
-            continue
-        samples.sort()
-        median = samples[len(samples) // 2]
-        shape.altitude = round(median, 1)
 
     # ── Keep junction polygons off taxi rect edges ──────────────
     # User rule (2026-04-24): a junction may join an
@@ -2188,6 +2203,62 @@ JUNCTION_BRIDGE_MAX_M = 100.0
 JUNCTION_BRIDGE_NODE_DIST_M = 30.0  # max boundary-vertex → graph
                                      # node distance to consider
                                      # the boundary vertex bridged.
+
+
+TERMINAL_BRIDGE_MAX_M = 200.0  # max distance from a terminal
+                                # corner to bridge into the graph
+TERMINAL_BRIDGE_MAX_NEIGHBOURS = 12  # per-corner bridge-out cap
+
+
+def _add_terminal_anchors(g: "ElevationGraph",
+                          layout: "PavementLayout") -> int:
+    """Add each terminal pad corner to the elevation graph as a
+    hard anchor at the terminal's flat altitude, then bridge it
+    to multiple nearby existing graph nodes (not just the nearest).
+
+    A single nearest-node bridge leaves the terminal anchor at the
+    far end of a long graph chain — the centerline path between
+    apron-side OSM nodes is often hundreds of metres of twisty
+    routing even when the straight-line distance is small.
+    Bridging to many nodes within ``TERMINAL_BRIDGE_MAX_M`` makes
+    the terminal's elevation constraint reach surrounding apron
+    nodes via short straight-line paths, so smoothing can lift the
+    apron UP to maintain 1.5 % grade with the terminal level.
+
+    Returns the number of terminal corner anchors added.
+    """
+    if not g.nodes:
+        return 0
+    added = 0
+    max_d2 = TERMINAL_BRIDGE_MAX_M * TERMINAL_BRIDGE_MAX_M
+    for shape in layout.shapes:
+        if shape.role != ROLE_TERMINAL:
+            continue
+        if shape.altitude is None:
+            continue
+        try:
+            coords = list(shape.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for (cx, cy) in coords:
+            # Collect every graph node within bridge range, sorted
+            # by distance.  Bridge to the closest N (capped to
+            # TERMINAL_BRIDGE_MAX_NEIGHBOURS) so the constraint
+            # propagates to the apron from multiple directions.
+            cand: List[Tuple[float, int]] = []
+            for i, (nx, ny) in enumerate(g.nodes):
+                d2 = (nx - cx) * (nx - cx) + (ny - cy) * (ny - cy)
+                if d2 < max_d2:
+                    cand.append((d2, i))
+            cand.sort()
+            new_idx = g.add_node(
+                cx, cy, anchor=float(shape.altitude))
+            for d2, i in cand[:TERMINAL_BRIDGE_MAX_NEIGHBOURS]:
+                g.add_edge(new_idx, i, max(0.5, math.sqrt(d2)))
+            added += 1
+    return added
 
 
 def _add_junction_bridges(g: "ElevationGraph",
