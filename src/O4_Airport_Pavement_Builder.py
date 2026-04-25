@@ -2546,11 +2546,16 @@ def _splice_one_hole(ring: List[Tuple[float, float]],
 # minimum count when no Steiner points are added.
 
 
-COLINEAR_DROP_M = 0.5  # max perpendicular distance to neighbours
-                        # for a non-anchor vertex to be removed
-                        # (loose enough to thin apt.dat boundary
-                        # traces, tight enough to preserve genuine
-                        # bends).
+COLINEAR_DROP_M = 3.0  # max perpendicular distance to neighbours
+                        # for a non-anchor vertex to be removed.
+                        # Bumped from 0.5 m → 3.0 m (user 2026-04-25)
+                        # to thin apt.dat boundary curves more
+                        # aggressively — eliminates most ear-clip
+                        # sliver triangles whose 3 anchored vertices
+                        # are nearly colinear.  Preserves rect /
+                        # runway / terminal corners (sharp 90° turns
+                        # are well above this threshold by definition)
+                        # and any vertex shared between junctions.
 
 
 def _drop_colinear_boundary_vertices(
