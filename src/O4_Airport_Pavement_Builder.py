@@ -582,11 +582,28 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # footprint; we use that as a seed.
     osm_terminal_polys = _extract_osm_terminals(
         nodes, ways, relations, to_m)
+    # Min-spacing simplification: vertices closer than this to a
+    # neighbour are redundant for the airport-scale render and only
+    # serve to spawn sliver triangles in the eventual ear-clip.
+    # Applied to terminals (curved building footprints often
+    # inherit closely-spaced OSM vertices) and to the junction
+    # boundaries below.
+    MIN_VERTEX_SPACING_M = 2.0
     terminal_polys: List[Polygon] = []
     for otp in osm_terminal_polys:
         pad = _terminal_pad_from_building(otp, pav_polys)
-        if pad is not None:
-            terminal_polys.append(pad)
+        if pad is None:
+            continue
+        try:
+            simp = pad.simplify(
+                MIN_VERTEX_SPACING_M, preserve_topology=True)
+            if (simp.geom_type == "Polygon"
+                    and not simp.is_empty
+                    and simp.area >= 100.0):
+                pad = simp
+        except Exception:
+            pass
+        terminal_polys.append(pad)
     terminal_union = (unary_union(terminal_polys)
                       if terminal_polys else None)
     for i, tp in enumerate(terminal_polys):
@@ -920,7 +937,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # coverage follows by construction.
     MIN_JUNCTION_AREA_M2 = 50.0   # drop only sliver noise from
                                    # rect-snap inexactness
-    SIMPLIFY_TOL_M = 1.0          # light boundary simplification
+    SIMPLIFY_TOL_M = 2.0          # min-spacing simplification —
+                                   # drops apt.dat-curve vertices
+                                   # closer than this to their
+                                   # neighbours.  Larger ⇒ fewer
+                                   # triangles, fewer slivers; rect /
+                                   # terminal seam corners survive
+                                   # because they're sharp 90°
+                                   # turns that DP keeps.
     RECT_CORNER_TOL_M = 2.0       # corner-to-boundary injection range
 
     taxi_rect_union = (unary_union(emitted_taxi_rects)
