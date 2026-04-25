@@ -2082,24 +2082,17 @@ class ElevationGraph:
 #   * Compound-slope junctions (spanning multiple plateaus) still
 #     triangulate.
 
-PLATEAU_MAX_RANGE_M = 0.5         # max elevation range from
+PLATEAU_MAX_RANGE_M = 2.0         # max elevation range from
                                    # min-to-max across an entire
-                                   # plateau cluster.  Outer bound
-                                   # — runaway-cluster guard.
-PLATEAU_EDGE_SANITY_GRADE = 0.003 # max per-edge grade allowed
-                                   # within a plateau (0.3 %).  This
-                                   # is the EFFECTIVE flatness
-                                   # criterion: the snapped plateau
-                                   # boundary's transition to
-                                   # surrounding ramps must still
-                                   # satisfy the 1.5 % FAA cap, and
-                                   # snapping a 0.5-1.5 % gradient
-                                   # cluster forces ramp grades
-                                   # ABOVE 1.5 % at the boundary —
-                                   # tested empirically (user 2026-
-                                   # 04-25): looser 1.5 % per-edge
-                                   # made plane-gradient violations
-                                   # WORSE (149 → 163 at SPJC).
+                                   # plateau cluster.  Loose: the
+                                   # verify pass shrinks plateaus
+                                   # whose snap would violate ramp
+                                   # grades.
+PLATEAU_EDGE_SANITY_GRADE = 0.015 # max per-edge grade allowed
+                                   # within a plateau (1.5 %, the
+                                   # FAA cap).  Loose for the same
+                                   # reason — verify pass enforces
+                                   # ramp compliance after snap.
 PLATEAU_MIN_NODES = 4              # ignore micro-plateaus that are
                                    # smaller than this many nodes
 PLATEAU_MIN_EXTENT_M = 30.0        # ignore plateaus whose bounding
@@ -2159,22 +2152,71 @@ def _detect_plateaus(g: "ElevationGraph") -> List[List[int]]:
 
 
 def _snap_plateaus(g: "ElevationGraph") -> int:
-    """Detect plateaus and snap every member node to the plateau's
-    median elevation.  Each snapped node becomes a hard anchor
-    (its elevation can't move in subsequent smoothing).
+    """Detect candidate plateaus, validate each one, snap to
+    median elevation only after shrinking to maintain ramp grade
+    compliance at the cluster boundary.
 
-    Returns the number of plateaus snapped (informational).
+    For each candidate cluster (detected with loose thresholds —
+    up to 1.5 % per-edge / 2.0 m total range), iteratively peel
+    off the boundary node whose post-snap edge-to-outside-node
+    grade would exceed TAXI_MAX_GRADE.  Stop when no boundary
+    edge violates grade, OR when the cluster shrinks below the
+    minimum size.
+
+    The result: aggressive plateau detection where geometry
+    permits, conservative shrinkage where transition ramps are
+    short — addresses Tier 2 of the sliver-elimination plan
+    (user 2026-04-25).
     """
-    plateaus = _detect_plateaus(g)
-    if not plateaus:
+    candidates = _detect_plateaus(g)
+    if not candidates:
         return 0
-    for cluster in plateaus:
-        elevs = sorted(g.elev[i] for i in cluster)
+    snapped = 0
+    for cluster in candidates:
+        cluster_set = set(cluster)
+        # Iterative shrink: remove the node whose boundary edge
+        # would force the worst grade violation, recompute the
+        # median, repeat.
+        guard = len(cluster) + 5
+        while guard > 0 and len(cluster_set) >= PLATEAU_MIN_NODES:
+            guard -= 1
+            elevs = sorted(g.elev[i] for i in cluster_set)
+            median = elevs[len(elevs) // 2]
+            # Find the worst boundary-edge grade if we snapped
+            # right now.
+            worst_node = -1
+            worst_excess = 0.0
+            for i in cluster_set:
+                for v, length in g.edges_adj[i]:
+                    if v in cluster_set:
+                        continue
+                    if length < 1e-3:
+                        continue
+                    grade = abs(median - g.elev[v]) / length
+                    excess = grade - TAXI_MAX_GRADE
+                    if excess > worst_excess:
+                        worst_excess = excess
+                        worst_node = i
+            if worst_node < 0:
+                break  # no violations — commit
+            cluster_set.discard(worst_node)
+        if len(cluster_set) < PLATEAU_MIN_NODES:
+            continue
+        # Re-check minimum xy extent (shrinkage may have
+        # eliminated geographic spread).
+        xs = [g.nodes[i][0] for i in cluster_set]
+        ys = [g.nodes[i][1] for i in cluster_set]
+        extent = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if extent < PLATEAU_MIN_EXTENT_M:
+            continue
+        # Commit.
+        elevs = sorted(g.elev[i] for i in cluster_set)
         median = elevs[len(elevs) // 2]
-        for i in cluster:
+        for i in cluster_set:
             g.elev[i] = float(median)
             g.anchor_elev[i] = float(median)
-    return len(plateaus)
+        snapped += 1
+    return snapped
 
 
 def _build_elevation_network(
