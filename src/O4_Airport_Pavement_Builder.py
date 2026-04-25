@@ -181,15 +181,52 @@ class PavementLayout:
             node_id_to_ll[nid] = self.m_to_ll(x, y)
             return nid
 
-        def _ring_to_nids(ring_coords):
+        def _ring_to_nids(ring_coords, ring_elevs=None):
+            """Build a closed-ring nid list from coords.
+
+            Returns ``(nids, elevs_or_None)``.  ``elevs_or_None`` is
+            an aligned per-vertex elevation list when ``ring_elevs``
+            is provided (used for ``node_altitudes`` polygons);
+            otherwise None.  Both share the same dedup logic so the
+            element-count invariant survives.
+
+            Defensive against upstream polygon-build bugs:
+
+            * Drops consecutive duplicate nids (two ring vertices
+              colliding in the SHARED_VERTEX_TOL_M bucket — would
+              produce a zero-length edge that crashes downstream
+              meshers).
+            * Drops non-consecutive duplicate nids (a ring revisits
+              the same node — figure-8 / self-touching polygon —
+              keeping only the first occurrence).
+            """
             coords = list(ring_coords)
+            elevs = list(ring_elevs) if ring_elevs is not None else None
             if coords and coords[0] == coords[-1]:
                 coords = coords[:-1]
+                if elevs is not None and len(elevs) > 1 and elevs[0] == elevs[-1]:
+                    elevs = elevs[:-1]
             if len(coords) < 3:
-                return None
+                return None, None
             nids = [_intern(x, y) for (x, y) in coords]
-            nids.append(nids[0])
-            return nids
+            # Dedup any duplicate nid (consecutive OR not).
+            seen: set = set()
+            deduped_nids: List[int] = []
+            deduped_elevs: List[float] = []
+            for k, nid in enumerate(nids):
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                deduped_nids.append(nid)
+                if elevs is not None and k < len(elevs):
+                    deduped_elevs.append(elevs[k])
+            if len(deduped_nids) < 3:
+                return None, None
+            deduped_nids.append(deduped_nids[0])
+            if elevs is not None:
+                deduped_elevs.append(deduped_elevs[0])
+                return deduped_nids, deduped_elevs
+            return deduped_nids, None
 
         # Emit one simple way per shape (exterior ring only, with
         # all tags on that way).  Interior rings — which appear
@@ -206,8 +243,79 @@ class PavementLayout:
         way_blocks: List[Tuple[int, List[int], Dict[str, str]]] = []
         next_wid = [-10001]
         for s in self.shapes:
-            ext_nids = _ring_to_nids(s.polygon.exterior.coords)
+            # Validate the polygon's geometry before emission.
+            # Upstream pipeline stages (decomposition, seam-point
+            # injection, shared-vertex enforcement) can occasionally
+            # produce a self-touching ring that's geometrically
+            # invalid; X-Plane's mesh builder crashes on these.
+            poly = s.polygon
+            if poly is None or poly.is_empty:
+                continue
+            if not poly.is_valid:
+                try:
+                    repaired = poly.buffer(0)
+                    if (repaired.is_empty
+                            or repaired.geom_type
+                            not in ("Polygon", "MultiPolygon")):
+                        continue
+                    if repaired.geom_type == "MultiPolygon":
+                        repaired = max(repaired.geoms,
+                                       key=lambda g: g.area)
+                    if (repaired.is_empty
+                            or repaired.geom_type != "Polygon"):
+                        continue
+                    # node_altitudes from the original ring no longer
+                    # aligns with the repaired ring; degrade to a
+                    # flat polygon at the mean of the original
+                    # vertex elevations to preserve emission.
+                    if s.node_altitudes:
+                        valid_elevs = [
+                            e for e in s.node_altitudes[:-1]]
+                        if valid_elevs:
+                            s.altitude = round(
+                                sum(valid_elevs) / len(valid_elevs),
+                                1)
+                        s.node_altitudes = None
+                    poly = repaired
+                except Exception:
+                    continue
+            # Pass node_altitudes alongside ring coords so dedup of
+            # duplicate nids drops the matching elevations too,
+            # keeping the per-vertex count invariant.
+            ext_nids, ext_elevs = _ring_to_nids(
+                poly.exterior.coords,
+                s.node_altitudes)
             if ext_nids is None:
+                continue
+            # Final validity check: rebuild the polygon from the
+            # POST-DEDUP lat/lon coords AT THE PRECISION THE OSM
+            # FILE WILL CONTAIN (.11f, ≈ 1 mm at the equator).
+            # Polygons that are valid at full float precision can
+            # become spike-vertex-on-non-adjacent-edge invalid
+            # after this truncation; X-Plane's mesh builder
+            # crashes on those.  Drop the whole shape rather than
+            # ship a polygon X-Plane can't handle.
+            try:
+                latlon_ring = []
+                for nid in ext_nids[:-1]:
+                    lat, lon = node_id_to_ll[nid]
+                    latlon_ring.append(
+                        (float(f"{lat:.11f}"),
+                         float(f"{lon:.11f}")))
+                check_poly = Polygon(
+                    [(lon, lat) for lat, lon in latlon_ring])
+                if not check_poly.is_valid:
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [pav-builder] WARN: dropping "
+                            f"invalid polygon (role={s.role}, "
+                            f"nids={len(ext_nids) - 1}): "
+                            f"X-Plane mesh builder would crash.\n")
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
                 continue
             tags = {
                 "aeroway": AEROWAY_FOR_ROLE.get(s.role, "taxiway"),
@@ -224,14 +332,14 @@ class PavementLayout:
                 tags["altitude_low"] = f"{s.altitude_low:.1f}"
                 tags["cell_size"] = "2"
                 tags["profile"] = "spline"
-            elif (s.node_altitudes is not None
-                  and len(s.node_altitudes) == len(ext_nids)):
+            elif (ext_elevs is not None
+                  and len(ext_elevs) == len(ext_nids)):
                 # Per-vertex elevation: comma-separated list, one
                 # value per ring nid (including the closing repeat).
                 # X-Plane mesh builder triangulates the polygon and
                 # interpolates linearly between vertex elevations.
                 tags["node_altitudes"] = ",".join(
-                    f"{e:.1f}" for e in s.node_altitudes)
+                    f"{e:.1f}" for e in ext_elevs)
             elif s.altitude is not None:
                 tags["altitude"] = f"{s.altitude:.1f}"
             way_blocks.append((next_wid[0], ext_nids, tags))
@@ -2744,6 +2852,15 @@ def _densify_long_boundary_edges(
                 best_e = ea + t * (eb - ea)
         return best_e if best_e is not None else fallback
 
+    # Pre-compute the bucket-key of every existing ring vertex so we
+    # can reject midpoints that would collide with one via
+    # ``to_osm``'s SHARED_VERTEX_TOL_M intern.  A midpoint that
+    # collides would emit the same OSM nid as a non-adjacent ring
+    # vertex, producing a polygon that visits the same node twice
+    # — duplicate-consecutive or self-intersection (figure-8) at
+    # OSM-write time.  Either crashes X-Plane's mesh builder.
+    existing_buckets = {
+        _corner_elevation_bucket(x, y) for (x, y) in ring}
     new_ring: List[Tuple[float, float]] = []
     new_elev: List[float] = []
     for i in range(n):
@@ -2761,10 +2878,14 @@ def _densify_long_boundary_edges(
             t = k / n_subs
             mx = a[0] + t * (b[0] - a[0])
             my = a[1] + t * (b[1] - a[1])
+            mb = _corner_elevation_bucket(mx, my)
+            if mb in existing_buckets:
+                continue  # would collide with an existing ring nid
             linear_me = ea + t * (eb - ea)
             me = _interp_at(mx, my, linear_me)
             new_ring.append((mx, my))
             new_elev.append(me)
+            existing_buckets.add(mb)
     return new_ring, new_elev
 
 
@@ -3272,8 +3393,21 @@ def _triangulate_junctions(
         # vertices, producing smaller triangles and gentler
         # gradients within the polygon (especially helpful for
         # long cut edges from hole-decomposition).
-        ring, vert_elev = _densify_long_boundary_edges(
+        densified_ring, densified_elev = _densify_long_boundary_edges(
             ring, vert_elev, neighbour_edges)
+        # Validate: a densification midpoint can occasionally land
+        # on a non-adjacent ring edge (concave polygons with
+        # near-touches), turning a valid polygon into a self-
+        # touching one.  X-Plane crashes on those.  Revert to the
+        # pre-densification ring if the densified polygon fails
+        # validity.
+        if len(densified_ring) > len(ring):
+            try:
+                test_poly = Polygon(densified_ring)
+                if test_poly.is_valid:
+                    ring, vert_elev = densified_ring, densified_elev
+            except Exception:
+                pass
 
         # ── Surface-complexity classification ───────────────────
         # User 2026-04-25: only triangulate where the surface has
