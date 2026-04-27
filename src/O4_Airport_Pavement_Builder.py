@@ -732,6 +732,15 @@ def build_airport_pavement(icao: str, xplane_root: str,
         else:
             pav_polys.extend(g for g in getattr(pm, "geoms", [])
                              if g.geom_type == "Polygon")
+    # Snapshot the apt.dat-only polygon list before DSF additions.
+    # Terminal-pad selection prefers the SMALLEST containing
+    # polygon, and DSF often ships small overlay-style polygons
+    # over apt.dat pavement; without this snapshot a small DSF
+    # overlay covering part of the apron will win over the larger
+    # apt.dat terminal pavement and the resulting terminal pad
+    # loses most of its area (SPJC terminal1 regressed from
+    # 105 K m² → 35 K m² before this fix).
+    apt_only_pav_polys: List[Polygon] = list(pav_polys)
     # Add draped pavement polygons from every available DSF for
     # this airport.  Some scenery packs (e.g. CYXY Whitehorse) ship
     # pavement geometry as DSF draped polygons referencing
@@ -983,7 +992,9 @@ def build_airport_pavement(icao: str, xplane_root: str,
     MIN_VERTEX_SPACING_M = 2.0
     terminal_polys: List[Polygon] = []
     for otp in osm_terminal_polys:
-        pad = _terminal_pad_from_building(otp, pav_polys)
+        # Apt.dat-only candidates — DSF polygons (overlays, gap
+        # fills) shouldn't compete for terminal-pad selection.
+        pad = _terminal_pad_from_building(otp, apt_only_pav_polys)
         if pad is None:
             continue
         try:
