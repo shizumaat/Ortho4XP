@@ -7756,20 +7756,41 @@ def _emit_primary_parallel_runway_stubs(
                     continue
                 ux, uy = dx / mag, dy / mag
                 cx, cy = interp_cx, interp_cy
+                # First-pass axis at default length, used only to
+                # probe the local pavement width.
                 ax_start = (cx - ux * STUB_LEN_M / 2,
                             cy - uy * STUB_LEN_M / 2)
                 ax_end = (cx + ux * STUB_LEN_M / 2,
                           cy + uy * STUB_LEN_M / 2)
                 try:
-                    stub_axis = LineString([ax_start, ax_end])
+                    probe_axis = LineString([ax_start, ax_end])
                 except Exception:
                     continue
-                # Width from pav probe at the exit point
                 _nat, _p90, narrow = _natural_half_width(
-                    stub_axis, pav_union)
+                    probe_axis, pav_union)
                 if narrow < 3.5 or narrow > 50.0:
                     continue
                 width = 2.0 * narrow
+                # Width-based stub length (user 2026-04-27 spec):
+                # the stub should be roughly square so its long
+                # edges sit on the apron-narrowing pavement
+                # boundary, corners snap there, and surrounding
+                # junctions only connect at the short edges instead
+                # of wrapping around the long edges.  Cap range
+                # 50..80 m so the stub never collapses to a sliver
+                # nor extends beyond the natural runway-apron
+                # transition length.  (Diagonal stubs would use a
+                # tighter cap; A/F/L at SPJC are perpendicular by
+                # construction so the same formula applies.)
+                target_len = max(50.0, min(STUB_LEN_M, width + 5.0))
+                ax_start = (cx - ux * target_len / 2,
+                            cy - uy * target_len / 2)
+                ax_end = (cx + ux * target_len / 2,
+                          cy + uy * target_len / 2)
+                try:
+                    stub_axis = LineString([ax_start, ax_end])
+                except Exception:
+                    continue
                 rect = _rect_from_axis_extended(
                     stub_axis, width, pav_union,
                     apt_vertices=apt_vertices)
@@ -9601,6 +9622,102 @@ def _snap_corners_to_pavement(
     # revert the wider side's corners to the pre-snap perpendicular
     # offset.
     return snapped
+
+
+def _cap_rect_length_to_width(
+    taxi_rects: List[Tuple[Polygon, LineString, str, str]],
+    rwy_centerlines: List[LineString],
+    pav: Polygon,
+    apt_vertices: Optional[List[Tuple[float, float]]],
+) -> List[Tuple[Polygon, LineString, str, str]]:
+    """Cap each rect's length-to-width ratio per the user's
+    2026-04-27 spec: rects should be roughly square (length ≈
+    width) so the long edges sit on the pavement-narrowing
+    boundary, corners snap there, and surrounding junctions
+    connect only at the short edges (never wrap around long
+    edges).
+
+    Cap depends on the bearing-to-nearest-runway:
+
+      * Parallel  (db < 20°)  — NO CAP (long parallel taxis are
+        legitimate, often running 500 m+ along the runway).
+      * Diagonal  (20° ≤ db < 45°) — length ≤ 1.0 × width
+        (truly square; matches the tighter 30 % margin used for
+        diagonal stubs in ``_rect_margin_frac_for``).
+      * Perpendicular (db ≥ 45°) — length ≤ 1.3 × width (small
+        excess so the rect can extend slightly past the apron's
+        narrow corridor without forcing surrounding junctions to
+        wrap).
+
+    Shrinks the axis symmetrically (same amount from both ends) so
+    the rect's centre stays put, then re-runs
+    ``_rect_from_axis_extended`` so corners re-snap to apt.dat
+    pavement boundary on the new axis.
+    """
+    PERP_CAP_RATIO = 1.3
+    DIAG_CAP_RATIO = 1.0
+    from shapely.ops import substring
+    out: List[Tuple[Polygon, LineString, str, str]] = []
+    for rect, axis, role, ref in taxi_rects:
+        try:
+            coords = list(rect.exterior.coords)
+        except Exception:
+            out.append((rect, axis, role, ref))
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            out.append((rect, axis, role, ref))
+            continue
+        edge_lens = [
+            math.hypot(coords[(i + 1) % 4][0] - coords[i][0],
+                       coords[(i + 1) % 4][1] - coords[i][1])
+            for i in range(4)]
+        length = max(edge_lens)
+        width = min(edge_lens)
+        if width < 1.0 or length < 1.0:
+            out.append((rect, axis, role, ref))
+            continue
+        db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
+        if db is None:
+            out.append((rect, axis, role, ref))
+            continue
+        if db < 20.0:
+            # Parallel — no cap.
+            out.append((rect, axis, role, ref))
+            continue
+        cap_ratio = (DIAG_CAP_RATIO if db < 45.0
+                     else PERP_CAP_RATIO)
+        max_len = cap_ratio * width
+        if length <= max_len + 0.5:
+            out.append((rect, axis, role, ref))
+            continue
+        axis_len = axis.length
+        new_axis_len = max_len
+        margin = (axis_len - new_axis_len) / 2.0
+        if margin <= 0:
+            out.append((rect, axis, role, ref))
+            continue
+        try:
+            new_axis = substring(
+                axis, margin, axis_len - margin)
+        except Exception:
+            out.append((rect, axis, role, ref))
+            continue
+        if (new_axis.is_empty
+                or new_axis.geom_type != "LineString"
+                or new_axis.length < 5.0):
+            out.append((rect, axis, role, ref))
+            continue
+        new_rect = _rect_from_axis_extended(
+            new_axis, width, pav, apt_vertices=apt_vertices)
+        if (new_rect is None or new_rect.is_empty
+                or new_rect.geom_type != "Polygon"
+                or not new_rect.is_valid):
+            out.append((rect, axis, role, ref))
+            continue
+        out.append((new_rect, new_axis, role, ref))
+    return out
 
 
 def _classify_role(axis: LineString, width: float,
