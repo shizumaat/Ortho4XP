@@ -8224,6 +8224,16 @@ def _extract_osm_taxi_centerlines(
             # excluded because they're typically already short
             # connector spurs that benefit from bend-splitting at
             # their natural curve points.
+            #
+            # The chord/path-only test is INSUFFICIENT for taxis like
+            # SPJC's L that have a long mostly-straight middle plus
+            # tight curves at the ends (chord/path = 0.955 even though
+            # L bends 23° at one end and 14-22° at the other).  A
+            # post-pass STRAIGHT-ENOUGH check requires chord/path
+            # close to 1 AND every interior bend below
+            # ``MAX_INTERIOR_BEND_DEG``.  L's max bend is 23° → fails;
+            # B/C/E/G/CYXY-E's max wobble is ~5° → still passes.
+            MAX_INTERIOR_BEND_DEG = 15.0
             has_digit = bool(ref) and any(c.isdigit() for c in ref)
             if not has_digit:
                 path_len = ls.length
@@ -8231,7 +8241,29 @@ def _extract_osm_taxi_centerlines(
                 if len(sc) >= 2 and path_len > 1e-6:
                     chord = math.hypot(sc[-1][0] - sc[0][0],
                                        sc[-1][1] - sc[0][1])
-                    if chord / path_len > 0.95:
+                    chord_ratio = chord / path_len
+                    max_interior_bend = 0.0
+                    for k in range(1, len(sc) - 1):
+                        ax, ay = sc[k - 1]
+                        bx, by = sc[k]
+                        cx, cy = sc[k + 1]
+                        v1x, v1y = bx - ax, by - ay
+                        v2x, v2y = cx - bx, cy - by
+                        m1 = math.hypot(v1x, v1y)
+                        m2 = math.hypot(v2x, v2y)
+                        if m1 < 1e-6 or m2 < 1e-6:
+                            continue
+                        d = (v1x * v2x + v1y * v2y) / (m1 * m2)
+                        if d > 1.0:
+                            d = 1.0
+                        elif d < -1.0:
+                            d = -1.0
+                        ang = math.degrees(math.acos(d))
+                        if ang > max_interior_bend:
+                            max_interior_bend = ang
+                    if (chord_ratio > 0.95
+                            and max_interior_bend
+                            < MAX_INTERIOR_BEND_DEG):
                         out.append((simp, ref))
                         continue
             # SHORT UNREFED runway-connecting stubs: SPLP has short
