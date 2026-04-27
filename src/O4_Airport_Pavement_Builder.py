@@ -976,6 +976,70 @@ def build_airport_pavement(icao: str, xplane_root: str,
             math.degrees(math.atan2(_dx, _dy)) % 180.0)
         _ref_longest_len[_ref] = _ls.length
 
+    # ── Primary-parallel SPINE LINES (pre-split) ─────────────────
+    # Per user 2026-04-27: identify each primary-parallel taxiway
+    # (overall db < 20° to the nearest runway) and build a single
+    # extended SPINE LINE running through it.  Diagonal stubs
+    # (B/C/D/E/G at SPJC) should END where they cross this spine —
+    # not where the diagonal's OSM polyline happens to terminate
+    # (which can be inside the apron, past where the parallel
+    # ought to "continue" through).  The spine line lets us
+    # imagine the parallel's centerline continuing through gaps
+    # / aprons in the OSM data, providing a stable inland-side
+    # bound for diagonal-stub trimming.
+    parallel_spines: List[LineString] = []
+    SPINE_EXTEND_M = 800.0  # extend each spine ±800 m past its
+                              # OSM-fragment endpoints so it acts
+                              # as a guide line through aprons.
+    if rwy_centerlines:
+        # Bearing of the FIRST runway centerline; we use it to
+        # decide whether a ref qualifies as a primary parallel
+        # (db < 20°).  All SPJC runways are parallel so any
+        # runway works as the reference.
+        _r0 = rwy_centerlines[0]
+        _rc = list(_r0.coords)
+        _rdx = _rc[-1][0] - _rc[0][0]
+        _rdy = _rc[-1][1] - _rc[0][1]
+        if math.hypot(_rdx, _rdy) > 1e-6:
+            _rwy_bearing = (
+                math.degrees(math.atan2(_rdx, _rdy)) % 180.0)
+            for _ref, _bearing in ref_overall_bearings.items():
+                _db = abs(_bearing - _rwy_bearing)
+                _db = min(_db, 180.0 - _db)
+                if _db >= 20.0:
+                    continue  # not a primary parallel
+                # Find the longest OSM centerline for this ref;
+                # use its endpoints to define the spine direction
+                # and base position.
+                best_ls: Optional[LineString] = None
+                best_len = 0.0
+                for _ls, _r2 in osm_centerlines:
+                    if _r2 != _ref:
+                        continue
+                    if _ls.length > best_len:
+                        best_len = _ls.length
+                        best_ls = _ls
+                if best_ls is None or best_len < 100.0:
+                    continue
+                _ec = list(best_ls.coords)
+                _eax, _eay = _ec[0]
+                _ebx, _eby = _ec[-1]
+                _edx = _ebx - _eax
+                _edy = _eby - _eay
+                _emag = math.hypot(_edx, _edy)
+                if _emag < 1e-6:
+                    continue
+                _ux = _edx / _emag
+                _uy = _edy / _emag
+                _start = (_eax - _ux * SPINE_EXTEND_M,
+                          _eay - _uy * SPINE_EXTEND_M)
+                _end = (_ebx + _ux * SPINE_EXTEND_M,
+                        _eby + _uy * SPINE_EXTEND_M)
+                try:
+                    parallel_spines.append(LineString([_start, _end]))
+                except Exception:
+                    pass
+
     # ── Augment pav_union with synthetic pavement around OSM
     # centerlines that don't intersect any apt.dat pavement
     # polygon.  Some airports (notably CYXY) have incomplete
@@ -1094,23 +1158,111 @@ def build_airport_pavement(icao: str, xplane_root: str,
     junction_points = _find_junction_points(
         nodes, ways, to_m, osm_centerlines=osm_centerlines)
 
-    # Trim PERPENDICULAR-TO-RUNWAY centerlines at a BUFFERED runway
-    # polygon so the last rect on a taxi that crosses the runway
-    # stops short of the runway-junction approach.  The runway
-    # boundary IS an intersection (rule 70 % of gap between
-    # intersections), but the physical junction — where the taxi
-    # widens into the runway apron — extends some distance
-    # OUTSIDE the runway polygon too.  A 30 m buffer pulls the
-    # centerline end back from the approach widening for taxis
-    # that cross runway perpendicularly.  Per user (2026-04-21):
-    # "rects are encroaching into intersections".
+    # ── Diagonal-stub trim at primary-parallel SPINES ────────────
+    # Per user 2026-04-27: a diagonal stub (B/C/D/E/G overall db
+    # ∈ [20°, 45°)) should END where its centerline crosses the
+    # nearest primary-parallel SPINE LINE — even when the spine
+    # passes through an apron with no OSM coverage.  Without this
+    # the stub's apron-side OSM endpoint can sit deep inside the
+    # apron, producing an over-long rect that the surrounding
+    # junction has to wrap around.  Adding the spine intersection
+    # to ``junction_points`` lets the existing
+    # ``_split_centerlines_at_points`` machinery clip the diagonal
+    # at the right place using its standard junction-margin rule.
+    if parallel_spines and rwy_centerlines:
+        _rwy_first = rwy_centerlines[0]
+        _rfc = list(_rwy_first.coords)
+        _rfdx = _rfc[-1][0] - _rfc[0][0]
+        _rfdy = _rfc[-1][1] - _rfc[0][1]
+        _rfmag = math.hypot(_rfdx, _rfdy)
+        if _rfmag > 1e-6:
+            _rfb = (math.degrees(math.atan2(_rfdx, _rfdy))
+                    % 180.0)
+            for _ls, _ref in osm_centerlines:
+                if not _ref:
+                    continue
+                _b = ref_overall_bearings.get(_ref)
+                if _b is None:
+                    continue
+                _db = abs(_b - _rfb)
+                _db = min(_db, 180.0 - _db)
+                # Only diagonal stubs (db ∈ [20°, 45°)) need this.
+                if not (20.0 <= _db < 45.0):
+                    continue
+                # Find the closest spine and intersect.
+                best_pt = None
+                best_d = float("inf")
+                for _spine in parallel_spines:
+                    try:
+                        _x = _ls.intersection(_spine)
+                    except Exception:
+                        continue
+                    if _x.is_empty:
+                        # Try extending the centerline ends to reach
+                        # the spine — handles diagonals whose OSM
+                        # path stops short of the spine's location.
+                        continue
+                    if _x.geom_type == "Point":
+                        _pt = (_x.x, _x.y)
+                    elif _x.geom_type == "MultiPoint":
+                        # Pick the intersection furthest from the
+                        # closest runway centerline — that's the
+                        # apron-side cut we want for trimming.
+                        _pt = None
+                        _far = -1.0
+                        for _g in _x.geoms:
+                            _gp = (_g.x, _g.y)
+                            try:
+                                _gd = min(
+                                    Point(_gp).distance(_r)
+                                    for _r in rwy_centerlines)
+                            except Exception:
+                                _gd = 0.0
+                            if _gd > _far:
+                                _far = _gd
+                                _pt = _gp
+                        if _pt is None:
+                            continue
+                    else:
+                        continue
+                    # Distance along centerline from runway end —
+                    # used to pick the closest spine intersection.
+                    try:
+                        _proj = _ls.project(Point(_pt))
+                    except Exception:
+                        continue
+                    _d = abs(_proj - _ls.length / 2)
+                    if _d < best_d:
+                        best_d = _d
+                        best_pt = _pt
+                if best_pt is not None:
+                    junction_points.append(best_pt)
+
+    # Trim runway-approaching centerlines at a BUFFERED runway
+    # polygon so the last rect on a taxi that crosses or enters
+    # the runway stops short of the runway-junction approach.
+    # The runway boundary IS an intersection (rule 70 % of gap
+    # between intersections), but the physical junction — where
+    # the taxi widens into the runway apron — extends some
+    # distance OUTSIDE the runway polygon too.  Pulling the
+    # centerline end back from the approach widening keeps the
+    # rect from "encroaching into intersections" (user
+    # 2026-04-21).
     #
-    # Only PERPENDICULAR taxis get buffered: diagonal stubs
-    # (e.g. SPLP's (-447,-1087) 45° stub) naturally approach
-    # runway at an angle and their pavement widens less
-    # dramatically; buffer-trimming them over-shrinks.
+    # Two thresholds:
+    #   * Perpendicular (perp_diff < 25°): pull back 30 m.  These
+    #     taxis hit the runway head-on and the widening is large.
+    #   * Diagonal (25° ≤ perp_diff < 70°): pull back 15 m.
+    #     The widening is gentler at oblique angles (B/C/D/E/G at
+    #     SPJC) but still significant.  Per user 2026-04-27: "B,
+    #     C, D, E, G should be handled like V3 stub" — V3 is a
+    #     near-perpendicular sub-ref and gets the 30 m buffer; the
+    #     diagonals get a smaller buffer so they don't over-shrink
+    #     while still getting the same kind of pull-back.
     RWY_JUNCTION_BUFFER_M = 30.0
-    PERP_TRIM_MAX_DEG = 25.0   # perp_diff < 25° → treat as perpendicular
+    RWY_DIAG_BUFFER_M = 15.0
+    PERP_TRIM_MAX_DEG = 25.0
+    DIAG_TRIM_MAX_DEG = 70.0
     if (layout.runway_union is not None
             and not layout.runway_union.is_empty
             and rwy_centerlines):
@@ -1146,14 +1298,27 @@ def build_airport_pavement(icao: str, xplane_root: str,
             delta = min(delta, 180.0 - delta)
             return abs(delta - 90.0)
 
+        try:
+            rwy_buffered_diag = layout.runway_union.buffer(
+                RWY_DIAG_BUFFER_M)
+        except Exception:
+            rwy_buffered_diag = layout.runway_union
         trimmed_centerlines: List[Tuple[LineString, str]] = []
         for ls, ref in osm_centerlines:
-            # Only buffer-trim PERPENDICULAR centerlines
-            if _perp_diff_to_runway(ls) >= PERP_TRIM_MAX_DEG:
+            # Pick buffer based on approach angle:
+            #   * perpendicular (perp_diff < 25°)   → 30 m buffer
+            #   * diagonal      (25° ≤ pd < 70°)    → 15 m buffer
+            #   * parallel      (pd ≥ 70°)          → no trim
+            pd = _perp_diff_to_runway(ls)
+            if pd < PERP_TRIM_MAX_DEG:
+                _buf = rwy_buffered
+            elif pd < DIAG_TRIM_MAX_DEG:
+                _buf = rwy_buffered_diag
+            else:
                 trimmed_centerlines.append((ls, ref))
                 continue
             try:
-                diff = ls.difference(rwy_buffered)
+                diff = ls.difference(_buf)
             except Exception:
                 trimmed_centerlines.append((ls, ref))
                 continue
