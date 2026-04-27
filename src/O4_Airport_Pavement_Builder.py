@@ -8066,16 +8066,33 @@ def _extract_osm_taxi_centerlines(
                         continue
                     out.append((seg, ref))
 
-    # Previously: when ANY centerline had a ref, we dropped every
-    # unrefed centerline.  That was a SPJC-specific assumption (where
-    # apt.dat ref coverage is comprehensive and unrefed bits are
-    # almost always spurious sub-segments of refed taxis).  At CYXY,
-    # KBNA, HECA etc. many real taxis have NO ref — dropping them
-    # left whole sections of the airport as residue→junction blobs.
-    # The downstream rect-builder already dedups by geometric
-    # overlap (≥70% of an unrefed axis inside an emitted refed rect
-    # → skip), so spurious unrefed sub-segments still get filtered
-    # out.  Keep everything here.
+    # Drop unrefed centerlines AT AIRPORTS THAT HAVE ANY REFED
+    # CENTERLINES (per user 2026-04-27).  At SPJC etc. the OSM data
+    # has comprehensive refs on real taxiways; unrefed lines that
+    # remain are typically apron decorations / vehicle paths /
+    # painted markings that, if extracted into rects, get inserted
+    # INSIDE apron polygons — junction polygons then wrap around
+    # them and produce visible elevation ridges where the rect's
+    # short edges meet the junction at slightly different heights.
+    # The user's directive: don't insert rects inside junction /
+    # apron polygons.
+    #
+    # Previously this was an "if any_ref drop unrefed" filter in
+    # this same place; an in-flight Session 8 change removed it on
+    # the theory that downstream geometric-overlap dedup would
+    # catch spurious unrefed sub-segments.  But spurious unrefed
+    # apron lines DON'T overlap any refed rect (they sit inside an
+    # apron region, not along a real taxi corridor) so the dedup
+    # never fires for them, and HEAD-clean's clean baseline (47
+    # rects, all refed at SPJC) regressed to 120 rects (65 of them
+    # unrefed) inside apron areas.  Restoring the filter here.
+    #
+    # At airports with NO refed centerlines (CYXY where every OSM
+    # taxi is unrefed) the filter is a no-op — every centerline is
+    # kept.
+    any_ref = any(r for (_, r) in out)
+    if any_ref:
+        out = [(ls, r) for (ls, r) in out if r]
     return out
 
 
@@ -8860,6 +8877,35 @@ def _build_taxi_rects(
             if (rect.is_empty or rect.geom_type != "Polygon"
                     or not rect.is_valid):
                 continue
+
+        # ── Apron-interior rect rejection (user 2026-04-27) ────────
+        # A rect whose 4 corners aren't on (or very near) the
+        # pavement boundary is sitting INSIDE an apron — the
+        # surrounding pavement wraps around it, downstream junction
+        # construction has to wrap a junction around it too, and the
+        # junction's elevation has to bridge the rect's slope on
+        # both long edges → visible elevation ridges in JOSM and at
+        # render time.
+        #
+        # Real taxi rects have their 4 corners at pavement-boundary
+        # points (the intersections where the taxi corridor meets
+        # the adjacent apron / parallel / runway).  If the rect's
+        # corners are well INSIDE the pavement, the centerline runs
+        # through an apron and shouldn't emit a separate rect — the
+        # apron stays as one continuous junction.
+        BOUNDARY_TOL_M = 2.0
+        rect_coords = list(rect.exterior.coords)
+        if rect_coords and rect_coords[0] == rect_coords[-1]:
+            rect_coords = rect_coords[:-1]
+        boundary = pav_union.boundary
+        n_off_boundary = sum(
+            1 for (cx, cy) in rect_coords
+            if Point(cx, cy).distance(boundary) > BOUNDARY_TOL_M)
+        if n_off_boundary >= 2:
+            # ≥ 2 corners away from any pavement edge — the rect
+            # sits inside an apron.  Skip it; the apron pavement
+            # stays as residue → junction.
+            continue
 
         role = _classify_role(trimmed, width, rwy_centerlines,
                                rwy_union, ref=ref)
