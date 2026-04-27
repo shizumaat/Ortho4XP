@@ -3748,17 +3748,108 @@ def _solve_pavement_mesh(
             for i in grp:
                 mesh.elev[i] = avg
 
+    # ── Apron-zone tighter grade cap ────────────────────────────
+    # User 2026-04-27: aprons (junction polygons that surround
+    # terminal pads) should hold a 1 % grade cap rather than the
+    # 1.5 % cap used elsewhere — keeps the parking / loading area
+    # visually flat near the terminal.  Excess slope is absorbed
+    # by the surrounding taxis (which still operate at 1.5 %), so
+    # the aircraft sees a gentle apron and a slightly steeper taxi
+    # connection rather than a gentle taxi and a too-steep apron.
+    #
+    # An apron node is any mesh node belonging to a junction
+    # polygon that shares at least one vertex with a terminal pad.
+    # An apron edge is one where BOTH endpoints are apron nodes —
+    # those get the 1 % cap.  Edges from an apron node out to a
+    # taxi rect's runway-side corner cross the apron boundary and
+    # keep the 1.5 % cap so the rect can slope to absorb the
+    # transition.
+    APRON_GRADE_CAP = 0.010
+    terminal_buckets: set = set()
+    for s in layout.shapes:
+        if s.role != ROLE_TERMINAL:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for (x, y) in coords:
+            terminal_buckets.add(_corner_elevation_bucket(x, y))
+    apron_nodes: set = set()
+    if terminal_buckets:
+        for s in layout.shapes:
+            if s.role != ROLE_JUNCTION:
+                continue
+            try:
+                coords = list(s.polygon.exterior.coords)
+            except Exception:
+                continue
+            if coords and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            touches_terminal = any(
+                _corner_elevation_bucket(x, y) in terminal_buckets
+                for (x, y) in coords)
+            if not touches_terminal:
+                continue
+            for (x, y) in coords:
+                nid = bucket_to_node.get(
+                    _corner_elevation_bucket(x, y))
+                if nid is not None:
+                    apron_nodes.add(nid)
+    apron_edges: List[Tuple[int, int, float]] = []
+    for i in apron_nodes:
+        for (j, length) in mesh.edges_adj[i]:
+            if j <= i:
+                continue
+            if j in apron_nodes:
+                apron_edges.append((i, j, length))
+
+    def _enforce_apron_cap() -> None:
+        # Iterate the apron-cap pass until no edge over the cap, or
+        # ``iters`` exhausted.  One linear pass over edges only
+        # corrects each edge once, but moving one edge's endpoints
+        # can put adjacent edges out of compliance, so a second
+        # pass picks up the cascade.  Cap at 8 inner iterations to
+        # bound runtime when anchors are mutually infeasible (the
+        # cap can't make adjacent anchored buckets agree, but the
+        # iteration still converges to a stable midpoint).
+        for _ in range(8):
+            any_change = False
+            for (i, j, length) in apron_edges:
+                ai = mesh.anchor_elev[i]
+                aj = mesh.anchor_elev[j]
+                if ai is not None and aj is not None:
+                    continue
+                diff = mesh.elev[i] - mesh.elev[j]
+                dmax = length * APRON_GRADE_CAP
+                if abs(diff) <= dmax:
+                    continue
+                excess = abs(diff) - dmax
+                sign = 1.0 if diff > 0 else -1.0
+                if ai is not None:
+                    mesh.elev[j] += excess * sign
+                elif aj is not None:
+                    mesh.elev[i] -= excess * sign
+                else:
+                    mesh.elev[i] -= 0.5 * excess * sign
+                    mesh.elev[j] += 0.5 * excess * sign
+                any_change = True
+            if not any_change:
+                break
+
     # Iterated smoothing.  ElevationGraph.smooth_rate_of_change
     # is invoked one outer pass at a time so we can interleave
     # rect short-edge equalisation between iterations.  Each
     # ``smooth_rate_of_change`` call internally applies the
-    # Laplacian + grade-cap until either ``iters`` is exhausted or
-    # the per-iteration max-change drops below ``tol``.  Calling
-    # it with iters=2 per outer pass keeps the inner-loop
-    # convergence tight while letting equalisation run frequently.
+    # Laplacian + 1.5 % grade-cap on every edge.  After each call
+    # we run the tighter apron cap (1 %) on apron-zone edges, then
+    # equalise rect / flat-shape constraints.
     OUTER_ITERS = 30
     for _ in range(OUTER_ITERS):
         mesh.smooth_rate_of_change(iters=2)
+        _enforce_apron_cap()
         _equalise_constraints()
 
 
