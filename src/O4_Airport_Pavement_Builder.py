@@ -7783,6 +7783,104 @@ def _emit_primary_parallel_runway_stubs(
                 # tighter cap; A/F/L at SPJC are perpendicular by
                 # construction so the same formula applies.)
                 target_len = max(50.0, min(STUB_LEN_M, width + 5.0))
+                # ----- L-style pull-back -----
+                # Distinguish L-style "primary parallel curving
+                # into a stub" (narrow connector pavement) from
+                # A/F-style "loop ramp" (wide rwy-end pavement).
+                # The signal: pavement WIDTH at exit_idx.
+                # • Wide  (≥ NARROW_PAV_M): loop ramp — keep stub
+                #   centred AT exit_idx (the apex of the loop is
+                #   exactly where the user wants the rect).
+                # • Narrow (< NARROW_PAV_M): smooth curve from a
+                #   primary parallel into the runway — the user
+                #   2026-04-27 spec calls for the diagonal rule:
+                #   pull the rect centre BACK along the path
+                #   toward the runway by 0.35 × gap (gap = path
+                #   length from runway-boundary crossing to
+                #   exit_idx).  Matches the diagonal-rule 35 %
+                #   retention used by ``_split_centerlines_at_points``
+                #   for V3-style diagonal stubs.  At SPJC this
+                #   lands the L stub at d_rwy ≈ 65 m (matching
+                #   user's target hand-edit from d_rwy ≈ 103 m
+                #   the loop-ramp rule gave).
+                NARROW_PAV_M = 60.0
+                PULL_BACK_FRAC = 0.35
+                if (endpoint_inside and ref
+                        and width < NARROW_PAV_M):
+                    pull_path: List[Tuple[float, float]] = []
+                    # Find runway-boundary crossing (last in-rwy
+                    # vertex → first out-of-rwy vertex; intersect
+                    # the connecting segment with the runway
+                    # boundary).
+                    s = 1 if end_idx == 0 else -1
+                    k = (end_idx if end_idx >= 0
+                         else len(coords) - 1)
+                    last_in = None
+                    while 0 <= k < len(coords):
+                        ptk = Point(coords[k])
+                        dk = ptk.distance(rwy_boundary)
+                        if (runway_union.contains(ptk)
+                                or dk <= ENDPOINT_INSIDE_TOL_M):
+                            last_in = k
+                            k += s
+                        else:
+                            break
+                    if last_in is not None and 0 <= k < len(coords):
+                        cross_pt = coords[k]
+                        try:
+                            seg = LineString(
+                                [coords[last_in], coords[k]])
+                            cd = seg.difference(runway_union)
+                            if (not cd.is_empty
+                                    and cd.geom_type == "LineString"):
+                                cc = list(cd.coords)
+                                d0 = math.hypot(
+                                    cc[0][0] - coords[last_in][0],
+                                    cc[0][1] - coords[last_in][1])
+                                d1 = math.hypot(
+                                    cc[-1][0] - coords[last_in][0],
+                                    cc[-1][1] - coords[last_in][1])
+                                cross_pt = (cc[0] if d0 < d1
+                                            else cc[-1])
+                        except Exception:
+                            pass
+                        pull_path.append(
+                            (cross_pt[0], cross_pt[1]))
+                        # Walk from there to exit_idx (inclusive).
+                        m = k
+                        while True:
+                            pull_path.append(
+                                (coords[m][0], coords[m][1]))
+                            if m == exit_idx:
+                                break
+                            m += s
+                            if not (0 <= m < len(coords)):
+                                break
+                    if len(pull_path) >= 2:
+                        try:
+                            gap_curve = LineString(pull_path)
+                            gap = gap_curve.length
+                        except Exception:
+                            gap = 0.0
+                        if gap > 30.0:
+                            # New centre at (1 - PULL_BACK_FRAC)
+                            # along the path FROM the runway side,
+                            # i.e. PULL_BACK_FRAC * gap inland of
+                            # the boundary crossing.
+                            new_along = (1.0 - PULL_BACK_FRAC) * gap
+                            cpt = gap_curve.interpolate(new_along)
+                            cx, cy = cpt.x, cpt.y
+                            # Local tangent at the new centre.
+                            eps_ = max(1.0, gap * 0.02)
+                            ta = max(0.0, new_along - eps_)
+                            tb = min(gap, new_along + eps_)
+                            pa = gap_curve.interpolate(ta)
+                            pb = gap_curve.interpolate(tb)
+                            tdx = pb.x - pa.x
+                            tdy = pb.y - pa.y
+                            tmag = math.hypot(tdx, tdy)
+                            if tmag > 1e-6:
+                                ux, uy = tdx / tmag, tdy / tmag
                 ax_start = (cx - ux * target_len / 2,
                             cy - uy * target_len / 2)
                 ax_end = (cx + ux * target_len / 2,
