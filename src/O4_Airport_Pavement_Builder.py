@@ -56,6 +56,21 @@ import O4_Pavement_Strips as PS
 # ──────────────────────────────────────────────────────────────────
 R_EARTH = 6_378_137.0
 SHARED_VERTEX_TOL_M = 0.5    # snap vertices closer than this together
+RUNWAY_INSIDE_APRON_FRAC = 0.95  # if ≥95% of a runway segment lies
+                                  # inside an apt.dat/DSF apron
+                                  # polygon (and that polygon is
+                                  # much larger than the segment —
+                                  # see RUNWAY_APRON_AREA_RATIO),
+                                  # treat the segment as apron-
+                                  # merged and drop the separate rect
+RUNWAY_APRON_AREA_RATIO = 3.0     # the containing apt.dat/DSF
+                                   # polygon must be ≥ this ratio
+                                   # times the segment area to count
+                                   # as an apron.  Normal runway
+                                   # segments sit in runway-shaped
+                                   # polygons whose area is only
+                                   # marginally larger than the
+                                   # segment itself.
 
 ROLE_RUNWAY = "runway"
 ROLE_PRIMARY_PARALLEL = PS.ROLE_PRIMARY_PARALLEL
@@ -315,6 +330,46 @@ class PavementLayout:
                     except Exception:
                         pass
                     continue
+                # Sliver-corner safety net: if any interior angle is
+                # below SLIVER_ANGLE_THRESHOLD_DEG, drop the polygon.
+                # The source-fix _drop_sliver_corners normally
+                # eliminates these for junctions, but this catches
+                # any path (rect emission, decomposition fragment,
+                # repaired-by-buffer(0) polygon) that could
+                # reintroduce a needle tip Triangle4XP can't handle.
+                ring_m = [self.ll_to_m(lat, lon)
+                          for (lat, lon) in latlon_ring]
+                cos_thresh = math.cos(
+                    math.radians(SLIVER_ANGLE_THRESHOLD_DEG))
+                m = len(ring_m)
+                worst_ang = None
+                for vi in range(m):
+                    ax, ay = ring_m[(vi - 1) % m]
+                    bx, by = ring_m[vi]
+                    cx, cy = ring_m[(vi + 1) % m]
+                    v1x, v1y = ax - bx, ay - by
+                    v2x, v2y = cx - bx, cy - by
+                    n1 = math.hypot(v1x, v1y)
+                    n2 = math.hypot(v2x, v2y)
+                    if n1 < 1e-9 or n2 < 1e-9:
+                        continue
+                    cos = (v1x * v2x + v1y * v2y) / (n1 * n2)
+                    if cos > cos_thresh:
+                        worst_ang = math.degrees(
+                            math.acos(max(-1.0, min(1.0, cos))))
+                        break
+                if worst_ang is not None:
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [pav-builder] WARN: dropping "
+                            f"sliver-corner polygon (role={s.role}, "
+                            f"nids={len(ext_nids) - 1}, "
+                            f"min angle {worst_ang:.2f}°): "
+                            f"X-Plane mesh builder would crash.\n")
+                    except Exception:
+                        pass
+                    continue
             except Exception:
                 continue
             tags = {
@@ -467,6 +522,34 @@ def _load_osm_airports(xplane_root: str, icao: str,
     # tile — try the natural tile + all 8 neighbours and merge.
     base_lat = int(math.floor(apt_lat))
     base_lon = int(math.floor(apt_lon))
+    # If the natural tile's airport-OSM cache is missing, download it
+    # via the same Overpass query Ortho4XP's main pipeline uses.  This
+    # makes build_airport_pavement self-sufficient when called outside
+    # the full Ortho4XP run (e.g. for standalone testing of new
+    # airports like CYXY whose OSM tile hasn't been pre-cached).
+    natural_path = _tile_path(base_lat, base_lon)
+    if not os.path.isfile(natural_path):
+        try:
+            import O4_OSM_Utils as _OSM
+            os.makedirs(os.path.dirname(natural_path), exist_ok=True)
+            layer = _OSM.OSM_layer()
+            queries = [('node["aeroway"]', 'way["aeroway"]',
+                        'rel["aeroway"]')]
+            ok = _OSM.OSM_queries_to_OSM_layer(
+                queries, layer, base_lat, base_lon,
+                tags_of_interest=["all"],
+                cached_suffix="airports")
+            if not ok:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] WARN: Overpass download failed "
+                    f"for airports tile +{base_lat}{base_lon:+04d}; "
+                    f"junctions/rects will be empty.\n")
+        except Exception as exc:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] WARN: airport OSM download error: "
+                f"{exc}\n")
     nodes: Dict[str, Tuple[float, float]] = {}
     ways: List[Tuple[str, List[str], Dict[str, str]]] = []
     relations: List[Tuple[str, List[str], Dict[str, str]]] = []
@@ -649,7 +732,136 @@ def build_airport_pavement(icao: str, xplane_root: str,
         else:
             pav_polys.extend(g for g in getattr(pm, "geoms", [])
                              if g.geom_type == "Polygon")
+    # Add draped pavement polygons from every available DSF for
+    # this airport.  Some scenery packs (e.g. CYXY Whitehorse) ship
+    # pavement geometry as DSF draped polygons referencing
+    # ``lib/airport/pavement/*.pol`` definitions, with little or no
+    # apt.dat row-110 coverage; for those airports the DSF is the
+    # primary pavement source and we need to admit it.  Other packs
+    # (e.g. SPJC Custom Scenery) ship apt.dat row-110 pavement AND
+    # add layered visual overlays on top via DSF — emitting those
+    # overlays as pavement duplicates the apt.dat coverage and pulls
+    # non-pavement decoration into the layout.
+    #
+    # Three-tier filtering:
+    #   1. ``O4_DSF_Reader._is_pavement_def`` admits only X-Plane
+    #      stock pavement library paths (``lib/airport/pavement/...``
+    #      and ``lib/airport/ground/pavement/...``).  Third-party
+    #      libraries are dropped at this stage.
+    #   2. Distance gate: the DSF tile is 1° × 1° (~110 km a side),
+    #      and a single tile covers many airports' pavement.  Any
+    #      DSF polygon whose bbox lies more than
+    #      ``DSF_AIRPORT_RADIUS_M`` (5 km) from THIS airport's
+    #      runway-bbox is somebody else's pavement — drop it.
+    #      Caught the SPJC regression where 9 junctions ended up
+    #      ~20 km away at SPLP because the SPJC custom scenery's
+    #      DSF tile contains both airports' pavement.
+    #   3. Overlay check: each surviving DSF polygon is compared
+    #      against the apt.dat pavement union built so far.  If the
+    #      polygon mostly overlaps existing pavement (≥ 80 %
+    #      inside), treat it as an overlay and drop it entirely —
+    #      preserves the apt.dat geometry.  Only DSF polygons that
+    #      contribute substantially NEW coverage are appended.
+    DSF_OVERLAY_FRAC = 0.80
+    DSF_AIRPORT_RADIUS_M = 5_000.0
+    apt_pav_union: Optional[Polygon] = None
+    if pav_polys:
+        try:
+            apt_pav_union = unary_union(pav_polys)
+        except Exception:
+            apt_pav_union = None
+    # Compute the airport's bounding box from runway corners +
+    # apt.dat pavement.  DSF polygons farther than
+    # DSF_AIRPORT_RADIUS_M from this bbox are not this airport's.
+    apt_bbox_m: Optional[Tuple[float, float, float, float]] = None
+    bbox_polys = list(runway_polys) + list(pav_polys)
+    if bbox_polys:
+        try:
+            uni = unary_union(bbox_polys)
+            if not uni.is_empty:
+                bx_min, by_min, bx_max, by_max = uni.bounds
+                apt_bbox_m = (bx_min - DSF_AIRPORT_RADIUS_M,
+                               by_min - DSF_AIRPORT_RADIUS_M,
+                               bx_max + DSF_AIRPORT_RADIUS_M,
+                               by_max + DSF_AIRPORT_RADIUS_M)
+        except Exception:
+            apt_bbox_m = None
+    try:
+        import O4_DSF_Reader as _DSFR
+        seen_dsf: set = set()
+        all_apt_dats = APR.find_all_airport_apt_dats(xplane_root, icao)
+        n_dsf_kept = 0
+        n_dsf_dropped_overlay = 0
+        n_dsf_dropped_far = 0
+        for ad in all_apt_dats:
+            dsf = _DSFR.find_associated_dsf(ad, anchor[0], anchor[1])
+            if dsf is None or dsf in seen_dsf:
+                continue
+            seen_dsf.add(dsf)
+            for ring in _DSFR.read_dsf_pavements(dsf):
+                if len(ring) < 3:
+                    continue
+                try:
+                    poly_ll = Polygon([(lon, lat) for (lon, lat) in ring])
+                    if not poly_ll.is_valid:
+                        poly_ll = poly_ll.buffer(0)
+                    if (poly_ll.is_empty
+                            or poly_ll.geom_type != "Polygon"):
+                        continue
+                    pm = shp_transform(to_m, poly_ll)
+                    if pm.is_empty or pm.geom_type != "Polygon":
+                        continue
+                    # Distance gate: skip polygons outside this
+                    # airport's expanded bbox.
+                    if apt_bbox_m is not None:
+                        px_min, py_min, px_max, py_max = pm.bounds
+                        if (px_max < apt_bbox_m[0]
+                                or px_min > apt_bbox_m[2]
+                                or py_max < apt_bbox_m[1]
+                                or py_min > apt_bbox_m[3]):
+                            n_dsf_dropped_far += 1
+                            continue
+                    # Overlay check: drop the polygon if most of its
+                    # area lies inside the existing apt.dat pavement
+                    # union (it's a decorative overlay rather than
+                    # new pavement).
+                    if apt_pav_union is not None:
+                        try:
+                            inter_area = pm.intersection(
+                                apt_pav_union).area
+                            if (pm.area > 0
+                                    and inter_area / pm.area
+                                    >= DSF_OVERLAY_FRAC):
+                                n_dsf_dropped_overlay += 1
+                                continue
+                        except Exception:
+                            pass
+                    pav_polys.append(pm)
+                    n_dsf_kept += 1
+                except Exception:
+                    continue
+        if (n_dsf_kept or n_dsf_dropped_overlay
+                or n_dsf_dropped_far):
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] {icao}: DSF pavement: "
+                    f"{n_dsf_kept} kept, "
+                    f"{n_dsf_dropped_overlay} dropped as overlay, "
+                    f"{n_dsf_dropped_far} dropped as off-airport.\n")
+            except Exception:
+                pass
+    except Exception:
+        pass
     pav_union = unary_union(pav_polys) if pav_polys else None
+    # Stash the pre-runway-subtraction pavement polygon list for
+    # the apron-merged-runway detection in _compute_elevations.
+    # A runway segment is "apron-merged" when the apt.dat polygon
+    # CONTAINING it is much larger than the segment itself —
+    # apron pavement enclosing a runway is far wider than the
+    # runway, while a normal runway lies inside a runway-shaped
+    # apt.dat polygon that's only marginally larger than itself.
+    apron_candidates = list(pav_polys)  # apt.dat + DSF, pre-subtract
     if pav_union is not None and layout.runway_union is not None:
         pav_union = pav_union.difference(layout.runway_union)
 
@@ -681,6 +893,78 @@ def build_airport_pavement(icao: str, xplane_root: str,
         xplane_root, icao, anchor[0], anchor[1])
     osm_centerlines = _extract_osm_taxi_centerlines(
         nodes, ways, to_m, rwy_centerlines=rwy_centerlines)
+
+    # ── Augment pav_union with synthetic pavement around OSM
+    # centerlines that don't intersect any apt.dat pavement
+    # polygon.  Some airports (notably CYXY) have incomplete
+    # apt.dat row-110 coverage — large parts of the taxi network
+    # exist in OSM but have NO matching apt.dat pavement.  Without
+    # synthetic coverage those centerlines fail the rect-extraction
+    # clip step ("clip empty") and the area is lost.  Buffer at a
+    # typical taxi half-width so downstream rect-build and
+    # junction-construction can proceed.
+    #
+    # Skip mis-tagged centerlines: a long OSM way tagged
+    # ``aeroway=taxiway`` whose path runs entirely outside both
+    # apt.dat pavement AND the SHARED-BUFFER (apt.dat ∪ DSF
+    # pavement, dilated by OSM_FALLBACK_OVERLAP_TOL_M to forgive
+    # OSM/apt.dat misalignment) is almost certainly a service
+    # road or perimeter road that was incorrectly tagged.  The
+    # shared buffer is the right denominator because by this point
+    # ``pav_union`` includes DSF draped pavement too — anything
+    # NOT touching it within the tolerance isn't a real airport
+    # taxi.  CYXY had a 1871 m mis-tagged service road
+    # (way -820551) that the pre-DSF logic was buffering into a
+    # spurious diagonal rect; this filter eliminates it.
+    OSM_FALLBACK_HALF_WIDTH_M = 15.0   # ~30 m wide synthetic strip
+                                        # — covers a code-C taxiway
+                                        # (23-25 m wide) with a
+                                        # small outward shoulder.
+    OSM_FALLBACK_OVERLAP_TOL_M = 30.0  # forgive 30 m misalignment
+                                        # between OSM centerline and
+                                        # apt.dat/DSF boundary
+    OSM_FALLBACK_MIN_OVERLAP_FRAC = 0.30  # require ≥30% of the
+                                           # centerline to lie within
+                                           # the tolerance buffer
+                                           # before treating it as a
+                                           # real (incompletely-
+                                           # mapped) taxiway
+    if pav_union is not None and osm_centerlines:
+        synth_polys: List[Polygon] = []
+        try:
+            tol_buf = pav_union.buffer(OSM_FALLBACK_OVERLAP_TOL_M,
+                                        cap_style=2, join_style=2)
+        except Exception:
+            tol_buf = pav_union
+        for axis, _ref in osm_centerlines:
+            try:
+                if axis.intersects(pav_union):
+                    continue  # already covered, no synth needed
+                inter = axis.intersection(tol_buf)
+                inter_len = inter.length if not inter.is_empty else 0
+                if axis.length <= 0:
+                    continue
+                if inter_len / axis.length < OSM_FALLBACK_MIN_OVERLAP_FRAC:
+                    # Mis-tagged centerline (service road, perimeter
+                    # road, etc.).  Skip.
+                    continue
+                buf = axis.buffer(OSM_FALLBACK_HALF_WIDTH_M,
+                                  cap_style=2, join_style=2)
+                if not buf.is_empty and buf.geom_type == "Polygon":
+                    synth_polys.append(buf)
+            except Exception:
+                continue
+        if synth_polys:
+            try:
+                synth_union = unary_union(synth_polys)
+                # Subtract any runway overlap from the synth so the
+                # runway remains the authoritative source.
+                if layout.runway_union is not None:
+                    synth_union = synth_union.difference(
+                        layout.runway_union)
+                pav_union = unary_union([pav_union, synth_union])
+            except Exception:
+                pass
 
 
     # ── Terminals: expand OSM building outlines to the containing
@@ -1028,6 +1312,78 @@ def build_airport_pavement(icao: str, xplane_root: str,
         apt_pav_vertices, taxi_rects)
     taxi_rects.extend(extra_stubs)
 
+    # ── Drop overlapping taxi rects ───────────────────────────────
+    # Pavement layout invariant (user 2026-04-26): rects MUST NOT
+    # overlap each other.  Junctions are constructed as the residue
+    # of pavement minus rects/runways/terminals; if rects overlap,
+    # the residue is wrong and junctions can't tile the gaps.
+    #
+    # Sources of rect-rect overlap from upstream rect extraction:
+    #   - OSM centerlines too close to each other (a main taxi and a
+    #     service road parallel to it; each produces a rect whose
+    #     half-width buffer covers the other).
+    #   - Apron-emit retries that try to add more rects to simplify
+    #     a junction polygon — without an explicit overlap check the
+    #     new rect can land on top of an existing one.
+    #
+    # Drop rule: walk all rect pairs; if their intersection exceeds
+    # RECT_OVERLAP_NOISE_M2 (a tiny float-noise threshold so corners
+    # that "kiss" but don't actually overlap aren't flagged), drop
+    # the rect with the SHORTER axis — the longer rect is more
+    # likely the real centerline.  Tie-break by larger area.
+    # Iterate until no rect-pair overlap remains.
+    RECT_OVERLAP_NOISE_M2 = 1.0
+    if len(taxi_rects) >= 2:
+        kept = list(taxi_rects)
+        changed = True
+        while changed:
+            changed = False
+            n = len(kept)
+            drop_idx: set = set()
+            for i in range(n):
+                if i in drop_idx:
+                    continue
+                rect_i, axis_i, role_i, ref_i = kept[i]
+                len_i = axis_i.length if axis_i is not None else 0.0
+                for j in range(i + 1, n):
+                    if j in drop_idx:
+                        continue
+                    rect_j, axis_j, role_j, ref_j = kept[j]
+                    len_j = axis_j.length if axis_j is not None else 0.0
+                    try:
+                        if not rect_i.intersects(rect_j):
+                            continue
+                        inter = rect_i.intersection(rect_j)
+                        if inter.is_empty:
+                            continue
+                        if inter.area <= RECT_OVERLAP_NOISE_M2:
+                            continue
+                        # Drop the shorter-axis rect; tie-break by
+                        # smaller area.
+                        if len_i < len_j or (
+                                abs(len_i - len_j) < 0.5
+                                and rect_i.area < rect_j.area):
+                            drop_idx.add(i)
+                            break
+                        else:
+                            drop_idx.add(j)
+                    except Exception:
+                        continue
+            if drop_idx:
+                kept = [k for idx, k in enumerate(kept)
+                        if idx not in drop_idx]
+                changed = True
+        if len(kept) < len(taxi_rects):
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] {icao}: dropped "
+                    f"{len(taxi_rects) - len(kept)} taxi rect(s) "
+                    f"that overlapped another rect.\n")
+            except Exception:
+                pass
+            taxi_rects = kept
+
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
     for rect, axis, role, ref in taxi_rects:
@@ -1207,6 +1563,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # files enforce and compare_target's v_tgt metric measures.
     _enforce_shared_vertices(layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
 
+    # Pavement layout invariant (user 2026-04-26): NO shape may
+    # overlap another, period.  Runs AFTER shared-vertex collapse
+    # because the collapse step can shift boundaries by up to
+    # SHARED_VERTEX_CLUSTER_TOL_M / 2 and create tiny new overlaps.
+    # Re-run shared-vertex collapse afterwards because clipping
+    # introduces new vertices at intersection points that may sit
+    # within the cluster tol of an existing vertex on the
+    # higher-priority shape's edge.
+    _drop_overlap_against_fixed_shapes(layout, icao=icao)
+    _enforce_shared_vertices(layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
+
     # Validate the invariant: every vertex of every shape must either
     # be unique (distance > 2 × tol to any other shape's vertex) OR
     # exactly equal to a vertex on an adjacent shape.  No "close but
@@ -1218,7 +1585,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
     if compute_elevations:
         _compute_elevations(
             layout, icao, xplane_root, apt,
-            osm_nodes=nodes, osm_ways=ways, to_m=to_m)
+            osm_nodes=nodes, osm_ways=ways, to_m=to_m,
+            apron_candidates_m=apron_candidates)
+        # Elevation phase can subdivide junctions, decompose holed
+        # polygons, and otherwise modify polygon geometry — re-run
+        # the shared-vertex collapse + overlap-clip so the
+        # invariants survive into the final layout.
+        _enforce_shared_vertices(
+            layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
+        _drop_overlap_against_fixed_shapes(layout, icao=icao)
+        _enforce_shared_vertices(
+            layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
 
     return layout
 
@@ -1234,14 +1611,46 @@ def build_airport_pavement(icao: str, xplane_root: str,
 TAXI_MAX_GRADE = 0.015
 TAXI_ANCHOR_DIST_M = 30.0   # snap taxi rect end to runway segment
                              # elevation when within this distance
+
+# ── Per-shape elevation field (Mode A / Mode B) ────────────────────
+# Mode A: 1D smoothing along a rect's axis at this spacing.  Mode B:
+# 2D grid smoothing within a non-rect pavement polygon at this
+# spacing.  Per-step grade cap is ``ELEVATION_GRID_STEP_M ×
+# TAXI_MAX_GRADE`` so two adjacent samples (axis or grid) cannot
+# differ by more than that amount.
+ELEVATION_GRID_STEP_M = 5.0
+ELEVATION_SMOOTH_MAX_ITERS = 50
+ELEVATION_SMOOTH_CONVERGE_M = 0.01
+# Tolerance for cross-junction shared-bucket reconciliation: when
+# two junctions touching the same SOFT (graph/DEM-derived) shared
+# bucket end up with smoothed values farther apart than this, we
+# overwrite both with the average to restore the shared-vertex
+# invariant; below this they stay at their per-junction smoothed
+# values (preserves the within-shape grade win).  0.10 m is ≈ 1 %
+# grade across a 10 m shared edge — well below the visible-cliff
+# threshold and below check_grade.py's CROSS-SHAPE 1.5 % bar.
+SHARED_AGREE_TOL_M = 0.10
+# Wire ``_smooth_polygon_grid`` (Mode B) into the per-junction flow
+# instead of the legacy per-vertex anchor lookup + 1D ring smoothing.
+# Default OFF (2026-04-26): Mode B's 2D-Euclidean anchor cones impose
+# tighter grade constraints than the elevation graph's network-
+# distance smoothing, which can cause regressions when rect corner
+# anchors that fit network compliance sit outside the 2D cones,
+# forcing wild midpoint fallbacks at free cells.  The helper +
+# constants are kept so a future iteration can re-engage Mode B
+# once rect-corner derivation is reworked to enforce 2D-Euclidean
+# grade compliance.
+USE_PER_POLYGON_ELEVATION_FIELD = False
+
 DEM_SUFFIX = ".hgt"
 _DEM_CACHE: Dict[Tuple[int, int], object] = {}
 
 
 def _load_airport_dem(lat0: float, lon0: float):
     """Return an ``O4_DEM_Utils.DEM`` covering the 1° tile that
-    contains (lat0, lon0).  Falls back to None if the .hgt file is
-    missing."""
+    contains (lat0, lon0).  Auto-downloads via Ortho4XP's standard
+    DEM provider chain when no local .hgt file exists.  Falls back
+    to None only when the download itself fails."""
     tile_lat = int(math.floor(lat0))
     tile_lon = int(math.floor(lon0))
     key = (tile_lat, tile_lon)
@@ -1256,13 +1665,31 @@ def _load_airport_dem(lat0: float, lon0: float):
     group_dir = (f"{'+' if group_lat >= 0 else '-'}{abs(group_lat):02d}"
                  f"{'+' if group_lon >= 0 else '-'}{abs(group_lon):03d}")
     dem_path = os.path.join("Elevation_data", group_dir, fname)
-    if not os.path.isfile(dem_path):
-        _DEM_CACHE[key] = None
-        return None
     try:
         import O4_DEM_Utils as _DEM
-        dem = _DEM.DEM(tile_lat, tile_lon, source=dem_path)
-    except Exception:
+        if os.path.isfile(dem_path):
+            dem = _DEM.DEM(tile_lat, tile_lon, source=dem_path)
+        else:
+            # Download via Ortho4XP's default DEM source chain
+            # (SRTM/View — DEM.load_data calls ensure_elevation
+            # internally).  Same path Ortho4XP's main pipeline
+            # uses for the elevation data step.
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] {fname} missing; downloading "
+                    f"DEM tile via Ortho4XP elevation provider...\n")
+            except Exception:
+                pass
+            dem = _DEM.DEM(tile_lat, tile_lon)
+    except Exception as exc:
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] WARN: DEM load/download failed for "
+                f"{fname}: {exc}\n")
+        except Exception:
+            pass
         _DEM_CACHE[key] = None
         return None
     _DEM_CACHE[key] = dem
@@ -1294,7 +1721,9 @@ def _find_cifp_path(xplane_root: str, icao: str) -> Optional[str]:
 def _compute_elevations(layout: "PavementLayout", icao: str,
                         xplane_root: str, apt,
                         osm_nodes=None, osm_ways=None,
-                        to_m=None) -> None:
+                        to_m=None,
+                        apron_candidates_m: Optional[
+                            List[Polygon]] = None) -> None:
     """Phase-2: add altitude tags to runways (segmented), taxi
     rects, and terminal pads.  Junctions / aprons / buildings are
     left un-elevated this iteration.
@@ -1432,6 +1861,75 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 shape.altitude = round((eh + el) / 2.0, 1)
             layout.shapes.append(shape)
             new_runway_polys.append(poly)
+
+        # Drop any newly-emitted runway segment whose footprint is
+        # contained inside an apt.dat / DSF pavement polygon that's
+        # MUCH LARGER than the segment itself.  Such a polygon is
+        # an apron enclosing the runway — the runway physically
+        # merges with the surrounding pavement (e.g. CYXY runway 02
+        # crosses the south apron at lat 60.7124).  Keeping a
+        # separate runway rect there produces a visible rectangular
+        # ribbon through the apron.  The junction polygon that
+        # fills the apron will smoothly join the LAST surviving
+        # runway segment's end at its shared corner.
+        #
+        # Detection: the segment is ≥ RUNWAY_INSIDE_APRON_FRAC
+        # contained inside an apt.dat polygon whose area is
+        # ≥ RUNWAY_APRON_AREA_RATIO times the segment area.  A
+        # normal runway sits inside a runway-shaped apt.dat
+        # polygon that's only marginally larger; an apron-merged
+        # runway sits inside a polygon many times its size.
+        if apron_candidates_m:
+            from shapely.strtree import STRtree
+            try:
+                index = STRtree(apron_candidates_m)
+            except Exception:
+                index = None
+            kept_shapes: List[BuiltShape] = []
+            kept_polys: List[Polygon] = []
+            n_dropped = 0
+            for sh in layout.shapes:
+                if sh.role != ROLE_RUNWAY:
+                    kept_shapes.append(sh)
+                    continue
+                drop = False
+                if (sh.polygon is not None
+                        and not sh.polygon.is_empty):
+                    seg_area = sh.polygon.area
+                    cand_iter = (index.query(sh.polygon)
+                                 if index is not None
+                                 else range(len(apron_candidates_m)))
+                    for ci in cand_iter:
+                        cand = apron_candidates_m[ci]
+                        try:
+                            if (cand.area
+                                    < seg_area
+                                    * RUNWAY_APRON_AREA_RATIO):
+                                continue
+                            inter = sh.polygon.intersection(cand)
+                            if (inter.area / seg_area
+                                    > RUNWAY_INSIDE_APRON_FRAC):
+                                drop = True
+                                break
+                        except Exception:
+                            continue
+                if drop:
+                    n_dropped += 1
+                    continue
+                kept_shapes.append(sh)
+                if sh.polygon is not None and not sh.polygon.is_empty:
+                    kept_polys.append(sh.polygon)
+            if n_dropped:
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] {icao}: dropped "
+                        f"{n_dropped} runway segment(s) "
+                        f"apron-merged.\n")
+                except Exception:
+                    pass
+                layout.shapes = kept_shapes
+                new_runway_polys = kept_polys
 
         # Segmented runway boundaries can drift sub-metre from the
         # original single-rect runway that junctions / rects were
@@ -1591,7 +2089,27 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         # automatically (vertex elevations all match the plateau).
         # Triangulation is reserved for compound-slope regions
         # crossing multiple plateaus.
-        _snap_plateaus(graph)
+        _, _soft_anchored = _snap_plateaus(graph)
+        # Post-plateau bridge enforcement (2026-04-26): each
+        # plateau cluster's boundary check ran while OTHER
+        # clusters were still pre-snap, so cross-cluster bridges
+        # can end up violating after both commit.  Walk every
+        # edge between two anchors; demote SOFT-anchored
+        # endpoints involved in violations so the next smoothing
+        # pass can pull them into compliance.  Hard anchors
+        # (CIFP runway thresholds) are never demoted.
+        n_demoted, n_hard_avg = _demote_violating_soft_anchors(
+            graph, _soft_anchored)
+        if n_demoted or n_hard_avg:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] {icao}: post-plateau bridge "
+                    f"reconciliation — demoted {n_demoted} soft "
+                    f"anchors, averaged {n_hard_avg} hard-vs-hard "
+                    f"violating pairs.\n")
+            except Exception:
+                pass
         # Re-smooth ramps between plateaus.  Plateau nodes are
         # now hard anchors; this run enforces 1.5 % grade on the
         # transition ramps between them.
@@ -1767,6 +2285,70 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # multi-directional slope behaviour the user requested.
     _triangulate_junctions(layout, graph, dem, tile_lat, tile_lon, m_to_ll)
 
+    # ── Global pavement mesh ────────────────────────────────────
+    # Build one mesh covering every pavement shape's boundary —
+    # nodes are unique vertex buckets, edges are ring adjacency
+    # plus cross-shape adjacency at shared buckets.  ANCHORED ONLY
+    # on runway corner buckets (CIFP-derived elevations are the
+    # sole HARD truth); every other node is free to be moved by
+    # the smoother to satisfy 2D Euclidean grade compliance with
+    # its neighbours.  After solving, each shape's altitude tags
+    # are rewritten from the mesh values.  Per the user 2026-04-26
+    # principle: only runways are HARD; taxi rect / terminal
+    # altitudes derived earlier from the centerline graph are
+    # initial seeds that the mesh can refine.
+    runway_anchors = _runway_corner_elev_map(layout)
+    if runway_anchors:
+        try:
+            mesh, bucket_to_node = _build_pavement_mesh(
+                layout, runway_anchors, dem,
+                tile_lat, tile_lon)
+            _solve_pavement_mesh(mesh, layout, bucket_to_node)
+            _writeback_pavement_mesh(layout, mesh, bucket_to_node)
+        except Exception as exc:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] WARN: {icao}: global pavement "
+                    f"mesh solve failed ({exc}); falling back to "
+                    f"per-shape elevations.\n")
+            except Exception:
+                pass
+    # Layer 2 (2026-04-26): clamp each junction's free boundary
+    # vertices to be grade-compliant with EVERY nearby boundary
+    # of EVERY other shape.  Iterate to a fixed point (constraints
+    # depend on neighbour elevations that are themselves being
+    # clamped — one pass settles only the "obvious" violations,
+    # later passes reconcile cascading effects).
+    for _ in range(8):
+        n = _clamp_junction_free_vertices(layout)
+        if n == 0:
+            break
+    # Junction subdivision (2026-04-26, refined): the
+    # perpendicular-cut pass now snaps new cut-line vertices to
+    # existing ring vertices within SUBDIVIDE_SNAP_RADIUS_M and
+    # only commits the split when ALL sub-polygons have a smaller
+    # worst within-shape grade than the parent.  Iterates to a
+    # fixed point (cap 4 passes); a sub-polygon may itself need
+    # further subdivision if it still has incompatible anchors.
+    for _ in range(4):
+        n = _subdivide_violating_junctions(layout)
+        if n == 0:
+            break
+    # Re-clamp free vertices after subdivision (the few new
+    # cut-line vertices that COULDN'T snap inherit interpolated
+    # elevations and may benefit from neighbour-clamping).
+    for _ in range(4):
+        n = _clamp_junction_free_vertices(layout)
+        if n == 0:
+            break
+    # Layer 3 (2026-04-26): scan every emitted polygon for any
+    # within-shape vertex pair grade > TAXI_MAX_GRADE.  Surface a
+    # WARN summary so regressions are visible during iteration —
+    # not yet a hard fail (would drop too much coverage at HECA-
+    # complexity airports while Layers 1/2 are still maturing).
+    _report_within_shape_violations(layout, icao)
+
 
 def _latlon_to_m_local(lat: float, lon: float,
                        lat0: float, lon0: float, cos0: float
@@ -1881,6 +2463,13 @@ NETWORK_BRIDGE_MAX_M = 60.0         # max dist for taxi→rwy bridge edge.
                                      # from the runway) aren't bridged;
                                      # wide enough to catch perpendicular
                                      # stub endpoints (V1 ~55 m at SPJC).
+                                     # Parallel taxis CAN legitimately
+                                     # diverge from runway elevation
+                                     # (real airports often have parallel
+                                     # taxiways sloping the opposite
+                                     # direction from the runway).  Only
+                                     # the stubs need a tight bridge to
+                                     # the runway.
 NETWORK_RUNWAY_ANCHOR_RADIUS_M = 5.0  # a taxi node within this of
                                        # rwy segment gets anchored
 
@@ -2207,7 +2796,94 @@ def _detect_plateaus(g: "ElevationGraph") -> List[List[int]]:
     return plateaus
 
 
-def _snap_plateaus(g: "ElevationGraph") -> int:
+def _demote_violating_soft_anchors(
+    g: "ElevationGraph",
+    soft_anchored: set,
+) -> Tuple[int, int]:
+    """After plateau snap, walk every edge and reconcile anchored-
+    pair grade violations:
+
+      1. SOFT-anchor demotion:  An edge between two anchors whose
+         elevation difference exceeds ``length × TAXI_MAX_GRADE``
+         and at least one endpoint is a plateau-snapped soft anchor
+         → demote the soft side(s).  The next smoothing pass pulls
+         them into compliance with the surviving (typically hard)
+         neighbour.
+      2. HARD-vs-HARD averaging:  An edge between two HARD anchors
+         with the same violation gets resolved by averaging:  both
+         endpoints adopt the midpoint elevation, capped to the
+         length × grade band.  This handles runway-runway crossings
+         where each runway's CIFP threshold gives a different
+         elevation at a shared (or near-shared) physical point —
+         e.g. CYXY has 3 runways that cross at the south apron with
+         CIFP-derived elevations differing by up to 16 % across a
+         few-metre bridge.  Averaging trades a small CIFP deviation
+         (≤ a few metres) for the elimination of a 16 % cliff in
+         the rendered surface.
+
+    Returns ``(num_soft_demoted, num_hard_pairs_averaged)``.
+    """
+    n = len(g.nodes)
+    to_demote: set = set()
+    hard_avg_pairs: List[Tuple[int, int, float]] = []
+    for i in range(n):
+        if g.anchor_elev[i] is None:
+            continue
+        for j, length in g.edges_adj[i]:
+            if j <= i:
+                continue
+            if g.anchor_elev[j] is None:
+                continue
+            if length < 1e-3:
+                continue
+            diff = abs(g.anchor_elev[i] - g.anchor_elev[j])
+            if diff <= length * TAXI_MAX_GRADE:
+                continue
+            i_soft = i in soft_anchored
+            j_soft = j in soft_anchored
+            if i_soft or j_soft:
+                if i_soft:
+                    to_demote.add(i)
+                if j_soft:
+                    to_demote.add(j)
+            else:
+                # Both hard — average them.
+                hard_avg_pairs.append((i, j, length))
+    for i in to_demote:
+        g.anchor_elev[i] = None
+    # Iterative averaging: a hard anchor in multiple violating
+    # pairs ends up at the average of its violating neighbours
+    # (we just take repeated pairwise averages — converges in a
+    # few passes).
+    n_hard = 0
+    for _ in range(8):
+        changed = False
+        for i, j, length in hard_avg_pairs:
+            ei = g.anchor_elev[i]
+            ej = g.anchor_elev[j]
+            if ei is None or ej is None:
+                continue
+            diff = abs(ei - ej)
+            if diff <= length * TAXI_MAX_GRADE:
+                continue
+            # Move both ends toward their midpoint by half the
+            # excess.
+            mid = 0.5 * (ei + ej)
+            new_i = ei + (mid - ei) * 0.5
+            new_j = ej + (mid - ej) * 0.5
+            g.anchor_elev[i] = new_i
+            g.elev[i] = new_i
+            g.anchor_elev[j] = new_j
+            g.elev[j] = new_j
+            changed = True
+            n_hard += 1
+        if not changed:
+            break
+    return len(to_demote), n_hard
+
+
+def _snap_plateaus(g: "ElevationGraph"
+                   ) -> Tuple[int, set]:
     """Detect candidate plateaus, validate each one, snap to
     median elevation only after shrinking to maintain ramp grade
     compliance at the cluster boundary.
@@ -2223,10 +2899,18 @@ def _snap_plateaus(g: "ElevationGraph") -> int:
     permits, conservative shrinkage where transition ramps are
     short — addresses Tier 2 of the sliver-elimination plan
     (user 2026-04-25).
+
+    Returns ``(num_clusters_snapped, set_of_soft_anchored_node_ids)``.
+    The soft-anchor set is consumed by the post-pass
+    ``_demote_violating_soft_anchors`` to reconcile cross-cluster
+    grade violations that neither cluster's own boundary check
+    could see (because each cluster's check ran while the OTHER
+    cluster was still pre-snap).
     """
     candidates = _detect_plateaus(g)
+    soft_anchored: set = set()
     if not candidates:
-        return 0
+        return 0, soft_anchored
     snapped = 0
     for cluster in candidates:
         cluster_set = set(cluster)
@@ -2265,14 +2949,17 @@ def _snap_plateaus(g: "ElevationGraph") -> int:
         extent = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
         if extent < PLATEAU_MIN_EXTENT_M:
             continue
-        # Commit.
+        # Commit.  Track each newly-anchored node in the soft set
+        # so the post-pass can demote them if cross-cluster bridges
+        # turn out to violate.
         elevs = sorted(g.elev[i] for i in cluster_set)
         median = elevs[len(elevs) // 2]
         for i in cluster_set:
             g.elev[i] = float(median)
             g.anchor_elev[i] = float(median)
+            soft_anchored.add(i)
         snapped += 1
-    return snapped
+    return snapped, soft_anchored
 
 
 def _build_elevation_network(
@@ -2524,6 +3211,29 @@ def _add_junction_bridges(g: "ElevationGraph",
                           layout: "PavementLayout") -> int:
     """Add cross-junction bridge edges to the elevation graph.
 
+    For each junction polygon, pair every boundary vertex with the
+    graph node nearest it (a centerline node, typically offset
+    ~22 m perpendicular into the adjacent rect).  Then add bridge
+    edges between every pair of those graph nodes, with bridge
+    length set to the **boundary-vertex-to-boundary-vertex**
+    distance — NOT the centerline-to-centerline distance.
+
+    The grade-compliance constraint
+    ``|N1.elev − N2.elev| ≤ length × TAXI_MAX_GRADE`` operates on
+    elevations carried by the graph nodes.  Those elevations
+    propagate to the rect altitudes, which propagate to the
+    junction's anchored boundary vertex elevations at the rect
+    corners.  The grade rule we ACTUALLY want enforced is between
+    the junction's anchored boundary vertices — i.e. the
+    corner-to-corner distance.
+
+    Using the centerline-to-centerline distance produces a slack
+    constraint: two parallel rects 60 m apart along their centerlines
+    but with corners only 25 m apart end up allowed
+    ``60 × 0.015 = 0.9 m`` of elevation difference, which becomes
+    ``0.9 m / 25 m = 3.6 %`` cross-grade at the corners (the
+    SPJC -10051 / HECA -10119 within-shape failure mode).
+
     Returns the number of bridges added (informational).
     """
     if not g.nodes:
@@ -2540,8 +3250,9 @@ def _add_junction_bridges(g: "ElevationGraph",
             coords = coords[:-1]
         if len(coords) < 3:
             continue
-        # Find the nearest graph node for each boundary vertex.
-        nbrs: List[int] = []
+        # Pair each boundary vertex with the nearest graph node and
+        # remember the BOUNDARY-VERTEX position for distance calcs.
+        nbrs: List[Tuple[int, float, float]] = []
         for (vx, vy) in coords:
             best_i = -1
             best_d2 = JUNCTION_BRIDGE_NODE_DIST_M ** 2
@@ -2551,22 +3262,29 @@ def _add_junction_bridges(g: "ElevationGraph",
                     best_d2 = d2
                     best_i = i
             if best_i >= 0:
-                nbrs.append(best_i)
+                nbrs.append((best_i, vx, vy))
         if len(nbrs) < 2:
             continue
-        # Dedup while preserving order.
-        seen: set = set()
-        uniq: List[int] = []
-        for ni in nbrs:
-            if ni not in seen:
-                seen.add(ni)
-                uniq.append(ni)
-        # Pairwise bridges (capped by JUNCTION_BRIDGE_MAX_M).
+        # Dedup graph-node ids while preserving order.  When two
+        # boundary vertices map to the same graph node (densified
+        # ring + same nearest centerline node), prefer the boundary
+        # position closest to that graph node.
+        best_for_idx: Dict[int, Tuple[int, float, float]] = {}
+        for ni, vx, vy in nbrs:
+            nx, ny = g.nodes[ni]
+            d2 = (nx - vx) ** 2 + (ny - vy) ** 2
+            existing = best_for_idx.get(ni)
+            if existing is None or d2 < (
+                    (g.nodes[ni][0] - existing[1]) ** 2
+                    + (g.nodes[ni][1] - existing[2]) ** 2):
+                best_for_idx[ni] = (ni, vx, vy)
+        uniq = list(best_for_idx.values())
+        # Pairwise bridges, length = boundary-vertex-to-boundary-vertex
+        # distance (NOT centerline-to-centerline).
         for a in range(len(uniq)):
+            ia, ax, ay = uniq[a]
             for b in range(a + 1, len(uniq)):
-                ia, ib = uniq[a], uniq[b]
-                ax, ay = g.nodes[ia]
-                bx, by = g.nodes[ib]
+                ib, bx, by = uniq[b]
                 d = math.hypot(ax - bx, ay - by)
                 if 0.5 < d <= JUNCTION_BRIDGE_MAX_M:
                     g.add_edge(ia, ib, d)
@@ -2634,6 +3352,577 @@ def _corner_elev_map(layout: "PavementLayout"
                     _corner_elevation_bucket(cx, cy),
                     float(s.altitude))
     return out
+
+
+def _runway_corner_elev_map(layout: "PavementLayout"
+                            ) -> Dict[Tuple[int, int], float]:
+    """Bucket → elevation map containing ONLY runway corners.
+
+    Runway elevations come from CIFP threshold data and are the
+    only HARD anchors in the pavement system — every other shape
+    (taxi rects, terminals, junctions) is allowed to be modified
+    by the global mesh smoother to satisfy 2D-Euclidean grade
+    compliance.
+
+    Sloped runways (altitude_high + altitude_low) follow the
+    X-Plane patch convention: ring indices 0,3 are the HIGH short
+    edge and 1,2 are the LOW short edge.  Flat runways carry a
+    single ``altitude``.
+    """
+    out: Dict[Tuple[int, int], float] = {}
+    for s in layout.shapes:
+        if s.role != ROLE_RUNWAY:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        if (s.altitude_high is not None
+                and s.altitude_low is not None
+                and len(coords) == 4):
+            elevs = [s.altitude_high, s.altitude_low,
+                     s.altitude_low, s.altitude_high]
+            for (cx, cy), e in zip(coords, elevs):
+                out.setdefault(
+                    _corner_elevation_bucket(cx, cy), float(e))
+            continue
+        if s.altitude is not None:
+            for (cx, cy) in coords:
+                out.setdefault(
+                    _corner_elevation_bucket(cx, cy),
+                    float(s.altitude))
+    return out
+
+
+# ── Global pavement mesh ─────────────────────────────────────────
+#
+# A mesh built from every pavement shape's boundary (rects, taxi
+# rects, terminals, junctions) where nodes are unique vertex
+# buckets and edges are ring-adjacency steps + cross-shape
+# adjacency at shared buckets.  Anchored only at runway corner
+# buckets — the CIFP-derived runway elevations are the sole HARD
+# truth.  Every other node is free to be moved by the smoother
+# into 2D-Euclidean grade compliance with its neighbours.
+#
+# After solving, each shape's altitude tags are rewritten from the
+# mesh values (taxi rect altitude_high/altitude_low ← mean of the
+# rect's high-side / low-side corner mesh values; flat shapes ←
+# mean of corner mesh values; junction node_altitudes ← per-vertex
+# mesh values).  Runway altitudes are preserved verbatim — they
+# anchored the mesh.
+
+
+def _build_pavement_mesh(
+        layout: "PavementLayout",
+        runway_anchors: Dict[Tuple[int, int], float],
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        ) -> Tuple["ElevationGraph",
+                   Dict[Tuple[int, int], int]]:
+    """Build a global ElevationGraph from every pavement shape's
+    boundary.  Returns ``(mesh, bucket_to_node)`` where the mesh
+    is ready for ``propagate_bounds()`` / ``choose_values()`` /
+    ``smooth_rate_of_change()`` and ``bucket_to_node`` lets the
+    writeback pass look up each shape's vertex elevations after
+    smoothing.
+
+    Initial elevations come from the existing per-shape altitude
+    tags — i.e. the centerline-graph-derived rect / terminal
+    elevations and the graph-or-DEM-sampled junction boundary
+    samples.  The mesh then refines those into 2D-Euclidean
+    compliance with the runway anchors.
+    """
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    mesh = ElevationGraph(lat0, lon0, cos0, tile_lat, tile_lon, dem)
+    bucket_to_node: Dict[Tuple[int, int], int] = {}
+
+    # Per-bucket initial elevation, accumulated as we walk shapes
+    # so a bucket touched by multiple shapes seeds itself from the
+    # mean of every shape's idea of what it should be.
+    bucket_init_sum: Dict[Tuple[int, int], Tuple[float, int]] = {}
+
+    def _bucket_for_node(x: float, y: float) -> int:
+        b = _corner_elevation_bucket(x, y)
+        nid = bucket_to_node.get(b)
+        if nid is None:
+            anchor = runway_anchors.get(b)
+            nid = mesh.add_node(x, y, anchor=anchor)
+            bucket_to_node[b] = nid
+        return nid
+
+    def _ring_with_elevs(s: "BuiltShape"
+                         ) -> Tuple[List[Tuple[float, float]],
+                                    List[Optional[float]]]:
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            return [], []
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            return [], []
+        if (s.altitude_high is not None
+                and s.altitude_low is not None
+                and len(coords) == 4):
+            elevs = [s.altitude_high, s.altitude_low,
+                     s.altitude_low, s.altitude_high]
+            return coords, [float(e) for e in elevs]
+        if (s.node_altitudes is not None
+                and len(s.node_altitudes) >= len(coords)):
+            na = list(s.node_altitudes)
+            if len(na) == len(coords) + 1:
+                na = na[:-1]
+            if len(na) == len(coords):
+                return coords, [float(e) for e in na]
+        if s.altitude is not None:
+            return coords, [float(s.altitude)] * len(coords)
+        return coords, [None] * len(coords)
+
+    # Pass 1 — register every boundary vertex as a mesh node and
+    # accumulate seed elevations.
+    for s in layout.shapes:
+        coords, elevs = _ring_with_elevs(s)
+        if not coords:
+            continue
+        for (x, y), e in zip(coords, elevs):
+            nid = _bucket_for_node(x, y)
+            if e is not None:
+                b = _corner_elevation_bucket(x, y)
+                tot, cnt = bucket_init_sum.get(b, (0.0, 0))
+                bucket_init_sum[b] = (tot + e, cnt + 1)
+
+    # Pass 2 — add edges.  Two kinds:
+    #   (a) ring-adjacency: each ring step (i → i+1) becomes an
+    #       edge weighted by 2D distance.  Cross-shape shared
+    #       edges are deduplicated.
+    #   (b) within-polygon all-pairs within
+    #       ``MESH_WITHIN_SHAPE_RADIUS_M`` of each other.  Without
+    #       these the mesh's grade-cap only enforces 1.5 % on
+    #       ring-adjacent pairs; vertices on opposite sides of a
+    #       wide junction could legitimately violate 1.5 % per 2D
+    #       metre even after smoothing because there's no direct
+    #       mesh edge between them.  Adding the all-pairs edges
+    #       (capped at the same radius check_grade.py uses for
+    #       within-shape violations) makes the smoother's grade-
+    #       cap pass enforce the 2D rule directly.
+    MESH_WITHIN_SHAPE_RADIUS_M = WITHIN_SHAPE_VIOLATION_RADIUS_M
+    seen_edges: set = set()
+    for s in layout.shapes:
+        coords, _e = _ring_with_elevs(s)
+        n = len(coords)
+        if n < 2:
+            continue
+        # Resolve every ring vertex to its bucket node id once.
+        node_ids: List[int] = []
+        for (cx, cy) in coords:
+            node_ids.append(
+                bucket_to_node[_corner_elevation_bucket(cx, cy)])
+        # (a) Ring adjacency.
+        for i in range(n):
+            ai = node_ids[i]
+            bi = node_ids[(i + 1) % n]
+            if ai == bi:
+                continue
+            key = (min(ai, bi), max(ai, bi))
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            ax, ay = coords[i]
+            bx, by = coords[(i + 1) % n]
+            d = math.hypot(bx - ax, by - ay)
+            if d <= 0:
+                continue
+            mesh.add_edge(ai, bi, d)
+        # (b) All-pairs within MESH_WITHIN_SHAPE_RADIUS_M.
+        if n < 3:
+            continue
+        radius2 = (MESH_WITHIN_SHAPE_RADIUS_M
+                   * MESH_WITHIN_SHAPE_RADIUS_M)
+        for i in range(n):
+            ax, ay = coords[i]
+            ai = node_ids[i]
+            for j in range(i + 1, n):
+                bx, by = coords[j]
+                bi = node_ids[j]
+                if ai == bi:
+                    continue
+                d2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+                if d2 <= 0 or d2 > radius2:
+                    continue
+                key = (min(ai, bi), max(ai, bi))
+                if key in seen_edges:
+                    continue
+                seen_edges.add(key)
+                mesh.add_edge(ai, bi, math.sqrt(d2))
+
+    # Pass 3 — cross-polygon proximity edges.  Pairs of mesh nodes
+    # in DIFFERENT polygons that sit within
+    # ``MESH_CROSS_SHAPE_RADIUS_M`` of each other in 2D need an
+    # edge so the smoother enforces 1.5 % grade compliance across
+    # the gap (and check_grade's CROSS-SHAPE check is satisfied).
+    # Without these, two boundary vertices in adjacent buckets
+    # (different node ids) on different shapes would diverge in
+    # elevation by the same network-distance-but-not-2D-distance
+    # mechanism that drives the original violation pattern.
+    #
+    # Bucketed spatial index: 5 m grid bins of node ids, then
+    # each node only checks neighbouring bins.  O(N) instead of
+    # the naive O(N²) all-pairs scan.
+    MESH_CROSS_SHAPE_RADIUS_M = 5.0
+    BIN_M = 5.0
+    bins: Dict[Tuple[int, int], List[int]] = {}
+    for nid, (nx, ny) in enumerate(mesh.nodes):
+        key = (int(math.floor(nx / BIN_M)),
+               int(math.floor(ny / BIN_M)))
+        bins.setdefault(key, []).append(nid)
+    radius2 = MESH_CROSS_SHAPE_RADIUS_M * MESH_CROSS_SHAPE_RADIUS_M
+    for nid, (nx, ny) in enumerate(mesh.nodes):
+        kx = int(math.floor(nx / BIN_M))
+        ky = int(math.floor(ny / BIN_M))
+        for dkx in (-1, 0, 1):
+            for dky in (-1, 0, 1):
+                cell = bins.get((kx + dkx, ky + dky))
+                if not cell:
+                    continue
+                for other in cell:
+                    if other <= nid:
+                        continue
+                    ox, oy = mesh.nodes[other]
+                    d2 = (ox - nx) ** 2 + (oy - ny) ** 2
+                    if d2 <= 0 or d2 > radius2:
+                        continue
+                    key = (nid, other)
+                    if key in seen_edges:
+                        continue
+                    seen_edges.add(key)
+                    mesh.add_edge(nid, other, math.sqrt(d2))
+
+    # Seed initial elevations on the mesh's elev[] array so the
+    # smoother starts from realistic per-shape values rather than
+    # pure DEM.  Anchors keep their anchor value; non-anchor nodes
+    # get the mean of every shape's seed at that bucket (or DEM if
+    # no shape contributed).
+    n_nodes = len(mesh.nodes)
+    init_elev: List[float] = [0.0] * n_nodes
+    for b, nid in bucket_to_node.items():
+        a = mesh.anchor_elev[nid]
+        if a is not None:
+            init_elev[nid] = a
+            continue
+        seed = bucket_init_sum.get(b)
+        if seed is not None and seed[1] > 0:
+            init_elev[nid] = seed[0] / seed[1]
+        else:
+            d = mesh.dem_elev[nid]
+            init_elev[nid] = d if d is not None else 0.0
+    mesh.elev = init_elev
+
+    return mesh, bucket_to_node
+
+
+def _solve_pavement_mesh(
+        mesh: "ElevationGraph",
+        layout: "PavementLayout",
+        bucket_to_node: Dict[Tuple[int, int], int]) -> None:
+    """Run propagate-bounds + Laplacian-with-grade-cap on the
+    pavement mesh, while enforcing two extra constraints during
+    every smoothing iteration:
+
+    1. Each sloped rect's short-edge corner pair is forced equal
+       (X-Plane patch format requires ``altitude_high`` /
+       ``altitude_low`` to apply uniformly across each short
+       edge).  Averaging the pair after each smoothing step lets
+       the rest of the mesh adjust around the equalised value,
+       so junctions sharing a rect corner bucket converge to
+       elevations consistent with the rect's emit.
+    2. Bounds-propagation gives every node a 2D Euclidean
+       feasibility band against every reachable runway anchor;
+       smoothing pulls free nodes toward neighbour means while
+       enforcing |Δelev| ≤ length × TAXI_MAX_GRADE on every
+       edge.
+
+    Mutates ``mesh.elev`` in place.
+    """
+    # propagate_bounds will RECOMPUTE intervals from anchors only;
+    # we want to keep our seeded initial values for free nodes,
+    # so cache and re-clip rather than calling choose_values.
+    seeded = list(mesh.elev)
+    mesh.propagate_bounds()
+    for i in range(len(mesh.nodes)):
+        if mesh.anchor_elev[i] is not None:
+            mesh.elev[i] = mesh.anchor_elev[i]
+            continue
+        lo = mesh.interval_lo[i]
+        hi = mesh.interval_hi[i]
+        if lo > hi:
+            mesh.elev[i] = 0.5 * (lo + hi)
+        else:
+            v = seeded[i]
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            mesh.elev[i] = v
+    # Pre-build the equalisation lists ONCE so the per-iteration
+    # equalise step is O(constraints) instead of O(shapes).  Two
+    # constraint families:
+    #   * Sloped rect short-edge pairs (corners 0+3 share
+    #     altitude_high, corners 1+2 share altitude_low).
+    #   * All corners of a FLAT shape (terminal, flat rect)
+    #     share a single elevation — the shape emits ``altitude``
+    #     uniformly.
+    rect_like_roles = {ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL,
+                       ROLE_STUB, ROLE_CROSS_CONNECTOR}
+    rect_pairs: List[Tuple[int, int, int, int]] = []
+    flat_groups: List[List[int]] = []
+    for s in layout.shapes:
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        nids = []
+        for c in coords:
+            nid = bucket_to_node.get(
+                _corner_elevation_bucket(c[0], c[1]))
+            if nid is None:
+                nids = []
+                break
+            nids.append(nid)
+        if not nids:
+            continue
+        # Sloped rect: 4-corner H/L/L/H pattern.
+        if (s.role in rect_like_roles
+                and s.altitude_high is not None
+                and s.altitude_low is not None
+                and len(nids) == 4):
+            rect_pairs.append(
+                (nids[0], nids[3], nids[1], nids[2]))
+            continue
+        # Flat shape: terminal, flat rect, or flat runway-like
+        # (runways are SKIPPED — their corners are anchored, not
+        # subject to equalisation by the mesh).
+        if s.role == ROLE_RUNWAY:
+            continue
+        if (s.role == ROLE_TERMINAL
+                or (s.role in rect_like_roles
+                    and s.altitude is not None)):
+            # Deduplicate node ids inside a single shape so
+            # adjacent ring vertices in the same bucket don't
+            # double-count.
+            uniq = list(dict.fromkeys(nids))
+            if len(uniq) >= 2:
+                flat_groups.append(uniq)
+
+    def _equalise_constraints() -> None:
+        for (h0, h1, l0, l1) in rect_pairs:
+            eh = 0.5 * (mesh.elev[h0] + mesh.elev[h1])
+            el = 0.5 * (mesh.elev[l0] + mesh.elev[l1])
+            mesh.elev[h0] = eh
+            mesh.elev[h1] = eh
+            mesh.elev[l0] = el
+            mesh.elev[l1] = el
+        for grp in flat_groups:
+            avg = sum(mesh.elev[i] for i in grp) / len(grp)
+            for i in grp:
+                mesh.elev[i] = avg
+
+    # Iterated smoothing.  ElevationGraph.smooth_rate_of_change
+    # is invoked one outer pass at a time so we can interleave
+    # rect short-edge equalisation between iterations.  Each
+    # ``smooth_rate_of_change`` call internally applies the
+    # Laplacian + grade-cap until either ``iters`` is exhausted or
+    # the per-iteration max-change drops below ``tol``.  Calling
+    # it with iters=2 per outer pass keeps the inner-loop
+    # convergence tight while letting equalisation run frequently.
+    OUTER_ITERS = 30
+    for _ in range(OUTER_ITERS):
+        mesh.smooth_rate_of_change(iters=2)
+        _equalise_constraints()
+
+
+def _equalize_rect_short_edges(
+        layout: "PavementLayout",
+        mesh: "ElevationGraph",
+        bucket_to_node: Dict[Tuple[int, int], int]) -> None:
+    """For every sloped 4-corner rect, force both corners on each
+    short edge to share a single mesh elevation (the mean of the
+    pair).  X-Plane's patch format requires ``altitude_high`` /
+    ``altitude_low`` to apply uniformly across each short edge, so
+    the two corners on the same short edge MUST emit at the same
+    elevation.  Without this step the rect writeback averages
+    behind the mesh's back, leaving any junction sharing a rect-
+    corner bucket reading a different elevation than the rect
+    itself emits — a 0.1–0.5 m cross-shape step at every shared
+    rect corner.
+
+    Mutating the mesh values in place propagates the equalised
+    elevation to every shape sharing the bucket; the subsequent
+    writeback then reads the same value everywhere.
+    """
+    rect_like_roles = {ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL,
+                       ROLE_STUB, ROLE_CROSS_CONNECTOR,
+                       ROLE_RUNWAY}
+    for s in layout.shapes:
+        if s.role not in rect_like_roles:
+            continue
+        if (s.altitude_high is None or s.altitude_low is None):
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        nids = []
+        for c in coords:
+            b = _corner_elevation_bucket(c[0], c[1])
+            nid = bucket_to_node.get(b)
+            if nid is None:
+                nids = []
+                break
+            nids.append(nid)
+        if len(nids) != 4:
+            continue
+        # Runway: anchor values are immutable.  Skip.
+        if s.role == ROLE_RUNWAY:
+            continue
+        # X-Plane patch convention: corners (0, 3) are HIGH side,
+        # (1, 2) are LOW side.  Average each short-edge pair.
+        e0, e3 = mesh.elev[nids[0]], mesh.elev[nids[3]]
+        e1, e2 = mesh.elev[nids[1]], mesh.elev[nids[2]]
+        eh = 0.5 * (e0 + e3)
+        el = 0.5 * (e1 + e2)
+        mesh.elev[nids[0]] = eh
+        mesh.elev[nids[3]] = eh
+        mesh.elev[nids[1]] = el
+        mesh.elev[nids[2]] = el
+
+
+def _writeback_pavement_mesh(
+        layout: "PavementLayout",
+        mesh: "ElevationGraph",
+        bucket_to_node: Dict[Tuple[int, int], int]) -> None:
+    """Rewrite each shape's altitude tags from the smoothed mesh.
+
+    * Runway shapes: untouched (their corners anchored the mesh).
+    * Sloped 4-corner taxi rects: ``altitude_high`` ← mean of the
+      two high-side corner mesh values; ``altitude_low`` ← mean of
+      the two low-side corner mesh values.  Re-orient the ring if
+      the high/low designation flipped.
+    * Flat 4-corner shapes (terminals, flat rects, flat runways
+      already): ``altitude`` ← mean of all corner mesh values.
+    * Junction shapes: per-vertex mesh elevations populate
+      ``node_altitudes``; the FLAT/PLANAR/COMPOUND classifier
+      (run later) collapses to a single ``altitude`` if the vertex
+      range is small enough.
+    """
+    rect_like_roles = {ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL,
+                       ROLE_STUB, ROLE_CROSS_CONNECTOR}
+
+    def _lookup(coord: Tuple[float, float]) -> Optional[float]:
+        b = _corner_elevation_bucket(coord[0], coord[1])
+        nid = bucket_to_node.get(b)
+        if nid is None:
+            return None
+        return float(mesh.elev[nid])
+
+    for s in layout.shapes:
+        if s.role == ROLE_RUNWAY:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        mesh_elevs: List[Optional[float]] = [
+            _lookup(c) for c in coords]
+        if not any(e is not None for e in mesh_elevs):
+            continue
+        # Fill any missing entries with the ring mean.
+        known = [e for e in mesh_elevs if e is not None]
+        fill = sum(known) / len(known) if known else 0.0
+        mesh_elevs = [e if e is not None else fill
+                      for e in mesh_elevs]
+        if (s.role in rect_like_roles
+                and s.altitude_high is not None
+                and s.altitude_low is not None
+                and len(coords) == 4):
+            # Sloped rect: X-Plane patch format requires both
+            # corners on each short edge to share a single
+            # elevation (``altitude_high`` for one short edge,
+            # ``altitude_low`` for the other).  The mesh solver
+            # enforces this constraint during smoothing
+            # (``_solve_pavement_mesh`` re-equalises rect short-
+            # edge pairs every iteration), so the four mesh values
+            # already satisfy ``e0 == e3`` and ``e1 == e2`` here
+            # except for floating-point noise — averaging is
+            # safe.  Junctions sharing a rect-corner bucket read
+            # the same equalised mesh value via writeback below.
+            short_a = 0.5 * (mesh_elevs[0] + mesh_elevs[3])
+            short_b = 0.5 * (mesh_elevs[1] + mesh_elevs[2])
+            eh = max(short_a, short_b)
+            el = min(short_a, short_b)
+            if abs(eh - el) >= 0.1:
+                s.altitude_high = round(eh, 1)
+                s.altitude_low = round(el, 1)
+                # If the original HIGH side (corners 0, 3) is now
+                # below, swap the ring orientation so corners 0, 3
+                # remain the HIGH short edge.
+                if short_a < short_b:
+                    new_coords = [coords[1], coords[0],
+                                  coords[3], coords[2]]
+                    try:
+                        new_poly = Polygon(new_coords)
+                        if new_poly.is_valid and not new_poly.is_empty:
+                            s.polygon = new_poly
+                    except Exception:
+                        pass
+                s.altitude = None
+                s.node_altitudes = None
+            else:
+                s.altitude_high = None
+                s.altitude_low = None
+                s.altitude = round(0.5 * (eh + el), 1)
+                s.node_altitudes = None
+            continue
+        if (s.role == ROLE_TERMINAL
+                or (s.role in rect_like_roles
+                    and s.altitude is not None)):
+            mean_e = sum(mesh_elevs) / len(mesh_elevs)
+            s.altitude = round(mean_e, 1)
+            s.altitude_high = None
+            s.altitude_low = None
+            continue
+        if s.role == ROLE_JUNCTION:
+            # Per-vertex: store node_altitudes spanning the closed
+            # ring.  Downstream classifier will collapse to FLAT or
+            # PLANAR if appropriate.
+            closed = mesh_elevs + [mesh_elevs[0]]
+            if (max(closed) - min(closed)) < 0.05:
+                s.altitude = round(
+                    sum(mesh_elevs) / len(mesh_elevs), 1)
+                s.node_altitudes = None
+            else:
+                s.node_altitudes = [round(e, 1) for e in closed]
+                s.altitude = None
 
 
 # ── Junction polygon decomposition ───────────────────────────────
@@ -2852,6 +4141,37 @@ def _densify_long_boundary_edges(
                 best_e = ea + t * (eb - ea)
         return best_e if best_e is not None else fallback
 
+    def _point_on_neighbour(mx: float, my: float) -> bool:
+        """True if point (mx, my) lies within SHARED_VERTEX_TOL_M of
+        some neighbour edge's interior.
+
+        A densification midpoint that lands this close to a
+        rect/runway/terminal edge will be snapped onto that edge by
+        X-Plane's vector_map encroachment check, creating a T-
+        junction that breaks the neighbour rect's 4-corner slope
+        rendering.  Skip these midpoints — the junction edge stays
+        un-densified at that point, which is the right call because
+        Triangle4XP doesn't need an interior-anchor near a shared
+        boundary anyway (the neighbour rect's own subdivision
+        provides the anchors).
+        """
+        tol2 = SHARED_VERTEX_TOL_M * SHARED_VERTEX_TOL_M
+        for nax, nay, nbx, nby, _, _ in neighbour_edges:
+            ndx = nbx - nax
+            ndy = nby - nay
+            seg2 = ndx * ndx + ndy * ndy
+            if seg2 < 0.04:
+                continue
+            t = ((mx - nax) * ndx + (my - nay) * ndy) / seg2
+            if t < 0.0 or t > 1.0:
+                continue
+            cx = nax + t * ndx
+            cy = nay + t * ndy
+            d2 = (mx - cx) * (mx - cx) + (my - cy) * (my - cy)
+            if d2 < tol2:
+                return True
+        return False
+
     # Pre-compute the bucket-key of every existing ring vertex so we
     # can reject midpoints that would collide with one via
     # ``to_osm``'s SHARED_VERTEX_TOL_M intern.  A midpoint that
@@ -2881,6 +4201,12 @@ def _densify_long_boundary_edges(
             mb = _corner_elevation_bucket(mx, my)
             if mb in existing_buckets:
                 continue  # would collide with an existing ring nid
+            # Skip midpoints that would land near a neighbour edge
+            # — X-Plane's vector_map would snap them onto the
+            # neighbour, creating a T-junction that breaks the
+            # neighbour rect's 4-corner slope rendering.
+            if _point_on_neighbour(mx, my):
+                continue
             linear_me = ea + t * (eb - ea)
             me = _interp_at(mx, my, linear_me)
             new_ring.append((mx, my))
@@ -2963,6 +4289,80 @@ def _drop_spike_vertices(
     return ring
 
 
+SLIVER_ANGLE_THRESHOLD_DEG = 2.0  # interior angles below this count
+                                   # as needle-tip slivers.  Source:
+                                   # residue construction can leave
+                                   # thin wedges where rect/terminal
+                                   # edges meet the apt.dat boundary at
+                                   # near-collinear angles.  The
+                                   # polygon is shapely-valid but a
+                                   # sub-2° corner forces Triangle4XP
+                                   # to emit a near-degenerate triangle
+                                   # there — crashes X-Plane's mesh
+                                   # builder.  Caught at junction-
+                                   # emission time by _drop_sliver_corners
+                                   # (drops just the tip vertex,
+                                   # preserves the rest of the polygon)
+                                   # and again by a to_osm safety net
+                                   # (drops the whole shape if any
+                                   # slipped through, e.g. via buffer(0)
+                                   # repair or post-densification).
+
+
+def _drop_sliver_corners(
+    ring: List[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Drop ring vertices whose interior angle is below
+    ``SLIVER_ANGLE_THRESHOLD_DEG``.
+
+    A sliver corner is a needle-tip vertex: the polygon comes in
+    along one edge, makes a near-180° fold, and goes back out
+    almost on top of the incoming edge, leaving a thin wedge.
+    Source: residue construction (apt.dat pav − rects − terminals)
+    leaves wedges where two rect/terminal edges meet the boundary at
+    nearly-collinear angles.  Shapely calls these polygons valid
+    (the two long edges are parallel-but-not-equal, no self-
+    intersection), but the polygon's needle-tip corner forces
+    Triangle4XP downstream to emit at least one corner triangle
+    with that interior angle — for sub-2° tips that triangle is
+    near-degenerate (NaN normal) and crashes X-Plane's mesh builder.
+
+    Dropping the tip vertex collapses the wedge into a single edge
+    between the two flanking vertices.  Coverage cost: the area
+    between the tip and the truncation chord (typically < 50 m²).
+
+    Iterates to a fixed point — dropping one tip can expose
+    another.  Capped at 8 passes.
+    """
+    if len(ring) < 4:
+        return ring
+    cos_thresh = math.cos(math.radians(SLIVER_ANGLE_THRESHOLD_DEG))
+    for _ in range(8):
+        n = len(ring)
+        if n < 4:
+            break
+        keep = [True] * n
+        for i in range(n):
+            ax, ay = ring[(i - 1) % n]
+            bx, by = ring[i]
+            cx, cy = ring[(i + 1) % n]
+            v1x, v1y = ax - bx, ay - by
+            v2x, v2y = cx - bx, cy - by
+            n1 = math.hypot(v1x, v1y)
+            n2 = math.hypot(v2x, v2y)
+            if n1 < 1e-9 or n2 < 1e-9:
+                continue
+            cos = (v1x * v2x + v1y * v2y) / (n1 * n2)
+            if cos > cos_thresh:
+                # Angle = acos(cos) is below threshold.
+                keep[i] = False
+        new_ring = [r for r, k in zip(ring, keep) if k]
+        if len(new_ring) == n:
+            break
+        ring = new_ring
+    return ring
+
+
 def _drop_colinear_boundary_vertices(
     ring: List[Tuple[float, float]],
     corner_elev: Dict[Tuple[int, int], float],
@@ -3010,22 +4410,18 @@ def _drop_colinear_boundary_vertices(
     return ring
 
 
-def _planar_fit_residuals(ring: List[Tuple[float, float]],
-                          elev: List[float]
-                          ) -> Optional[List[float]]:
+def _planar_fit(ring: List[Tuple[float, float]],
+                elev: List[float]
+                ) -> Optional[Tuple[float, float, float, List[float]]]:
     """Fit a plane ``z = a*x + b*y + c`` to (x, y, z) by least
-    squares and return the per-vertex residuals (|actual - plane|).
+    squares and return ``(a, b, c, per-vertex residuals)``.  The
+    slope magnitude is ``sqrt(a² + b²)`` (rise per metre of horizontal
+    travel — directly comparable to ``TAXI_MAX_GRADE``).
     Returns None if the fit is degenerate (colinear xy).
-
-    Used to detect "uniformly sloped" junction polygons that can
-    emit as a single polygon with ``node_altitudes`` instead of
-    being triangulated — X-Plane interpolates linearly across the
-    ring and the render is identical to our triangulated mesh.
     """
     n = len(ring)
     if n < 3 or len(elev) != n:
         return None
-    # Normal equations: A^T A x = A^T b where A rows are [x, y, 1].
     sxx = sxy = sxc = syy = syc = scc = 0.0
     sxz = syz = szc = 0.0
     for (x, y), z in zip(ring, elev):
@@ -3038,11 +4434,6 @@ def _planar_fit_residuals(ring: List[Tuple[float, float]],
         sxz += x * z
         syz += y * z
         szc += z
-    # 3×3 system:
-    #   [sxx sxy sxc] [a]   [sxz]
-    #   [sxy syy syc] [b] = [syz]
-    #   [sxc syc scc] [c]   [szc]
-    # Solve via Cramer's rule.
     det = (sxx * (syy * scc - syc * syc)
            - sxy * (sxy * scc - syc * sxc)
            + sxc * (sxy * syc - syy * sxc))
@@ -3060,8 +4451,17 @@ def _planar_fit_residuals(ring: List[Tuple[float, float]],
     a = det_a / det
     b = det_b / det
     c = det_c / det
-    return [abs(z - (a * x + b * y + c))
-            for (x, y), z in zip(ring, elev)]
+    residuals = [abs(z - (a * x + b * y + c))
+                 for (x, y), z in zip(ring, elev)]
+    return (a, b, c, residuals)
+
+
+def _planar_fit_residuals(ring: List[Tuple[float, float]],
+                          elev: List[float]
+                          ) -> Optional[List[float]]:
+    """Backwards-compat wrapper: residuals only."""
+    f = _planar_fit(ring, elev)
+    return None if f is None else f[3]
 
 
 def _match_elev(rx: float, ry: float,
@@ -3080,6 +4480,347 @@ def _match_elev(rx: float, ry: float,
     return best_e
 
 
+
+
+# ── Mode B: per-polygon 2D elevation grid ─────────────────────────
+#
+# Build a 5 m grid covering a non-rect pavement polygon's bbox,
+# pin cells nearest each "hard anchor" (rect/runway/terminal corner
+# elevations) to those anchor values, initialize free cells to DEM
+# clipped into the local feasibility cone (anchor ± dist × 1.5 %),
+# then Laplacian-smooth + grade-cap every adjacent cell pair until
+# the field is stable.  Returns a sampler that bilinearly
+# interpolates the smoothed grid at any (x, y) the caller asks
+# about.  The polygon's boundary vertices then take their
+# elevations from this single shared field — which is what
+# guarantees within-shape grade compliance for the polygon.
+#
+# Per the elevation-field plan (2026-04-26) this replaces per-
+# vertex independent elevation derivation.  Rect / runway / terminal
+# corner anchors stay immutable across smoothing iterations.
+
+
+def _smooth_polygon_grid(
+        polygon: Polygon,
+        hard_anchors: List[Tuple[float, float, float]],
+        graph: Optional["ElevationGraph"],
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        layout_anchor: Tuple[float, float],
+        grid_step_m: float = ELEVATION_GRID_STEP_M,
+        max_iters: int = ELEVATION_SMOOTH_MAX_ITERS,
+        convergence_tol_m: float = ELEVATION_SMOOTH_CONVERGE_M):
+    """Smooth a 2D elevation field within ``polygon``.
+
+    ``hard_anchors`` is a list of ``(x, y, elev)`` triples whose
+    elevation must be preserved exactly (rect / runway / terminal
+    corners; cross-junction shared vertices already locked from a
+    previous outer iteration).
+
+    Returns ``(sampler, sample)`` where ``sampler(x, y)`` returns
+    the bilinearly-interpolated elevation, or ``None`` if the
+    polygon was too small for grid construction.  When no anchors
+    are reachable for the polygon, falls back to the global
+    elevation graph / DEM at each query point — same path
+    ``_vertex_elev_anchored`` step 5 takes today.
+    """
+    import numpy as np
+
+    # Degenerate polygon — return a graph/DEM sampler.
+    if polygon is None or polygon.is_empty:
+        return None
+    minx, miny, maxx, maxy = polygon.bounds
+    span_x = maxx - minx
+    span_y = maxy - miny
+    if span_x <= 0 or span_y <= 0:
+        return None
+
+    # Build grid bbox with a 1-cell margin so boundary vertices land
+    # comfortably inside the active region.
+    margin = grid_step_m
+    minx -= margin
+    miny -= margin
+    maxx += margin
+    maxy += margin
+    nx = max(2, int(math.ceil((maxx - minx) / grid_step_m)) + 1)
+    ny = max(2, int(math.ceil((maxy - miny) / grid_step_m)) + 1)
+    # Cap grid size — should never trigger for realistic airport
+    # polygons but prevents pathological all-airport polygons from
+    # eating all RAM.
+    if nx * ny > 250_000:
+        return None
+
+    # Cell-center coords.
+    xs = minx + np.arange(nx) * grid_step_m
+    ys = miny + np.arange(ny) * grid_step_m
+
+    # ── INSIDE mask ─────────────────────────────────────────────
+    # A cell is INSIDE if its center sits inside the polygon OR
+    # within ``grid_step_m`` of the polygon boundary (so cells
+    # straddling the boundary stay active).  Bilinear sampling at
+    # boundary vertices needs the surrounding cells active.
+    from shapely.prepared import prep
+    prepped = prep(polygon)
+    boundary = polygon.boundary
+    inside = np.zeros((nx, ny), dtype=bool)
+    for i in range(nx):
+        for j in range(ny):
+            pt = Point(float(xs[i]), float(ys[j]))
+            if prepped.contains(pt):
+                inside[i, j] = True
+            else:
+                try:
+                    if boundary.distance(pt) < grid_step_m:
+                        inside[i, j] = True
+                except Exception:
+                    pass
+
+    if not inside.any():
+        return None
+
+    # ── Pin anchors ─────────────────────────────────────────────
+    # Each hard anchor pins its NEAREST INSIDE cell to its elevation.
+    # Multiple anchors hitting the same cell are averaged (rare —
+    # implies two rect corners within one grid cell, which means
+    # they should be the same shared-vertex bucket already).
+    pinned = np.zeros((nx, ny), dtype=bool)
+    pinned_elev = np.zeros((nx, ny), dtype=float)
+    pinned_count = np.zeros((nx, ny), dtype=int)
+    eff_anchors: List[Tuple[float, float, float]] = []
+    for (ax, ay, az) in hard_anchors:
+        i = int(round((ax - minx) / grid_step_m))
+        j = int(round((ay - miny) / grid_step_m))
+        if 0 <= i < nx and 0 <= j < ny:
+            # Snap to the nearest INSIDE cell within a 1-cell radius
+            # (anchors at the boundary may map to an INACTIVE cell).
+            if not inside[i, j]:
+                snapped = False
+                for di in range(-1, 2):
+                    for dj in range(-1, 2):
+                        ii, jj = i + di, j + dj
+                        if (0 <= ii < nx and 0 <= jj < ny
+                                and inside[ii, jj]):
+                            i, j = ii, jj
+                            snapped = True
+                            break
+                    if snapped:
+                        break
+                if not snapped:
+                    continue
+            if pinned[i, j]:
+                pinned_elev[i, j] = (
+                    pinned_elev[i, j] * pinned_count[i, j] + az
+                ) / (pinned_count[i, j] + 1)
+                pinned_count[i, j] += 1
+            else:
+                pinned[i, j] = True
+                pinned_elev[i, j] = az
+                pinned_count[i, j] = 1
+            eff_anchors.append((float(xs[i]), float(ys[j]),
+                                float(pinned_elev[i, j])))
+
+    # ── Per-cell feasibility band ───────────────────────────────
+    INF = float("inf")
+    lo = np.full((nx, ny), -INF, dtype=float)
+    hi = np.full((nx, ny), INF, dtype=float)
+    if eff_anchors:
+        XX, YY = np.meshgrid(xs, ys, indexing="ij")
+        for (ax, ay, az) in eff_anchors:
+            dist = np.hypot(XX - ax, YY - ay)
+            band = dist * TAXI_MAX_GRADE
+            lo = np.maximum(lo, az - band)
+            hi = np.minimum(hi, az + band)
+
+    # ── Initialize cells ────────────────────────────────────────
+    # Pinned: their anchor elevation.  Free: prefer the elevation
+    # graph's already-grade-compliant network value (smoothed at
+    # 1.5 % across the centerline graph), falling back to DEM
+    # only when the cell is too far from the network for graph
+    # sampling to return.  Using the graph first preserves grade
+    # compliance for free cells beyond any anchor cone's reach —
+    # raw DEM-init lets real-terrain bumps leak into the polygon's
+    # interior, producing wild boundary samples.
+    elev = pinned_elev.copy()
+    cos0 = math.cos(math.radians(layout_anchor[0]))
+    lat0, lon0 = layout_anchor
+    for i in range(nx):
+        for j in range(ny):
+            if not inside[i, j] or pinned[i, j]:
+                continue
+            d = None
+            if graph is not None:
+                d = graph.elevation_at(float(xs[i]), float(ys[j]))
+            if d is None and dem is not None:
+                lat = lat0 + math.degrees(ys[j] / R_EARTH)
+                lon = (lon0 + math.degrees(
+                    xs[i] / (R_EARTH * cos0)))
+                d = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+            l = lo[i, j]
+            h = hi[i, j]
+            if d is None:
+                if l == -INF and h == INF:
+                    elev[i, j] = 0.0
+                elif l == -INF:
+                    elev[i, j] = h
+                elif h == INF:
+                    elev[i, j] = l
+                else:
+                    elev[i, j] = 0.5 * (l + h)
+            else:
+                if l > h:
+                    elev[i, j] = 0.5 * (l + h)
+                else:
+                    elev[i, j] = max(l, min(h, d))
+
+    # ── Iterate Laplacian + grade cap ───────────────────────────
+    step_cap = grid_step_m * TAXI_MAX_GRADE
+    inside_arr = inside
+    pinned_arr = pinned
+    free_inside = inside_arr & ~pinned_arr
+    damping = 0.5
+
+    for _ in range(max_iters):
+        # Laplacian — average of 4 cardinal INSIDE neighbours.
+        e_pad = np.pad(elev, 1, mode="edge")
+        in_pad = np.pad(inside_arr, 1, mode="constant",
+                        constant_values=False)
+        n_e = e_pad[2:, 1:-1]
+        n_w = e_pad[:-2, 1:-1]
+        n_n = e_pad[1:-1, 2:]
+        n_s = e_pad[1:-1, :-2]
+        m_e = in_pad[2:, 1:-1]
+        m_w = in_pad[:-2, 1:-1]
+        m_n = in_pad[1:-1, 2:]
+        m_s = in_pad[1:-1, :-2]
+        cnt = (m_e.astype(np.int8)
+               + m_w.astype(np.int8)
+               + m_n.astype(np.int8)
+               + m_s.astype(np.int8))
+        sum_n = (n_e * m_e + n_w * m_w + n_n * m_n + n_s * m_s)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean_n = np.where(cnt > 0,
+                              sum_n / np.maximum(cnt, 1),
+                              elev)
+        target = elev + damping * (mean_n - elev)
+        new_elev = np.where(free_inside, target, elev)
+        # Clip free cells back into feasibility bands.
+        new_elev = np.where(
+            free_inside,
+            np.maximum(np.minimum(new_elev, hi), lo),
+            new_elev)
+
+        # Edge grade cap on each axis-aligned cell pair.
+        for axis in (0, 1):
+            if axis == 0:
+                a = new_elev[:-1, :]
+                b = new_elev[1:, :]
+                ia = inside_arr[:-1, :]
+                ib = inside_arr[1:, :]
+                pa = pinned_arr[:-1, :]
+                pb = pinned_arr[1:, :]
+            else:
+                a = new_elev[:, :-1]
+                b = new_elev[:, 1:]
+                ia = inside_arr[:, :-1]
+                ib = inside_arr[:, 1:]
+                pa = pinned_arr[:, :-1]
+                pb = pinned_arr[:, 1:]
+            both_inside = ia & ib
+            diff = a - b
+            need = both_inside & (np.abs(diff) > step_cap)
+            sign = np.sign(diff)
+            excess = np.maximum(np.abs(diff) - step_cap, 0.0)
+            both_free = (~pa) & (~pb)
+            a_pinned = pa & (~pb)
+            b_pinned = pb & (~pa)
+            half = 0.5 * excess * sign
+            corr_a_both = -half
+            corr_b_both = half
+            corr_b_apf = excess * sign
+            corr_a_bpf = -excess * sign
+            apply_both = need & both_free
+            apply_b_apf = need & a_pinned
+            apply_a_bpf = need & b_pinned
+            if axis == 0:
+                new_elev[:-1, :] = np.where(
+                    apply_both, a + corr_a_both, new_elev[:-1, :])
+                new_elev[1:, :] = np.where(
+                    apply_both, b + corr_b_both, new_elev[1:, :])
+                new_elev[1:, :] = np.where(
+                    apply_b_apf, b + corr_b_apf, new_elev[1:, :])
+                new_elev[:-1, :] = np.where(
+                    apply_a_bpf, a + corr_a_bpf, new_elev[:-1, :])
+            else:
+                new_elev[:, :-1] = np.where(
+                    apply_both, a + corr_a_both, new_elev[:, :-1])
+                new_elev[:, 1:] = np.where(
+                    apply_both, b + corr_b_both, new_elev[:, 1:])
+                new_elev[:, 1:] = np.where(
+                    apply_b_apf, b + corr_b_apf, new_elev[:, 1:])
+                new_elev[:, :-1] = np.where(
+                    apply_a_bpf, a + corr_a_bpf, new_elev[:, :-1])
+            # Re-pin: pinned cells must never have their elevation
+            # mutated by the cap pass.
+            new_elev = np.where(pinned_arr, pinned_elev, new_elev)
+
+        max_change = float(np.max(np.abs(new_elev - elev)))
+        elev = new_elev
+        if max_change < convergence_tol_m:
+            break
+
+    # ── Bilinear sampler closure ────────────────────────────────
+    def sampler(x: float, y: float) -> Optional[float]:
+        fi = (x - minx) / grid_step_m
+        fj = (y - miny) / grid_step_m
+        i0 = int(math.floor(fi))
+        j0 = int(math.floor(fj))
+        if i0 < 0:
+            i0 = 0
+        if j0 < 0:
+            j0 = 0
+        if i0 > nx - 2:
+            i0 = nx - 2
+        if j0 > ny - 2:
+            j0 = ny - 2
+        u = fi - i0
+        v = fj - j0
+        if u < 0:
+            u = 0.0
+        elif u > 1:
+            u = 1.0
+        if v < 0:
+            v = 0.0
+        elif v > 1:
+            v = 1.0
+        m00 = inside[i0, j0]
+        m10 = inside[i0 + 1, j0]
+        m01 = inside[i0, j0 + 1]
+        m11 = inside[i0 + 1, j0 + 1]
+        if m00 and m10 and m01 and m11:
+            c00 = elev[i0, j0]
+            c10 = elev[i0 + 1, j0]
+            c01 = elev[i0, j0 + 1]
+            c11 = elev[i0 + 1, j0 + 1]
+            e0 = c00 * (1 - u) + c10 * u
+            e1 = c01 * (1 - u) + c11 * u
+            return float(e0 * (1 - v) + e1 * v)
+        # Fallback: nearest INSIDE cell within a 2-cell radius.
+        best_d2 = float("inf")
+        best_e: Optional[float] = None
+        for di in range(-2, 4):
+            for dj in range(-2, 4):
+                ii = i0 + di
+                jj = j0 + dj
+                if (0 <= ii < nx and 0 <= jj < ny
+                        and inside[ii, jj]):
+                    d2 = (xs[ii] - x) ** 2 + (ys[jj] - y) ** 2
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_e = float(elev[ii, jj])
+        return best_e
+
+    return sampler
 
 
 # ── Junction triangulation pass ──────────────────────────────────
@@ -3137,7 +4878,19 @@ def _triangulate_junctions(
     # Computed lazily and cached: the first junction to look up a
     # shared-bucket vertex computes its elevation; subsequent
     # junctions read the same value.
-    shared_junction_elev: Dict[Tuple[int, int], float] = {}
+    # Two-tier cache so we can distinguish where a shared-bucket
+    # value came from: rect-corner / near-corner / edge-interp
+    # (HARD — same physical pavement element pinned the value, must
+    # be preserved) versus graph or DEM (SOFT — sampled from a 1.5 %
+    # network-distance-compliant model, but not 2D-Euclidean
+    # compliant against other graph samples that may be far on the
+    # network but close in 2D).  Junction-local smoothing must be
+    # free to move SOFT values into 2D grade compliance; the cross-
+    # junction iteration below averages SOFT shared-bucket values
+    # across every junction that touches the bucket so junctions
+    # still agree on a single shared elevation.
+    shared_junction_elev: Dict[Tuple[int, int], float] = {}      # HARD
+    shared_junction_elev_soft: Dict[Tuple[int, int], float] = {}  # SOFT
 
     # Flat list of (cx, cy, elev) for nearest-corner search beyond
     # the 0.5 m bucket.  Catches boundary vertices that landed close
@@ -3229,26 +4982,42 @@ def _triangulate_junctions(
 
     def _vertex_elev_anchored(x: float, y: float
                               ) -> Tuple[Optional[float], bool]:
-        """Return ``(elev, is_anchor)``.  ``is_anchor`` is True if
-        the elevation came from a corner, rect-edge interpolation,
-        or another junction's prior smoothed value at this same
-        bucket (must not be moved by junction-local smoothing).
-        False means a graph / DEM sample that the smoothing pass is
-        free to pull into grade compliance."""
+        """Return ``(elev, is_anchor)``.  ``is_anchor`` is True only
+        for HARD anchor sources: rect / runway / terminal corner
+        elevations (whether matched by exact bucket or off-bucket
+        near-corner / edge-interp search), or a value already cached
+        from such a source on a prior shared-bucket lookup.  Returns
+        is_anchor=False for graph- or DEM-sampled values so the
+        boundary smoother and Mode B grid are free to pull them into
+        2D Euclidean grade compliance with the real anchors —
+        graph-derived values respect 1.5 % over **network distance**
+        (centerline graph), which can yield arbitrarily large 2D
+        steps between graph nodes that are far on the network but
+        close in 2D.  Cross-junction agreement on shared SOFT
+        buckets is restored by the cross-junction averaging pass in
+        the outer iteration below."""
         bucket = _corner_elevation_bucket(x, y)
         # 1. Bucket lookup — exact shared-vertex match against
-        # rect / runway / terminal corners.
+        # rect / runway / terminal corners.  HARD.
         e = corner_elev.get(bucket)
         if e is not None:
             return e, True
-        # 2. Cross-junction shared bucket — if another junction
-        # has already locked this bucket's elevation, reuse it so
-        # both junctions render at the same height at the shared
-        # boundary point.
+        # 2a. Cross-junction shared bucket previously locked from a
+        # HARD source (rect corner / near-corner / edge-interp).
         e_shared = shared_junction_elev.get(bucket)
         if e_shared is not None:
             return e_shared, True
+        # 2b. Cross-junction shared bucket previously sampled from a
+        # SOFT source (graph / DEM).  Reuse the value so this call
+        # returns deterministically consistent with the first
+        # junction that touched the bucket — but mark it FREE so
+        # smoothing can still move it.
+        e_shared_soft = shared_junction_elev_soft.get(bucket)
+        if e_shared_soft is not None:
+            return e_shared_soft, False
         # 3. Wider linear search for off-bucket near-corner matches.
+        # Treated as HARD: the value comes from a real rect / runway /
+        # terminal corner physically nearby.
         best_e: Optional[float] = None
         best_d2 = NEAR_CORNER_M * NEAR_CORNER_M
         for cx, cy, ce in near_corner_list:
@@ -3263,15 +5032,16 @@ def _triangulate_junctions(
         # 4. Rect-edge interpolation — pulls junction vertices
         # pushed 1m off a long edge (or any boundary-trace vertex
         # within NEAR_EDGE_M of a rect/runway/terminal edge) onto
-        # the rect's slope at the projected position.
+        # the rect's slope at the projected position.  HARD.
         e_edge = _edge_interp_elev(x, y)
         if e_edge is not None:
             if bucket in shared_junction_buckets:
                 shared_junction_elev[bucket] = e_edge
             return e_edge, True
-        # 5. Free sample.  Anchor it if it's shared between
-        # junctions (deterministic graph value -> same anchor
-        # for both junctions).
+        # 5. Free sample from graph / DEM.  SOFT — caller's smoother
+        # is free to move this value.  Cache shared-bucket values
+        # in the SOFT cache so subsequent junctions see the same
+        # initial value.
         e_free: Optional[float] = None
         if graph is not None:
             e_free = graph.elevation_at(x, y)
@@ -3281,8 +5051,7 @@ def _triangulate_junctions(
         if e_free is None:
             return None, False
         if bucket in shared_junction_buckets:
-            shared_junction_elev[bucket] = e_free
-            return e_free, True
+            shared_junction_elev_soft[bucket] = e_free
         return e_free, False
 
     def _smooth_junction_boundary(
@@ -3383,20 +5152,17 @@ def _triangulate_junctions(
                 break
         return e
 
-    new_shapes: List[BuiltShape] = []
-    triangle_count = 0
-    grade_violations = 0
+    # ── Per-junction ring cleanup (independent of elevation) ────
+    # Build the cleaned ring + Polygon once per junction; reuse
+    # across every cross-junction iteration so we don't redo
+    # geometric cleanup at each pass.
+    junction_cleaned: List[Tuple["BuiltShape",
+                                  List[Tuple[float, float]],
+                                  Polygon]] = []
+    junction_dropped_shapes: List["BuiltShape"] = []
     for shape in layout.shapes:
         if shape.role != ROLE_JUNCTION:
-            new_shapes.append(shape)
             continue
-        # Splice any interior holes into the exterior so triangulation
-        # incorporates hole-boundary vertices (typically rect corners
-        # for rects fully enclosed by an apron-style junction).
-        # Without splicing, the triangulation covers the holes too
-        # and the included rect's corners never become triangle
-        # vertices — producing visible elevation steps along the
-        # rect's long edge inside the apron.
         try:
             ring = _splice_holes(shape.polygon)
         except Exception:
@@ -3405,56 +5171,162 @@ def _triangulate_junctions(
                 if ring and ring[0] == ring[-1]:
                     ring = ring[:-1]
             except Exception:
-                new_shapes.append(shape)
+                # Couldn't extract a ring at all — preserve the
+                # original shape unchanged downstream.
+                junction_dropped_shapes.append(shape)
                 continue
         if len(ring) < 3:
-            continue  # degenerate junction; drop
-        # Drop non-shared, non-corner-anchored vertices whose
-        # perpendicular distance to the line through their two
-        # neighbours is below COLINEAR_DROP_M.  Without this, a
-        # long apt.dat boundary trace with closely-spaced near-
-        # colinear vertices forces ear-clipping to emit slivers
-        # whose plane gradient perpendicular to the long axis can
-        # exceed 50 % even when no triangle EDGE violates grade.
-        # Preserved vertices: anything in the corner-elev bucket
-        # (rect/runway/terminal corner) or any cross-junction
-        # shared bucket — those carry topological meaning beyond
-        # boundary tracing and must not be removed.
+            continue
         ring = _drop_colinear_boundary_vertices(
             ring, corner_elev, shared_junction_buckets)
         if len(ring) < 3:
             continue
-        # Drop spike vertices: any ring vertex that lies on (or
-        # within sub-mm of) a NON-adjacent edge of the same ring.
-        # Source: residue / decomposition / seam-injection passes
-        # can occasionally produce a "stick-out-and-return"
-        # boundary where the ring ventures away from a straight
-        # section and returns onto it.  Such polygons are valid in
-        # shapely's eyes at full float precision but become hard
-        # self-intersections after the .11f OSM truncation —
-        # crash X-Plane's mesh builder.  Drop the spike vertex
-        # (eliminates the near-zero-area lobe).
         ring = _drop_spike_vertices(ring)
         if len(ring) < 3:
             continue
-        # Vertex elevations + anchor flags.
+        ring = _drop_sliver_corners(ring)
+        if len(ring) < 3:
+            continue
+        try:
+            poly = Polygon(ring)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if (poly.is_empty or poly.geom_type != "Polygon"
+                    or poly.area < 0.5):
+                continue
+        except Exception:
+            continue
+        junction_cleaned.append((shape, ring, poly))
+
+    # ── Single-pass per-junction smoothing + shared-vertex
+    # reconciliation.  Per-junction smoothing alone moves SOFT
+    # (graph-derived) boundary vertices independently in each
+    # junction that touches the same shared bucket, breaking the
+    # shared-vertex invariant.  After all junctions have smoothed,
+    # we walk every shared SOFT bucket and overwrite each junction's
+    # value with the cross-junction average; this restores
+    # consistency at shared vertices.
+    #
+    # Per the elevation field plan (2026-04-26), Step 3's iterative
+    # variant of this — average then lock then re-smooth — was
+    # tried and made within-shape grade worse, because forcing the
+    # average at a shared vertex pulls it away from each junction's
+    # locally-optimal smooth solution and constrains the next
+    # smoothing round.  A single average pass keeps the per-
+    # junction smoothing's local optimum and only sacrifices a
+    # small grade residual at shared vertices.
+    iter_results: List[Tuple["BuiltShape",
+                             List[Tuple[float, float]],
+                             List[float]]] = []
+    for (shape, ring, poly) in junction_cleaned:
         ev_pairs = [_vertex_elev_anchored(x, y) for (x, y) in ring]
         vert_elev_raw: List[Optional[float]] = [p[0] for p in ev_pairs]
         is_anchor_list: List[bool] = [p[1] for p in ev_pairs]
-        # Fill any None gaps with the average of known neighbours
-        # (or 0.0 if all are unknown — should not happen).
         known = [e for e in vert_elev_raw if e is not None]
         fallback = sum(known) / len(known) if known else 0.0
         vert_elev = [e if e is not None else fallback
                      for e in vert_elev_raw]
-        # Junction-local smoothing: pull non-anchored vertex
-        # elevations into pairwise grade compliance with their
-        # neighbours.  Anchored (corner-derived) vertices are
-        # untouchable so the shared-vertex invariant with rect /
-        # runway / terminal corners is preserved.
+        # Mode B (gated): replace free-vertex elevations with
+        # bilinear samples from a 2D smoothed field.  Hard anchors
+        # keep their corner-derived value.
+        if USE_PER_POLYGON_ELEVATION_FIELD:
+            try:
+                _anchors_b: List[
+                    Tuple[float, float, float]] = [
+                        (rx, ry, e)
+                        for (rx, ry), e, isa in zip(
+                            ring, vert_elev, is_anchor_list)
+                        if isa]
+                sampler_b = _smooth_polygon_grid(
+                    poly, _anchors_b, graph, dem,
+                    tile_lat, tile_lon, layout.anchor)
+                if sampler_b is not None:
+                    for k, (rx, ry) in enumerate(ring):
+                        if is_anchor_list[k]:
+                            continue
+                        e_b = sampler_b(rx, ry)
+                        if e_b is not None:
+                            vert_elev[k] = float(e_b)
+            except Exception:
+                pass
+        # Junction-local 1D boundary smoothing — pull free vertices
+        # into anchor-band compliance with the polygon's hard
+        # anchors.
         vert_elev = _smooth_junction_boundary(
             ring, vert_elev, is_anchor_list)
+        iter_results.append((shape, ring, vert_elev))
 
+    # Cross-junction shared-vertex reconciliation.  Per-junction
+    # smoothing moves SOFT (graph-derived) shared boundary vertices
+    # independently — at most shared buckets the moves agree across
+    # all junctions to within a small tolerance (junctions have
+    # similar local boundaries near a shared vertex), but at some
+    # buckets the per-junction smoothing diverges and we'd ship a
+    # visible cross-shape cliff.  For the divergent buckets, revert
+    # to the cached SOFT graph value (which both junctions would
+    # have read consistently anyway — same as baseline behaviour
+    # for shared buckets).  Where smoothing converged consistently
+    # across junctions, keep the smoothed value (this is the
+    # within-shape-grade win that the SOFT classification
+    # delivers).
+    # Cross-junction reconciliation at shared SOFT buckets.  Each
+    # junction's per-junction smoother moved its copy of the
+    # shared vertex toward its own neighbour mean, so two
+    # junctions touching the same bucket can disagree on the
+    # final elevation.  For buckets where the disagreement
+    # exceeds SHARED_AGREE_TOL_M we average across all junctions
+    # and overwrite — restoring the shared-vertex invariant at
+    # the cost of a small within-shape grade residual local to
+    # that vertex.  For buckets where every junction's smoother
+    # already converged to within tolerance, we leave the
+    # per-junction values alone — preserving the SOFT
+    # classification's within-shape-grade win.  The tolerance is
+    # generous (0.10 m, 1 % grade across a 10 m shared edge) so
+    # most shared SOFT buckets pass without averaging.  Constant
+    # is module-level so both legacy and Mode B paths can use it.
+    shared_smooth_samples: Dict[
+        Tuple[int, int], List[float]] = {}
+    for (shape, ring, vert_elev) in iter_results:
+        seen: set = set()
+        for (vx, vy), e in zip(ring, vert_elev):
+            bucket = _corner_elevation_bucket(vx, vy)
+            if bucket in seen:
+                continue
+            seen.add(bucket)
+            if bucket in corner_elev:
+                continue
+            if bucket not in shared_junction_buckets:
+                continue
+            if bucket not in shared_junction_elev_soft:
+                continue
+            shared_smooth_samples.setdefault(
+                bucket, []).append(e)
+    shared_lock: Dict[Tuple[int, int], float] = {}
+    for bucket, vals in shared_smooth_samples.items():
+        if len(vals) >= 2 and (
+                max(vals) - min(vals) > SHARED_AGREE_TOL_M):
+            shared_lock[bucket] = sum(vals) / len(vals)
+    if shared_lock:
+        for (shape, ring, vert_elev) in iter_results:
+            for k, (vx, vy) in enumerate(ring):
+                bucket = _corner_elevation_bucket(vx, vy)
+                if bucket in shared_lock:
+                    vert_elev[k] = shared_lock[bucket]
+
+    new_shapes: List[BuiltShape] = []
+    triangle_count = 0
+    grade_violations = 0
+    # Carry every non-junction shape through unchanged, plus any
+    # junction shape that failed pre-loop cleanup.
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            new_shapes.append(shape)
+    for shape in junction_dropped_shapes:
+        new_shapes.append(shape)
+    # Emit each cleaned junction with its post-iteration vert_elev
+    # passed through the existing densify + FLAT/PLANAR/COMPOUND
+    # classifier.
+    for (shape, ring, vert_elev) in iter_results:
         # Densify long boundary edges (user 2026-04-25): for any
         # ring segment longer than MAX_BOUNDARY_EDGE_M, insert
         # interpolated midpoints.  Each midpoint's elevation is
@@ -3552,9 +5424,22 @@ def _triangulate_junctions(
             except Exception:
                 pass  # fall through to triangulation
         # Best-fit plane: solve ax + by + c = z via 3×3 normal eqns.
-        residuals = _planar_fit_residuals(ring, vert_elev)
+        # Classify as PLANAR only when the fit's residuals are tight
+        # AND the plane's slope itself is grade-compliant.  A polygon
+        # whose vertices lie on a 5 % plane has tiny residuals but
+        # X-Plane would render a 5 % cross-grade across the polygon
+        # — well above TAXI_MAX_GRADE.  Demote those to COMPOUND so
+        # _smooth_junction_boundary's anchor-band clamping pulls the
+        # free vertices into compliance instead.
+        plane = _planar_fit(ring, vert_elev)
+        residuals = plane[3] if plane is not None else None
+        if plane is not None:
+            slope_mag = math.hypot(plane[0], plane[1])
+        else:
+            slope_mag = float("inf")
         if (residuals is not None
-                and max(residuals) < PLANAR_RESIDUAL_M):
+                and max(residuals) < PLANAR_RESIDUAL_M
+                and slope_mag <= TAXI_MAX_GRADE):
             # PLANAR — single polygon, per-vertex altitudes.
             try:
                 planar_poly = Polygon(ring)
@@ -3651,7 +5536,955 @@ def _triangulate_junctions(
     return triangle_count
 
 
+# Layer 2: free-vertex clamping with neighbour-boundary lookup ─────
+#
+# After _triangulate_junctions sets every junction's per-vertex
+# elevation, walk each junction's boundary and tighten any FREE
+# vertex (one whose elevation is NOT pinned to a rect/runway/
+# terminal corner or to another junction's shared vertex) so that
+# it satisfies grade compliance with every nearby shape boundary
+# point — not just the same-polygon anchored vertices considered
+# during the first smoothing pass.
+#
+# Why a separate pass:
+#   The first-pass smoothing (_smooth_junction_boundary) only
+#   considers anchors WITHIN the same polygon.  Adjacent junction
+#   polygons that are 1.5–5 m apart but don't share node IDs
+#   (HECA's "adjacent-but-not-shared" pattern) can have their
+#   nearby boundary vertices drift to incompatible elevations,
+#   producing the visible sunken-area / elevated-plateau cliffs
+#   the user reported at SPJC and the 159% within-shape grade
+#   violations at HECA.
+#
+# What this pass does NOT change:
+#   * Rect / runway / terminal altitudes — those are derived from
+#     the elevation graph and the 1.5 % grade rule along the taxi
+#     network; this pass operates only on junction polygons.
+#   * Anchored junction vertices (shared with another shape via
+#     the OSM nid).  Moving them would break the shared-vertex
+#     invariant.
+#
+# Where it operates:
+#   For each junction polygon's free vertex V at coord (x, y) with
+#   current elevation e_v, scan every other shape's boundary
+#   edges within NEIGHBOUR_CLAMP_RADIUS_M.  Each nearby boundary
+#   point E at distance d contributes a feasibility band
+#   ``[E_elev − d × TAXI_MAX_GRADE, E_elev + d × TAXI_MAX_GRADE]``.
+#   Intersect these bands and clip e_v.  When the intersection is
+#   empty (anchors disagree), fall back to the midpoint — Layer 1
+#   will eventually reconcile the conflicting anchors.
+NEIGHBOUR_CLAMP_RADIUS_M = 5.0
+
+
+def _clamp_junction_free_vertices(layout: "PavementLayout") -> int:
+    """Per-junction free-vertex clamp using every nearby shape
+    boundary as a soft anchor (Layer 2).
+
+    Returns the number of free-vertex elevations that changed
+    (informational).  Mutates each junction's
+    ``node_altitudes`` and ``altitude`` in place.
+    """
+    if layout.anchor is None:
+        return 0
+    cos0 = math.cos(math.radians(layout.anchor[0]))
+
+    def _to_m(lat: float, lon: float) -> Tuple[float, float]:
+        x = math.radians(lon - layout.anchor[1]) * R_EARTH * cos0
+        y = math.radians(lat - layout.anchor[0]) * R_EARTH
+        return x, y
+
+    # Build a global pool of boundary edges + per-endpoint elevation
+    # for every emitted shape.  Each entry: (shape_idx, ax, ay, bx,
+    # by, ea, eb).  The shape_idx lets us skip the polygon's own
+    # edges when clamping its own free vertices.
+    boundary_edges: List[Tuple[int, float, float, float, float,
+                               float, float]] = []
+    # Also collect the SHARED-NID set: any nid referenced by 2+
+    # shapes is treated as anchored on every polygon that uses it
+    # (cross-shape continuity).  to_osm's bucket dedup means two
+    # shapes that share a corner get the same OSM nid; we approx
+    # the same here using bucket coords.
+    bucket_count: Dict[Tuple[int, int], int] = {}
+    for si, s in enumerate(layout.shapes):
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        # Per-vertex elevations for THIS shape.
+        if s.altitude is not None:
+            elevs = [float(s.altitude)] * len(coords)
+        elif (s.altitude_high is not None
+              and s.altitude_low is not None
+              and len(coords) == 4):
+            elevs = [float(s.altitude_high),
+                     float(s.altitude_low),
+                     float(s.altitude_low),
+                     float(s.altitude_high)]
+        elif s.node_altitudes is not None:
+            # node_altitudes spans the closed ring (one value per
+            # vertex INCLUDING the closing repeat).  Drop the last.
+            na = list(s.node_altitudes)
+            if len(na) == len(coords) + 1:
+                na = na[:-1]
+            if len(na) != len(coords):
+                continue
+            elevs = [float(e) for e in na]
+        else:
+            continue
+        for vi, (cx, cy) in enumerate(coords):
+            bucket = _corner_elevation_bucket(cx, cy)
+            bucket_count[bucket] = bucket_count.get(bucket, 0) + 1
+        n = len(coords)
+        for i in range(n):
+            ax, ay = coords[i]
+            bx, by = coords[(i + 1) % n]
+            ea = elevs[i]
+            eb = elevs[(i + 1) % n]
+            boundary_edges.append((si, ax, ay, bx, by, ea, eb))
+
+    shared_buckets = {b for b, c in bucket_count.items() if c >= 2}
+    rect_like_roles = {ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+                       ROLE_CROSS_CONNECTOR, ROLE_TERMINAL}
+
+    # Track each boundary edge's bucket-key endpoints so we can
+    # cheaply detect "is this edge incident to vertex V?" later.
+    edge_endpoints: List[Tuple[Tuple[int, int],
+                                Tuple[int, int]]] = []
+    for (_, ax, ay, bx, by, _, _) in boundary_edges:
+        edge_endpoints.append((
+            _corner_elevation_bucket(ax, ay),
+            _corner_elevation_bucket(bx, by)))
+
+    # Spatial index for boundary_edges to avoid the O(n²) scan
+    # for very complex airports (HECA has 5113 boundary vertices →
+    # the inner loop is otherwise unbounded).  Build a grid keyed
+    # by integer cell of size NEIGHBOUR_CLAMP_RADIUS_M.
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    cell = NEIGHBOUR_CLAMP_RADIUS_M
+    for ei, (_, ax, ay, bx, by, _, _) in enumerate(boundary_edges):
+        # Insert into all cells the segment's bbox touches.
+        x0, x1 = (ax, bx) if ax <= bx else (bx, ax)
+        y0, y1 = (ay, by) if ay <= by else (by, ay)
+        ix0 = int(math.floor((x0 - cell) / cell))
+        ix1 = int(math.floor((x1 + cell) / cell))
+        iy0 = int(math.floor((y0 - cell) / cell))
+        iy1 = int(math.floor((y1 + cell) / cell))
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                grid.setdefault((ix, iy), []).append(ei)
+
+    n_changed = 0
+    for si, s in enumerate(layout.shapes):
+        if s.role != ROLE_JUNCTION:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        # Build per-vertex elevations and FREE-vs-anchored flags.
+        if s.altitude is not None:
+            elevs = [float(s.altitude)] * len(coords)
+            uniform_alt = True
+        elif s.node_altitudes is not None:
+            na = list(s.node_altitudes)
+            if len(na) == len(coords) + 1:
+                na = na[:-1]
+            if len(na) != len(coords):
+                continue
+            elevs = [float(e) for e in na]
+            uniform_alt = False
+        else:
+            continue
+        # A vertex is ANCHORED if its bucket is shared with another
+        # shape (rect/runway/terminal or another junction with the
+        # same coord).  We check via the shared_buckets set.
+        is_anchor = []
+        for (cx, cy) in coords:
+            b = _corner_elevation_bucket(cx, cy)
+            is_anchor.append(b in shared_buckets)
+        # Now clamp each FREE vertex.
+        new_elevs = list(elevs)
+        for vi, (cx, cy) in enumerate(coords):
+            if is_anchor[vi]:
+                continue
+            ix = int(math.floor(cx / cell))
+            iy = int(math.floor(cy / cell))
+            lo_v = float("-inf")
+            hi_v = float("inf")
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    bucket = (ix + dx, iy + dy)
+                    if bucket not in grid:
+                        continue
+                    v_bucket = _corner_elevation_bucket(cx, cy)
+                    for ei in grid[bucket]:
+                        (s_other, ax, ay, bx, by,
+                         ea, eb) = boundary_edges[ei]
+                        # Skip ONLY edges incident to THIS vertex —
+                        # they trivially equal the vertex's own
+                        # elevation and would lock it in place.  All
+                        # other same-shape boundary edges DO
+                        # constrain it (the polygon's far-side
+                        # vertices, narrow-waist near-touches, etc.).
+                        ek0, ek1 = edge_endpoints[ei]
+                        if v_bucket == ek0 or v_bucket == ek1:
+                            continue
+                        edx = bx - ax
+                        edy = by - ay
+                        seg2 = edx * edx + edy * edy
+                        if seg2 < 0.04:
+                            continue
+                        t = ((cx - ax) * edx + (cy - ay) * edy) / seg2
+                        if t < 0.0:
+                            t = 0.0
+                        elif t > 1.0:
+                            t = 1.0
+                        ccx = ax + t * edx
+                        ccy = ay + t * edy
+                        d = math.hypot(cx - ccx, cy - ccy)
+                        if d > NEIGHBOUR_CLAMP_RADIUS_M:
+                            continue
+                        e_at = ea + t * (eb - ea)
+                        band = max(d, 0.01) * TAXI_MAX_GRADE
+                        if e_at - band > lo_v:
+                            lo_v = e_at - band
+                        if e_at + band < hi_v:
+                            hi_v = e_at + band
+            if lo_v > hi_v:
+                # Conflicting nearby anchors — pick midpoint as a
+                # least-squares-style compromise.  Layer 1 will
+                # eventually reconcile the source corners.
+                target = 0.5 * (lo_v + hi_v)
+            else:
+                target = elevs[vi]
+                if target < lo_v:
+                    target = lo_v
+                if target > hi_v:
+                    target = hi_v
+            target = round(target, 1)
+            if abs(target - elevs[vi]) > 0.05:
+                new_elevs[vi] = target
+                n_changed += 1
+        # Persist changes.
+        if uniform_alt:
+            # Was a single altitude; if any free vertex shifted, we
+            # have to switch to per-vertex node_altitudes.
+            if any(abs(new_elevs[i] - elevs[i]) > 0.05
+                   for i in range(len(elevs))):
+                elev_range = max(new_elevs) - min(new_elevs)
+                if elev_range < 0.05:
+                    s.altitude = round(
+                        sum(new_elevs) / len(new_elevs), 1)
+                else:
+                    s.altitude = None
+                    closed = list(new_elevs) + [new_elevs[0]]
+                    s.node_altitudes = closed
+        else:
+            # Already per-vertex.  Update node_altitudes (ring +
+            # closing repeat).
+            closed = list(new_elevs) + [new_elevs[0]]
+            s.node_altitudes = closed
+            # If everything collapsed to one value, switch back to
+            # flat altitude.
+            elev_range = max(new_elevs) - min(new_elevs)
+            if elev_range < 0.05:
+                s.altitude = round(
+                    sum(new_elevs) / len(new_elevs), 1)
+                s.node_altitudes = None
+    return n_changed
+
+
+SUBDIVIDE_VIOLATION_GRADE = 0.10   # 10 % — only attempt
+                                    # subdivision when the worst
+                                    # vertex pair exceeds this.
+                                    # Below 10 % the rendered cliff
+                                    # is small (< 1.5 m over 15 m)
+                                    # and not worth the polygon-
+                                    # split overhead.
+SUBDIVIDE_MAX_PAIR_DIST_M = 60.0   # only consider pairs within
+                                    # this radius — same as
+                                    # check_grade's
+                                    # WITHIN_SHAPE_MAX_PAIR_DIST_M
+                                    # (Triangle4XP-plausible edge).
+SUBDIVIDE_MIN_AREA_M2 = 5.0        # don't emit sub-polygons
+                                    # smaller than this — they'd
+                                    # become slivers and re-trigger
+                                    # the sliver-corner safety net.
+
+
+SUBDIVIDE_SNAP_RADIUS_M = 5.0      # snap new cut-line vertices
+                                    # to existing ring vertices when
+                                    # within this radius.  Without
+                                    # snapping, the cut introduces
+                                    # 0.5-2 m new vertices very
+                                    # close to existing ones; the
+                                    # interpolated-vs-original
+                                    # elevation mismatch over those
+                                    # tiny distances produces huge
+                                    # spurious grade percentages
+                                    # (worse than the original
+                                    # violation we were trying to fix).
+
+
+def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
+    """Split junction polygons whose worst within-shape vertex pair
+    exceeds ``SUBDIVIDE_VIOLATION_GRADE`` along a perpendicular
+    cut through the midpoint of the violating pair.
+
+    Cut-vertex placement: new vertices created where the cut line
+    intersects the polygon boundary are SNAPPED to existing ring
+    vertices within ``SUBDIVIDE_SNAP_RADIUS_M``.  Without snapping,
+    the cut creates ring-adjacent vertex pairs spaced 0.5-2 m apart
+    whose interpolated-vs-original elevations differ by small
+    amounts — registering as huge grade percentages
+    (e.g. 0.4 m / 0.5 m = 73.9 %) that are WORSE than the original
+    violation we were trying to fix.
+
+    Validation: a sub-polygon is only accepted when its own worst
+    within-shape vertex pair is BETTER (smaller grade) than the
+    parent's worst pair.  If the cut would produce a sub-polygon
+    that's MORE violating, the original is kept and the cut is
+    abandoned — prevents the iterative subdivision from making
+    things worse.
+
+    Returns the number of polygons that were subdivided
+    (informational).
+    """
+    if not layout.shapes:
+        return 0
+    from shapely.geometry import LineString
+    from shapely.ops import split as _shapely_split
+    n_subdivided = 0
+    new_shapes: List[BuiltShape] = []
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            new_shapes.append(s)
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            new_shapes.append(s)
+            continue
+        try:
+            ring = list(s.polygon.exterior.coords)
+        except Exception:
+            new_shapes.append(s)
+            continue
+        if ring and ring[0] == ring[-1]:
+            ring = ring[:-1]
+        n = len(ring)
+        if n < 4:
+            new_shapes.append(s)
+            continue
+        if s.altitude is not None:
+            elevs = [float(s.altitude)] * n
+        elif s.node_altitudes is not None:
+            na = list(s.node_altitudes)
+            if len(na) == n + 1:
+                na = na[:-1]
+            if len(na) != n:
+                new_shapes.append(s)
+                continue
+            elevs = [float(e) for e in na]
+        else:
+            new_shapes.append(s)
+            continue
+
+        def _worst_grade(pts: List[Tuple[float, float]],
+                         es: List[float]) -> Tuple[float,
+                                                    Optional[Tuple[int, int]]]:
+            """Return (worst_grade, worst_pair_idx) over all
+            vertex pairs of ``pts`` within
+            SUBDIVIDE_MAX_PAIR_DIST_M and > 0.5 m apart.  The
+            distance floor is critical: < 0.5 m pairs are
+            essentially the same vertex with rounding noise
+            and produce huge spurious grades."""
+            radius2 = SUBDIVIDE_MAX_PAIR_DIST_M ** 2
+            min_d2 = 0.5 ** 2
+            wg = 0.0
+            wp = None
+            m = len(pts)
+            for a in range(m):
+                xa, ya = pts[a]
+                ea = es[a]
+                for b in range(a + 1, m):
+                    xb, yb = pts[b]
+                    dx_ = xa - xb
+                    dy_ = ya - yb
+                    d2_ = dx_ * dx_ + dy_ * dy_
+                    if d2_ < min_d2 or d2_ > radius2:
+                        continue
+                    d_ = math.sqrt(d2_)
+                    de_ = abs(ea - es[b])
+                    if de_ <= TAXI_MAX_GRADE * d_ + 0.10:
+                        continue
+                    g_ = de_ / d_
+                    if g_ > wg:
+                        wg = g_
+                        wp = (a, b)
+            return wg, wp
+
+        worst_grade, worst_pair = _worst_grade(ring, elevs)
+        if (worst_pair is None
+                or worst_grade < SUBDIVIDE_VIOLATION_GRADE):
+            new_shapes.append(s)
+            continue
+        # Build the perpendicular cut line through the midpoint.
+        i, j = worst_pair
+        pi = ring[i]
+        pj = ring[j]
+        mx = 0.5 * (pi[0] + pj[0])
+        my = 0.5 * (pi[1] + pj[1])
+        dx = pj[0] - pi[0]
+        dy = pj[1] - pi[1]
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-6:
+            new_shapes.append(s)
+            continue
+        # Perpendicular unit vector (rotate +90°).
+        px = -dy / seg_len
+        py = dx / seg_len
+        bx_min, by_min, bx_max, by_max = s.polygon.bounds
+        bbox_diag = math.hypot(bx_max - bx_min, by_max - by_min)
+        L = max(bbox_diag * 2.0, 1000.0)
+        cut = LineString([
+            (mx - L * px, my - L * py),
+            (mx + L * px, my + L * py),
+        ])
+        try:
+            parts = _shapely_split(s.polygon, cut)
+        except Exception:
+            new_shapes.append(s)
+            continue
+        sub_polys: List[Polygon] = []
+        try:
+            for g in getattr(parts, "geoms", [parts]):
+                if (g is None or g.is_empty
+                        or g.geom_type != "Polygon"
+                        or g.area < SUBDIVIDE_MIN_AREA_M2):
+                    continue
+                sub_polys.append(g)
+        except Exception:
+            new_shapes.append(s)
+            continue
+        if len(sub_polys) < 2:
+            new_shapes.append(s)
+            continue
+
+        # Pre-compute snap-target ring vertices keyed by their
+        # squared snap radius for O(n) lookup per sub-vertex.
+        snap_r2 = SUBDIVIDE_SNAP_RADIUS_M ** 2
+
+        def _snap_to_ring(qx: float, qy: float
+                          ) -> Tuple[float, float, int]:
+            """Return the closest ring vertex within snap radius
+            and its index, or ``(qx, qy, -1)`` if no ring vertex
+            is close enough.
+            """
+            best_k = -1
+            best_d2 = snap_r2
+            for k in range(n):
+                rx, ry = ring[k]
+                d2 = (rx - qx) ** 2 + (ry - qy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_k = k
+            if best_k >= 0:
+                rx, ry = ring[best_k]
+                return rx, ry, best_k
+            return qx, qy, -1
+
+        def _lookup_elev(qx: float, qy: float, hint_idx: int
+                         ) -> float:
+            """Look up elevation for sub-polygon vertex.  When
+            ``hint_idx`` ≥ 0 (snapped to ring vertex) use the
+            original elevation directly.  Otherwise interpolate
+            along the closest original ring edge.
+            """
+            if hint_idx >= 0:
+                return elevs[hint_idx]
+            best_d2 = float("inf")
+            best_e = elevs[0]
+            for k in range(n):
+                ax, ay = ring[k]
+                bx, by = ring[(k + 1) % n]
+                edx = bx - ax
+                edy = by - ay
+                seg2 = edx * edx + edy * edy
+                if seg2 < 1e-9:
+                    continue
+                t = ((qx - ax) * edx + (qy - ay) * edy) / seg2
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                ccx = ax + t * edx
+                ccy = ay + t * edy
+                d2 = (qx - ccx) ** 2 + (qy - ccy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    ea = elevs[k]
+                    eb = elevs[(k + 1) % n]
+                    best_e = ea + t * (eb - ea)
+            return round(float(best_e), 1)
+
+        # Build snapped sub-polygons + per-vertex elevations.
+        # Acceptance criterion: each sub-polygon's own worst pair
+        # must be MEASURABLY better (≥ 0.5 % grade improvement)
+        # than the parent's worst.  This prevents cuts that
+        # technically separate the worst pair but introduce new
+        # cut-line-vertex pairs of similar magnitude (the bug
+        # that made the relaxed version worse than the strict).
+        validated_subs: List[Tuple[Polygon, List[Tuple[float, float]],
+                                    List[float]]] = []
+        cut_was_useful = True
+        for sp in sub_polys:
+            sub_ring_raw = list(sp.exterior.coords)
+            if sub_ring_raw and sub_ring_raw[0] == sub_ring_raw[-1]:
+                sub_ring_raw = sub_ring_raw[:-1]
+            snapped_pts: List[Tuple[float, float]] = []
+            snapped_hints: List[int] = []
+            for (qx, qy) in sub_ring_raw:
+                sx, sy, hint = _snap_to_ring(qx, qy)
+                if (snapped_pts and abs(snapped_pts[-1][0] - sx) < 1e-9
+                        and abs(snapped_pts[-1][1] - sy) < 1e-9):
+                    continue  # consecutive dup after snap
+                snapped_pts.append((sx, sy))
+                snapped_hints.append(hint)
+            while (len(snapped_pts) >= 2
+                   and abs(snapped_pts[0][0]
+                           - snapped_pts[-1][0]) < 1e-9
+                   and abs(snapped_pts[0][1]
+                           - snapped_pts[-1][1]) < 1e-9):
+                snapped_pts.pop()
+                snapped_hints.pop()
+            if len(snapped_pts) < 3:
+                cut_was_useful = False
+                break
+            try:
+                snapped_poly = Polygon(snapped_pts)
+                if not snapped_poly.is_valid:
+                    snapped_poly = snapped_poly.buffer(0)
+                if (snapped_poly.is_empty
+                        or snapped_poly.geom_type != "Polygon"
+                        or snapped_poly.area < SUBDIVIDE_MIN_AREA_M2):
+                    cut_was_useful = False
+                    break
+            except Exception:
+                cut_was_useful = False
+                break
+            sub_elevs = [_lookup_elev(qx, qy, h)
+                         for (qx, qy), h
+                         in zip(snapped_pts, snapped_hints)]
+            sub_worst, _ = _worst_grade(snapped_pts, sub_elevs)
+            if sub_worst >= worst_grade - 0.005:
+                cut_was_useful = False
+                break
+            validated_subs.append(
+                (snapped_poly, snapped_pts, sub_elevs))
+
+        if not cut_was_useful or len(validated_subs) < 2:
+            new_shapes.append(s)
+            continue
+
+        for sp, sub_pts, sub_elevs in validated_subs:
+            sub_shape = BuiltShape(
+                polygon=sp, role=ROLE_JUNCTION, ref=s.ref)
+            elev_range = max(sub_elevs) - min(sub_elevs)
+            if elev_range < 0.05:
+                sub_shape.altitude = round(
+                    sum(sub_elevs) / len(sub_elevs), 1)
+            else:
+                closed = list(sub_elevs) + [sub_elevs[0]]
+                sub_shape.node_altitudes = closed
+            new_shapes.append(sub_shape)
+        n_subdivided += 1
+    layout.shapes = new_shapes
+    return n_subdivided
+
+
+def _report_within_shape_violations(
+        layout: "PavementLayout", icao: str) -> None:
+    """Layer 3: scan every emitted polygon for vertex-pair grade
+    violations and emit a stderr WARN summary.
+
+    Pair set: only pairs within ``WITHIN_SHAPE_VIOLATION_RADIUS_M``
+    of each other (the same Triangle4XP-plausible-edge radius
+    check_grade.py uses).  Far-pair grades are noisy false
+    positives — Triangle4XP would interpose a Steiner point and
+    never connect them directly.
+    """
+    if not layout.shapes:
+        return
+    radius = WITHIN_SHAPE_VIOLATION_RADIUS_M
+    radius2 = radius * radius
+    cos0 = math.cos(math.radians(layout.anchor[0]))
+    n_viol = 0
+    worst_pct = 0.0
+    worst_info: Optional[Tuple[str, str, float, float, float, float]] = None
+    for s in layout.shapes:
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        n = len(coords)
+        if n < 3:
+            continue
+        if s.altitude is not None:
+            elevs = [float(s.altitude)] * n
+        elif s.node_altitudes is not None:
+            na = list(s.node_altitudes)
+            if len(na) == n + 1:
+                na = na[:-1]
+            if len(na) != n:
+                continue
+            elevs = [float(e) for e in na]
+        elif (s.altitude_high is not None and s.altitude_low is not None
+              and n == 4):
+            elevs = [float(s.altitude_high), float(s.altitude_low),
+                     float(s.altitude_low), float(s.altitude_high)]
+        else:
+            continue
+        # Convert ring to local meter coords for grade check.
+        coords_m = []
+        for (lon, lat) in coords:
+            # Some shapes' polygons store (x, y) in meters already
+            # (the new pavement builder works in meters); others
+            # might store (lon, lat).  Detect by magnitude.
+            if abs(lon) > 180.0 or abs(lat) > 180.0:
+                coords_m.append((lon, lat))  # already meters
+            else:
+                # lat/lon → meters
+                x = math.radians(lon - layout.anchor[1]) * R_EARTH * cos0
+                y = math.radians(lat - layout.anchor[0]) * R_EARTH
+                coords_m.append((x, y))
+        for i in range(n):
+            xi, yi = coords_m[i]
+            ei = elevs[i]
+            for j in range(i + 1, n):
+                xj, yj = coords_m[j]
+                dx = xi - xj
+                dy = yi - yj
+                d2 = dx * dx + dy * dy
+                if d2 > radius2 or d2 < 0.25:
+                    continue
+                d = math.sqrt(d2)
+                de = abs(ei - elevs[j])
+                if de <= TAXI_MAX_GRADE * d + 0.10:
+                    continue
+                pct = (de / d) * 100.0
+                if pct > worst_pct:
+                    worst_pct = pct
+                    worst_info = (
+                        s.role or "?", s.ref or "",
+                        ei, elevs[j], d, de)
+                n_viol += 1
+    if n_viol > 0:
+        try:
+            import sys as _sys
+            msg = (f"  [pav-builder] WARN: {icao}: {n_viol} within-shape "
+                   f"grade violations (> {TAXI_MAX_GRADE * 100:.1f}%, "
+                   f"checked pairs within {radius:.0f} m)")
+            if worst_info is not None:
+                role, ref, ea, eb, d, de = worst_info
+                rstr = f"/{ref}" if ref else ""
+                msg += (f"; worst {worst_pct:.1f}% on "
+                        f"{role}{rstr} ({ea:.1f} → {eb:.1f}, "
+                        f"d={d:.1f}m, de={de:.1f}m)")
+            msg += ".\n"
+            _sys.stderr.write(msg)
+        except Exception:
+            pass
+
+
+WITHIN_SHAPE_VIOLATION_RADIUS_M = 60.0   # max pair distance for
+                                          # within-shape violation
+                                          # reporting; matches
+                                          # check_grade.py's
+                                          # WITHIN_SHAPE_MAX_PAIR_DIST_M.
+
+
 SHARED_VERTEX_CLUSTER_TOL_M = 1.5
+
+
+def _drop_overlap_against_fixed_shapes(
+        layout: "PavementLayout",
+        icao: str = "") -> None:
+    """Enforce the no-overlap invariant on the layout.
+
+    Walks every shape and, where it overlaps another shape, modifies
+    or drops it so no two shapes overlap.  Order of priority (the
+    LATER a role appears in this list, the more it "yields"):
+
+    1. RUNWAY corners (CIFP-anchored, immutable footprint).
+    2. TAXI rect (one per OSM centerline; rect dedup ran upstream).
+    3. TERMINAL pad (OSM building).
+    4. JUNCTION (residue — must clip to fit around all of the above).
+
+    Strategy:
+
+    * Drop duplicate TERMINAL polygons (a terminal entirely inside
+      another terminal is a duplicate from OSM relation parsing).
+    * Drop duplicate or heavily-overlapping RUNWAY segments
+      (apron-merged runway segmentation can produce overlap with
+      the original single-rect runway).
+    * Clip each JUNCTION against every fixed shape (rect / runway /
+      terminal) and against larger junctions.  Iterate up to 4
+      passes so chained clips converge.
+
+    Mutates ``layout.shapes`` in place.
+    """
+    from shapely.strtree import STRtree
+    MIN_KEEP_AREA_M2 = 0.5
+    NOISE_OVERLAP_M2 = 1.0   # ignore sub-1 m² overlaps as float noise
+
+    def _valid_poly(p: Optional[Polygon]) -> Optional[Polygon]:
+        if p is None or p.is_empty:
+            return None
+        if p.geom_type != "Polygon":
+            return None
+        if not p.is_valid:
+            try:
+                p = p.buffer(0)
+            except Exception:
+                return None
+            if p.is_empty or p.geom_type != "Polygon":
+                return None
+        return p
+
+    def _clip_keep_largest(p: Polygon, c: Polygon
+                           ) -> Optional[Polygon]:
+        """Return ``p.difference(c)``, picking the largest piece if
+        the difference is a MultiPolygon.  Returns None if the
+        result is empty / below MIN_KEEP_AREA_M2."""
+        try:
+            d = p.difference(c)
+        except Exception:
+            return p
+        if d.is_empty:
+            return None
+        if d.geom_type == "Polygon":
+            return d if d.area >= MIN_KEEP_AREA_M2 else None
+        if d.geom_type == "MultiPolygon":
+            pieces = [g for g in d.geoms
+                      if g.geom_type == "Polygon"
+                      and g.area >= MIN_KEEP_AREA_M2]
+            if not pieces:
+                return None
+            pieces.sort(key=lambda g: -g.area)
+            return pieces[0]
+        return None
+
+    n_dropped = 0
+    n_clipped = 0
+    DUPLICATE_FRAC = 0.80
+
+    # ── Step 1: enforce same-role no-overlap.  Two shapes of the
+    # same role (two terminals, two runway segments, two taxi
+    # rects) must never overlap.  Three behaviours:
+    #
+    #   * If one shape is mostly inside the other (≥ DUPLICATE_FRAC
+    #     of its area), drop it as a duplicate.
+    #   * Otherwise, clip the smaller shape against the larger so
+    #     the overlap region is removed from the smaller (the
+    #     larger is "the more authoritative" footprint).
+    #   * If the clip leaves no usable polygon, drop it.
+    for role_set in [
+            {ROLE_TERMINAL},
+            {ROLE_RUNWAY},
+            {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+             ROLE_STUB, ROLE_CROSS_CONNECTOR}]:
+        # Iterate to a fixed point in case clipping creates new
+        # adjacencies that need further clipping.
+        for _ in range(4):
+            candidates: List[int] = [
+                i for i, s in enumerate(layout.shapes)
+                if s.role in role_set
+                and _valid_poly(s.polygon) is not None]
+            # Sort by area DESC so smaller shapes are clipped
+            # against larger ones (we walk pairs (i, j) with i<j
+            # and clip the SMALLER of the pair).
+            candidates.sort(
+                key=lambda i: -layout.shapes[i].polygon.area)
+            any_change = False
+            for ai in range(len(candidates)):
+                i = candidates[ai]
+                if layout.shapes[i].polygon is None:
+                    continue
+                pi = layout.shapes[i].polygon
+                for bi in range(ai + 1, len(candidates)):
+                    j = candidates[bi]
+                    if layout.shapes[j].polygon is None:
+                        continue
+                    pj = layout.shapes[j].polygon
+                    try:
+                        if not pi.intersects(pj):
+                            continue
+                        inter = pi.intersection(pj)
+                        if (inter.is_empty
+                                or inter.area <= NOISE_OVERLAP_M2):
+                            continue
+                        # Duplicate test.
+                        a_min = min(pi.area, pj.area)
+                        if (a_min > 0
+                                and inter.area / a_min
+                                >= DUPLICATE_FRAC):
+                            # j is the smaller (sorted desc) —
+                            # drop it.
+                            layout.shapes[j].polygon = None
+                            n_dropped += 1
+                            any_change = True
+                            continue
+                        # Partial overlap — clip j against i.
+                        clipped = _clip_keep_largest(pj, pi)
+                        if clipped is None:
+                            layout.shapes[j].polygon = None
+                            n_dropped += 1
+                        else:
+                            layout.shapes[j].polygon = clipped
+                            n_clipped += 1
+                        any_change = True
+                    except Exception:
+                        continue
+            if not any_change:
+                break
+    layout.shapes = [s for s in layout.shapes
+                     if s.polygon is not None]
+
+    # ── Step 2: priority-ordered clip pass.  Each role yields to
+    # everything LISTED ABOVE it in the ``priority`` list:
+    #   * RUNWAY (CIFP-anchored) — never modified.
+    #   * TERMINAL — yields to runway only.
+    #   * TAXI rects — yield to runway + terminal.
+    #   * JUNCTION (residue) — yields to everything.
+    # Each shape is clipped against every higher-priority shape it
+    # overlaps; the result keeps only the largest piece if the clip
+    # produces multiple disjoint fragments.  Same-priority shapes
+    # of the JUNCTION class additionally yield to LARGER junctions
+    # so two junctions can't both claim the same residue area.
+    priority: List[set] = [
+        {ROLE_RUNWAY},
+        {ROLE_TERMINAL},
+        {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+         ROLE_STUB, ROLE_CROSS_CONNECTOR},
+        {ROLE_JUNCTION},
+    ]
+    for outer in range(4):
+        any_change = False
+        # For each tier (after the first), clip its shapes against
+        # all higher-priority shapes.
+        for tier_idx in range(1, len(priority)):
+            tier_roles = priority[tier_idx]
+            higher_polys: List[Polygon] = []
+            for s in layout.shapes:
+                if s.polygon is None:
+                    continue
+                role_tier = next(
+                    (ti for ti, rs in enumerate(priority)
+                     if s.role in rs), -1)
+                if 0 <= role_tier < tier_idx:
+                    p = _valid_poly(s.polygon)
+                    if p is not None:
+                        higher_polys.append(p)
+            higher_tree = (STRtree(higher_polys)
+                           if higher_polys else None)
+            # Targets in this tier, sorted by area (largest first
+            # — within the JUNCTION tier this lets smaller junctions
+            # later be clipped against the already-finalised
+            # larger ones).
+            target_idx: List[int] = [
+                i for i, s in enumerate(layout.shapes)
+                if s.role in tier_roles
+                and _valid_poly(s.polygon) is not None]
+            target_idx.sort(
+                key=lambda i: -layout.shapes[i].polygon.area)
+            for k, i in enumerate(target_idx):
+                tp = layout.shapes[i].polygon
+                if tp is None:
+                    continue
+                new_p: Optional[Polygon] = tp
+                # Clip against higher-priority shapes.
+                if higher_tree is not None:
+                    for hit in higher_tree.query(new_p):
+                        fp = higher_polys[hit]
+                        try:
+                            if not new_p.intersects(fp):
+                                continue
+                            inter = new_p.intersection(fp)
+                            if (inter.is_empty
+                                    or inter.area
+                                    <= NOISE_OVERLAP_M2):
+                                continue
+                            clipped = _clip_keep_largest(new_p, fp)
+                            if clipped is None:
+                                new_p = None
+                                break
+                            new_p = clipped
+                            any_change = True
+                            n_clipped += 1
+                        except Exception:
+                            continue
+                if (new_p is not None
+                        and tier_roles == {ROLE_JUNCTION}):
+                    # Also clip against LARGER same-tier junctions.
+                    for k2 in range(k):
+                        i2 = target_idx[k2]
+                        tp2 = layout.shapes[i2].polygon
+                        if tp2 is None:
+                            continue
+                        try:
+                            if not new_p.intersects(tp2):
+                                continue
+                            inter = new_p.intersection(tp2)
+                            if (inter.is_empty
+                                    or inter.area
+                                    <= NOISE_OVERLAP_M2):
+                                continue
+                            clipped = _clip_keep_largest(new_p, tp2)
+                            if clipped is None:
+                                new_p = None
+                                break
+                            new_p = clipped
+                            any_change = True
+                            n_clipped += 1
+                        except Exception:
+                            continue
+                if new_p is None:
+                    layout.shapes[i].polygon = None
+                    n_dropped += 1
+                    continue
+                if new_p is not tp:
+                    layout.shapes[i].polygon = new_p
+        if not any_change:
+            break
+
+    layout.shapes = [s for s in layout.shapes
+                     if s.polygon is not None]
+
+    if (n_clipped + n_dropped) > 0:
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] {icao}: overlap-clip pass — "
+                f"{n_clipped} clip operation(s), "
+                f"{n_dropped} shape(s) dropped.\n")
+        except Exception:
+            pass
 
 
 def _enforce_shared_vertices(layout: "PavementLayout",
@@ -4552,11 +7385,6 @@ CLOSE_INTERSECTION_M = 200.0  # intersections within this distance
 GAP_BRIDGE_MAX_M = 120.0       # bridge same-ref polyline gaps up to this
 STUB_MAX_LEN_M = 250.0         # polylines <= this emit as one rect
 
-# Parallel refs at SPJC.  These are the "long taxi" refs where target
-# splits into many segments.  For these, we aggressively bridge gaps
-# across intermediate intersections.
-PARALLEL_REFS = frozenset({"A", "F", "L", "V", "M", "U"})
-
 
 def _bridge_same_ref_polylines(lines: List[LineString]
                                ) -> List[LineString]:
@@ -4684,7 +7512,13 @@ def _emit_primary_parallel_runway_stubs(
         if tags.get("aeroway") != "taxiway":
             continue
         ref = tags.get("ref", "")
-        if ref and ref not in PARALLEL_REFS:
+        # Sub-refs (letter+digit, e.g. V1, L3) are short connector
+        # spurs at every airport — never the long parallel taxi
+        # we're hunting for here.  All other refs (or no ref) are
+        # candidates; the length filter at the end (UNREFED_MIN_LEN_M
+        # for unrefed; the by-ref endpoint test for everything else)
+        # keeps only the long ones that touch the runway.
+        if ref and any(c.isdigit() for c in ref):
             continue
         pts = []
         for n in nds:
@@ -4979,17 +7813,17 @@ def _extract_osm_taxi_centerlines(
             scoords = list(simp.coords)
             if len(scoords) < 2:
                 continue
-            # Single-letter non-parallel stubs (B, C, D, E, G) are
-            # continuous diagonal taxis at SPJC — the target emits
-            # them as ONE long rect covering ~35 % of the full
-            # path.  Bend-splitting fragments them into junk.
-            # Detection: letter-only ref, not a primary/secondary
-            # parallel ref, and path is geometrically straight
-            # (chord/path > 0.95).  Emit as ONE centerline.
-            if (ref
-                    and len(ref) == 1
-                    and ref not in PARALLEL_REFS
-                    and ref not in {"Q", "R", "X"}):
+            # Geometrically-straight-enough centerlines emit as ONE
+            # rect rather than being bend-split.  This catches
+            # continuous diagonal taxis at any airport (e.g. SPJC's
+            # B/C/E/G, CYXY's E parallel) where the simplified
+            # polyline has small bends that would otherwise get
+            # bend-split into too-short fragments.  Sub-refs are
+            # excluded because they're typically already short
+            # connector spurs that benefit from bend-splitting at
+            # their natural curve points.
+            has_digit = bool(ref) and any(c.isdigit() for c in ref)
+            if not has_digit:
                 path_len = ls.length
                 sc = list(simp.coords)
                 if len(sc) >= 2 and path_len > 1e-6:
@@ -5130,9 +7964,16 @@ def _extract_osm_taxi_centerlines(
                         continue
                     out.append((seg, ref))
 
-    any_ref = any(r for _, r in out)
-    if any_ref:
-        out = [(ls, r) for ls, r in out if r]
+    # Previously: when ANY centerline had a ref, we dropped every
+    # unrefed centerline.  That was a SPJC-specific assumption (where
+    # apt.dat ref coverage is comprehensive and unrefed bits are
+    # almost always spurious sub-segments of refed taxis).  At CYXY,
+    # KBNA, HECA etc. many real taxis have NO ref — dropping them
+    # left whole sections of the airport as residue→junction blobs.
+    # The downstream rect-builder already dedups by geometric
+    # overlap (≥70% of an unrefed axis inside an emitted refed rect
+    # → skip), so spurious unrefed sub-segments still get filtered
+    # out.  Keep everything here.
     return out
 
 
@@ -5520,23 +8361,12 @@ def _split_centerlines_at_points(
         # the taxi's axis due to the oblique crossing.
         if not rwy_centerlines:
             return 0.15
-        # PARALLEL_REFS (A, F, L, V, M, U) and cross-connector
-        # refs (Q, R, X) always use the 15 % primary margin.
-        if ref in PARALLEL_REFS:
-            return 0.15
-        if ref in {"Q", "R", "X"}:
-            return 0.15
-        # Unrefed taxis: apply the diagonal-stub rule only for
-        # SHORT centerlines (< 250 m).  SPLP's main taxi runs
-        # long primaries at ~19° off runway (perp_diff=71°
-        # inside the 20-75 window) and must stay at 15 % margin
-        # to preserve the full primary-parallel length.  Only
-        # short unrefed diagonal connectors (e.g. SPLP's
-        # (-449,-1084) L=109) should get 35 % + bias
-        # shrinkage.  Refed non-parallel taxis (SPJC B/C/E/G,
-        # V1/V3/V5 sub-refs) always qualify for the diagonal
-        # check regardless of length.
-        if not ref and ls.length >= 250.0:
+        # Long taxis (refed or not) parallel to the runway use the
+        # primary 15 % margin — the angle-based check below
+        # (perp_diff window 20-75) excludes them from the diagonal-
+        # stub treatment automatically.  Short non-parallel
+        # diagonal connectors get the 30 %/35 % shrinkage.
+        if ls.length >= 250.0:
             return 0.15
         # Short unrefed parallel-to-runway rects (between two
         # diagonal stubs on SPLP's south chain) need extra margin
@@ -5662,13 +8492,13 @@ def _split_centerlines_at_points(
         breaks.append(ls.length)
 
         # Enumerate candidate segments and identify which are the
-        # first/last ones that would actually emit.  For cross-
-        # connector refs (Q/R/X), first and last emitted segments
-        # use 30 % margin each side (40 % rect) because the taxi
-        # terminates into a WIDER parallel taxi whose widening
-        # zone extends into the cross-connector's axis.  Middle
-        # segments between two cross-ref junctions use 15 %.
-        CROSS_CONNECTOR_REFS = {"Q", "R", "X"}
+        # first/last ones that would actually emit.  Cross-connector
+        # taxis (perpendicular to the runway, terminating into wider
+        # parallel taxis) use 30 % margin each side on first/last
+        # emitted segments because the parallel-taxi widening zone
+        # extends into the cross-connector's axis.  Detected by
+        # geometry: bearing within 20° of perpendicular to nearest
+        # runway, axis midpoint > 250 m from runway centerline.
         n_breaks = len(breaks)
         # Collect only segments that will actually emit (post-margin
         # length >= 40 m under ANY margin we might apply, so first/
@@ -5688,7 +8518,40 @@ def _split_centerlines_at_points(
                 # Won't emit — skip so it doesn't shift end-indexing.
                 continue
             candidates.append((p0, p1))
-        is_cross = ref in CROSS_CONNECTOR_REFS
+        # Cross-connector detection: full centerline is perpendicular
+        # (within 20°) to nearest runway AND its midpoint is > 250 m
+        # from any runway centerline (i.e. it's a connector BETWEEN
+        # parallels, not a runway-touching stub).
+        is_cross = False
+        if rwy_centerlines:
+            try:
+                lc = list(ls.coords)
+                if len(lc) >= 2:
+                    ldx = lc[-1][0] - lc[0][0]
+                    ldy = lc[-1][1] - lc[0][1]
+                    lmag = math.hypot(ldx, ldy)
+                    if lmag > 1e-6:
+                        l_bearing = math.degrees(
+                            math.atan2(ldx, ldy)) % 180.0
+                        mid = ls.interpolate(ls.length / 2.0)
+                        rmid = min(rwy_centerlines,
+                                   key=lambda r: mid.distance(r))
+                        rcc = list(rmid.coords)
+                        if len(rcc) >= 2:
+                            rdx2 = rcc[-1][0] - rcc[0][0]
+                            rdy2 = rcc[-1][1] - rcc[0][1]
+                            rmag2 = math.hypot(rdx2, rdy2)
+                            if rmag2 > 1e-6:
+                                r_bearing = math.degrees(
+                                    math.atan2(rdx2, rdy2)) % 180.0
+                                d = abs(l_bearing - r_bearing)
+                                d = min(d, 180.0 - d)
+                                d_perp = abs(d - 90.0)
+                                d_to_rwy = mid.distance(rmid)
+                                if d_perp <= 20.0 and d_to_rwy > 250.0:
+                                    is_cross = True
+            except Exception:
+                pass
         for idx, (p0, p1) in enumerate(candidates):
             gap = p1 - p0
             is_end_seg = (idx == 0 or idx == len(candidates) - 1)
@@ -6596,70 +9459,50 @@ def _classify_role(axis: LineString, width: float,
                    rwy_centerlines: List[LineString],
                    rwy_union: Optional[Polygon],
                    ref: str = "") -> str:
-    """Classify by (a) ref pattern and (b) axis bearing to runway.
+    """Classify a taxi rect by axis geometry alone.
 
-    * Ref letter-only (A, F, L, V, U, M) → parallel candidate.
-    * Ref Q/R/X (known cross) → cross_connector.
-    * Ref letter+digit (A1, L3, V2) → stub.
-    * Ref unknown or empty: use angle-only classification.
+    The role is determined entirely by:
+      * bearing to nearest runway (parallel within 20°,
+        perpendicular beyond 45°),
+      * straight-line distance from axis midpoint to nearest runway
+        centerline (close → primary, far → secondary or cross),
+      * axis length (must clear minimum length per role).
 
-    The ref-pattern rule handles SPJC cleanly because the chart
-    naming convention is stable.  The angle fallback handles SPLP
-    (no refs) and unnamed airports.
+    Ref letters are NOT used as a classifier — they vary wildly
+    between airports (SPJC's parallel taxis are A/F/L/V; CYXY's
+    is E; KBNA uses different letters again; many CYXY taxis have
+    no ref at all).  The only ref-pattern rule retained is:
+
+      * Sub-ref (any digit in the label, e.g. V1, L3, A1) →
+        always STUB.  Sub-ref tagging is universal: a digit
+        suffix means a short connector spur regardless of airport.
+
+    Roles:
+      * PRIMARY_PARALLEL  — db < 20°, length ≥ 50 m, < 400 m from runway
+      * SECONDARY_PARALLEL — db < 20°, length ≥ 50 m, ≥ 400 m from runway
+      * CROSS_CONNECTOR   — db > 45°, length ≥ 80 m, > 250 m from runway
+      * STUB              — everything else (short, runway-adjacent perp, etc.)
     """
-    # ── Ref-based classification (SPJC convention) ──────────────
-    if ref:
-        has_digit = any(c.isdigit() for c in ref)
-        if ref in ("Q", "R", "X"):
-            db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
-            if db is not None and db > 40.0:
-                return ROLE_CROSS_CONNECTOR
-            return ROLE_STUB
-        # Known parallel refs (A/F/L/V/M/U) always emit as parallel.
-        # A separate post-pass detects the SHORT runway-connector
-        # segment (stub-A) and demotes it.
-        if ref in ("M", "U"):
-            return ROLE_SECONDARY_PARALLEL
-        if ref in PARALLEL_REFS:
-            return ROLE_PRIMARY_PARALLEL
-        if has_digit:
-            # L1, A3, V5 etc. — sub-refs = stub
-            return ROLE_STUB
-        # Plain-letter non-parallel (B, C, D, E, G) = stub
+    if ref and any(c.isdigit() for c in ref):
+        # Sub-refs are always stubs.
         return ROLE_STUB
 
-    # ── Angle-only classification (refless airports like SPLP) ─
-    # Uses bearing-to-runway, length, and distance-to-runway.
     db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
     if db is None:
         return ROLE_STUB
-    # Distance from axis midpoint to nearest runway centerline.
     try:
         mid = axis.interpolate(0.5, normalized=True)
         dist_rwy = min(mid.distance(r) for r in rwy_centerlines)
     except Exception:
         dist_rwy = 1e6
     length = axis.length
-    # Parallel branch (bearing within 20° of a runway).
     if db < 20.0:
-        # Parallel-oriented rects are part of the primary-parallel
-        # chain even when short.  SPLP's main taxi has a 66-80 m
-        # parallel segment between runway-connecting diagonals
-        # that should emit as a primary_parallel rather than a
-        # stub (user feedback 2026-04-21: "the next piece should
-        # be a primary parallel, not a stub").
         if length >= 50.0:
-            # Close to runway → primary; far → secondary.
             if dist_rwy < 400.0:
                 return ROLE_PRIMARY_PARALLEL
             return ROLE_SECONDARY_PARALLEL
-        # Very short parallel — treat as stub (e.g. ramp tie-in).
         return ROLE_STUB
-    # Perpendicular branch (bearing > 45° off a runway).
     if db > 45.0 and length >= 80.0:
-        # Cross-connector if the axis sits BETWEEN parallels (i.e.
-        # not adjacent to the runway).  Perpendicular pieces close
-        # to the runway are stubs (runway-connector).
         if dist_rwy > 250.0:
             return ROLE_CROSS_CONNECTOR
         return ROLE_STUB

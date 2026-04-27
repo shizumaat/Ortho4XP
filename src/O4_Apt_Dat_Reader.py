@@ -157,7 +157,13 @@ def find_airport_apt_dat(xplane_root: str, icao: str) -> Optional[str]:
         xplane_root, "Resources", "default scenery",
         "default apt dat", "Earth nav data", "apt.dat")
 
-    # Step 1: per-airport Custom Scenery packs.
+    # Two-pass search: prefer files that contain proper row-110
+    # pavement polygons (our pipeline needs those), then fall back to
+    # any file that just contains the airport.  This handles e.g. the
+    # KBNA Custom Scenery pack which uses row-120 linear features but
+    # no row-110 pavements — the Global pack is the right source for
+    # pavement geometry there.
+    custom_packs: List[str] = []
     if os.path.isdir(custom_scenery):
         for entry in sorted(os.listdir(custom_scenery)):
             if entry == "Global Airports":
@@ -165,17 +171,23 @@ def find_airport_apt_dat(xplane_root: str, icao: str) -> Optional[str]:
             pack_apt = os.path.join(
                 custom_scenery, entry, "Earth nav data", "apt.dat")
             if os.path.isfile(pack_apt) and _file_has_airport(pack_apt, icao):
-                return pack_apt
+                custom_packs.append(pack_apt)
 
-    # Step 2: Global Airports pack (X-Plane 11 or 12 location).
+    candidates: List[str] = list(custom_packs)
     for cand in (global_pack_v11, global_pack_v12):
         if os.path.isfile(cand) and _file_has_airport(cand, icao):
-            return cand
-
-    # Step 3: default apt.dat.
+            candidates.append(cand)
     if os.path.isfile(default_pack) and _file_has_airport(default_pack, icao):
-        return default_pack
+        candidates.append(default_pack)
 
+    # First pass: prefer the most-specific source that ALSO has pavement.
+    for cand in candidates:
+        if _file_has_airport_with_pavement(cand, icao):
+            return cand
+    # Second pass: any file with the airport header (lets the rest of
+    # the pipeline at least parse runways even if no pavements exist).
+    if candidates:
+        return candidates[0]
     return None
 
 
@@ -307,6 +319,53 @@ def load_airport(
 # ──────────────────────────────────────────────────────────────────────
 # Internal: file scanning
 # ──────────────────────────────────────────────────────────────────────
+def find_all_airport_apt_dats(xplane_root: str,
+                              icao: str) -> List[str]:
+    """Return EVERY apt.dat path under ``xplane_root`` that contains
+    a row-1 header for ``icao`` (any pack — Custom Scenery,
+    Global Airports, default).
+
+    Different packs commonly carry different geometry for the same
+    airport: a community pack might add row-110 pavement that the
+    Global pack lacks, AND a custom DSF with draped polygons that
+    neither has.  Callers that want the union of all available
+    pavement geometry walk this list.
+    """
+    if not xplane_root or not os.path.isdir(xplane_root):
+        return []
+    icao = icao.strip().upper()
+    if not icao:
+        return []
+    out: List[str] = []
+    custom_scenery = os.path.join(xplane_root, "Custom Scenery")
+    if os.path.isdir(custom_scenery):
+        for entry in sorted(os.listdir(custom_scenery)):
+            pack_apt = os.path.join(
+                custom_scenery, entry, "Earth nav data", "apt.dat")
+            if (os.path.isfile(pack_apt)
+                    and _file_has_airport(pack_apt, icao)):
+                out.append(pack_apt)
+    global_v11 = os.path.join(
+        xplane_root, "Custom Scenery", "Global Airports",
+        "Earth nav data", "apt.dat")
+    global_v12 = os.path.join(
+        xplane_root, "Global Scenery", "Global Airports",
+        "Earth nav data", "apt.dat")
+    for cand in (global_v11, global_v12):
+        if (os.path.isfile(cand)
+                and _file_has_airport(cand, icao)
+                and cand not in out):
+            out.append(cand)
+    default = os.path.join(
+        xplane_root, "Resources", "default scenery",
+        "default apt dat", "Earth nav data", "apt.dat")
+    if (os.path.isfile(default)
+            and _file_has_airport(default, icao)
+            and default not in out):
+        out.append(default)
+    return out
+
+
 def _file_has_airport(aptdat_path: str, icao: str) -> bool:
     """Return True if `aptdat_path` contains a row 1 header for ICAO.
 
@@ -326,6 +385,40 @@ def _file_has_airport(aptdat_path: str, icao: str) -> bool:
                 if len(parts) < 5 or parts[0] != "1":
                     continue
                 if parts[4].upper() == icao:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _file_has_airport_with_pavement(aptdat_path: str, icao: str) -> bool:
+    """Return True if `aptdat_path` contains a row 1 header for ICAO
+    AND the airport block has at least one row 110 (pavement header).
+
+    Some Custom Scenery packs (e.g. KBNA) replace pavement polygons
+    with linear-feature markup (row 120 + 111 nodes), leaving the
+    airport block with 0 row-110 records.  Our pavement pipeline
+    needs row-110 polygons to compute the residue/junction set, so
+    such packs are unusable for pavement geometry — we fall back to
+    the Global apt.dat which does have proper row-110 pavements.
+    """
+    icao = icao.upper()
+    try:
+        in_block = False
+        with open(aptdat_path, "r", encoding="utf-8",
+                  errors="replace") as f:
+            for line in f:
+                stripped = line.lstrip()
+                if (stripped.startswith("1 ") or stripped.startswith("1\t")):
+                    parts = stripped.split()
+                    if len(parts) >= 5 and parts[0] == "1":
+                        if in_block:
+                            return False  # next airport, no 110 found
+                        if parts[4].upper() == icao:
+                            in_block = True
+                            continue
+                if in_block and (stripped.startswith("110 ")
+                                 or stripped.startswith("110\t")):
                     return True
     except Exception:
         return False

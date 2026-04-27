@@ -350,6 +350,20 @@ def _check_plane_gradient(ways: List[Way],
     return out
 
 
+WITHIN_SHAPE_MAX_PAIR_DIST_M = 60.0   # max distance between two
+                                        # polygon vertices for the
+                                        # pair to be checked for grade.
+                                        # Triangle4XP will not create a
+                                        # triangle edge between vertices
+                                        # much further apart than this
+                                        # (interior Steiner refinement
+                                        # subdivides any large triangle),
+                                        # so far-pair checks would be
+                                        # false positives.  60 m covers
+                                        # a typical taxi rect's diagonal
+                                        # plus margin.
+
+
 def _check_within_shape(ways: List[Way],
                         nodes: Dict[str, Tuple[float, float]],
                         ll_to_m,
@@ -359,12 +373,15 @@ def _check_within_shape(ways: List[Way],
     For 3-vertex polygons (triangles), every pair IS a triangle
     edge X-Plane will render — check all 3 pairs.
 
-    For 4+-vertex polygons, only ADJACENT (consecutive ring)
-    pairs are guaranteed to be edges in the rendered mesh; the
-    interior triangulation is decided later by Triangle4XP, which
-    inserts Steiner points and connects vertices freely.  Far-pair
-    checks here would be false positives — Triangle4XP may never
-    create those edges.
+    For 4+-vertex polygons, check every pair within
+    ``WITHIN_SHAPE_MAX_PAIR_DIST_M`` of each other.  Triangle4XP
+    triangulates polygon interiors with Steiner refinement; any
+    boundary vertex pair this close to each other is a plausible
+    triangle edge in the resulting mesh.  Far pairs are skipped —
+    Triangle4XP would interpose Steiner points and never connect
+    them directly.  This catches the dominant within-shape
+    failure mode (free-vertex drift near anchored neighbours)
+    that the prior consecutive-only check missed.
 
     A violation requires ``|de| > grade × dist + ELEV_ROUNDING_NOISE_M``
     so single-decimal rounding doesn't produce spurious flags at
@@ -392,8 +409,16 @@ def _check_within_shape(ways: List[Way],
         if n == 3:
             pairs = [(0, 1), (1, 2), (2, 0)]  # all 3 triangle edges
         else:
-            # Only consecutive ring vertices = boundary edges.
-            pairs = [(i, (i + 1) % n) for i in range(n)]
+            # All pairs within WITHIN_SHAPE_MAX_PAIR_DIST_M.
+            pairs = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dx = pts[i][0] - pts[j][0]
+                    dy = pts[i][1] - pts[j][1]
+                    if (dx * dx + dy * dy
+                            <= WITHIN_SHAPE_MAX_PAIR_DIST_M
+                            * WITHIN_SHAPE_MAX_PAIR_DIST_M):
+                        pairs.append((i, j))
         for i, j in pairs:
             xi, yi, ei = pts[i]
             xj, yj, ej = pts[j]
