@@ -2360,6 +2360,11 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # altitudes derived earlier from the centerline graph are
     # initial seeds that the mesh can refine.
     runway_anchors = _runway_corner_elev_map(layout)
+    # Augment with junction corners that sit close to (but not
+    # exactly at) a runway polygon — see ``_near_runway_anchor_map``.
+    near_runway_anchors = _near_runway_anchor_map(layout)
+    for _b, _e in near_runway_anchors.items():
+        runway_anchors.setdefault(_b, _e)
     if runway_anchors:
         try:
             mesh, bucket_to_node = _build_pavement_mesh(
@@ -3457,6 +3462,131 @@ def _runway_corner_elev_map(layout: "PavementLayout"
                 out.setdefault(
                     _corner_elevation_bucket(cx, cy),
                     float(s.altitude))
+    return out
+
+
+# Tolerance for "junction corner is adjacent to runway pavement".
+# The bucket-exact match in ``_runway_corner_elev_map`` only catches
+# junction corners that LITERALLY coincide with a runway vertex
+# (within SHARED_VERTEX_TOL_M = 0.5 m).  Real airports often have
+# the junction polygon ending a few metres short of the runway
+# polygon — apt.dat polygon precision, runway-end blast pads, etc.
+# Without an anchor, the mesh solver settles those corners to
+# whatever the inland taxi pavement is at, producing a visible
+# elevation drop between the junction and the runway (user reported
+# this at SPJC's 16L L1 stub).
+NEAR_RUNWAY_ANCHOR_M = 60.0
+
+
+def _runway_elev_at_point(rwy_shape: "BuiltShape",
+                          x: float, y: float) -> Optional[float]:
+    """Interpolate the runway shape's surface elevation at the
+    point on its boundary closest to ``(x, y)``.
+
+    For a flat runway (``altitude``), returns that value regardless
+    of position.  For a sloped runway (``altitude_high`` /
+    ``altitude_low``), parameterises ``(x, y)``'s nearest-boundary
+    projection along the high-low axis and linearly interpolates.
+    Returns ``None`` if the shape has no usable elevation tag.
+    """
+    if rwy_shape.altitude is not None:
+        return float(rwy_shape.altitude)
+    if (rwy_shape.altitude_high is None
+            or rwy_shape.altitude_low is None):
+        return None
+    try:
+        coords = list(rwy_shape.polygon.exterior.coords)
+    except Exception:
+        return None
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) != 4:
+        return float(
+            (rwy_shape.altitude_high + rwy_shape.altitude_low) / 2)
+    # X-Plane convention: corners 0,3 = HIGH short edge,
+    # corners 1,2 = LOW short edge.  Axis = midpoint(0,3) →
+    # midpoint(1,2).
+    high_mx = 0.5 * (coords[0][0] + coords[3][0])
+    high_my = 0.5 * (coords[0][1] + coords[3][1])
+    low_mx = 0.5 * (coords[1][0] + coords[2][0])
+    low_my = 0.5 * (coords[1][1] + coords[2][1])
+    ax = low_mx - high_mx
+    ay = low_my - high_my
+    a2 = ax * ax + ay * ay
+    if a2 < 1e-9:
+        return float(
+            (rwy_shape.altitude_high + rwy_shape.altitude_low) / 2)
+    t = ((x - high_mx) * ax + (y - high_my) * ay) / a2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    return float(rwy_shape.altitude_high
+                 + t * (rwy_shape.altitude_low
+                        - rwy_shape.altitude_high))
+
+
+def _near_runway_anchor_map(
+    layout: "PavementLayout",
+    tol_m: float = NEAR_RUNWAY_ANCHOR_M,
+) -> Dict[Tuple[int, int], float]:
+    """Bucket → elevation map for JUNCTION corners that sit within
+    ``tol_m`` of a runway polygon, anchored to the runway's
+    elevation at the closest boundary point.
+
+    Per user 2026-04-27: junctions adjacent to a runway should
+    match the runway's elevation at that boundary, even when the
+    junction polygon falls a few metres short of the runway
+    polygon (apt.dat polygon-precision artefact, blast-pad gap,
+    DSF / runway boundary mismatch).  Without this anchor the
+    mesh solver settles the junction at the inland taxi area's
+    elevation, producing the user-reported drop (SPJC 16L: junction
+    -10163 at 12.9 m next to runway -10077 at 13.4 m).
+
+    Only RUNWAY-FACING corners get anchored — corners on the inland
+    side of the junction (further from any runway) stay free for
+    the mesh solver to slope the junction smoothly away from the
+    runway-facing edge.
+    """
+    out: Dict[Tuple[int, int], float] = {}
+    runways = [s for s in layout.shapes
+               if s.role == ROLE_RUNWAY
+               and s.polygon is not None
+               and not s.polygon.is_empty]
+    if not runways:
+        return out
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if not coords:
+            continue
+        for (jx, jy) in coords:
+            best_d = tol_m
+            best_e = None
+            for r in runways:
+                try:
+                    d = r.polygon.distance(Point(jx, jy))
+                except Exception:
+                    continue
+                if d > best_d:
+                    continue
+                e = _runway_elev_at_point(r, jx, jy)
+                if e is None:
+                    continue
+                best_d = d
+                best_e = e
+            if best_e is None:
+                continue
+            bucket = _corner_elevation_bucket(jx, jy)
+            # Don't override an exact runway-corner bucket (those
+            # are already in ``runway_anchors`` from the corner map).
+            out.setdefault(bucket, best_e)
     return out
 
 
