@@ -949,6 +949,33 @@ def build_airport_pavement(icao: str, xplane_root: str,
     osm_centerlines = _extract_osm_taxi_centerlines(
         nodes, ways, to_m, rwy_centerlines=rwy_centerlines)
 
+    # ── Per-ref OVERALL chord bearings (pre-split) ───────────────
+    # Used by ``_classify_role`` to disambiguate diagonal-overall
+    # taxis whose curving ends happen to align near-parallel to
+    # the runway locally.  Without this, a B/C/E/G stub at SPJC —
+    # which enters the runway at a shallow angle — gets a small
+    # post-curve segment classified as PRIMARY_PARALLEL because
+    # the segment's local bearing falls inside the 20° parallel
+    # window, even though the OVERALL B/C/E/G chord is diagonal.
+    # The parent's overall chord bearing is the right reference.
+    ref_overall_bearings: Dict[str, float] = {}
+    _ref_longest_len: Dict[str, float] = {}
+    for _ls, _ref in osm_centerlines:
+        if not _ref:
+            continue
+        if _ls.length <= _ref_longest_len.get(_ref, 0.0):
+            continue
+        _coords = list(_ls.coords)
+        if len(_coords) < 2:
+            continue
+        _dx = _coords[-1][0] - _coords[0][0]
+        _dy = _coords[-1][1] - _coords[0][1]
+        if math.hypot(_dx, _dy) < 1.0:
+            continue
+        ref_overall_bearings[_ref] = (
+            math.degrees(math.atan2(_dx, _dy)) % 180.0)
+        _ref_longest_len[_ref] = _ls.length
+
     # ── Augment pav_union with synthetic pavement around OSM
     # centerlines that don't intersect any apt.dat pavement
     # polygon.  Some airports (notably CYXY) have incomplete
@@ -1296,7 +1323,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
         osm_centerlines, pav_union, layout.runway_union,
-        rwy_centerlines, apt_vertices=apt_pav_vertices)
+        rwy_centerlines, apt_vertices=apt_pav_vertices,
+        ref_overall_bearings=ref_overall_bearings)
 
     # Filter stubs by user's runway-connection rule: a stub rect is
     # kept only if its OSM centerline reaches a runway.  Stubs whose
@@ -1390,6 +1418,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # likely the real centerline.  Tie-break by larger area.
     # Iterate until no rect-pair overlap remains.
     RECT_OVERLAP_NOISE_M2 = 1.0
+    # Drop only when the overlap is a SIGNIFICANT fraction of the
+    # smaller rect's area; a diagonal stub joining a primary parallel
+    # legitimately produces a small corner-overlap triangle (e.g. at
+    # SPJC, C joining A produces a 24 m² corner overlap on a 10 051 m²
+    # C rect — 0.2 %, not a duplicate).  5 % is the empirical
+    # boundary: above that, the rects clearly cover the same area;
+    # below that, it's a diagonal-stub corner kiss.
+    RECT_OVERLAP_FRAC_TOL = 0.05
     if len(taxi_rects) >= 2:
         kept = list(taxi_rects)
         changed = True
@@ -1414,6 +1450,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         if inter.is_empty:
                             continue
                         if inter.area <= RECT_OVERLAP_NOISE_M2:
+                            continue
+                        # Diagonal stubs that join a primary parallel
+                        # (e.g. SPJC's B/C/E/G connecting to A/F/L/V)
+                        # legitimately share a small corner triangle
+                        # with their parent.  Drop only when the
+                        # overlap is a SIGNIFICANT fraction of the
+                        # smaller rect — not just a corner kiss.
+                        smaller_area = min(rect_i.area, rect_j.area)
+                        if (smaller_area > 0
+                                and inter.area
+                                / smaller_area
+                                <= RECT_OVERLAP_FRAC_TOL):
                             continue
                         # Drop the shorter-axis rect; tie-break by
                         # smaller area.
@@ -9117,6 +9165,7 @@ def _build_taxi_rects(
     rwy_union: Optional[Polygon],
     rwy_centerlines: List[LineString],
     apt_vertices: Optional[List[Tuple[float, float]]] = None,
+    ref_overall_bearings: Optional[Dict[str, float]] = None,
 ) -> List[Tuple[Polygon, LineString, str, str]]:
     """Convert each usable centerline into a 4-vertex rect.
 
@@ -9240,7 +9289,8 @@ def _build_taxi_rects(
             continue
 
         role = _classify_role(trimmed, width, rwy_centerlines,
-                               rwy_union, ref=ref)
+                               rwy_union, ref=ref,
+                               ref_overall_bearings=ref_overall_bearings)
         emitted.append((rect, trimmed, role, ref))
         try:
             emitted_union = (unary_union([emitted_union, rect])
@@ -10034,7 +10084,9 @@ def _cap_rect_length_to_width(
 def _classify_role(axis: LineString, width: float,
                    rwy_centerlines: List[LineString],
                    rwy_union: Optional[Polygon],
-                   ref: str = "") -> str:
+                   ref: str = "",
+                   ref_overall_bearings: Optional[Dict[str, float]]
+                   = None) -> str:
     """Classify a taxi rect by axis geometry alone.
 
     The role is determined entirely by:
@@ -10047,11 +10099,20 @@ def _classify_role(axis: LineString, width: float,
     Ref letters are NOT used as a classifier — they vary wildly
     between airports (SPJC's parallel taxis are A/F/L/V; CYXY's
     is E; KBNA uses different letters again; many CYXY taxis have
-    no ref at all).  The only ref-pattern rule retained is:
+    no ref at all).  The only ref-pattern rules retained are:
 
       * Sub-ref (any digit in the label, e.g. V1, L3, A1) →
         always STUB.  Sub-ref tagging is universal: a digit
         suffix means a short connector spur regardless of airport.
+      * Diagonal parent ref → always STUB.  When the parent OSM
+        way's chord bearing is itself diagonal (db ≥ 20°), every
+        segment of that ref is part of a diagonal stub even if
+        a curving end-segment happens to align near-parallel
+        locally.  At SPJC, B/C/E/G enter the runway at shallow
+        angles; without this check, the post-curve sub-segment
+        (B's 85 m piece, db_local = 18°) gets misclassified as
+        PRIMARY_PARALLEL even though there's no actual B parallel
+        taxiway.
 
     Roles:
       * PRIMARY_PARALLEL  — db < 20°, length ≥ 50 m, < 400 m from runway
@@ -10066,6 +10127,33 @@ def _classify_role(axis: LineString, width: float,
     db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
     if db is None:
         return ROLE_STUB
+
+    # Diagonal-parent check: if this rect's REF has an overall-
+    # DIAGONAL parent OSM way (parent db_overall ∈ [20°, 45°)),
+    # force STUB regardless of the local segment bearing.  See
+    # the ``Diagonal parent ref`` rule above.  Excludes
+    # perpendicular parents (db ≥ 45°, e.g. cross-connectors
+    # like Q/R at SPJC) which legitimately classify as
+    # CROSS_CONNECTOR via the local-axis check below.
+    if (ref and ref_overall_bearings
+            and ref in ref_overall_bearings
+            and rwy_centerlines):
+        try:
+            _rwy = min(rwy_centerlines,
+                       key=lambda r: axis.distance(r))
+            _rc = list(_rwy.coords)
+            _rdx = _rc[-1][0] - _rc[0][0]
+            _rdy = _rc[-1][1] - _rc[0][1]
+            if math.hypot(_rdx, _rdy) > 1e-6:
+                _rwy_bearing = (math.degrees(
+                    math.atan2(_rdx, _rdy)) % 180.0)
+                _ref_db = abs(ref_overall_bearings[ref]
+                              - _rwy_bearing)
+                _ref_db = min(_ref_db, 180.0 - _ref_db)
+                if 20.0 <= _ref_db < 45.0:
+                    return ROLE_STUB
+        except Exception:
+            pass
     try:
         mid = axis.interpolate(0.5, normalized=True)
         dist_rwy = min(mid.distance(r) for r in rwy_centerlines)
