@@ -1,5 +1,13 @@
 """Snap every non-runway vertex in a target OSM to its nearest
-apt.dat pavement edge.
+PAVEMENT edge.
+
+Pavement = apt.dat row-110 polygons ∪ runway footprints (rows
+100 + blast pads) ∪ DSF draped pavement (filtered the same way
+the build pipeline does — see O4_DSF_Reader and
+``DSF_OVERLAY_FRAC``/``DSF_AIRPORT_RADIUS_M``).  Per user
+2026-04-27: the build pipeline now incorporates DSF, so the
+target snapping must use the same coverage set or the comparison
+target won't match what the pipeline could legitimately produce.
 
 Writes a new file ``<basename>_snapped.osm`` next to the input so
 the original stays intact.  The user reviews the snapped file and,
@@ -9,10 +17,10 @@ Rules:
 * Runway vertices are NOT moved (they're already at apt.dat
   row-100 + blast-pad corners).
 * Every other vertex is snapped to the nearest point on the
-  apt.dat pavement MultiPolygon boundary, PROVIDED the snap
-  distance is ≤ ``MAX_SNAP_DIST_M`` (default 25 m) — farther
-  than that and we assume the user deliberately drew a vertex in
-  the interior (e.g. midpoint of a long edge) and leave it alone.
+  pavement union boundary, PROVIDED the snap distance is
+  ≤ ``MAX_SNAP_DIST_M`` (default 25 m) — farther than that and
+  we assume the user deliberately drew a vertex in the interior
+  (e.g. midpoint of a long edge) and leave it alone.
 * Shared nodes move ONCE (the node is snapped, every way that
   references it follows).
 * A per-node diagnostic (distance, moved/skipped) is printed so
@@ -38,8 +46,17 @@ from shapely.ops import nearest_points, transform as shp_transform, unary_union
 
 import O4_Apt_Dat_Reader as APR
 
+try:
+    import O4_DSF_Reader as _DSFR
+except Exception:
+    _DSFR = None
+
 R_EARTH = 6_378_137.0
 MAX_SNAP_DIST_M = 25.0
+# DSF filter constants: mirror the build pipeline so the snapped
+# target reflects the same coverage the pipeline can produce.
+DSF_OVERLAY_FRAC = 0.80
+DSF_AIRPORT_RADIUS_M = 5_000.0
 
 
 def _projection(anchor):
@@ -56,12 +73,24 @@ def _projection(anchor):
     return to_m, to_ll
 
 
-def _apt_pavement_boundary_m(apt: APR.Airport, to_m):
+def _apt_pavement_boundary_m(apt: APR.Airport, to_m,
+                              xplane_root: str, icao: str,
+                              anchor: Tuple[float, float]):
     """Return (pav_union, pav_boundary, pav_vertices) in meter
-    space.  ``pav_vertices`` is the full set of apt.dat vertex
-    coords (exterior + interior rings of each pavement polygon
-    plus runway corners) — used for vertex-preferred snap."""
-    pav_polys = []
+    space.  ``pav_vertices`` is the full set of pavement vertex
+    coords (exterior + interior rings of each apt.dat pavement
+    polygon, runway corners, AND surviving DSF pavement
+    polygons) — used for vertex-preferred snap.
+
+    DSF polygons are filtered the same way the build pipeline
+    does (see O4_Airport_Pavement_Builder):
+      • distance gate: drop polygons > DSF_AIRPORT_RADIUS_M from
+        the airport bbox;
+      • overlay drop: a polygon ≥ DSF_OVERLAY_FRAC inside the
+        existing apt.dat pavement is decorative paint, not new
+        pavement — drop it.
+    """
+    apt_pav_polys = []
     # Pavements from apt.dat rows 110+
     for pav in apt.pavements:
         if pav.polygon is None or pav.polygon.is_empty:
@@ -70,10 +99,10 @@ def _apt_pavement_boundary_m(apt: APR.Airport, to_m):
         if pm.is_empty:
             continue
         if pm.geom_type == "Polygon":
-            pav_polys.append(pm)
+            apt_pav_polys.append(pm)
         else:
-            pav_polys.extend(g for g in getattr(pm, "geoms", [])
-                             if g.geom_type == "Polygon")
+            apt_pav_polys.extend(g for g in getattr(pm, "geoms", [])
+                                 if g.geom_type == "Polygon")
     # Runway footprints (row 100 rect + blast pads)
     for r in apt.runways:
         ax, ay = to_m(r.lon_a, r.lat_a)
@@ -89,15 +118,78 @@ def _apt_pavement_boundary_m(apt: APR.Airport, to_m):
         bx2 = bx + ux * b_extra; by2 = by + uy * b_extra
         px, py = -uy, ux
         half = r.width_m / 2.0
-        pav_polys.append(Polygon([
+        apt_pav_polys.append(Polygon([
             (ax2 + px*half, ay2 + py*half),
             (bx2 + px*half, by2 + py*half),
             (bx2 - px*half, by2 - py*half),
             (ax2 - px*half, ay2 - py*half),
         ]))
-    if not pav_polys:
+    if not apt_pav_polys:
         raise SystemExit("No pavement polygons parsed from apt.dat")
-    # Collect every apt.dat polygon vertex (pre-union).
+    pav_polys = list(apt_pav_polys)
+    apt_pav_union = unary_union(apt_pav_polys).buffer(0)
+    # Compute airport bbox for DSF distance gate.
+    apt_bbox_m = None
+    try:
+        bx_min, by_min, bx_max, by_max = apt_pav_union.bounds
+        apt_bbox_m = (bx_min - DSF_AIRPORT_RADIUS_M,
+                      by_min - DSF_AIRPORT_RADIUS_M,
+                      bx_max + DSF_AIRPORT_RADIUS_M,
+                      by_max + DSF_AIRPORT_RADIUS_M)
+    except Exception:
+        pass
+    # DSF pavement (apply same overlay/distance filters as build).
+    n_dsf_kept = n_dsf_overlay = n_dsf_far = 0
+    if _DSFR is not None:
+        try:
+            seen_dsf = set()
+            for ad in APR.find_all_airport_apt_dats(xplane_root, icao):
+                dsf = _DSFR.find_associated_dsf(ad, anchor[0], anchor[1])
+                if dsf is None or dsf in seen_dsf:
+                    continue
+                seen_dsf.add(dsf)
+                for ring in _DSFR.read_dsf_pavements(dsf):
+                    if len(ring) < 3:
+                        continue
+                    try:
+                        poly_ll = Polygon(
+                            [(lon, lat) for (lon, lat) in ring])
+                        if not poly_ll.is_valid:
+                            poly_ll = poly_ll.buffer(0)
+                        if (poly_ll.is_empty
+                                or poly_ll.geom_type != "Polygon"):
+                            continue
+                        pm = shp_transform(to_m, poly_ll)
+                        if pm.is_empty or pm.geom_type != "Polygon":
+                            continue
+                        if apt_bbox_m is not None:
+                            px_min, py_min, px_max, py_max = pm.bounds
+                            if (px_max < apt_bbox_m[0]
+                                    or px_min > apt_bbox_m[2]
+                                    or py_max < apt_bbox_m[1]
+                                    or py_min > apt_bbox_m[3]):
+                                n_dsf_far += 1
+                                continue
+                        try:
+                            inter = pm.intersection(apt_pav_union).area
+                            if (pm.area > 0
+                                    and inter / pm.area
+                                    >= DSF_OVERLAY_FRAC):
+                                n_dsf_overlay += 1
+                                continue
+                        except Exception:
+                            pass
+                        pav_polys.append(pm)
+                        n_dsf_kept += 1
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    if n_dsf_kept or n_dsf_overlay or n_dsf_far:
+        print(f"  DSF pavement: {n_dsf_kept} kept, "
+              f"{n_dsf_overlay} dropped as overlay, "
+              f"{n_dsf_far} dropped as off-airport.")
+    # Collect every pavement-polygon vertex (apt.dat + DSF + runway).
     vertices: List[Tuple[float, float]] = []
     for pp in pav_polys:
         if pp.is_empty or pp.geom_type != "Polygon":
@@ -170,7 +262,8 @@ def main(argv=None):
     apt = APR.load_airport(apt_path, args.icao)
     anchor = _anchor(apt)
     to_m, to_ll = _projection(anchor)
-    _, boundary, apt_vertices = _apt_pavement_boundary_m(apt, to_m)
+    _, boundary, apt_vertices = _apt_pavement_boundary_m(
+        apt, to_m, args.xplane, args.icao, anchor)
     print(f"Loaded {args.icao}: boundary length = {boundary.length:.0f} m,"
           f" vertices = {len(apt_vertices)}")
     VERTEX_SNAP_M = 8.0  # prefer vertex within 8 m of target node

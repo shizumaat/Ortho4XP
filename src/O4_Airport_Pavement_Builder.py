@@ -677,7 +677,7 @@ def _runway_rect_m(runway, to_m) -> Polygon:
 # overlap — but for our purposes they ARE one continuous coverage.
 # Closing 0.5 m gaps via buffer-shrink merges them while preserving
 # real holes (typically meters-wide non-pavement islands).
-PAVEMENT_BRIDGE_GAP_M = 0.5
+PAVEMENT_BRIDGE_GAP_M = 0.1
 
 
 def _merge_near_touching(geom: Optional[Polygon],
