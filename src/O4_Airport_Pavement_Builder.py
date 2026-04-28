@@ -56,13 +56,6 @@ import O4_Pavement_Strips as PS
 # ──────────────────────────────────────────────────────────────────
 R_EARTH = 6_378_137.0
 SHARED_VERTEX_TOL_M = 0.5    # snap vertices closer than this together
-# Per user 2026-04-28: emit taxiway and runway rects 20 % wider than
-# the apt.dat / OSM-derived nominal width — 10 % buffer on each side.
-# Widens the visible pavement footprint without changing the rect
-# axis or elevation profile.  Applied at construction time for taxi
-# rects + runway segments; the residue / apron junctions adjust
-# around the widened runway footprint.
-RECT_WIDTH_BUFFER_FACTOR = 1.20
 RUNWAY_INSIDE_APRON_FRAC = 0.95  # if ≥95% of a runway segment lies
                                   # inside an apt.dat/DSF apron
                                   # polygon (and that polygon is
@@ -641,62 +634,6 @@ def _airport_anchor(apt: APR.Airport) -> Tuple[float, float]:
 # Runway rects
 # ──────────────────────────────────────────────────────────────────
 
-def _widen_rect_perpendicular(rect: "Polygon",
-                              axis: "LineString",
-                              factor: float) -> "Optional[Polygon]":
-    """Widen a 4-corner rect by ``factor`` perpendicular to its
-    axis (i.e., scale the long-edge offset from the axis on each
-    side).  Axis direction stays fixed; long-axis length stays
-    fixed.  Returns the widened polygon, or ``None`` if the input
-    isn't a valid 4-corner rect.
-
-    Used by ``_build_taxi_rects`` to add a 10 % buffer per side to
-    accepted rects without affecting upstream validation steps
-    (apron-interior, dedup) which operate on the nominal-width
-    rect.
-    """
-    try:
-        coords = list(rect.exterior.coords)
-    except Exception:
-        return rect
-    if coords and coords[0] == coords[-1]:
-        coords = coords[:-1]
-    if len(coords) != 4:
-        return rect
-    try:
-        ac = list(axis.coords)
-        if len(ac) < 2:
-            return rect
-        ax = ac[-1][0] - ac[0][0]
-        ay = ac[-1][1] - ac[0][1]
-        L = math.hypot(ax, ay)
-        if L < 1e-6:
-            return rect
-        ux, uy = ax / L, ay / L
-        nx, ny = -uy, ux  # left-perpendicular unit normal
-        # Use the axis START as the reference; project each corner
-        # onto (axial, perpendicular) frame, scale perpendicular,
-        # reconstruct.
-        ox, oy = ac[0][0], ac[0][1]
-        new_corners: List[Tuple[float, float]] = []
-        for cx, cy in coords:
-            dx, dy = cx - ox, cy - oy
-            axial = dx * ux + dy * uy
-            perp = dx * nx + dy * ny
-            new_perp = perp * factor
-            new_x = ox + axial * ux + new_perp * nx
-            new_y = oy + axial * uy + new_perp * ny
-            new_corners.append((new_x, new_y))
-        new_poly = Polygon(new_corners)
-        if not new_poly.is_valid:
-            new_poly = new_poly.buffer(0)
-        if new_poly.is_empty or new_poly.geom_type != "Polygon":
-            return rect
-        return new_poly
-    except Exception:
-        return rect
-
-
 def _runway_rect_m(runway, to_m) -> Polygon:
     """4-vertex runway rect spanning end-to-end including blast pads.
 
@@ -717,7 +654,7 @@ def _runway_rect_m(runway, to_m) -> Polygon:
     bx2 = bx + ux * b_extra
     by2 = by + uy * b_extra
     px, py = -uy, ux
-    half = runway.width_m * RECT_WIDTH_BUFFER_FACTOR / 2.0
+    half = runway.width_m / 2.0
     return Polygon([
         (ax2 + px * half, ay2 + py * half),
         (bx2 + px * half, by2 + py * half),
@@ -3508,8 +3445,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         _LEGACY_RUNWAY_MARGIN = 3.0
         for i, seg in enumerate(runway_segment_chain):
             lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m = seg
-            width_m = (max(1.0, width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
-                       * RECT_WIDTH_BUFFER_FACTOR)
+            width_m = max(1.0, width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
             ax, ay = _latlon_to_m_local(lat_a, lon_a, lat0, lon0, cos0)
             bx, by = _latlon_to_m_local(lat_b, lon_b, lat0, lon0, cos0)
             length = math.hypot(bx - ax, by - ay)
@@ -6029,6 +5965,88 @@ def _solve_pavement_mesh(
         except Exception:
             pass
 
+    # Per user 2026-04-28: the per-vertex apron pinning above uses
+    # the multi-source Dijkstra's NEAREST-source cone, which can
+    # assign drastically different elevations (e.g. 716 m vs 713 m)
+    # to two vertices on the same polygon edge if their nearest
+    # sources differ.  The ``smooth_rate_of_change`` grade-cap
+    # cannot fix this because both endpoints are anchored — line
+    # 4461-4462 ``if anchor[i] and anchor[j]: continue``.
+    #
+    # Post-pin grade reconciliation: walk every edge in
+    # ``mesh.edges_adj`` (polygon ring edges + within-shape +
+    # cross-shape proximity edges, covers ALL polygons including
+    # small junctions below the apron-pin area threshold).  When
+    # grade exceeds ``TAXI_MAX_GRADE`` and both endpoints are
+    # apron-pinned (not externally anchored from runway / taxi /
+    # CIFP / terminal), average the two pinned values.  Iterate
+    # until convergence.  Preserves the pinned approximation of
+    # DEM while eliminating cliffs at the cone-discontinuity seams.
+    APRON_GRADE_FIX_ITERS = 200
+    # Build the set of FREELY-PINNED apron nodes — set by
+    # ``_pin_apron_targets`` above (i.e. in ``apron_node_ids`` but
+    # not a source).  External anchors (runway / taxi / CIFP /
+    # terminal) are excluded.
+    free_pinned: set = set()
+    for nid in apron_node_ids:
+        if nid in sources_per_node:
+            continue
+        if mesh.anchor_elev[nid] is None:
+            continue
+        free_pinned.add(nid)
+    if free_pinned:
+        for _it in range(APRON_GRADE_FIX_ITERS):
+            any_change = False
+            for u in range(len(mesh.nodes)):
+                eu = mesh.anchor_elev[u]
+                if eu is None:
+                    continue
+                u_free = u in free_pinned
+                for v, length in mesh.edges_adj[u]:
+                    if v <= u:
+                        continue
+                    ev = mesh.anchor_elev[v]
+                    if ev is None:
+                        continue
+                    v_free = v in free_pinned
+                    if not u_free and not v_free:
+                        continue
+                    diff = eu - ev
+                    dmax = length * TAXI_MAX_GRADE
+                    if abs(diff) <= dmax:
+                        continue
+                    excess = abs(diff) - dmax
+                    sign = 1 if diff > 0 else -1
+                    if u_free and v_free:
+                        half = 0.5 * excess * sign
+                        new_eu = eu - half
+                        new_ev = ev + half
+                        mesh.anchor_elev[u] = new_eu
+                        mesh.interval_lo[u] = new_eu
+                        mesh.interval_hi[u] = new_eu
+                        seeded[u] = new_eu
+                        mesh.anchor_elev[v] = new_ev
+                        mesh.interval_lo[v] = new_ev
+                        mesh.interval_hi[v] = new_ev
+                        seeded[v] = new_ev
+                        eu = new_eu
+                    elif u_free:
+                        new_eu = eu - excess * sign
+                        mesh.anchor_elev[u] = new_eu
+                        mesh.interval_lo[u] = new_eu
+                        mesh.interval_hi[u] = new_eu
+                        seeded[u] = new_eu
+                        eu = new_eu
+                    else:  # v_free
+                        new_ev = ev + excess * sign
+                        mesh.anchor_elev[v] = new_ev
+                        mesh.interval_lo[v] = new_ev
+                        mesh.interval_hi[v] = new_ev
+                        seeded[v] = new_ev
+                    any_change = True
+            if not any_change:
+                break
+
     for i in range(len(mesh.nodes)):
         if mesh.anchor_elev[i] is not None:
             mesh.elev[i] = mesh.anchor_elev[i]
@@ -6468,7 +6486,112 @@ def _decompose_polygon_with_holes(polygon: Polygon,
             continue
         pieces.extend(_decompose_polygon_with_holes(
             g, min_area_m2=min_area_m2, max_depth=max_depth - 1))
+    # Per user 2026-04-28: when a polygon has multiple holes at
+    # close y-centroids (typical when widened runway segments +
+    # taxi rects produce nearby holes), the recursive horizontal
+    # cuts can leave thin (~ 2 m thick) horizontal strips between
+    # cut lines.  In X-Plane those strips render as cliffs because
+    # adjacent corners on a 2 m-thick polygon can have several
+    # metres of elevation difference (the apron-pin's nearest-
+    # source cone is ill-conditioned for such thin geometry).
+    # Merge any piece thinner than ``MIN_PIECE_THICKNESS_M`` into
+    # its largest-shared-boundary neighbour so the apron stays
+    # one continuous polygon.
+    MIN_PIECE_THICKNESS_M = 4.0
+    pieces = _merge_thin_decomposed_pieces(
+        pieces, min_thickness_m=MIN_PIECE_THICKNESS_M)
     return pieces
+
+
+def _polygon_min_thickness(poly: "Polygon") -> float:
+    """Approximate minimum thickness of a polygon: half-width of
+    the rotated minimum bounding rectangle.  Fast computation: try
+    the polygon's minimum-rotated-rectangle and return the shorter
+    side length."""
+    try:
+        mrr = poly.minimum_rotated_rectangle
+        if mrr.is_empty or mrr.geom_type != "Polygon":
+            return 0.0
+        coords = list(mrr.exterior.coords)
+        if len(coords) < 5:
+            return 0.0
+        sides = []
+        for i in range(4):
+            ax, ay = coords[i]
+            bx, by = coords[i + 1]
+            sides.append(math.hypot(bx - ax, by - ay))
+        return min(sides)
+    except Exception:
+        return 0.0
+
+
+def _merge_thin_decomposed_pieces(
+        pieces: "List[Polygon]",
+        min_thickness_m: float = 4.0,
+        max_iters: int = 50,
+        ) -> "List[Polygon]":
+    """Merge any piece in ``pieces`` whose minimum-rotated-rectangle
+    thickness is less than ``min_thickness_m`` into the neighbouring
+    piece sharing the longest boundary.  Used by
+    ``_decompose_polygon_with_holes`` to suppress 2 m-thick horizontal
+    strips that arise when multiple holes have close y-centroids.
+    Returns a possibly-shorter list with thin strips absorbed.
+    """
+    if not pieces:
+        return pieces
+    work = list(pieces)
+    for _it in range(max_iters):
+        # Find the thinnest piece below threshold.
+        thin_idx: Optional[int] = None
+        thin_thick = float('inf')
+        for i, p in enumerate(work):
+            if p is None or p.is_empty:
+                continue
+            t = _polygon_min_thickness(p)
+            if t < min_thickness_m and t < thin_thick:
+                thin_idx = i
+                thin_thick = t
+        if thin_idx is None:
+            break
+        thin = work[thin_idx]
+        # Find the neighbour with the longest shared boundary.
+        best_j: Optional[int] = None
+        best_share = 0.0
+        thin_boundary = thin.boundary
+        for j, p in enumerate(work):
+            if j == thin_idx or p is None or p.is_empty:
+                continue
+            try:
+                shared = thin_boundary.intersection(
+                    p.boundary).length
+            except Exception:
+                shared = 0.0
+            if shared > best_share:
+                best_share = shared
+                best_j = j
+        if best_j is None or best_share <= 0.0:
+            # No neighbour to merge with; drop the thin piece so
+            # it doesn't render as a cliff.
+            work[thin_idx] = None
+            continue
+        try:
+            merged = unary_union([thin, work[best_j]])
+            if merged.is_empty:
+                work[thin_idx] = None
+                continue
+            if merged.geom_type == "MultiPolygon":
+                # Pick the largest piece — the union didn't fully
+                # bridge.  Drop the thin one.
+                work[thin_idx] = None
+                continue
+            if merged.geom_type != "Polygon":
+                work[thin_idx] = None
+                continue
+            work[best_j] = merged
+            work[thin_idx] = None
+        except Exception:
+            work[thin_idx] = None
+    return [p for p in work if p is not None and not p.is_empty]
 
 
 # ── Hole splicing ────────────────────────────────────────────────
@@ -11431,57 +11554,13 @@ def _split_centerlines_at_points(
             # unavoidable).  Override the percentage margin with a
             # small fixed value when the corresponding endpoint of
             # this segment touches a bend-shared end of the
-            # centerline.
-            #
-            # BUT: cap the extension at the point where the corridor
-            # widens past 1.3 × narrow_hw — past that the rect would
-            # extend deep into an apron, fail the apron-interior
-            # check in ``_build_taxi_rects`` (≥ 2 corners off-
-            # boundary), and never be emitted (e.g. CYXY's North F
-            # bend-extends 57 m into an apron).  Walk inward from
-            # the centerline's end probing the half-width; stop
-            # where the corridor is back to within 1.3 × narrow_hw.
-            CORRIDOR_WIDTH_FACTOR = 1.3
-            def _bend_margin_at(end_param: float, sign: int) -> float:
-                """``end_param`` = 0 (start) or ls.length (end);
-                ``sign`` = +1 (walk forward into the line) or -1
-                (walk backward).  Returns a margin in metres at
-                least ``BEND_ENDPOINT_MARGIN_M`` and at most the
-                point where the corridor narrows back to
-                ``CORRIDOR_WIDTH_FACTOR × narrow_hw``."""
-                base = BEND_ENDPOINT_MARGIN_M
-                if narrow_hw <= 0:
-                    return base
-                target_hw = narrow_hw * CORRIDOR_WIDTH_FACTOR
-                # Walk inward from the bend at 5 m steps up to
-                # gap/2 meters; stop at the first sample where the
-                # local half-width is ≤ target_hw.
-                STEP = 5.0
-                MAX = max(base, gap / 2.0)
-                u = base
-                while u <= MAX:
-                    t = end_param + sign * u
-                    if t < 0 or t > ls.length:
-                        break
-                    try:
-                        hw_here = _avg_perp_halfwidth(ls, t)
-                    except Exception:
-                        hw_here = 0.0
-                    if 0 < hw_here <= target_hw:
-                        return u
-                    u += STEP
-                # Corridor never narrowed to ≤ target_hw within
-                # half the gap — fall back to the percentage margin
-                # so the rect doesn't extend into apron territory.
-                return float('inf')
+            # centerline.  ``p0 == 0`` ⇒ start side touches centerline
+            # start; ``p1 == ls.length`` ⇒ end side touches centerline
+            # end.
             if start_is_bend and abs(p0) < 0.5:
-                bm = _bend_margin_at(0.0, +1)
-                if bm != float('inf'):
-                    m_start = min(m_start, bm)
+                m_start = min(m_start, BEND_ENDPOINT_MARGIN_M)
             if end_is_bend and abs(p1 - ls.length) < 0.5:
-                bm = _bend_margin_at(ls.length, -1)
-                if bm != float('inf'):
-                    m_end = min(m_end, bm)
+                m_end = min(m_end, BEND_ENDPOINT_MARGIN_M)
             rect_p0 = p0 + m_start
             rect_p1 = p1 - m_end
             if rect_p1 - rect_p0 < MIN_SEGMENT_LEN_M:
@@ -11629,17 +11708,6 @@ def _build_taxi_rects(
             # ≥ 2 corners away from any pavement edge — the rect
             # sits inside an apron.  Skip it; the apron pavement
             # stays as residue → junction.
-            continue
-
-        # Per user 2026-04-28: widen the accepted rect by 20 %
-        # perpendicular to its axis (10 % per side) so the rendered
-        # taxi pavement extends slightly past the apt.dat-derived
-        # nominal width.  Applied AFTER the apron-interior check
-        # (which uses the narrow rect's corners) and AFTER the rect
-        # has otherwise passed validation.
-        rect = _widen_rect_perpendicular(
-            rect, trimmed, RECT_WIDTH_BUFFER_FACTOR)
-        if rect is None or rect.is_empty:
             continue
 
         role = _classify_role(trimmed, width, rwy_centerlines,
