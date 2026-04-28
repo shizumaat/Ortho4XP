@@ -8371,6 +8371,20 @@ def _emit_primary_parallel_runway_stubs(
                     if (rect.is_empty
                             or rect.geom_type != "Polygon"):
                         continue
+                # Per user 2026-04-27: F-style runway-end stubs sit
+                # in the wide runway-end ramp; the half-width probe
+                # (capped at RAY_CAP_M = 40 m) under-sizes the rect
+                # so the ramp extends past the rect's long edges and
+                # the surrounding junction wraps around them.  After
+                # the rect is built and snapped, ray-cast each corner
+                # outward perpendicular to the axis until it hits
+                # the apt.dat pavement boundary — turning the rect
+                # into a trapezoid that covers the FULL ramp width
+                # at each end independently.
+                rect = _extend_rect_corners_perpendicular(
+                    rect, stub_axis, pav_union)
+                if rect is None or rect.is_empty:
+                    continue
                 # Skip if the stub would overlap an existing rect
                 # or a same-ref rect's 30 m buffer (duplicates the
                 # L SE stub that the main pipeline already emits).
@@ -9956,6 +9970,106 @@ def _probe_axis_width(axis: LineString, pav: Polygon,
     dists.sort()
     # Median, then 2× for full width
     return dists[len(dists) // 2] * 2.0
+
+
+def _extend_rect_corners_perpendicular(
+        rect: Polygon, axis: LineString,
+        pav: Polygon, max_dist: float = 80.0,
+        ) -> Polygon:
+    """Extend each rect corner OUTWARD perpendicular to the rect's
+    AXIS until the apt.dat pavement boundary (or ``max_dist``).
+
+    Used for runway-end stubs (e.g. SPJC's F) where the half-width
+    probe is capped at ``RAY_CAP_M = 40 m`` in
+    ``_natural_half_width``, so a stub sitting in a wide runway-end
+    ramp ends up under-sized.  The pavement extends past the
+    rect's long edges, and the surrounding junction wraps around
+    them (wrap-around = polygon along long edge of sloping rect,
+    forbidden by the user's invariant).  Per user 2026-04-27: the
+    rect should cover the FULL pavement width at each end —
+    turning into a trapezoid where each corner sits exactly on the
+    pavement boundary independently.
+
+    The returned polygon has the same 4 corners in the same order
+    (so X-Plane's altitude_high/low convention is preserved); each
+    corner is just shifted outward to its respective pavement edge.
+    """
+    coords = list(rect.exterior.coords)
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) != 4:
+        return rect
+    a = list(axis.coords)
+    if len(a) < 2:
+        return rect
+    p1, p2 = a[0], a[-1]
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    mag = math.hypot(dx, dy)
+    if mag < 1e-6:
+        return rect
+    ux = dx / mag
+    uy = dy / mag
+    px = -uy
+    py = ux
+    STEP = 0.5
+
+    def _ray_extent(ax: float, ay: float,
+                    dir_x: float, dir_y: float,
+                    base_dist: float) -> float:
+        """From axis point (ax, ay) heading (dir_x, dir_y), find
+        the FURTHEST distance d such that (ax+d*dir,ay+d*dir) is
+        inside ``pav``.  Start at base_dist and walk OUTWARD only
+        (we never shrink past base_dist; the rect keeps at least
+        its nominal half-width)."""
+        # If even base_dist is OUTSIDE pav, the original rect
+        # corner is already outside; keep base.
+        if not pav.contains(
+                Point(ax + dir_x * base_dist,
+                      ay + dir_y * base_dist)):
+            return base_dist
+        d = base_dist
+        while d < max_dist:
+            d_test = d + STEP
+            if not pav.contains(
+                    Point(ax + dir_x * d_test,
+                          ay + dir_y * d_test)):
+                return d
+            d = d_test
+        return d
+
+    new_corners: List[Tuple[float, float]] = []
+    for cx, cy in coords:
+        # For each corner: project onto axis to determine which
+        # endpoint (p1 or p2) it belongs to and which perp side.
+        vx = cx - p1[0]
+        vy = cy - p1[1]
+        proj = vx * ux + vy * uy
+        # axis endpoint nearer this corner
+        ax_pt = p1 if proj < mag * 0.5 else p2
+        # perpendicular signed distance from axis
+        rel_x = cx - ax_pt[0]
+        rel_y = cy - ax_pt[1]
+        perp_signed = rel_x * px + rel_y * py
+        if perp_signed >= 0:
+            dir_x, dir_y = px, py
+        else:
+            dir_x, dir_y = -px, -py
+        base = abs(perp_signed)
+        if base < 1.0:
+            new_corners.append((cx, cy))
+            continue
+        d = _ray_extent(ax_pt[0], ax_pt[1], dir_x, dir_y, base)
+        new_corners.append(
+            (ax_pt[0] + dir_x * d, ax_pt[1] + dir_y * d))
+
+    try:
+        new_rect = Polygon(new_corners)
+        if new_rect.is_valid and not new_rect.is_empty:
+            return new_rect
+    except Exception:
+        pass
+    return rect
 
 
 def _rect_from_axis_extended(axis: LineString, width: float,
