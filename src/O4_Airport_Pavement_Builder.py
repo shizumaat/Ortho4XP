@@ -1193,16 +1193,16 @@ def _drop_primary_parallels_embedded_in_pavement(
     """
     if apt_pav_union is None or apt_pav_union.is_empty:
         return taxi_rects
-    # Per user 2026-04-28: a sloping rect cannot have any junction
-    # or apron pavement within 1 m of its long edge for >10% of the
-    # edge length.  The slope along the rect's long edge is uniform
-    # (altitude_high at one short edge, altitude_low at the other);
-    # any adjacent junction-class pavement would have to match that
-    # slope along the seam, which produces visible elevation
-    # glitches in X-Plane when the junction's natural DEM slope
-    # differs from the rect's straight-line slope.  Absorb the rect
-    # into the junction so the whole region becomes one polygon
-    # with per-vertex node_altitudes capturing the natural slope.
+    # Per user 2026-04-28: a sloping rect cannot have a junction or
+    # apron polygon running alongside its long edge.  The slope
+    # along the rect's long edge is uniform (altitude_high at one
+    # short edge, altitude_low at the other); any adjacent junction-
+    # class pavement would have to match that slope along the seam,
+    # which produces visible elevation glitches in X-Plane when the
+    # junction's natural DEM slope differs from the rect's straight-
+    # line slope.  Absorb the rect into the junction so the whole
+    # region becomes one polygon with per-vertex node_altitudes
+    # capturing the natural slope.
     #
     # "Junction-class pavement" = pav_union − runway_polys − OTHER
     # taxi rects.  This excludes:
@@ -1236,40 +1236,54 @@ def _drop_primary_parallels_embedded_in_pavement(
         pass
     if junction_pav.is_empty:
         return taxi_rects
-    # Pre-buffer junction-pav by proximity_m so the long-edge
-    # intersection check counts edge length within proximity_m.
-    try:
-        junction_buf = junction_pav.buffer(proximity_m)
-    except Exception:
-        junction_buf = junction_pav
     # All sloping-rect roles are subject to the absorption rule.
     sloping_rect_roles = {ROLE_PRIMARY_PARALLEL,
                           ROLE_SECONDARY_PARALLEL,
                           ROLE_STUB, ROLE_CROSS_CONNECTOR}
 
-    # Per user 2026-04-28: absorb only when BOTH long edges have
-    # junction-class pavement within 1 m at the same axial position
-    # (rect is "sandwiched" / embedded), AND PARTIALLY — only the
-    # axial range where both sides are adjacent gets absorbed; the
+    # Per user 2026-04-28 (final): absorb wherever EITHER long edge
+    # has junction-class pavement running alongside it.  Sloping
+    # rects cannot share a long edge with an apron/junction polygon
+    # — the rect's straight-line slope along the long edge has to
+    # match the junction's natural DEM slope along the seam, which
+    # it generally won't.  Whether the apron sits on one side or
+    # both, the violation is the same.  Apply PARTIAL absorption —
+    # only the axial range where adjacency holds gets absorbed; the
     # rest of the rect survives as shorter rect(s).
     #
-    # Walk each rect's axis at 5 m steps.  At each step, check the
-    # left and right long-edge midpoints.  A step is "absorbed" only
-    # when both sides are within 1 m of junction-pav.  Find
-    # contiguous absorbed runs ≥ 10 % of axial length; keep
-    # non-absorbed intervals (≥ 30 m fragments) as new rects.
+    # Probe semantics: at every 5 m axis step, compute a point
+    # ``OUTER_PROBE_M`` METRES OUTSIDE each long edge and ask
+    # whether that point lies *directly inside* junction-pav (no
+    # buffer).  A real apron extends many meters past the rect's
+    # long edge, so a point 2 m beyond the edge will hit it.  The
+    # 1 m-and-buffer formulation we replaced was sensitive to
+    # sub-1 m slivers caused by apt.dat / DSF polygons that render
+    # ~0.5 m wider than the OSM-tagged taxi width — those slivers
+    # are polygon-imprecision noise, NOT real apron adjacency, and
+    # spuriously absorbed every rect at CYXY.
+    #
+    # Walk each rect's axis at 5 m steps.  At each step, sample the
+    # 2 m-outside-left and 2 m-outside-right points.  A step is
+    # "adjacent" when EITHER outside point is in junction-pav.  Find
+    # contiguous adjacent runs ≥ 10 % of axial length; keep non-
+    # adjacent intervals (≥ 30 m fragments) as new rects.
     #
     # Use cases:
-    #   - F primary parallel at CYXY (288 m, 33 % + 100 %): both-
-    #     sides-adjacent at the 33 % axial range → split into a
-    #     shorter rect for the remaining 67 % (~190 m kept).
-    #   - F embedded in SPJC apron (both sides 100 %): full
-    #     absorption.
-    #   - E primary parallel along CYXY apron edge (one side 100 %,
-    #     other 0 %): no axial step has both sides adjacent → no
-    #     absorption.
+    #   - F primary parallel at CYXY: south 30 % is INSIDE the apron
+    #     (apron extends past both long edges) → adjacent →
+    #     absorbed.  North 70 % extends out of the apron — only
+    #     polygon-imprecision slivers within 0.5 m of the long edge,
+    #     no substantive apron at 2 m → not adjacent → kept,
+    #     extending from apron edge to the centerline bend.
+    #   - E primary parallel at CYXY: apron runs alongside ONE long
+    #     side for ~65 % of length, with several meters of apron
+    #     past the edge → adjacent → absorbed.  Non-adjacent
+    #     fragments (if any ≥ 30 m) survive.
+    #   - F embedded in SPJC apron (both sides 100 %): fully
+    #     absorbed.
     SAMPLE_STEP_M = 5.0
     MIN_KEPT_M = 30.0
+    OUTER_PROBE_M = 2.0
 
     kept: List[Tuple[Polygon, LineString, str, str]] = []
     abs_refs: List[str] = []
@@ -1313,32 +1327,33 @@ def _drop_primary_parallels_embedded_in_pavement(
             continue
 
         n_steps = max(2, int(L / SAMPLE_STEP_M) + 1)
-        both_adj = [False] * n_steps
+        either_adj = [False] * n_steps
+        outer = half_w + OUTER_PROBE_M
         for i in range(n_steps):
             u = min(L, i * SAMPLE_STEP_M)
             cx = a_mid[0] + u * ux
             cy = a_mid[1] + u * uy
             try:
-                left_pt = Point(cx + nx * half_w,
-                                 cy + ny * half_w)
-                right_pt = Point(cx - nx * half_w,
-                                  cy - ny * half_w)
-                both_adj[i] = (
-                    bool(junction_buf.contains(left_pt))
-                    and bool(junction_buf.contains(right_pt)))
+                left_pt = Point(cx + nx * outer,
+                                 cy + ny * outer)
+                right_pt = Point(cx - nx * outer,
+                                  cy - ny * outer)
+                either_adj[i] = (
+                    bool(junction_pav.contains(left_pt))
+                    or bool(junction_pav.contains(right_pt)))
             except Exception:
                 continue
 
-        # Find contiguous "both adjacent" runs ≥ 10 % of axis.
+        # Find contiguous "either adjacent" runs ≥ 10 % of axis.
         min_run_steps = max(1, int(adjacency_frac * n_steps))
         absorbed_intervals: List[Tuple[float, float]] = []
         i = 0
         while i < n_steps:
-            if not both_adj[i]:
+            if not either_adj[i]:
                 i += 1
                 continue
             j = i
-            while j < n_steps and both_adj[j]:
+            while j < n_steps and either_adj[j]:
                 j += 1
             if (j - i) >= min_run_steps:
                 u_start = i * SAMPLE_STEP_M
@@ -1411,7 +1426,7 @@ def _drop_primary_parallels_embedded_in_pavement(
         try:
             import sys as _sys
             _sys.stderr.write(
-                f"  [pav-builder] both-sides-adjacent absorption: "
+                f"  [pav-builder] long-edge-adjacent absorption: "
                 f"{n_full} dropped, {n_split} split, "
                 f"{n_clipped} clipped (refs: "
                 f"{', '.join(abs_refs)}).\n")
@@ -2137,78 +2152,19 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 except Exception:
                     pass
 
-    # ── Augment pav_union with synthetic pavement around OSM
-    # centerlines that don't intersect any apt.dat pavement
-    # polygon.  Some airports (notably CYXY) have incomplete
-    # apt.dat row-110 coverage — large parts of the taxi network
-    # exist in OSM but have NO matching apt.dat pavement.  Without
-    # synthetic coverage those centerlines fail the rect-extraction
-    # clip step ("clip empty") and the area is lost.  Buffer at a
-    # typical taxi half-width so downstream rect-build and
-    # junction-construction can proceed.
-    #
-    # Skip mis-tagged centerlines: a long OSM way tagged
-    # ``aeroway=taxiway`` whose path runs entirely outside both
-    # apt.dat pavement AND the SHARED-BUFFER (apt.dat ∪ DSF
-    # pavement, dilated by OSM_FALLBACK_OVERLAP_TOL_M to forgive
-    # OSM/apt.dat misalignment) is almost certainly a service
-    # road or perimeter road that was incorrectly tagged.  The
-    # shared buffer is the right denominator because by this point
-    # ``pav_union`` includes DSF draped pavement too — anything
-    # NOT touching it within the tolerance isn't a real airport
-    # taxi.  CYXY had a 1871 m mis-tagged service road
-    # (way -820551) that the pre-DSF logic was buffering into a
-    # spurious diagonal rect; this filter eliminates it.
-    OSM_FALLBACK_HALF_WIDTH_M = 15.0   # ~30 m wide synthetic strip
-                                        # — covers a code-C taxiway
-                                        # (23-25 m wide) with a
-                                        # small outward shoulder.
-    OSM_FALLBACK_OVERLAP_TOL_M = 30.0  # forgive 30 m misalignment
-                                        # between OSM centerline and
-                                        # apt.dat/DSF boundary
-    OSM_FALLBACK_MIN_OVERLAP_FRAC = 0.30  # require ≥30% of the
-                                           # centerline to lie within
-                                           # the tolerance buffer
-                                           # before treating it as a
-                                           # real (incompletely-
-                                           # mapped) taxiway
-    if pav_union is not None and osm_centerlines:
-        synth_polys: List[Polygon] = []
-        try:
-            tol_buf = pav_union.buffer(OSM_FALLBACK_OVERLAP_TOL_M,
-                                        cap_style=2, join_style=2)
-        except Exception:
-            tol_buf = pav_union
-        for axis, _ref in osm_centerlines:
-            try:
-                if axis.intersects(pav_union):
-                    continue  # already covered, no synth needed
-                inter = axis.intersection(tol_buf)
-                inter_len = inter.length if not inter.is_empty else 0
-                if axis.length <= 0:
-                    continue
-                if inter_len / axis.length < OSM_FALLBACK_MIN_OVERLAP_FRAC:
-                    # Mis-tagged centerline (service road, perimeter
-                    # road, etc.).  Skip.
-                    continue
-                buf = axis.buffer(OSM_FALLBACK_HALF_WIDTH_M,
-                                  cap_style=2, join_style=2)
-                if not buf.is_empty and buf.geom_type == "Polygon":
-                    synth_polys.append(buf)
-            except Exception:
-                continue
-        if synth_polys:
-            try:
-                synth_union = unary_union(synth_polys)
-                # Subtract any runway overlap from the synth so the
-                # runway remains the authoritative source.
-                if layout.runway_union is not None:
-                    synth_union = synth_union.difference(
-                        layout.runway_union)
-                pav_union = unary_union([pav_union, synth_union])
-            except Exception:
-                pass
-
+    # ── Pavement source-of-truth (user 2026-04-28): apt.dat row-110
+    # ∪ DSF pavement, period.  Earlier revisions augmented pav_union
+    # with a 30 m-wide synthetic buffer around any OSM centerline
+    # that didn't intersect apt.dat/DSF; the rationale was to keep
+    # rect-extraction working at airports where the OSM taxiway
+    # network is more complete than the apt.dat coverage.  That
+    # workaround is dropped: OSM centerlines drive WHICH taxiways
+    # exist (geometry, ref tag, role), but the actual pavement
+    # surface comes from apt.dat ∪ DSF only.  Centerlines without
+    # matching apt.dat/DSF coverage produce no rect — that's an
+    # apt.dat data gap to be fixed at the source, not papered over
+    # with a synthetic strip whose width arbitrarily differs from
+    # the OSM-tagged taxi width.
 
     # ── Terminals: expand OSM building outlines to the containing
     # apt.dat pavement polygon (or buffer if no polygon contains).
@@ -2812,12 +2768,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # parallels that legitimately cross unpaved area are unaffected
     # (their long edges aren't inside pavement).
     #
-    # Note: we test against ``pav_union`` (the full union), not
-    # ``apt_pav_union`` (row-110 only), because the residue is
-    # computed from ``pav_union`` and that's what determines whether
-    # the junction wraps the long edge.  At SPJC's SE apron, the
-    # long edges of F are 0 % / 24 % inside row-110 alone but
-    # ≈100 % inside the full pavement union including DSF.
+    # Note: ``pav_union`` is now apt.dat ∪ DSF only (no OSM-synth);
+    # that's the right denominator for the absorption check.
+    # Including DSF is essential — at SPJC's SE apron, F's long
+    # edges are 0 % / 24 % inside row-110 alone but ≈100 % inside
+    # apt.dat ∪ DSF.
     taxi_rects = _drop_primary_parallels_embedded_in_pavement(
         taxi_rects, pav_union, runway_polys=runway_polys)
 
