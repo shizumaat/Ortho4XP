@@ -3474,12 +3474,17 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 index = None
             kept_shapes: List[BuiltShape] = []
             kept_polys: List[Polygon] = []
+            # Track each dropped segment alongside the apron
+            # candidate that contained it — used below to clip the
+            # hole-fill merge so it can't bleed outside the apron.
+            dropped_with_apron: List[Tuple[Polygon, Polygon]] = []
             n_dropped = 0
             for sh in layout.shapes:
                 if sh.role != ROLE_RUNWAY:
                     kept_shapes.append(sh)
                     continue
                 drop = False
+                drop_apron: Optional[Polygon] = None
                 if (sh.polygon is not None
                         and not sh.polygon.is_empty):
                     seg_area = sh.polygon.area
@@ -3497,11 +3502,17 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                             if (inter.area / seg_area
                                     > RUNWAY_INSIDE_APRON_FRAC):
                                 drop = True
+                                drop_apron = cand
                                 break
                         except Exception:
                             continue
                 if drop:
                     n_dropped += 1
+                    if (sh.polygon is not None
+                            and not sh.polygon.is_empty
+                            and drop_apron is not None):
+                        dropped_with_apron.append(
+                            (sh.polygon, drop_apron))
                     continue
                 kept_shapes.append(sh)
                 if sh.polygon is not None and not sh.polygon.is_empty:
@@ -3517,6 +3528,26 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     pass
                 layout.shapes = kept_shapes
                 new_runway_polys = kept_polys
+
+                # Per user 2026-04-28: when an apron-merged runway
+                # segment is dropped, its rect-shaped hole remains
+                # in the surrounding junction polygons (the
+                # residue was computed earlier with the runway
+                # subtracted from pav_union, then split into
+                # pieces around the hole).  Fill the hole by
+                # re-emitting the dropped segment as a JUNCTION
+                # polygon — its vertices match the adjacent
+                # junctions' boundary at the runway's edges, so
+                # the new junction shares a boundary with the
+                # apron pieces and the airport pavement coverage
+                # is continuous (no runway-shaped void).
+                for dp, _apron in dropped_with_apron:
+                    if dp.is_empty:
+                        continue
+                    layout.shapes.append(BuiltShape(
+                        polygon=dp,
+                        role=ROLE_JUNCTION,
+                        ref=""))
 
         # Resolve runway-runway crossings: when two runway segments
         # overlap significantly (e.g. CYXY's crosswind 02/20 crossing
