@@ -2168,7 +2168,52 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # apt.dat polygon that's only marginally larger than itself.
     apron_candidates = list(pav_polys)  # apt.dat + DSF, pre-subtract
     if pav_union is not None and layout.runway_union is not None:
-        pav_union = pav_union.difference(layout.runway_union)
+        # Per user 2026-04-28: where a runway passes through a much
+        # larger apron polygon, the runway is "apron-merged" — the
+        # apron physically covers the runway pavement and the
+        # downstream runway-segment-chain processing will drop the
+        # apron-merged segments.  Don't subtract those parts from
+        # pav_union now: the apron junctions should cover them
+        # naturally, with no runway-shaped void to fill later.
+        #
+        # Detection mirrors ``_compute_elevations``'s segment-level
+        # check (line ~3469) but applied to the original runway
+        # polygons: the runway/candidate intersection counts as
+        # apron-merged when the candidate is ≥
+        # RUNWAY_APRON_AREA_RATIO × the intersection area.  A small
+        # taxiway-sized candidate doesn't qualify (intersection is
+        # most of the candidate); only big apron polygons do.
+        apron_merged_regions: List[Polygon] = []
+        for r_poly in runway_polys:
+            for cand in apron_candidates:
+                try:
+                    inter = r_poly.intersection(cand)
+                    if inter.is_empty or inter.area < 1.0:
+                        continue
+                    if cand.area > inter.area * RUNWAY_APRON_AREA_RATIO:
+                        # Take the intersection as the apron-merged
+                        # region — extracted as Polygon parts only.
+                        if inter.geom_type == "Polygon":
+                            apron_merged_regions.append(inter)
+                        elif hasattr(inter, "geoms"):
+                            for g in inter.geoms:
+                                if (g.geom_type == "Polygon"
+                                        and not g.is_empty):
+                                    apron_merged_regions.append(g)
+                except Exception:
+                    continue
+        if apron_merged_regions:
+            try:
+                merged_union = unary_union(apron_merged_regions)
+                effective_runway = layout.runway_union.difference(
+                    merged_union)
+            except Exception:
+                effective_runway = layout.runway_union
+        else:
+            effective_runway = layout.runway_union
+        pav_union = pav_union.difference(effective_runway)
+        # Stash for the defensive residue subtraction below.
+        layout._effective_runway_union = effective_runway
 
     # Collect all apt.dat pavement vertices (pre-union, real apt.dat
     # coord set) + runway corners.  This is the authoritative vertex
@@ -2982,9 +3027,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
             residue = residue.difference(terminal_union)
         # Defensive: subtract runway even though pav_union already
         # had it removed — floating-point boundary artifacts can
-        # leave sub-meter residue slivers overlapping runway.
-        if layout.runway_union is not None and not layout.runway_union.is_empty:
-            residue = residue.difference(layout.runway_union)
+        # leave sub-meter residue slivers overlapping runway.  Use
+        # the EFFECTIVE runway union (i.e. with apron-merged
+        # regions excluded) so the residue covers parts of runways
+        # that pass through aprons.
+        _eff_rwy = getattr(layout, "_effective_runway_union",
+                           layout.runway_union)
+        if _eff_rwy is not None and not _eff_rwy.is_empty:
+            residue = residue.difference(_eff_rwy)
 
         # Per user 2026-04-27 invariant: NO polygon along the long
         # edge of a sloping rect.  Even if apt.dat has pavement
@@ -3529,25 +3579,15 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 layout.shapes = kept_shapes
                 new_runway_polys = kept_polys
 
-                # Per user 2026-04-28: when an apron-merged runway
-                # segment is dropped, its rect-shaped hole remains
-                # in the surrounding junction polygons (the
-                # residue was computed earlier with the runway
-                # subtracted from pav_union, then split into
-                # pieces around the hole).  Fill the hole by
-                # re-emitting the dropped segment as a JUNCTION
-                # polygon — its vertices match the adjacent
-                # junctions' boundary at the runway's edges, so
-                # the new junction shares a boundary with the
-                # apron pieces and the airport pavement coverage
-                # is continuous (no runway-shaped void).
-                for dp, _apron in dropped_with_apron:
-                    if dp.is_empty:
-                        continue
-                    layout.shapes.append(BuiltShape(
-                        polygon=dp,
-                        role=ROLE_JUNCTION,
-                        ref=""))
+                # Per user 2026-04-28: dropping the apron-merged
+                # runway segment leaves no hole — the residue
+                # computation in ``build_airport_pavement`` already
+                # excludes apron-merged regions from the runway-
+                # subtraction (see ``_effective_runway_union``), so
+                # the surrounding apron junction(s) cover the
+                # runway segment's footprint naturally.  Nothing to
+                # do here.
+                _ = dropped_with_apron  # used only for the log line
 
         # Resolve runway-runway crossings: when two runway segments
         # overlap significantly (e.g. CYXY's crosswind 02/20 crossing
