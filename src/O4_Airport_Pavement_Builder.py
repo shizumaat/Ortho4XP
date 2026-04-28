@@ -663,6 +663,141 @@ def _runway_rect_m(runway, to_m) -> Polygon:
     ])
 
 
+def _detect_runway_shoulders(
+        runway,
+        to_m,
+        pav_polys: "List[Polygon]",
+        max_lat_gap_m: float = 1.0,
+        min_self_inside_frac: float = 0.80,
+        min_runway_overlap_frac: float = 0.40,
+        min_axial_aspect: float = 2.5,
+        min_strip_length_m: float = 50.0,
+        ) -> "Tuple[float, float, List[int]]":
+    """Scan ``pav_polys`` for polygons that are runway pavement
+    (shoulders or the runway's own envelope polygon often labelled
+    as a "taxiway" by apt.dat) and return the perpendicular extent
+    those polygons + the runway itself jointly occupy.
+
+    Per user 2026-04-27: long thin pavement polygons parallel to a
+    runway and touching it (within 1 m of the runway edge) are
+    SHOULDERS — fold them into the runway emit so the runway
+    pavement reflects actual paved area, not just the apt.dat row-100
+    designation.  At HECA, runway 05R/23L's apt.dat row-100 width is
+    60 m but a row-110 polygon "New Taxiway 1" sits centered on the
+    runway at 75.6 m wide (the runway-with-shoulders envelope).
+    Without this absorption, the 7.8 m-per-side shoulder strip
+    emits as junctions wrapping the runway.  At CYXY's short
+    crosswind 02/20 (22.9 m wide), narrow strips "North of 02" and
+    "South of 02" act as shoulders extending the runway pavement
+    asymmetrically.
+
+    Returns ``(new_left, new_right, absorbed_indices)``:
+      * ``new_left``  — most-negative perpendicular offset from the
+        runway centerline that emitted runway pavement should reach.
+      * ``new_right`` — most-positive perpendicular offset.
+      * ``absorbed_indices`` — indices into ``pav_polys`` of the
+        polygons folded into the runway.  Caller should remove them
+        from ``pav_polys`` (and ``apt_only_pav_polys`` if applicable)
+        so they don't re-emit as separate junction shapes.
+
+    When no shoulders are found, returns ``(-runway_half, +runway_half,
+    [])``.
+
+    Detection rules per polygon:
+      1. Long axis aligned with runway (axial extent ≥
+         ``min_axial_aspect`` × perpendicular extent, axial extent ≥
+         ``min_strip_length_m``).
+      2. Polygon mostly inside the runway's longitudinal extent:
+         ``polygon's u-extent inside [0, L] ≥ min_self_inside_frac
+         × polygon's total u-extent``.
+      3. Polygon covers a significant fraction of the runway's
+         length: ``u-overlap with [0, L] ≥ min_runway_overlap_frac
+         × runway length L``.  Filters out tiny end-only blast pads
+         (e.g. CYXY's '32L' polygon, 79 m at one end of a 2899 m
+         runway) while admitting partial-length shoulders that
+         cover roughly half the runway (e.g. CYXY's "North of 02"
+         covering 47 % of the 02/20 runway).
+      4. Perpendicular interval overlaps or touches
+         ``[-runway_half, +runway_half]`` within ``max_lat_gap_m``.
+      5. Side-extension limit: the polygon's extension PAST the
+         runway edge on each side is less than the runway width.
+         Filters out large aprons (e.g. CYXY's "Apron 1 and E",
+         329 m wide, that nibbles the runway edge by 4 m) while
+         admitting both wide envelopes (HECA's runway-with-
+         shoulders polygon, 7.8 m past each edge) and narrow
+         single-side shoulders (CYXY's "North of 02", 18 m past
+         the north edge).
+    """
+    ax, ay = to_m(runway.lon_a, runway.lat_a)
+    bx, by = to_m(runway.lon_b, runway.lat_b)
+    udx = bx - ax
+    udy = by - ay
+    L = math.hypot(udx, udy)
+    runway_half = runway.width_m / 2.0
+    if L < 1.0:
+        return (-runway_half, runway_half, [])
+    ux, uy = udx / L, udy / L
+    nx, ny = -uy, ux  # perpendicular (rotated 90° CCW from u)
+
+    runway_width = 2.0 * runway_half
+    new_left = -runway_half
+    new_right = runway_half
+    absorbed: List[int] = []
+    for idx, pav in enumerate(pav_polys):
+        if pav is None or pav.is_empty:
+            continue
+        try:
+            coords = list(pav.exterior.coords)
+        except Exception:
+            continue
+        if not coords:
+            continue
+        u_proj = [(cx - ax) * ux + (cy - ay) * uy for cx, cy in coords]
+        n_proj = [(cx - ax) * nx + (cy - ay) * ny for cx, cy in coords]
+        u_min, u_max = min(u_proj), max(u_proj)
+        n_min, n_max = min(n_proj), max(n_proj)
+        u_extent = u_max - u_min
+        n_extent = n_max - n_min
+        if u_extent < min_strip_length_m:
+            continue
+        if u_extent < min_axial_aspect * n_extent:
+            continue
+        # Polygon must be mostly inside the runway's longitudinal
+        # extent.
+        u_overlap = min(u_max, L) - max(u_min, 0.0)
+        if u_overlap < min_self_inside_frac * u_extent:
+            continue
+        # Polygon must cover a significant fraction of the runway
+        # length (filters out end-only blast pads / stopways).
+        if u_overlap < min_runway_overlap_frac * L:
+            continue
+        # Perpendicular adjacency / overlap.
+        if n_max < -runway_half - max_lat_gap_m:
+            continue
+        if n_min > runway_half + max_lat_gap_m:
+            continue
+        # Side-extension limit: the polygon's extension PAST the
+        # runway edge on each side must be less than the runway
+        # width.  Catches both:
+        #   - HECA's "New Taxiway 1" envelope (8.7 m past each edge,
+        #     well under 60 m runway width — accepted).
+        #   - CYXY's "North of 02" shoulder (18 m past the north
+        #     edge, under 22.9 m runway width — accepted).
+        # Rejects:
+        #   - CYXY's "Apron 1 and E" (extends 325 m past the east
+        #     edge of 14R/32L, way over the 45.7 m runway width).
+        north_ext = max(0.0, n_max - runway_half)
+        south_ext = max(0.0, -runway_half - n_min)
+        if north_ext > runway_width or south_ext > runway_width:
+            continue
+        absorbed.append(idx)
+        if n_min < new_left:
+            new_left = n_min
+        if n_max > new_right:
+            new_right = n_max
+    return (new_left, new_right, absorbed)
+
+
 # ──────────────────────────────────────────────────────────────────
 # Pavement union helpers
 # ──────────────────────────────────────────────────────────────────
@@ -1096,6 +1231,108 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # loses most of its area (SPJC terminal1 regressed from
     # 105 K m² → 35 K m² before this fix).
     apt_only_pav_polys: List[Polygon] = list(pav_polys)
+
+    # ── Runway shoulder absorption ─────────────────────────────────
+    # Long thin row-110 polygons parallel to a runway and touching
+    # or overlapping it are runway shoulders (or, when wider than
+    # the apt.dat row-100 width and centered on the runway, the
+    # runway's own envelope polygon — apt.dat sometimes labels
+    # these as "taxiways", e.g. HECA's "New Taxiway 1").  Fold them
+    # into the runway: widen the runway emit to the union of
+    # perpendicular extents, mutate the runway's apt.dat record so
+    # downstream CIFP segmenting picks up the new width, and remove
+    # the absorbed polygons from the pavement set so they don't
+    # re-emit as junction polygons wrapping the runway.
+    #
+    # Asymmetric shoulders (one side only — common at gravel
+    # crosswind runways like CYXY's 02/20) are handled by shifting
+    # the runway centerline toward the shoulder midpoint while
+    # widening to the union extent.  The CIFP threshold elevations
+    # (anchored at the original runway thresholds) still apply
+    # because the threshold lat/lon stays paired with the same
+    # apt.dat designation; the perpendicular shift moves the
+    # centerline by the shoulder offset (typically < 20 m, well
+    # within DEM noise tolerance).
+    absorbed_pav_indices: set = set()
+    for ridx, r in enumerate(apt.runways):
+        new_left, new_right, absorbed = _detect_runway_shoulders(
+            r, to_m, pav_polys)
+        new_width = new_right - new_left
+        # Only widen when the new extent meaningfully exceeds the
+        # apt.dat row-100 width (≥ 0.5 m on top of current).
+        if new_width <= r.width_m + 0.5:
+            continue
+        offset = 0.5 * (new_left + new_right)
+        # Shift centerline by ``offset`` perpendicular.  The
+        # perpendicular vector in meter space is (nx, ny) =
+        # (-uy, ux), where (ux, uy) is the runway's
+        # along-axis unit vector.
+        ax_m, ay_m = to_m(r.lon_a, r.lat_a)
+        bx_m, by_m = to_m(r.lon_b, r.lat_b)
+        udx = bx_m - ax_m
+        udy = by_m - ay_m
+        L_axis = math.hypot(udx, udy)
+        if L_axis < 1.0:
+            continue
+        ux_m, uy_m = udx / L_axis, udy / L_axis
+        nx_m, ny_m = -uy_m, ux_m
+        # Apply offset back through the inverse of ``to_m``.  Our
+        # to_m projection (see ``_projection``) is anchored at
+        # ``layout.anchor`` = (lat0, lon0) and uses cos(lat0).
+        lat0, lon0 = layout.anchor
+        cos0 = math.cos(math.radians(lat0))
+        d_lat_per_m = 1.0 / R_EARTH
+        d_lon_per_m = 1.0 / (R_EARTH * cos0) if cos0 > 1e-9 else 0.0
+        d_lat = math.degrees(ny_m * offset * d_lat_per_m)
+        d_lon = math.degrees(nx_m * offset * d_lon_per_m)
+        old_w = r.width_m
+        old_lat_a, old_lon_a = r.lat_a, r.lon_a
+        if abs(offset) > 0.05:
+            r.lat_a = r.lat_a + d_lat
+            r.lon_a = r.lon_a + d_lon
+            r.lat_b = r.lat_b + d_lat
+            r.lon_b = r.lon_b + d_lon
+        r.width_m = new_width
+        new_rect = _runway_rect_m(r, to_m)
+        if new_rect.is_empty:
+            r.lat_a, r.lon_a = old_lat_a, old_lon_a
+            r.width_m = old_w
+            continue
+        runway_polys[ridx] = new_rect
+        ref = f"{r.desig_a}/{r.desig_b}"
+        for s in layout.shapes:
+            if s.role == ROLE_RUNWAY and s.ref == ref:
+                s.polygon = new_rect
+                break
+        absorbed_pav_indices.update(absorbed)
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] {icao}: widened runway "
+                f"{r.desig_a}/{r.desig_b}: {old_w:.1f}m → "
+                f"{r.width_m:.1f}m"
+                + (f" (centerline shifted {offset:+.1f}m)"
+                   if abs(offset) > 0.5 else "")
+                + f" — absorbed {len(absorbed)} shoulder polygon(s).\n"
+            )
+        except Exception:
+            pass
+
+    if absorbed_pav_indices:
+        # Filter both pav_polys and the apt-only snapshot.  Use
+        # WKB-identity to filter apt_only_pav_polys (its indices
+        # don't necessarily match pav_polys' if either was modified;
+        # the snapshot was taken just above so they're identical at
+        # this point, but using WKB is robust to future changes).
+        absorbed_wkbs = {pav_polys[i].wkb for i in absorbed_pav_indices
+                         if 0 <= i < len(pav_polys)}
+        pav_polys = [p for i, p in enumerate(pav_polys)
+                     if i not in absorbed_pav_indices]
+        apt_only_pav_polys = [p for p in apt_only_pav_polys
+                              if p.wkb not in absorbed_wkbs]
+        layout.runway_union = (unary_union(runway_polys)
+                                if runway_polys else None)
+
     # Add draped pavement polygons from every available DSF for
     # this airport.  Some scenery packs (e.g. CYXY Whitehorse) ship
     # pavement geometry as DSF draped polygons referencing
