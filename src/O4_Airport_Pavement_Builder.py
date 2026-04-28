@@ -2211,9 +2211,21 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 effective_runway = layout.runway_union
         else:
             effective_runway = layout.runway_union
+        # Two pav_union variants:
+        #   * ``pav_union_for_rects`` — full runway subtraction.
+        #     Used by ``_build_taxi_rects`` for centerline clipping
+        #     and the apron-interior boundary check.  Keeps F-style
+        #     rects from extending into apron-merged-runway regions
+        #     and failing the corner-on-boundary check (regression
+        #     observed at CYXY's North F when residue switched to
+        #     effective-runway subtraction).
+        #   * ``pav_union`` (mutated below) — effective_runway
+        #     subtraction so the residue / apron junctions cover
+        #     apron-merged regions naturally.
+        pav_union_for_rects = pav_union.difference(layout.runway_union)
         pav_union = pav_union.difference(effective_runway)
-        # Stash for the defensive residue subtraction below.
         layout._effective_runway_union = effective_runway
+        layout._pav_union_for_rects = pav_union_for_rects
 
     # Collect all apt.dat pavement vertices (pre-union, real apt.dat
     # coord set) + runway corners.  This is the authoritative vertex
@@ -2791,14 +2803,24 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # Uniform pipeline per user (2026-04-20): intersections +
     # sharp curves define break points; 70% rect between
     # consecutive breaks.  No width analysis.
+    # Use ``pav_union_for_rects`` (full runway subtraction, no
+    # apron-merged-runway carve-out) for centerline splitting + rect
+    # building.  The apron-merge exclusion was added to ``pav_union``
+    # to keep apron junctions seamless across apron-merged runway
+    # ends, but it makes the pavement boundary expand outward into
+    # those former runway regions — primary parallels at the airport
+    # NW (e.g. CYXY's F) then have their natural corridor end (where
+    # the pavement narrows back to taxi width) lost in the expanded
+    # pav_union, and the apron-interior corner check rejects them.
+    _pav_for_rects = getattr(layout, "_pav_union_for_rects", pav_union)
     osm_centerlines = _split_centerlines_at_points(
         osm_centerlines, junction_points, approach_tol_m=25.0,
-        pav_union=pav_union, rwy_union=layout.runway_union,
+        pav_union=_pav_for_rects, rwy_union=layout.runway_union,
         rwy_centerlines=rwy_centerlines)
 
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
-        osm_centerlines, pav_union, layout.runway_union,
+        osm_centerlines, _pav_for_rects, layout.runway_union,
         rwy_centerlines, apt_vertices=apt_pav_vertices,
         ref_overall_bearings=ref_overall_bearings)
 
@@ -11554,13 +11576,54 @@ def _split_centerlines_at_points(
             # unavoidable).  Override the percentage margin with a
             # small fixed value when the corresponding endpoint of
             # this segment touches a bend-shared end of the
-            # centerline.  ``p0 == 0`` ⇒ start side touches centerline
-            # start; ``p1 == ls.length`` ⇒ end side touches centerline
-            # end.
+            # centerline.
+            #
+            # BUT: cap the extension at the point where the corridor
+            # widens past 1.3 × narrow_hw — past that the rect would
+            # extend deep into an apron, fail the apron-interior
+            # check in ``_build_taxi_rects`` (≥ 2 corners off-
+            # boundary), and never be emitted (e.g. CYXY's North F
+            # bend-extends 57 m into an apron).  Walk inward from
+            # the centerline's end probing the half-width; stop
+            # where the corridor is back to within 1.3 × narrow_hw.
+            CORRIDOR_WIDTH_FACTOR = 1.3
+            def _bend_margin_at(end_param: float, sign: int) -> float:
+                """``end_param`` = 0 (start) or ls.length (end);
+                ``sign`` = +1 (walk forward into the line) or -1
+                (walk backward).  Returns a margin in metres at
+                least ``BEND_ENDPOINT_MARGIN_M`` and at most the
+                point where the corridor narrows back to
+                ``CORRIDOR_WIDTH_FACTOR × narrow_hw``."""
+                base = BEND_ENDPOINT_MARGIN_M
+                if narrow_hw <= 0:
+                    return base
+                target_hw = narrow_hw * CORRIDOR_WIDTH_FACTOR
+                STEP = 5.0
+                MAX = max(base, gap / 2.0)
+                u = base
+                while u <= MAX:
+                    t = end_param + sign * u
+                    if t < 0 or t > ls.length:
+                        break
+                    try:
+                        hw_here = _avg_perp_halfwidth(ls, t)
+                    except Exception:
+                        hw_here = 0.0
+                    if 0 < hw_here <= target_hw:
+                        return u
+                    u += STEP
+                # Corridor never narrowed to ≤ target_hw within
+                # half the gap — fall back to the percentage margin
+                # so the rect doesn't extend into apron territory.
+                return float('inf')
             if start_is_bend and abs(p0) < 0.5:
-                m_start = min(m_start, BEND_ENDPOINT_MARGIN_M)
+                bm = _bend_margin_at(0.0, +1)
+                if bm != float('inf'):
+                    m_start = min(m_start, bm)
             if end_is_bend and abs(p1 - ls.length) < 0.5:
-                m_end = min(m_end, BEND_ENDPOINT_MARGIN_M)
+                bm = _bend_margin_at(ls.length, -1)
+                if bm != float('inf'):
+                    m_end = min(m_end, bm)
             rect_p0 = p0 + m_start
             rect_p1 = p1 - m_end
             if rect_p1 - rect_p0 < MIN_SEGMENT_LEN_M:
