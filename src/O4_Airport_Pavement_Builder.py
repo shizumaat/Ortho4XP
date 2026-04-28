@@ -715,6 +715,99 @@ def _sample_runway_segment_elev(
                - float(shape.altitude_high)))
 
 
+def _snap_polygon_vertices_to_rect_corners(
+        poly: "Polygon",
+        sloping_rect_polys: "List[Polygon]",
+        snap_tol_m: float = 5.0,
+        ) -> "Polygon":
+    """Snap every vertex of ``poly`` that lies within ``snap_tol_m``
+    of any sloping-rect corner to that corner.
+
+    Per user 2026-04-28 invariant: a sloping rect (runway, primary/
+    secondary parallel, stub, cross-connector) can only share a
+    *corner* with an adjacent junction polygon — never a point on
+    one of its four edges.  Edge-interior coincidence breaks the
+    rect's straight-line slope by injecting an extra elevation
+    constraint at a non-corner location.
+
+    The runway-crossing-junction emit (``_resolve_runway_crossings``)
+    builds a junction polygon from the union of crossing runway
+    segments.  Shapely's ``unary_union`` produces vertices at every
+    boundary intersection point; some of those points land 2-5 m
+    *along* a surviving rect's long edge instead of *at* the rect's
+    corner because the dropped (in-crossing) and surviving (out-of-
+    crossing) runway segments don't perfectly tile.  Snapping near-
+    corner vertices fixes the immediate violation without distorting
+    the union polygon's overall footprint.
+
+    Consecutive duplicate vertices produced by the snap are deduped.
+    Returns the input polygon unchanged if snapping would leave
+    fewer than 3 distinct vertices or produce an invalid polygon.
+    """
+    try:
+        coords = list(poly.exterior.coords)
+    except Exception:
+        return poly
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) < 3:
+        return poly
+
+    corners: List[Tuple[float, float]] = []
+    for r in sloping_rect_polys:
+        if r is None or r.is_empty:
+            continue
+        try:
+            rc = list(r.exterior.coords)
+        except Exception:
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        corners.extend((float(x), float(y)) for x, y in rc)
+    if not corners:
+        return poly
+
+    snap_tol2 = snap_tol_m * snap_tol_m
+    snapped: List[Tuple[float, float]] = []
+    for vx, vy in coords:
+        best_corner: Optional[Tuple[float, float]] = None
+        best_d2 = snap_tol2
+        for cx, cy in corners:
+            d2 = (vx - cx) ** 2 + (vy - cy) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_corner = (cx, cy)
+        if best_corner is not None:
+            snapped.append(best_corner)
+        else:
+            snapped.append((float(vx), float(vy)))
+
+    # Dedupe consecutive duplicates (within 1 cm).
+    deduped: List[Tuple[float, float]] = []
+    for v in snapped:
+        if (not deduped
+                or (v[0] - deduped[-1][0]) ** 2
+                + (v[1] - deduped[-1][1]) ** 2 > 1e-4):
+            deduped.append(v)
+    if (len(deduped) > 1
+            and (deduped[0][0] - deduped[-1][0]) ** 2
+            + (deduped[0][1] - deduped[-1][1]) ** 2 < 1e-4):
+        deduped.pop()
+    if len(deduped) < 3:
+        return poly
+
+    try:
+        new_poly = Polygon(deduped + [deduped[0]])
+        if not new_poly.is_valid:
+            new_poly = new_poly.buffer(0)
+        if (new_poly.is_empty
+                or new_poly.geom_type != "Polygon"):
+            return poly
+        return new_poly
+    except Exception:
+        return poly
+
+
 def _resolve_runway_crossings(
         layout: "PavementLayout",
         min_overlap_m2: float = 20.0,
@@ -794,6 +887,18 @@ def _resolve_runway_crossings(
         r = find(i)
         groups.setdefault(r, []).append(i)
 
+    # Pre-compute sloping-rect corner snap targets for the corner-
+    # alignment pass below.  Sloping rects = runway + parallel +
+    # stub + cross-connector; junction vertices can only land on
+    # their corners, never on their edges.
+    sloping_roles_for_snap = (ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                              ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+                              ROLE_CROSS_CONNECTOR)
+    all_sloping_indices = [i for i, s in enumerate(layout.shapes)
+                            if s.role in sloping_roles_for_snap
+                            and s.polygon is not None
+                            and not s.polygon.is_empty]
+
     drop_set: set = set()
     new_shapes: List[BuiltShape] = []
     n_resolved = 0
@@ -802,6 +907,7 @@ def _resolve_runway_crossings(
             continue
         seg_shapes = [layout.shapes[rwy_indices[m]] for m in members]
         seg_polys = [s.polygon for s in seg_shapes]
+        member_set = {rwy_indices[m] for m in members}
         try:
             union_poly = unary_union(seg_polys)
             if not union_poly.is_valid:
@@ -817,6 +923,17 @@ def _resolve_runway_crossings(
             if not polys:
                 continue
             union_poly = polys[0]
+        # Snap any union-polygon vertex that lands within 5 m of a
+        # surviving sloping-rect corner to that corner.  Without
+        # this, ``unary_union``'s intersection points can sit a few
+        # metres along a surviving rect's edge — violating the
+        # corner-only-junction-vertex invariant.
+        other_sloping_polys = [
+            layout.shapes[i].polygon
+            for i in all_sloping_indices
+            if i not in member_set]
+        union_poly = _snap_polygon_vertices_to_rect_corners(
+            union_poly, other_sloping_polys, snap_tol_m=5.0)
         try:
             coords = list(union_poly.exterior.coords)
         except Exception:
@@ -3472,6 +3589,40 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                         new_shapes.append(_dc_replace(
                             shape, polygon=extra, source_axis=None))
                 layout.shapes = new_shapes
+
+                # Per user 2026-04-28: junction polygon vertices
+                # cannot land on a sloping rect's edge interior —
+                # only on corners.  The 2 m runway-shrink difference
+                # above can produce boundary intersection points 2 m
+                # along a runway rect's edge; snap them to the
+                # nearest corner.  Same helper used in
+                # ``_resolve_runway_crossings``.
+                sloping_rect_polys_for_snap = [
+                    s.polygon for s in layout.shapes
+                    if s.role in (ROLE_RUNWAY,
+                                   ROLE_PRIMARY_PARALLEL,
+                                   ROLE_SECONDARY_PARALLEL,
+                                   ROLE_STUB,
+                                   ROLE_CROSS_CONNECTOR)
+                    and s.polygon is not None
+                    and not s.polygon.is_empty]
+                for shape in layout.shapes:
+                    if shape.role != ROLE_JUNCTION:
+                        continue
+                    if (shape.polygon is None
+                            or shape.polygon.is_empty):
+                        continue
+                    # Exclude this junction's own polygon from snap
+                    # candidates (it isn't a sloping rect anyway,
+                    # but be defensive).  Snap tolerance 5 m matches
+                    # the runway-clip's 2 m buffer plus a small
+                    # cushion for Shapely overlay precision.
+                    snapped = _snap_polygon_vertices_to_rect_corners(
+                        shape.polygon,
+                        sloping_rect_polys_for_snap,
+                        snap_tol_m=5.0)
+                    if snapped is not None and not snapped.is_empty:
+                        shape.polygon = snapped
 
     # ── Terminal pad elevations (flat, DEM median) ──────────────
     # Computed BEFORE the elevation graph so terminal corners can be
