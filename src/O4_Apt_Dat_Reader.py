@@ -366,29 +366,92 @@ def find_all_airport_apt_dats(xplane_root: str,
     return out
 
 
-def _file_has_airport(aptdat_path: str, icao: str) -> bool:
-    """Return True if `aptdat_path` contains a row 1 header for ICAO.
+# Process-wide cache for apt.dat header scans.  Keyed by
+# (path, mtime_ns, size) so a stale entry is invalidated automatically
+# if the file is rewritten during the same process run.  Populated
+# lazily by :func:`_index_apt_dat` on first access; subsequent
+# `_file_has_airport` / `_file_has_airport_with_pavement` calls become
+# O(1) dict lookups.
+#
+# Why this matters: the auto-patch pipeline calls
+# ``build_airport_pavement(icao, ...)`` once per airport in a tile, and
+# each call invokes ``find_airport_apt_dat`` and
+# ``find_all_airport_apt_dats``.  Before the cache, every airport
+# invocation re-scanned every apt.dat file in the X-Plane install
+# (Custom Scenery + Global + default), which on a typical setup with
+# ~25 airports per tile pulled ~10 GB through the line scanner per
+# tile build.  After the cache, each apt.dat is scanned exactly once
+# per process.
+_APT_DAT_INDEX_CACHE: dict = {}
 
-    Cheap streaming scan: stops at the first match.  A row 1 line
-    looks like ``1 109 0 0 SPJC Jorge Chavez Intl`` (where ``109`` is
-    the elevation in feet).
+
+def _index_apt_dat(aptdat_path: str) -> Tuple[frozenset, frozenset]:
+    """Return ``(icaos_present, icaos_with_pavement)`` for the file.
+
+    Both sets are uppercase ICAO codes.  An entry in
+    ``icaos_with_pavement`` means the airport block has at least one
+    row 110 (pavement header).  Result is cached process-wide; if the
+    file is rewritten (mtime / size changes) the cache entry is
+    invalidated and the file is rescanned.
     """
+    try:
+        st = os.stat(aptdat_path)
+    except OSError:
+        return frozenset(), frozenset()
+    key = (aptdat_path, st.st_mtime_ns, st.st_size)
+    cached = _APT_DAT_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Drop any stale entry for this path (different mtime/size).
+    for k in [k for k in _APT_DAT_INDEX_CACHE if k[0] == aptdat_path]:
+        _APT_DAT_INDEX_CACHE.pop(k, None)
+
+    icaos = set()
+    with_pavement = set()
+    current: Optional[str] = None
+    saw_pavement_in_current = False
     try:
         with open(aptdat_path, "r", encoding="utf-8",
                   errors="replace") as f:
             for line in f:
-                if not line.startswith("1 ") and not line.startswith("1\t"):
-                    continue
-                # Avoid sub-record types like 100, 1300, 1302 which
-                # also start with "1".
-                parts = line.split()
-                if len(parts) < 5 or parts[0] != "1":
-                    continue
-                if parts[4].upper() == icao:
-                    return True
+                stripped = line.lstrip()
+                if stripped.startswith("1 ") or stripped.startswith("1\t"):
+                    parts = stripped.split()
+                    if len(parts) >= 5 and parts[0] == "1":
+                        # Close out the previous airport block.
+                        if current is not None and saw_pavement_in_current:
+                            with_pavement.add(current)
+                        current = parts[4].upper()
+                        saw_pavement_in_current = False
+                        icaos.add(current)
+                        continue
+                if (current is not None
+                        and not saw_pavement_in_current
+                        and (stripped.startswith("110 ")
+                             or stripped.startswith("110\t"))):
+                    saw_pavement_in_current = True
+        # Close out the last block at EOF.
+        if current is not None and saw_pavement_in_current:
+            with_pavement.add(current)
     except Exception:
-        return False
-    return False
+        # Cache an empty result so we don't re-attempt every call.
+        result = (frozenset(), frozenset())
+        _APT_DAT_INDEX_CACHE[key] = result
+        return result
+
+    result = (frozenset(icaos), frozenset(with_pavement))
+    _APT_DAT_INDEX_CACHE[key] = result
+    return result
+
+
+def _file_has_airport(aptdat_path: str, icao: str) -> bool:
+    """Return True if `aptdat_path` contains a row 1 header for ICAO.
+
+    Backed by :func:`_index_apt_dat`'s process-wide cache; the file is
+    fully scanned at most once per (path, mtime, size).
+    """
+    icaos, _ = _index_apt_dat(aptdat_path)
+    return icao.upper() in icaos
 
 
 def _file_has_airport_with_pavement(aptdat_path: str, icao: str) -> bool:
@@ -401,28 +464,11 @@ def _file_has_airport_with_pavement(aptdat_path: str, icao: str) -> bool:
     needs row-110 polygons to compute the residue/junction set, so
     such packs are unusable for pavement geometry — we fall back to
     the Global apt.dat which does have proper row-110 pavements.
+
+    Backed by :func:`_index_apt_dat`'s process-wide cache.
     """
-    icao = icao.upper()
-    try:
-        in_block = False
-        with open(aptdat_path, "r", encoding="utf-8",
-                  errors="replace") as f:
-            for line in f:
-                stripped = line.lstrip()
-                if (stripped.startswith("1 ") or stripped.startswith("1\t")):
-                    parts = stripped.split()
-                    if len(parts) >= 5 and parts[0] == "1":
-                        if in_block:
-                            return False  # next airport, no 110 found
-                        if parts[4].upper() == icao:
-                            in_block = True
-                            continue
-                if in_block and (stripped.startswith("110 ")
-                                 or stripped.startswith("110\t")):
-                    return True
-    except Exception:
-        return False
-    return False
+    _, with_pavement = _index_apt_dat(aptdat_path)
+    return icao.upper() in with_pavement
 
 
 def _read_airport_block(aptdat_path: str, icao: str) -> Optional[List[str]]:
