@@ -176,6 +176,104 @@ def test_no_self_overlap(icao):
 
 
 @pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
+def test_no_vertex_on_sloping_rect_edge(icao):
+    """Per user 2026-04-28 invariant: a junction (or any non-rect)
+    polygon vertex can only land on a sloping rect's CORNER, never
+    on the interior of one of its four edges.  Edge-interior
+    coincidence injects an extra elevation constraint at a non-
+    corner location and breaks the rect's straight-line slope.
+
+    Caught the CYXY runway-crossing-junction regression where
+    ``_resolve_runway_crossings``'s ``unary_union`` plus the
+    downstream 2 m runway-shrink ``difference`` were placing 4
+    junction vertices 2–5 m along surviving runway segments' long
+    edges (near corners but not at them).
+    """
+    import math
+    layout = _build_layout(icao)
+    sloping_roles = {
+        "runway", "primary_parallel", "secondary_parallel",
+        "stub", "cross_connector"}
+    sloping = [s for s in layout.shapes
+               if s.role in sloping_roles
+               and s.polygon is not None
+               and not s.polygon.is_empty]
+    others = [s for s in layout.shapes
+              if s.role not in sloping_roles
+              and s.polygon is not None
+              and not s.polygon.is_empty]
+    if not sloping or not others:
+        return
+
+    # Tolerances: a vertex is ON an edge if it's within 0.5 m of
+    # the edge AND > 0.5 m away from either endpoint (i.e. not at
+    # a corner — corners are allowed).
+    EDGE_PROX_M = 0.5
+    CORNER_GUARD_M = 0.5
+
+    violations = []
+    for s in sloping:
+        coords = list(s.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            # Sloping rects must be 4-corner — flag anything else.
+            violations.append(
+                (s.role, s.ref or "?", "non-rect", len(coords)))
+            continue
+        edges = [(coords[i], coords[(i + 1) % 4])
+                 for i in range(4)]
+        for o in others:
+            ocoords = list(o.polygon.exterior.coords)
+            if ocoords and ocoords[0] == ocoords[-1]:
+                ocoords = ocoords[:-1]
+            for px, py in ocoords:
+                # Skip vertices that coincide with one of the
+                # rect's corners.
+                if any(math.hypot(px - cx, py - cy) <= CORNER_GUARD_M
+                       for cx, cy in coords):
+                    continue
+                for (ax, ay), (bx, by) in edges:
+                    dx = bx - ax
+                    dy = by - ay
+                    L2 = dx * dx + dy * dy
+                    if L2 <= 0:
+                        continue
+                    t = ((px - ax) * dx + (py - ay) * dy) / L2
+                    if t <= 0.001 or t >= 0.999:
+                        continue
+                    proj_x = ax + t * dx
+                    proj_y = ay + t * dy
+                    d = math.hypot(px - proj_x, py - proj_y)
+                    # Also check distance to endpoints (if very
+                    # close to one, that's a near-corner case
+                    # already excluded above; but the edge
+                    # parametrization t may put the projection in-
+                    # interior even when the vertex is closer to a
+                    # corner than to the midline).
+                    d_a = math.hypot(px - ax, py - ay)
+                    d_b = math.hypot(px - bx, py - by)
+                    if (d < EDGE_PROX_M
+                            and d_a > CORNER_GUARD_M
+                            and d_b > CORNER_GUARD_M):
+                        violations.append(
+                            (s.role, s.ref or "?", o.role,
+                             o.ref or "?", t, d))
+                        break
+    if violations:
+        summary = "; ".join(
+            f"{v[2]}({v[3]}) vertex on {v[0]}({v[1]}) "
+            f"edge t={v[4]:.3f} d={v[5]:.2f}m"
+            for v in violations[:5])
+        msg = (f"{icao}: {len(violations)} vertex-on-sloping-rect-"
+               f"edge violation(s).  Junction polygons must share "
+               f"only CORNERS with sloping rects, never edge "
+               f"interiors.  First {min(5, len(violations))}: "
+               f"{summary}.")
+        assert False, msg
+
+
+@pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
 def test_coverage_within_source_envelope(icao):
     """Emitted pavement union must not exceed apt.dat + runway
     coverage by more than the airport's allowed fraction.  Catches
