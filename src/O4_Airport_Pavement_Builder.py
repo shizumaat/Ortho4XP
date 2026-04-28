@@ -1506,7 +1506,22 @@ def _drop_primary_parallels_embedded_in_pavement(
             kept.append(entry)
             continue
 
-        # Build new rects from kept intervals.
+        # Build new rects from kept intervals.  Drop any kept
+        # fragment that's apron-interior — i.e. ≥ 2 of its 4 corners
+        # are off the pavement boundary.  These are tiny rects
+        # floating inside an apron polygon, with no real corridor
+        # geometry around them; emitting them just creates a rect-
+        # shaped hole in the apron's residue (and a thin diagonal
+        # junction polygon connecting the hole to the apron's
+        # outer boundary — see CYXY -10005/-10129 regression).
+        # Mirrors ``_build_taxi_rects``'s apron-interior check.
+        APRON_INTERIOR_TOL_M = 2.0
+        try:
+            pav_boundary = apt_pav_union.boundary
+        except Exception:
+            pav_boundary = None
+        n_dropped_interior = 0
+        new_rects: List[Tuple[Polygon, LineString, str, str]] = []
         for u_lo, u_hi in kept_intervals:
             new_a_mid = (a_mid[0] + u_lo * ux,
                          a_mid[1] + u_lo * uy)
@@ -1529,15 +1544,46 @@ def _drop_primary_parallels_embedded_in_pavement(
                 if (new_rect.is_empty
                         or new_rect.geom_type != "Polygon"):
                     continue
+                # Apron-interior check on the kept fragment.  A
+                # kept fragment naturally has 2 corners at the
+                # absorbed/kept split (interior to the original
+                # rect's footprint, slightly off-boundary by ~1-3 m
+                # due to apt.dat boundary imprecision at corridor
+                # narrowings).  The discriminator is "all 4 corners
+                # off-boundary" — captures truly apron-floating
+                # fragments (CYXY -10005: all 4 corners 2.5-23 m
+                # off) without dropping normal split-end fragments
+                # (CYXY -10004: 3 corners 0-2.9 m off but at most
+                # one corner > 3 m off).
+                if pav_boundary is not None:
+                    n_off = sum(
+                        1 for (cx, cy) in new_corners
+                        if Point(cx, cy).distance(pav_boundary)
+                        > APRON_INTERIOR_TOL_M)
+                    max_off = max(
+                        (Point(cx, cy).distance(pav_boundary)
+                         for (cx, cy) in new_corners),
+                        default=0.0)
+                    # Drop if all 4 corners off boundary AND at
+                    # least one is > 5 m off (indicating real
+                    # apron-floating, not boundary imprecision).
+                    if n_off == 4 and max_off > 5.0:
+                        n_dropped_interior += 1
+                        continue
                 new_axis = LineString([new_a_mid, new_b_mid])
-                kept.append((new_rect, new_axis, role, ref))
+                new_rects.append((new_rect, new_axis, role, ref))
             except Exception:
                 continue
-        if len(kept_intervals) >= 2:
+        kept.extend(new_rects)
+        if not new_rects:
+            n_full += 1
+        elif len(new_rects) >= 2:
             n_split += 1
         else:
             n_clipped += 1
-        abs_refs.append(ref or "?")
+        abs_refs.append(
+            f"{ref or '?'}"
+            f"{'/int=' + str(n_dropped_interior) if n_dropped_interior else ''}")
 
     if abs_refs:
         try:
