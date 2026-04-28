@@ -56,6 +56,13 @@ import O4_Pavement_Strips as PS
 # ──────────────────────────────────────────────────────────────────
 R_EARTH = 6_378_137.0
 SHARED_VERTEX_TOL_M = 0.5    # snap vertices closer than this together
+# Per user 2026-04-28: emit taxiway and runway rects 20 % wider than
+# the apt.dat / OSM-derived nominal width — 10 % buffer on each side.
+# Widens the visible pavement footprint without changing the rect
+# axis or elevation profile.  Applied at construction time for taxi
+# rects + runway segments; the residue / apron junctions adjust
+# around the widened runway footprint.
+RECT_WIDTH_BUFFER_FACTOR = 1.20
 RUNWAY_INSIDE_APRON_FRAC = 0.95  # if ≥95% of a runway segment lies
                                   # inside an apt.dat/DSF apron
                                   # polygon (and that polygon is
@@ -634,6 +641,62 @@ def _airport_anchor(apt: APR.Airport) -> Tuple[float, float]:
 # Runway rects
 # ──────────────────────────────────────────────────────────────────
 
+def _widen_rect_perpendicular(rect: "Polygon",
+                              axis: "LineString",
+                              factor: float) -> "Optional[Polygon]":
+    """Widen a 4-corner rect by ``factor`` perpendicular to its
+    axis (i.e., scale the long-edge offset from the axis on each
+    side).  Axis direction stays fixed; long-axis length stays
+    fixed.  Returns the widened polygon, or ``None`` if the input
+    isn't a valid 4-corner rect.
+
+    Used by ``_build_taxi_rects`` to add a 10 % buffer per side to
+    accepted rects without affecting upstream validation steps
+    (apron-interior, dedup) which operate on the nominal-width
+    rect.
+    """
+    try:
+        coords = list(rect.exterior.coords)
+    except Exception:
+        return rect
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) != 4:
+        return rect
+    try:
+        ac = list(axis.coords)
+        if len(ac) < 2:
+            return rect
+        ax = ac[-1][0] - ac[0][0]
+        ay = ac[-1][1] - ac[0][1]
+        L = math.hypot(ax, ay)
+        if L < 1e-6:
+            return rect
+        ux, uy = ax / L, ay / L
+        nx, ny = -uy, ux  # left-perpendicular unit normal
+        # Use the axis START as the reference; project each corner
+        # onto (axial, perpendicular) frame, scale perpendicular,
+        # reconstruct.
+        ox, oy = ac[0][0], ac[0][1]
+        new_corners: List[Tuple[float, float]] = []
+        for cx, cy in coords:
+            dx, dy = cx - ox, cy - oy
+            axial = dx * ux + dy * uy
+            perp = dx * nx + dy * ny
+            new_perp = perp * factor
+            new_x = ox + axial * ux + new_perp * nx
+            new_y = oy + axial * uy + new_perp * ny
+            new_corners.append((new_x, new_y))
+        new_poly = Polygon(new_corners)
+        if not new_poly.is_valid:
+            new_poly = new_poly.buffer(0)
+        if new_poly.is_empty or new_poly.geom_type != "Polygon":
+            return rect
+        return new_poly
+    except Exception:
+        return rect
+
+
 def _runway_rect_m(runway, to_m) -> Polygon:
     """4-vertex runway rect spanning end-to-end including blast pads.
 
@@ -654,7 +717,7 @@ def _runway_rect_m(runway, to_m) -> Polygon:
     bx2 = bx + ux * b_extra
     by2 = by + uy * b_extra
     px, py = -uy, ux
-    half = runway.width_m / 2.0
+    half = runway.width_m * RECT_WIDTH_BUFFER_FACTOR / 2.0
     return Polygon([
         (ax2 + px * half, ay2 + py * half),
         (bx2 + px * half, by2 + py * half),
@@ -3445,7 +3508,8 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         _LEGACY_RUNWAY_MARGIN = 3.0
         for i, seg in enumerate(runway_segment_chain):
             lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m = seg
-            width_m = max(1.0, width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
+            width_m = (max(1.0, width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
+                       * RECT_WIDTH_BUFFER_FACTOR)
             ax, ay = _latlon_to_m_local(lat_a, lon_a, lat0, lon0, cos0)
             bx, by = _latlon_to_m_local(lat_b, lon_b, lat0, lon0, cos0)
             length = math.hypot(bx - ax, by - ay)
@@ -11565,6 +11629,17 @@ def _build_taxi_rects(
             # ≥ 2 corners away from any pavement edge — the rect
             # sits inside an apron.  Skip it; the apron pavement
             # stays as residue → junction.
+            continue
+
+        # Per user 2026-04-28: widen the accepted rect by 20 %
+        # perpendicular to its axis (10 % per side) so the rendered
+        # taxi pavement extends slightly past the apt.dat-derived
+        # nominal width.  Applied AFTER the apron-interior check
+        # (which uses the narrow rect's corners) and AFTER the rect
+        # has otherwise passed validation.
+        rect = _widen_rect_perpendicular(
+            rect, trimmed, RECT_WIDTH_BUFFER_FACTOR)
+        if rect is None or rect.is_empty:
             continue
 
         role = _classify_role(trimmed, width, rwy_centerlines,
