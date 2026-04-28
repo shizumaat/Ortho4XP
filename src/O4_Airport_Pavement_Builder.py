@@ -1271,7 +1271,20 @@ def _drop_primary_parallels_embedded_in_pavement(
         # Long edges per ``_rect_from_axis_extended`` convention
         # (corners 0,1 form one long edge; corners 2,3 the other).
         long_edges = [(rc[0], rc[1]), (rc[2], rc[3])]
-        any_embedded = False
+        # User 2026-04-28 refinement: absorb only when BOTH long
+        # edges have ≥10% adjacency to junction-class pavement —
+        # i.e. the rect is "sandwiched" / embedded inside an apron.
+        # When only ONE long edge has adjacency, the rect is at the
+        # apron's boundary (the normal position for a primary
+        # parallel running along an apron edge) and should remain
+        # as a sloping rect; the apron polygon stops at the rect's
+        # long edge and uses its boundary altitudes to spline
+        # smoothly with the rect's altH/altL.  CYXY's E primary
+        # parallel "extending from the south apron edge" is exactly
+        # this case: edge 0 along apron (69-100% adj.), edge 1 in
+        # grass (0% adj.) → KEEP.  SPJC's F (truly inside the SE
+        # apron) has BOTH edges in apron → ABSORB.
+        edges_embedded = 0
         for (e0, e1) in long_edges:
             ex = e1[0] - e0[0]
             ey = e1[1] - e0[1]
@@ -1280,21 +1293,17 @@ def _drop_primary_parallels_embedded_in_pavement(
                 continue
             try:
                 edge_line = LineString([e0, e1])
-                # 1 m proximity check: edge length within 1 m of
-                # junction-class pavement.
                 inside = edge_line.intersection(junction_buf)
                 if inside.is_empty:
                     continue
                 inside_len = (inside.length
                               if hasattr(inside, "length")
                               else 0.0)
-                if inside_len / mag < adjacency_frac:
-                    continue
-                any_embedded = True
-                break
+                if inside_len / mag >= adjacency_frac:
+                    edges_embedded += 1
             except Exception:
                 continue
-        if any_embedded:
+        if edges_embedded >= 2:
             dropped_refs.append(ref or "?")
         else:
             kept.append(entry)
@@ -10736,7 +10745,30 @@ def _split_centerlines_at_points(
         # Removed the length gate; the angle alone classifies.
         perp_diff = abs(delta - 90.0)
         if 20.0 < perp_diff < 75.0:
-            return 0.30
+            # Per user 2026-04-28: the 30 % diagonal-stub margin is
+            # appropriate ONLY when at least one endpoint sits AT a
+            # runway boundary — i.e. the segment IS the stub between
+            # a parallel taxi and the runway.  When NEITHER endpoint
+            # is near a runway, the segment is a non-stub diagonal
+            # connector (e.g. CYXY E nodes 2-4 transitioning between
+            # the south-of-apron parallel section and the apron-
+            # internal parallel section, perp_diff ≈ 60° but both
+            # ends far from any runway).  Such segments shouldn't
+            # lose 60 % of their length to junction-margin trim;
+            # they're not bordered by junctions on both sides.
+            STUB_ENDPOINT_RUNWAY_M = 50.0
+            ep0 = Point(c[0])
+            ep1 = Point(c[-1])
+            ep0_near = any(
+                ep0.distance(r) <= STUB_ENDPOINT_RUNWAY_M
+                for r in rwy_centerlines)
+            ep1_near = any(
+                ep1.distance(r) <= STUB_ENDPOINT_RUNWAY_M
+                for r in rwy_centerlines)
+            if ep0_near or ep1_near:
+                return 0.30
+            # Neither endpoint near a runway — treat as a long
+            # diagonal connector with the parallel-style 15 % margin.
         # Short unrefed parallel-to-runway rect (perp_diff >= 75°,
         # length < 150 m) sitting between two diagonal stubs on
         # SPLP's south chain — apply 30 % margin each side so the
@@ -11854,6 +11886,10 @@ def _snap_corners_to_pavement(
                 else:
                     candidates[i] = None
                     use_original[i] = True
+                    # candidates[i] is now None; subsequent j
+                    # iterations would dereference it.  Break and
+                    # let the outer i loop advance.
+                    break
 
     snapped: List[Tuple[float, float]] = []
     for i, (cx, cy) in enumerate(corners):
