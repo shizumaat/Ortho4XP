@@ -1132,7 +1132,8 @@ def _clip_residue_at_stub_long_edges(
 def _drop_primary_parallels_embedded_in_pavement(
         taxi_rects: "List[Tuple[Polygon, LineString, str, str]]",
         apt_pav_union: "Optional[Polygon]",
-        embed_frac: float = 0.95,
+        runway_polys: "Optional[List[Polygon]]" = None,
+        embed_frac: float = 0.10,
         long_edge_buffer_m: float = 5.0,
         ) -> "List[Tuple[Polygon, LineString, str, str]]":
     """Drop ``primary_parallel`` rects whose long edges sit entirely
@@ -1190,6 +1191,28 @@ def _drop_primary_parallels_embedded_in_pavement(
     """
     if apt_pav_union is None or apt_pav_union.is_empty:
         return taxi_rects
+    # Per user 2026-04-28: a sloping rect can't have JUNCTION pavement
+    # adjacent to its long edge for >10% of its length without
+    # producing X-Plane elevation glitches (the rect's long edge has
+    # uniform altitude_high/altitude_low pattern; the adjacent
+    # junction polygon's spline has to match it, but if the slope
+    # along the junction's edge differs, the seam misrenders).  The
+    # right behaviour is to absorb the rect into the junction so the
+    # whole region is one polygon with per-vertex node_altitudes
+    # capturing the slope.  Subtract runway polygons from the
+    # pavement union so RUNWAY adjacency to a parallel taxi (perfectly
+    # normal) doesn't trigger absorption — only JUNCTION-class
+    # pavement (apron, ramp, residue) adjacency triggers it.
+    junction_pav = apt_pav_union
+    if runway_polys:
+        try:
+            for r in runway_polys:
+                if r is not None and not r.is_empty:
+                    junction_pav = junction_pav.difference(r)
+            if junction_pav.is_empty:
+                return taxi_rects
+        except Exception:
+            junction_pav = apt_pav_union
     kept: List[Tuple[Polygon, LineString, str, str]] = []
     dropped_refs: List[str] = []
     for entry in taxi_rects:
@@ -1220,8 +1243,9 @@ def _drop_primary_parallels_embedded_in_pavement(
                 continue
             try:
                 edge_line = LineString([e0, e1])
-                # Test 1: the long edge is mostly inside pavement.
-                inside = edge_line.intersection(apt_pav_union)
+                # Test 1: the long edge has junction pavement adjacent
+                # for ≥ embed_frac of its length.
+                inside = edge_line.intersection(junction_pav)
                 if inside.is_empty:
                     continue
                 inside_len = (inside.length
@@ -1255,7 +1279,7 @@ def _drop_primary_parallels_embedded_in_pavement(
                 ])
                 if not strip.is_valid or strip.is_empty:
                     continue
-                covered = strip.intersection(apt_pav_union).area
+                covered = strip.intersection(junction_pav).area
                 if covered / strip.area < embed_frac:
                     continue
                 any_embedded = True
@@ -2678,17 +2702,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # long edges of F are 0 % / 24 % inside row-110 alone but
     # ≈100 % inside the full pavement union including DSF.
     taxi_rects = _drop_primary_parallels_embedded_in_pavement(
-        taxi_rects, pav_union)
-
-    # Partial-embed split: when only a CONTIGUOUS PREFIX or SUFFIX
-    # of a primary_parallel rect's axis is bounded by apron pavement
-    # on one side, clip the rect to keep only the unbounded portion.
-    # The dropped portion's footprint reappears in the residue and
-    # gets covered by the apron polygon.  At CYXY, taxiway E's NW
-    # half is bounded by the SW apron; this clips E to its SE
-    # portion (the non-embedded part adjacent to runway 14R/32L).
-    taxi_rects = _split_primary_parallels_at_pavement_boundary(
-        taxi_rects, pav_union)
+        taxi_rects, pav_union, runway_polys=runway_polys)
 
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
@@ -3834,36 +3848,21 @@ def _orient_rect_for_altitude(shape: "BuiltShape",
 #      surface at an arbitrary meter-space point — used to map
 #      rect axis endpoints onto the network.
 NETWORK_DENSIFY_M = 30.0            # max edge length
-NETWORK_BRIDGE_MAX_M = 250.0        # max dist for taxi→rwy bridge edge.
-                                     # User 2026-04-27 directive:
-                                     # "Taxiways and aprons should not be
-                                     # anchored to runway elevation by
-                                     # anything other than the max slope
-                                     # of pavement connecting to a
-                                     # runway."  The bridge edge models
-                                     # exactly that: edge length is the
-                                     # pavement-traversal distance from
-                                     # the taxi node to the runway, so
-                                     # the propagator's grade-cap
-                                     # produces ``runway_elev ± dist ×
-                                     # 1.5%`` at the taxi node — the
-                                     # max-slope budget.
-                                     #
-                                     # 250 m catches parallel taxis ~150
-                                     # m off the runway centerline (e.g.
-                                     # CYXY's E at ~165 m) so they
-                                     # anchor to the PHYSICALLY-MEETING
-                                     # runway segment rather than a
-                                     # far-away anchor reached by long
-                                     # OSM-network paths (CYXY E was
-                                     # otherwise anchoring at 14R end,
-                                     # 560 m away at 694 m, when it
-                                     # actually meets the runway near
-                                     # 32L at 706 m).  Edge length =
-                                     # max(0.5, dist - half_width) so
-                                     # the grade budget reflects actual
-                                     # taxi-rect-to-runway-edge metres,
-                                     # not centerline-to-centerline.
+NETWORK_BRIDGE_MAX_M = 60.0         # max dist for taxi→rwy bridge edge.
+                                     # User 2026-04-28: grade is along
+                                     # the taxiway AXIS, not Euclidean.
+                                     # Lateral bridges from a taxi to
+                                     # nearby runway segments would
+                                     # constrain the taxi by short
+                                     # Euclidean distances rather than
+                                     # actual axis-walked distances,
+                                     # producing wrong altH/altL.  Only
+                                     # bridge perpendicular STUB
+                                     # endpoints (≤ 60 m from runway,
+                                     # e.g. SPJC's V1 at ~55 m); leave
+                                     # parallel taxis to inherit
+                                     # elevation through their axial
+                                     # OSM-network path.
 NETWORK_RUNWAY_ANCHOR_RADIUS_M = 5.0  # a taxi node within this of
                                        # rwy segment gets anchored
 
