@@ -3262,6 +3262,15 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # rearrange polygon coords and put node_altitudes out of
         # sync with the rect's emitted altitude tags.
         _snap_junction_altitudes_to_rect_corners(layout)
+        # Per user 2026-04-28: junctions sharing a boundary vertex
+        # MUST agree on its altitude.  Subdivide / clamp passes can
+        # leave sub-metre disagreement at shared buckets — average
+        # them so X-Plane doesn't render a tear at the seam.
+        _enforce_shared_vertex_altitudes(layout)
+        # Re-run the rect-corner snap after the shared-vertex
+        # average, since averaging can pull a shared-with-rect
+        # bucket away from the rect's tag value.
+        _snap_junction_altitudes_to_rect_corners(layout)
 
     return layout
 
@@ -4127,6 +4136,68 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # not yet a hard fail (would drop too much coverage at HECA-
     # complexity airports while Layers 1/2 are still maturing).
     _report_within_shape_violations(layout, icao)
+
+
+def _enforce_shared_vertex_altitudes(
+        layout: "PavementLayout") -> int:
+    """For every vertex bucket shared by ≥ 2 shapes, force every
+    polygon's per-vertex altitude at that bucket to a single
+    canonical value.
+
+    Per user 2026-04-28: junctions sharing a boundary node MUST
+    agree on its altitude, otherwise X-Plane renders a tear / step
+    at the seam.  Subdivide / clamp / shared-vertex passes can
+    leave neighbouring junctions with sub-metre disagreement at
+    shared buckets even when the underlying mesh value is
+    consistent.
+
+    Policy: take the AVERAGE of the disagreeing altitudes.  Skip
+    sloping rect tags (altitude_high / altitude_low / altitude) —
+    those are the authoritative source and were already aligned by
+    ``_snap_junction_altitudes_to_rect_corners``.
+
+    Returns the number of altitude entries adjusted.
+    """
+    # Gather per-bucket altitude votes from junction polygons only.
+    # (Sloped rect altitudes are tag-level; junctions emit per-vertex.)
+    bucket_to_entries: Dict[Tuple[int, int],
+                            List[Tuple[int, int, float]]] = {}
+    for si, s in enumerate(layout.shapes):
+        if s.role != ROLE_JUNCTION:
+            continue
+        if not s.node_altitudes:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for vi, (cx, cy) in enumerate(coords):
+            if vi >= len(s.node_altitudes):
+                break
+            b = _corner_elevation_bucket(cx, cy)
+            bucket_to_entries.setdefault(b, []).append(
+                (si, vi, float(s.node_altitudes[vi])))
+    n_changed = 0
+    for b, entries in bucket_to_entries.items():
+        if len(entries) < 2:
+            continue
+        alts = [e[2] for e in entries]
+        spread = max(alts) - min(alts)
+        if spread < 0.05:
+            continue
+        avg = round(sum(alts) / len(alts), 1)
+        for si, vi, _e in entries:
+            shape = layout.shapes[si]
+            if abs(shape.node_altitudes[vi] - avg) < 0.05:
+                continue
+            shape.node_altitudes[vi] = avg
+            # Maintain closed-ring invariant: last == first.
+            if (vi == 0 and len(shape.node_altitudes) >= 2):
+                shape.node_altitudes[-1] = avg
+            n_changed += 1
+    return n_changed
 
 
 def _snap_junction_altitudes_to_rect_corners(
