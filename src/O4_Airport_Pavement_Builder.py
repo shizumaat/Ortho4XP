@@ -3482,38 +3482,58 @@ class ElevationGraph:
         return lat, lon
 
     def propagate_bounds(self) -> None:
-        """Compute per-node feasibility interval [lo, hi] as the
-        intersection of (anchor ± dist × TAXI_MAX_GRADE) over all
-        reachable anchors.  Unreachable nodes get (-inf, +inf)."""
+        """Compute per-node feasibility interval [lo, hi] from
+        anchor cones via a single MULTI-SOURCE Dijkstra.
+
+        Each node ends up with the cone of its NEAREST reachable
+        anchor: ``[anchor_val ± nearest_dist × TAXI_MAX_GRADE]``.
+        Unreachable nodes get ``(-inf, +inf)``.
+
+        This is looser than the previous all-anchor-intersection
+        semantics (which ran one Dijkstra per anchor and intersected
+        every cone, costing ``O(anchors × (V + E) log V)``).  The
+        looser bounds let the seed re-clip pass through more values
+        unchanged, but the smoother's hard edge-grade-cap (run
+        repeatedly inside :func:`smooth_rate_of_change`) still
+        enforces 1.5 %/m on every edge — so the final elevation
+        field is grade-compliant.
+
+        On large airports the speedup is dramatic: ``propagate_bounds``
+        was 20 s of SPJC's 30 s elevation phase before this change.
+        With multi-source Dijkstra it becomes effectively a single
+        graph traversal (``O((V + E) log V)``) regardless of anchor
+        count.
+        """
         import heapq
         n = len(self.nodes)
         INF = float("inf")
         lo = [-INF] * n
         hi = [INF] * n
-        anchors = [i for i, a in enumerate(self.anchor_elev) if a is not None]
-        for aidx in anchors:
-            a_val = self.anchor_elev[aidx]
-            # Dijkstra from aidx; dist[k] = shortest graph distance
-            dist = [INF] * n
-            dist[aidx] = 0.0
-            heap = [(0.0, aidx)]
-            while heap:
-                d, u = heapq.heappop(heap)
-                if d > dist[u]:
-                    continue
-                for v, length in self.edges_adj[u]:
-                    nd = d + length
-                    if nd < dist[v]:
-                        dist[v] = nd
-                        heapq.heappush(heap, (nd, v))
-            # Apply this anchor's cone to every reachable node.
-            for k in range(n):
-                if dist[k] < INF:
-                    band = dist[k] * TAXI_MAX_GRADE
-                    node_lo = a_val - band
-                    node_hi = a_val + band
-                    if node_lo > lo[k]: lo[k] = node_lo
-                    if node_hi < hi[k]: hi[k] = node_hi
+        nearest_dist: List[float] = [INF] * n
+        nearest_val: List[float] = [0.0] * n
+        heap: List[Tuple[float, int, float]] = []
+        for i, a in enumerate(self.anchor_elev):
+            if a is None:
+                continue
+            nearest_dist[i] = 0.0
+            nearest_val[i] = a
+            heapq.heappush(heap, (0.0, i, float(a)))
+        while heap:
+            d, u, val = heapq.heappop(heap)
+            if d > nearest_dist[u]:
+                continue
+            for w, length in self.edges_adj[u]:
+                nd = d + length
+                if nd < nearest_dist[w]:
+                    nearest_dist[w] = nd
+                    nearest_val[w] = val
+                    heapq.heappush(heap, (nd, w, val))
+        for i in range(n):
+            if nearest_dist[i] == INF:
+                continue
+            band = nearest_dist[i] * TAXI_MAX_GRADE
+            lo[i] = nearest_val[i] - band
+            hi[i] = nearest_val[i] + band
         self.interval_lo = lo
         self.interval_hi = hi
 
@@ -5005,35 +5025,45 @@ def _solve_pavement_mesh(
 
     n_apron_pinned = 0
     if apron_node_ids:
-        # Multi-source Dijkstra: per_lo/per_hi at each node = ∩ over
-        # all sources of (src_elev ± dist × 1.5%).
+        # Single multi-source Dijkstra over the global apron graph.
+        # Each node ends up with the cone of its NEAREST source:
+        # ``[src_elev ± nearest_dist × TAXI_MAX_GRADE]``.  Same
+        # algorithmic shift as the centerline ``propagate_bounds``
+        # — we previously did one Dijkstra per source and intersected
+        # cones, which scales as O(sources × (V+E) log V).  At HECA
+        # there are hundreds of sources and the per-source variant
+        # was tens of seconds; the single-pass multi-source pattern
+        # is one graph traversal regardless of source count.
         import heapq
         INF = float("inf")
         per_lo: Dict[int, float] = {nid: -INF for nid in apron_node_ids}
         per_hi: Dict[int, float] = {nid: INF for nid in apron_node_ids}
+        nearest_dist: Dict[int, float] = {nid: INF
+                                           for nid in apron_node_ids}
+        nearest_val: Dict[int, float] = {nid: 0.0
+                                          for nid in apron_node_ids}
+        heap: List[Tuple[float, int, float]] = []
         for src_nid, src_elev in sources_per_node.items():
-            dist = {nid: INF for nid in apron_node_ids}
-            dist[src_nid] = 0.0
-            heap = [(0.0, src_nid)]
-            while heap:
-                d, u = heapq.heappop(heap)
-                if d > dist[u]:
-                    continue
-                for v, length in apron_graph_adj.get(u, ()):
-                    nd = d + length
-                    if v in dist and nd < dist[v]:
-                        dist[v] = nd
-                        heapq.heappush(heap, (nd, v))
-            for nid, du in dist.items():
-                if du == INF:
-                    continue
-                band = du * TAXI_MAX_GRADE
-                lo_i = src_elev - band
-                hi_i = src_elev + band
-                if lo_i > per_lo[nid]:
-                    per_lo[nid] = lo_i
-                if hi_i < per_hi[nid]:
-                    per_hi[nid] = hi_i
+            nearest_dist[src_nid] = 0.0
+            nearest_val[src_nid] = src_elev
+            heapq.heappush(heap, (0.0, src_nid, float(src_elev)))
+        while heap:
+            d, u, val = heapq.heappop(heap)
+            if d > nearest_dist[u]:
+                continue
+            for v, length in apron_graph_adj.get(u, ()):
+                nd = d + length
+                if v in nearest_dist and nd < nearest_dist[v]:
+                    nearest_dist[v] = nd
+                    nearest_val[v] = val
+                    heapq.heappush(heap, (nd, v, val))
+        for nid in apron_node_ids:
+            d = nearest_dist[nid]
+            if d == INF:
+                continue
+            band = d * TAXI_MAX_GRADE
+            per_lo[nid] = nearest_val[nid] - band
+            per_hi[nid] = nearest_val[nid] + band
 
         # Pin every apron-EXCLUSIVE node (i.e. not already a source).
         # Target = plane-fit value (smooth across the polygon, free
