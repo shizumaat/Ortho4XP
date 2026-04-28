@@ -770,6 +770,156 @@ def _clip_residue_at_stub_long_edges(
     return residue
 
 
+def _drop_primary_parallels_embedded_in_pavement(
+        taxi_rects: "List[Tuple[Polygon, LineString, str, str]]",
+        apt_pav_union: "Optional[Polygon]",
+        embed_frac: float = 0.95,
+        long_edge_buffer_m: float = 5.0,
+        ) -> "List[Tuple[Polygon, LineString, str, str]]":
+    """Drop ``primary_parallel`` rects whose long edges sit entirely
+    inside apt.dat row-110 pavement.
+
+    Per user 2026-04-27 invariant: a junction polygon must NEVER run
+    along a sloping rect's long edge — X-Plane's elevation engine
+    over-constrains the junction's spline to F's long-edge altitudes
+    and produces visible elevation glitches.
+
+    There are two ways the invariant gets violated for a primary
+    parallel:
+
+    1. apt.dat pavement bulges past the long edge between the rect's
+       short corners.  The residue then runs along the long edge to
+       reach the bulge.  ``_clip_residue_at_stub_long_edges`` already
+       handles this for STUBs by carving the bulge away.
+    2. The rect sits FULLY INSIDE a paved area (apron, ramp, big
+       terminal area).  apt.dat covers the rect's footprint AND
+       everything around it; the residue is the apron, and it
+       inevitably traces the rect's long edges as it wraps around
+       the rect-shaped hole.
+
+    Case 2 doesn't have a "carve away the bulge" fix — there's no
+    bulge, the entire surrounding pavement is legitimate apron.  The
+    correct behaviour is to NOT emit the rect at all: let the apron
+    junction cover the rect's footprint and slope multi-
+    directionally.  The primary-parallel grade rule isn't worth
+    enforcing for a taxi lane that's just one of many possible
+    paths through a paved apron — the apron's own elevation
+    propagation produces a perfectly serviceable surface.
+
+    SPJC's F is the canonical example.  F is a 121×60 m primary
+    parallel sitting in the middle of the SE apron; row-110 pavement
+    covers F + everything around it.  Dropping F lets the SE apron
+    (junction -10132) absorb F's footprint instead of wrapping
+    around F's long edges.
+
+    Implementation: a primary-parallel rect is considered embedded
+    when AT LEAST ONE of its two long edges is ≥ ``embed_frac``
+    inside ``apt_pav_union``, AND the strip just outside that edge
+    (``long_edge_buffer_m`` wide) is also covered.  Why "at least
+    one" instead of "both": a primary parallel can sit on the edge
+    of an apron, with one long edge inside the apron (where the
+    junction wraps it — the violation we're fixing) and the other
+    long edge along the apron's outer pavement boundary (where
+    there's no junction at all, so no wrap to worry about).  SPJC's
+    F is exactly this: south long edge fully inside the SE apron
+    (100 %), north long edge on the apron's outer boundary (27 %).
+    Dropping F is correct in both cases — the apron absorbs the
+    embedded side, and the boundary side becomes the apron's new
+    edge.  Only when NEITHER long edge is embedded does the rect
+    actually carry the pavement (a primary parallel through grass)
+    — those we must keep.
+    """
+    if apt_pav_union is None or apt_pav_union.is_empty:
+        return taxi_rects
+    kept: List[Tuple[Polygon, LineString, str, str]] = []
+    dropped_refs: List[str] = []
+    for entry in taxi_rects:
+        rect, axis, role, ref = entry
+        if role != ROLE_PRIMARY_PARALLEL:
+            kept.append(entry)
+            continue
+        try:
+            rc = list(rect.exterior.coords)
+        except Exception:
+            kept.append(entry)
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            kept.append(entry)
+            continue
+        # Long edges per ``_rect_from_axis_extended`` convention
+        # (corners 0,1 form one long edge; corners 2,3 the other).
+        long_edges = [(rc[0], rc[1]), (rc[2], rc[3])]
+        cx_r, cy_r = rect.centroid.x, rect.centroid.y
+        any_embedded = False
+        for (e0, e1) in long_edges:
+            ex = e1[0] - e0[0]
+            ey = e1[1] - e0[1]
+            mag = math.hypot(ex, ey)
+            if mag < 0.5:
+                continue
+            try:
+                edge_line = LineString([e0, e1])
+                # Test 1: the long edge is mostly inside pavement.
+                inside = edge_line.intersection(apt_pav_union)
+                if inside.is_empty:
+                    continue
+                inside_len = (inside.length
+                              if hasattr(inside, "length")
+                              else 0.0)
+                if inside_len / mag < embed_frac:
+                    continue
+                # Test 2: the strip just OUTSIDE the long edge is
+                # also pavement (otherwise the rect IS the pavement
+                # boundary on this side, not embedded).  This guard
+                # prevents dropping a primary parallel whose long
+                # edge happens to lie along an apron boundary
+                # (where ``edge_line.intersection(pav_union)`` is
+                # also ≈100 % because the edge is exactly on the
+                # boundary).  Only when the strip JUST BEYOND the
+                # edge is covered are we truly looking at an
+                # embedded rect with junction wrap on this side.
+                ux, uy = ex / mag, ey / mag
+                nx, ny = -uy, ux
+                mid_x = 0.5 * (e0[0] + e1[0])
+                mid_y = 0.5 * (e0[1] + e1[1])
+                if (cx_r - mid_x) * nx + (cy_r - mid_y) * ny > 0:
+                    nx, ny = -nx, -ny
+                strip = Polygon([
+                    e0,
+                    e1,
+                    (e1[0] + nx * long_edge_buffer_m,
+                     e1[1] + ny * long_edge_buffer_m),
+                    (e0[0] + nx * long_edge_buffer_m,
+                     e0[1] + ny * long_edge_buffer_m),
+                ])
+                if not strip.is_valid or strip.is_empty:
+                    continue
+                covered = strip.intersection(apt_pav_union).area
+                if covered / strip.area < embed_frac:
+                    continue
+                any_embedded = True
+                break
+            except Exception:
+                continue
+        if any_embedded:
+            dropped_refs.append(ref or "?")
+        else:
+            kept.append(entry)
+    if dropped_refs:
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] dropped "
+                f"{len(dropped_refs)} primary_parallel rect(s) fully "
+                f"embedded in apt.dat pavement (apron absorbs them): "
+                f"{', '.join(dropped_refs)}.\n")
+        except Exception:
+            pass
+    return kept
+
+
 def _add_stub_to_runway_bridges(
         residue: "Polygon",
         taxi_rects: "List[Tuple[Polygon, LineString, str, str]]",
@@ -1890,6 +2040,26 @@ def build_airport_pavement(icao: str, xplane_root: str,
             except Exception:
                 pass
             taxi_rects = kept
+
+    # Per user 2026-04-27 invariant: a junction polygon must NEVER run
+    # along a sloping rect's long edge.  When a primary_parallel rect
+    # sits FULLY INSIDE the airport's pavement union (apt.dat row-110
+    # ⊕ DSF ⊕ OSM-synthetic — i.e. the same union that becomes the
+    # residue), the surrounding apron junction unavoidably wraps the
+    # rect's long edges as it traces around the rect-shaped hole.
+    # The fix is not to emit the rect at all: let the apron absorb
+    # the rect's footprint and slope multi-directionally.  Primary
+    # parallels that legitimately cross unpaved area are unaffected
+    # (their long edges aren't inside pavement).
+    #
+    # Note: we test against ``pav_union`` (the full union), not
+    # ``apt_pav_union`` (row-110 only), because the residue is
+    # computed from ``pav_union`` and that's what determines whether
+    # the junction wraps the long edge.  At SPJC's SE apron, the
+    # long edges of F are 0 % / 24 % inside row-110 alone but
+    # ≈100 % inside the full pavement union including DSF.
+    taxi_rects = _drop_primary_parallels_embedded_in_pavement(
+        taxi_rects, pav_union)
 
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
