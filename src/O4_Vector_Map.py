@@ -237,45 +237,23 @@ def include_airports(vector_map, tile):
             taxiway_data = AUTOPATCH.extract_taxiway_info(
                 airport_layer, dico_airports, tile
             )
-            # Download building data within 1km of each airport boundary
-            # (per-airport bbox so distant airports don't fill gaps)
-            building_layer = OSM.OSM_layer()
-            cached_bldg = FNAMES.osm_cached(
-                tile.lat, tile.lon, "apt_bldg_local"
-            )
-            if os.path.isfile(cached_bldg):
-                UI.vprint(
-                    1,
-                    "    * Recycling building data from", cached_bldg,
-                )
-                building_layer.update_dicosm(
-                    cached_bldg,
-                    {"n": [], "w": [("building", "")], "r": []},
-                    {"n": [], "w": [("building", "")], "r": []},
-                )
-            else:
-                apt_bboxes = AUTOPATCH.compute_airport_bboxes(
-                    dico_airports, tile, buffer_m=1000.0
-                )
-                for apt_key, apt_bbox in apt_bboxes:
-                    UI.vprint(
-                        1,
-                        "   Auto-patch: Building query for {}:"
-                        " S={:.4f} W={:.4f} N={:.4f} E={:.4f}".format(
-                            apt_key, *apt_bbox
-                        ),
-                    )
-                    OSM.OSM_query_to_OSM_layer(
-                        'way["building"]',
-                        apt_bbox,
-                        building_layer,
-                        tags_of_interest=["building"],
-                    )
-                if apt_bboxes:
-                    building_layer.write_to_file(cached_bldg)
+            # Building data: rely solely on aeroway=hangar and
+            # aeroway=terminal features that are ALREADY in the
+            # per-tile airport_layer cache.  Per user 2026-04-27:
+            # the previous per-airport ``way["building"]`` Overpass
+            # queries (one per airport, with a 1 km buffer) caused
+            # rate-limit cascades and partial failures on tiles
+            # with many small airports (e.g. 25+ airports in the
+            # Charlotte tile), and the resulting building cache
+            # often failed to write entirely.  General building
+            # footprints (control towers, fire stations, fuel
+            # depots, etc.) catch only edge cases — terminals and
+            # hangars dominate the apron-paint cut-outs.  Skipping
+            # the extra query trades minor coverage for speed,
+            # robustness, and zero rate-limit risk.
             building_data = AUTOPATCH.extract_building_info(
                 airport_layer, dico_airports, tile,
-                building_layer=building_layer,
+                building_layer=None,
             )
             # Load cached big roads for tunnel/road-aware terrain modeling
             road_data = None
