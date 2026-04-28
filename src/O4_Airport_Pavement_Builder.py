@@ -6846,7 +6846,14 @@ def _decompose_polygon_with_holes(polygon: Polygon,
     # Merge any piece thinner than ``MIN_PIECE_THICKNESS_M`` into
     # its largest-shared-boundary neighbour so the apron stays
     # one continuous polygon.
-    MIN_PIECE_THICKNESS_M = 4.0
+    # Per user 2026-04-28: bumped from 4 m to 8 m after catching a
+    # 5 m × 67 m strip (CYXY -10110) that sat between two aprons
+    # at very different elevations and rendered a ~5 m cliff in
+    # X-Plane.  Strips up to ~8 m thick can still arise from
+    # multiple horizontal hole-centroid cuts and produce visible
+    # cliffs; merging them all into the larger neighbour is safer
+    # than emitting micro-aprons.
+    MIN_PIECE_THICKNESS_M = 8.0
     pieces = _merge_thin_decomposed_pieces(
         pieces, min_thickness_m=MIN_PIECE_THICKNESS_M)
     return pieces
