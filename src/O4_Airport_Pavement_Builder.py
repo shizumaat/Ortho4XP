@@ -3255,6 +3255,13 @@ def build_airport_pavement(icao: str, xplane_root: str,
         _drop_overlap_against_fixed_shapes(layout, icao=icao)
         _enforce_shared_vertices(
             layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
+        # Per user 2026-04-28: junction polygon vertices that
+        # coincide with a runway / sloping-rect corner MUST emit
+        # the rect's altitude tag value.  Run this AFTER all the
+        # shared-vertex / overlap-clip passes since they can
+        # rearrange polygon coords and put node_altitudes out of
+        # sync with the rect's emitted altitude tags.
+        _snap_junction_altitudes_to_rect_corners(layout)
 
     return layout
 
@@ -4120,6 +4127,96 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # not yet a hard fail (would drop too much coverage at HECA-
     # complexity airports while Layers 1/2 are still maturing).
     _report_within_shape_violations(layout, icao)
+
+
+def _snap_junction_altitudes_to_rect_corners(
+        layout: "PavementLayout") -> int:
+    """For every junction polygon, snap any vertex whose bucket
+    coincides with a runway / sloping-rect corner to that rect's
+    corresponding altitude tag value (``altitude_high`` for HIGH
+    corners 0,3; ``altitude_low`` for LOW corners 1,2; ``altitude``
+    for flat shapes).
+
+    Without this pass, the smoothing / subdivision / clamping
+    passes can leave a junction's ``node_altitudes`` entry at a
+    value derived from mesh interpolation rather than the rect's
+    EMITTED altitude tag — resulting in a vertical step at the
+    shared corner where the rect tag and the junction's per-vertex
+    altitude disagree.
+
+    Returns the number of altitude entries adjusted.
+    """
+    rwy_corner_alt: Dict[Tuple[int, int], float] = {}
+    sloping_rect_roles_for_snap = {
+        ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+        ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+        ROLE_CROSS_CONNECTOR,
+    }
+    for s in layout.shapes:
+        if s.role not in sloping_rect_roles_for_snap:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        if (s.altitude_high is not None
+                and s.altitude_low is not None):
+            for i, (cx, cy) in enumerate(coords):
+                b = _corner_elevation_bucket(cx, cy)
+                e = (s.altitude_high
+                     if i in (0, 3)
+                     else s.altitude_low)
+                # First-writer wins (consistent with
+                # ``_runway_corner_elev_map`` semantics) — avoids
+                # different runway segments at a shared corner
+                # disagreeing about the canonical altitude.
+                rwy_corner_alt.setdefault(b, float(e))
+        elif s.altitude is not None:
+            for (cx, cy) in coords:
+                b = _corner_elevation_bucket(cx, cy)
+                rwy_corner_alt.setdefault(b, float(s.altitude))
+    if not rwy_corner_alt:
+        return 0
+    n_changed = 0
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            continue
+        if not s.node_altitudes:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        # node_altitudes spans the closed ring; coords from
+        # ``polygon.exterior.coords`` is also closed.  Walk the open
+        # ring (drop closing repeat) and update by index.
+        if coords and coords[0] == coords[-1]:
+            coords_open = coords[:-1]
+        else:
+            coords_open = coords
+        for i, (cx, cy) in enumerate(coords_open):
+            if i >= len(s.node_altitudes):
+                break
+            b = _corner_elevation_bucket(cx, cy)
+            target_e = rwy_corner_alt.get(b)
+            if target_e is None:
+                continue
+            if abs(s.node_altitudes[i] - target_e) < 0.05:
+                continue
+            s.node_altitudes[i] = round(target_e, 1)
+            n_changed += 1
+        # Maintain closed-ring invariant: last == first.
+        if (s.node_altitudes
+                and len(s.node_altitudes) >= 2
+                and s.node_altitudes[0] != s.node_altitudes[-1]):
+            s.node_altitudes[-1] = s.node_altitudes[0]
+    return n_changed
 
 
 def _latlon_to_m_local(lat: float, lon: float,
