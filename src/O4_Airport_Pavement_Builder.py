@@ -1279,6 +1279,164 @@ def _drop_primary_parallels_embedded_in_pavement(
     return kept
 
 
+def _split_primary_parallels_at_pavement_boundary(
+        taxi_rects: "List[Tuple[Polygon, LineString, str, str]]",
+        pav_union: "Optional[Polygon]",
+        step_m: float = 10.0,
+        min_dropped_m: float = 100.0,
+        min_kept_m: float = 50.0,
+        ) -> "List[Tuple[Polygon, LineString, str, str]]":
+    """Clip primary_parallel rects whose long edge has a contiguous
+    embedded sub-range at one end of the rect's axis.
+
+    Per user 2026-04-27: when a taxiway is bounded by apron pavement
+    along most of one side, that bounded section should be ABSORBED
+    INTO THE APRON (covered by it, removed from the taxi rect).
+    The rule fires for FULL embedding via
+    ``_drop_primary_parallels_embedded_in_pavement``; this helper
+    handles PARTIAL embedding where only a sub-range of the rect's
+    axis is bounded.  The unbounded portion stays as a (shorter)
+    sloping rect; the absorbed portion's footprint reappears in
+    the residue → junction polygon → apron extends to cover it.
+
+    Algorithm:
+        1. Walk the rect's axis at ``step_m``-metre steps.  At each
+           step ``u``, sample the left and right long-edge midpoints
+           at axial offset ``u`` and check whether either falls
+           inside ``pav_union``.
+        2. Mark each step as "embedded" or not.
+        3. Find embedded contiguous prefixes / suffixes ≥
+           ``min_dropped_m`` long.
+        4. If clipping the embedded prefix and/or suffix leaves a
+           kept range ≥ ``min_kept_m``, replace the rect with the
+           clipped version.
+
+    The clipped rect uses the same axis direction; its corners are
+    at the new axial bounds projected to the original perpendicular
+    half-width.
+
+    At CYXY, taxiway E (469 m, NW-SE oriented) has its NW half
+    bounded by SW apron pavement on its west side.  This helper
+    clips E's NW portion (~290 m) and keeps the SE portion
+    (~180 m), leaving the apron polygon to cover E's NW footprint.
+    """
+    if pav_union is None or pav_union.is_empty:
+        return taxi_rects
+    out: List[Tuple[Polygon, LineString, str, str]] = []
+    n_clipped = 0
+    for entry in taxi_rects:
+        rect, axis, role, ref = entry
+        if role != ROLE_PRIMARY_PARALLEL:
+            out.append(entry)
+            continue
+        try:
+            rc = list(rect.exterior.coords)
+        except Exception:
+            out.append(entry)
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            out.append(entry)
+            continue
+        # Axis from short-edge-A midpoint (corners 0,3) to short-
+        # edge-B midpoint (corners 1,2).  Per the convention used by
+        # ``_rect_from_axis_extended`` / runway-segment emit, corners
+        # [0, 1] form one long edge and [2, 3] form the other.
+        a_mid = (0.5 * (rc[0][0] + rc[3][0]),
+                  0.5 * (rc[0][1] + rc[3][1]))
+        b_mid = (0.5 * (rc[1][0] + rc[2][0]),
+                  0.5 * (rc[1][1] + rc[2][1]))
+        ax = b_mid[0] - a_mid[0]
+        ay = b_mid[1] - a_mid[1]
+        L = math.hypot(ax, ay)
+        if L < 1.0:
+            out.append(entry)
+            continue
+        ux, uy = ax / L, ay / L
+        nx, ny = -uy, ux
+        half_w = math.hypot(rc[0][0] - a_mid[0], rc[0][1] - a_mid[1])
+        if half_w < 1.0:
+            out.append(entry)
+            continue
+        n_steps = max(2, int(math.floor(L / step_m)) + 1)
+        embedded: List[bool] = []
+        try:
+            for i in range(n_steps):
+                u = min(L, i * step_m)
+                cx = a_mid[0] + u * ux
+                cy = a_mid[1] + u * uy
+                left = Point(cx + nx * half_w, cy + ny * half_w)
+                right = Point(cx - nx * half_w, cy - ny * half_w)
+                emb = (pav_union.contains(left)
+                       or pav_union.contains(right))
+                embedded.append(emb)
+        except Exception:
+            out.append(entry)
+            continue
+        # Find embedded prefix length (in steps).
+        pfx = 0
+        while pfx < n_steps and embedded[pfx]:
+            pfx += 1
+        # Find embedded suffix length (in steps).
+        sfx = 0
+        while sfx < n_steps - pfx and embedded[n_steps - 1 - sfx]:
+            sfx += 1
+        # Convert to metres.  step_m is the axis step; the embedded
+        # prefix ends at the LAST embedded step's u-coordinate, so
+        # the prefix length in metres is ``pfx_steps × step_m``.
+        pfx_m = pfx * step_m
+        sfx_m = sfx * step_m
+        # Allowable clip: prefix or suffix must be ≥ min_dropped_m,
+        # and the kept range must be ≥ min_kept_m.
+        clip_pfx = pfx_m >= min_dropped_m
+        clip_sfx = sfx_m >= min_dropped_m
+        if not (clip_pfx or clip_sfx):
+            out.append(entry)
+            continue
+        u_lo = pfx_m if clip_pfx else 0.0
+        u_hi = (L - sfx_m) if clip_sfx else L
+        if u_hi - u_lo < min_kept_m:
+            out.append(entry)
+            continue
+        # Build clipped rect: 4 corners at u_lo and u_hi axial
+        # offsets, ±half_w perpendicular.
+        new_a_mid = (a_mid[0] + u_lo * ux, a_mid[1] + u_lo * uy)
+        new_b_mid = (a_mid[0] + u_hi * ux, a_mid[1] + u_hi * uy)
+        new_corners = [
+            (new_a_mid[0] + nx * half_w, new_a_mid[1] + ny * half_w),
+            (new_b_mid[0] + nx * half_w, new_b_mid[1] + ny * half_w),
+            (new_b_mid[0] - nx * half_w, new_b_mid[1] - ny * half_w),
+            (new_a_mid[0] - nx * half_w, new_a_mid[1] - ny * half_w),
+        ]
+        try:
+            new_rect = Polygon(new_corners)
+            if not new_rect.is_valid:
+                new_rect = new_rect.buffer(0)
+            if (new_rect.is_empty
+                    or new_rect.geom_type != "Polygon"):
+                out.append(entry)
+                continue
+            new_axis = LineString([new_a_mid, new_b_mid])
+            out.append((new_rect, new_axis, role, ref))
+            n_clipped += 1
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] clipped primary_parallel "
+                    f"{ref!r}: {L:.0f}m → {(u_hi - u_lo):.0f}m "
+                    f"(dropped "
+                    + ("prefix " if clip_pfx else "")
+                    + ("suffix " if clip_sfx else "")
+                    + "embedded in pavement).\n")
+            except Exception:
+                pass
+        except Exception:
+            out.append(entry)
+            continue
+    return out
+
+
 def _add_stub_to_runway_bridges(
         residue: "Polygon",
         taxi_rects: "List[Tuple[Polygon, LineString, str, str]]",
@@ -2522,6 +2680,16 @@ def build_airport_pavement(icao: str, xplane_root: str,
     taxi_rects = _drop_primary_parallels_embedded_in_pavement(
         taxi_rects, pav_union)
 
+    # Partial-embed split: when only a CONTIGUOUS PREFIX or SUFFIX
+    # of a primary_parallel rect's axis is bounded by apron pavement
+    # on one side, clip the rect to keep only the unbounded portion.
+    # The dropped portion's footprint reappears in the residue and
+    # gets covered by the apron polygon.  At CYXY, taxiway E's NW
+    # half is bounded by the SW apron; this clips E to its SE
+    # portion (the non-embedded part adjacent to runway 14R/32L).
+    taxi_rects = _split_primary_parallels_at_pavement_boundary(
+        taxi_rects, pav_union)
+
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
     for rect, axis, role, ref in taxi_rects:
@@ -3666,19 +3834,36 @@ def _orient_rect_for_altitude(shape: "BuiltShape",
 #      surface at an arbitrary meter-space point — used to map
 #      rect axis endpoints onto the network.
 NETWORK_DENSIFY_M = 30.0            # max edge length
-NETWORK_BRIDGE_MAX_M = 60.0         # max dist for taxi→rwy bridge edge.
-                                     # Tight enough that interior nodes
-                                     # of parallel taxis (typically > 100 m
-                                     # from the runway) aren't bridged;
-                                     # wide enough to catch perpendicular
-                                     # stub endpoints (V1 ~55 m at SPJC).
-                                     # Parallel taxis CAN legitimately
-                                     # diverge from runway elevation
-                                     # (real airports often have parallel
-                                     # taxiways sloping the opposite
-                                     # direction from the runway).  Only
-                                     # the stubs need a tight bridge to
-                                     # the runway.
+NETWORK_BRIDGE_MAX_M = 250.0        # max dist for taxi→rwy bridge edge.
+                                     # User 2026-04-27 directive:
+                                     # "Taxiways and aprons should not be
+                                     # anchored to runway elevation by
+                                     # anything other than the max slope
+                                     # of pavement connecting to a
+                                     # runway."  The bridge edge models
+                                     # exactly that: edge length is the
+                                     # pavement-traversal distance from
+                                     # the taxi node to the runway, so
+                                     # the propagator's grade-cap
+                                     # produces ``runway_elev ± dist ×
+                                     # 1.5%`` at the taxi node — the
+                                     # max-slope budget.
+                                     #
+                                     # 250 m catches parallel taxis ~150
+                                     # m off the runway centerline (e.g.
+                                     # CYXY's E at ~165 m) so they
+                                     # anchor to the PHYSICALLY-MEETING
+                                     # runway segment rather than a
+                                     # far-away anchor reached by long
+                                     # OSM-network paths (CYXY E was
+                                     # otherwise anchoring at 14R end,
+                                     # 560 m away at 694 m, when it
+                                     # actually meets the runway near
+                                     # 32L at 706 m).  Edge length =
+                                     # max(0.5, dist - half_width) so
+                                     # the grade budget reflects actual
+                                     # taxi-rect-to-runway-edge metres,
+                                     # not centerline-to-centerline.
 NETWORK_RUNWAY_ANCHOR_RADIUS_M = 5.0  # a taxi node within this of
                                        # rwy segment gets anchored
 
