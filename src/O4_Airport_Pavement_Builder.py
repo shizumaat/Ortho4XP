@@ -10859,6 +10859,43 @@ def _split_centerlines_at_points(
         except Exception:
             pass
 
+    # Per user 2026-04-28: at sub-segment endpoints that are SHARED
+    # with another sub-segment endpoint (i.e. the centerline was
+    # bend-split there in ``_extract_osm_taxi_centerlines``), the
+    # natural break is the bend itself.  A small junction polygon
+    # at the bend is unavoidable (rect axes are straight; bent
+    # centerlines need a junction at every angle change).  But the
+    # default 15-30% margin on the segment overshoots the bend by
+    # tens of metres, leaving a long uncovered corridor that the
+    # downstream junction balloons into.  At bend-shared endpoints
+    # use a small fixed margin (``BEND_ENDPOINT_MARGIN_M``) instead
+    # of the percentage so the rect extends right up to the bend.
+    BEND_ENDPOINT_MARGIN_M = 5.0
+    BEND_SHARED_TOL_M = 25.0
+    bend_share_tol2 = BEND_SHARED_TOL_M * BEND_SHARED_TOL_M
+    centerline_endpoints: List[Tuple[Tuple[float, float],
+                                     Tuple[float, float]]] = []
+    for ls, _ref in centerlines:
+        try:
+            cs = list(ls.coords)
+            centerline_endpoints.append((cs[0], cs[-1]))
+        except Exception:
+            centerline_endpoints.append(((0.0, 0.0), (0.0, 0.0)))
+
+    def _is_bend_shared(idx: int, endpoint: Tuple[float, float]) -> bool:
+        """True iff ``endpoint`` of centerline ``idx`` lies within
+        ``BEND_SHARED_TOL_M`` of any other centerline's endpoint —
+        signalling that the two centerlines were bend-split apart
+        from one continuous OSM way at that point."""
+        ex, ey = endpoint
+        for j, (s2, e2) in enumerate(centerline_endpoints):
+            if j == idx:
+                continue
+            for px, py in (s2, e2):
+                if (ex - px) ** 2 + (ey - py) ** 2 <= bend_share_tol2:
+                    return True
+        return False
+
     def _avg_perp_halfwidth(ls: LineString, t: float) -> float:
         """(left+right)/2 perpendicular half-width at axis param t,
         so widening detection is comparable to narrow_hw (which is
@@ -10984,8 +11021,20 @@ def _split_centerlines_at_points(
         return 0.15
 
     result: List[Tuple[LineString, str]] = []
-    for ls, ref in centerlines:
+    for ls_idx, (ls, ref) in enumerate(centerlines):
         gap_margin_frac = _rect_margin_frac_for(ls, ref)
+        # Detect whether the centerline's start / end is a bend-shared
+        # endpoint (continuation with a neighbouring sub-segment via
+        # bend).  Used below to clamp the margin at those endpoints.
+        try:
+            _ls_cs = list(ls.coords)
+            _start_endpoint = _ls_cs[0]
+            _end_endpoint = _ls_cs[-1]
+        except Exception:
+            _start_endpoint = (0.0, 0.0)
+            _end_endpoint = (0.0, 0.0)
+        start_is_bend = _is_bend_shared(ls_idx, _start_endpoint)
+        end_is_bend = _is_bend_shared(ls_idx, _end_endpoint)
         # Estimate centerline's narrow half-width for midpoint check.
         if pav_for_probe is not None and not pav_for_probe.is_empty:
             _nat, _p90, narrow_hw = _natural_half_width(ls, pav_for_probe)
@@ -11195,6 +11244,19 @@ def _split_centerlines_at_points(
             else:
                 m_start = gap_margin_frac * gap
                 m_end = gap_margin_frac * gap
+            # Per user 2026-04-28: at bend-shared centerline endpoints,
+            # the rect should extend right up to the bend (only the
+            # tiny natural triangular junction at the angle change is
+            # unavoidable).  Override the percentage margin with a
+            # small fixed value when the corresponding endpoint of
+            # this segment touches a bend-shared end of the
+            # centerline.  ``p0 == 0`` ⇒ start side touches centerline
+            # start; ``p1 == ls.length`` ⇒ end side touches centerline
+            # end.
+            if start_is_bend and abs(p0) < 0.5:
+                m_start = min(m_start, BEND_ENDPOINT_MARGIN_M)
+            if end_is_bend and abs(p1 - ls.length) < 0.5:
+                m_end = min(m_end, BEND_ENDPOINT_MARGIN_M)
             rect_p0 = p0 + m_start
             rect_p1 = p1 - m_end
             if rect_p1 - rect_p0 < MIN_SEGMENT_LEN_M:
@@ -11375,20 +11437,53 @@ def _build_taxi_rects(
         if role_str == ROLE_STUB:
             return True
         return False
-    stub_ref_best: Dict[str, int] = {}
-    for i, (rect, axis, role, ref) in enumerate(emitted):
+    # Per-ref, group same-ref rects into geometrically-overlapping
+    # clusters; within each cluster, keep only the longest.  Non-
+    # overlapping rects of the same ref (e.g. multiple sub-segments
+    # of one OSM way that bend-split into rects covering distinct
+    # parts of the corridor) coexist — only OSM fragmentation that
+    # produces actual duplicates gets deduped.
+    OVERLAP_PROX_M = 5.0
+    by_ref: Dict[str, List[int]] = {}
+    for i, (_r, _a, role, ref) in enumerate(emitted):
         if not _should_dedup(ref, role):
             continue
-        cur = stub_ref_best.get(ref)
-        if cur is None or axis.length > emitted[cur][1].length:
-            stub_ref_best[ref] = i
-    keep: List[Tuple[Polygon, LineString, str, str]] = []
-    for i, item in enumerate(emitted):
-        _rect, _axis, role, ref = item
-        if _should_dedup(ref, role):
-            if stub_ref_best.get(ref) != i:
+        by_ref.setdefault(ref, []).append(i)
+    drop: set = set()
+    for ref, idxs in by_ref.items():
+        # Build overlap clusters.
+        n = len(idxs)
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for a in range(n):
+            ra = emitted[idxs[a]][0]
+            for b in range(a + 1, n):
+                rb = emitted[idxs[b]][0]
+                try:
+                    overlap = ra.intersection(rb).area
+                    proximate = ra.distance(rb) < OVERLAP_PROX_M
+                except Exception:
+                    overlap, proximate = 0.0, False
+                if overlap > 1.0 or proximate:
+                    pa, pb = find(a), find(b)
+                    if pa != pb:
+                        parent[pa] = pb
+        clusters: Dict[int, List[int]] = {}
+        for k in range(n):
+            clusters.setdefault(find(k), []).append(idxs[k])
+        # Within each cluster, keep only the longest axis.
+        for members in clusters.values():
+            if len(members) <= 1:
                 continue
-        keep.append(item)
+            members.sort(key=lambda m: -emitted[m][1].length)
+            for m in members[1:]:
+                drop.add(m)
+    keep: List[Tuple[Polygon, LineString, str, str]] = [
+        item for i, item in enumerate(emitted) if i not in drop]
     return keep
 
 
