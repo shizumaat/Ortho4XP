@@ -1242,17 +1242,40 @@ def _drop_primary_parallels_embedded_in_pavement(
         junction_buf = junction_pav.buffer(proximity_m)
     except Exception:
         junction_buf = junction_pav
-    # All sloping-rect roles are subject to the absorption rule.  A
-    # stub (or cross-connector) bordering a junction is just as
-    # constrained as a primary parallel — its long edge has a
-    # uniform slope from short edge to short edge, and any junction
-    # adjacent to that edge has to match the slope or produce a
-    # visible elevation seam.
+    # All sloping-rect roles are subject to the absorption rule.
     sloping_rect_roles = {ROLE_PRIMARY_PARALLEL,
                           ROLE_SECONDARY_PARALLEL,
                           ROLE_STUB, ROLE_CROSS_CONNECTOR}
+
+    # Per user 2026-04-28: absorb only when BOTH long edges have
+    # junction-class pavement within 1 m at the same axial position
+    # (rect is "sandwiched" / embedded), AND PARTIALLY — only the
+    # axial range where both sides are adjacent gets absorbed; the
+    # rest of the rect survives as shorter rect(s).
+    #
+    # Walk each rect's axis at 5 m steps.  At each step, check the
+    # left and right long-edge midpoints.  A step is "absorbed" only
+    # when both sides are within 1 m of junction-pav.  Find
+    # contiguous absorbed runs ≥ 10 % of axial length; keep
+    # non-absorbed intervals (≥ 30 m fragments) as new rects.
+    #
+    # Use cases:
+    #   - F primary parallel at CYXY (288 m, 33 % + 100 %): both-
+    #     sides-adjacent at the 33 % axial range → split into a
+    #     shorter rect for the remaining 67 % (~190 m kept).
+    #   - F embedded in SPJC apron (both sides 100 %): full
+    #     absorption.
+    #   - E primary parallel along CYXY apron edge (one side 100 %,
+    #     other 0 %): no axial step has both sides adjacent → no
+    #     absorption.
+    SAMPLE_STEP_M = 5.0
+    MIN_KEPT_M = 30.0
+
     kept: List[Tuple[Polygon, LineString, str, str]] = []
-    dropped_refs: List[str] = []
+    abs_refs: List[str] = []
+    n_full = 0
+    n_split = 0
+    n_clipped = 0
     for entry in taxi_rects:
         rect, axis, role, ref = entry
         if role not in sloping_rect_roles:
@@ -1268,54 +1291,130 @@ def _drop_primary_parallels_embedded_in_pavement(
         if len(rc) != 4:
             kept.append(entry)
             continue
-        # Long edges per ``_rect_from_axis_extended`` convention
-        # (corners 0,1 form one long edge; corners 2,3 the other).
-        long_edges = [(rc[0], rc[1]), (rc[2], rc[3])]
-        # User 2026-04-28 refinement: absorb only when BOTH long
-        # edges have ≥10% adjacency to junction-class pavement —
-        # i.e. the rect is "sandwiched" / embedded inside an apron.
-        # When only ONE long edge has adjacency, the rect is at the
-        # apron's boundary (the normal position for a primary
-        # parallel running along an apron edge) and should remain
-        # as a sloping rect; the apron polygon stops at the rect's
-        # long edge and uses its boundary altitudes to spline
-        # smoothly with the rect's altH/altL.  CYXY's E primary
-        # parallel "extending from the south apron edge" is exactly
-        # this case: edge 0 along apron (69-100% adj.), edge 1 in
-        # grass (0% adj.) → KEEP.  SPJC's F (truly inside the SE
-        # apron) has BOTH edges in apron → ABSORB.
-        edges_embedded = 0
-        for (e0, e1) in long_edges:
-            ex = e1[0] - e0[0]
-            ey = e1[1] - e0[1]
-            mag = math.hypot(ex, ey)
-            if mag < 0.5:
-                continue
+        # Axis from short-edge midpoints (corners 0,3 → one short
+        # edge; 1,2 → other) per ``_rect_from_axis_extended``
+        # convention.
+        a_mid = (0.5 * (rc[0][0] + rc[3][0]),
+                  0.5 * (rc[0][1] + rc[3][1]))
+        b_mid = (0.5 * (rc[1][0] + rc[2][0]),
+                  0.5 * (rc[1][1] + rc[2][1]))
+        ax = b_mid[0] - a_mid[0]
+        ay = b_mid[1] - a_mid[1]
+        L = math.hypot(ax, ay)
+        if L < 30.0:
+            kept.append(entry)
+            continue
+        ux = ax / L
+        uy = ay / L
+        nx, ny = -uy, ux
+        half_w = math.hypot(rc[0][0] - a_mid[0], rc[0][1] - a_mid[1])
+        if half_w < 1.0:
+            kept.append(entry)
+            continue
+
+        n_steps = max(2, int(L / SAMPLE_STEP_M) + 1)
+        both_adj = [False] * n_steps
+        for i in range(n_steps):
+            u = min(L, i * SAMPLE_STEP_M)
+            cx = a_mid[0] + u * ux
+            cy = a_mid[1] + u * uy
             try:
-                edge_line = LineString([e0, e1])
-                inside = edge_line.intersection(junction_buf)
-                if inside.is_empty:
-                    continue
-                inside_len = (inside.length
-                              if hasattr(inside, "length")
-                              else 0.0)
-                if inside_len / mag >= adjacency_frac:
-                    edges_embedded += 1
+                left_pt = Point(cx + nx * half_w,
+                                 cy + ny * half_w)
+                right_pt = Point(cx - nx * half_w,
+                                  cy - ny * half_w)
+                both_adj[i] = (
+                    bool(junction_buf.contains(left_pt))
+                    and bool(junction_buf.contains(right_pt)))
             except Exception:
                 continue
-        if edges_embedded >= 2:
-            dropped_refs.append(ref or "?")
-        else:
+
+        # Find contiguous "both adjacent" runs ≥ 10 % of axis.
+        min_run_steps = max(1, int(adjacency_frac * n_steps))
+        absorbed_intervals: List[Tuple[float, float]] = []
+        i = 0
+        while i < n_steps:
+            if not both_adj[i]:
+                i += 1
+                continue
+            j = i
+            while j < n_steps and both_adj[j]:
+                j += 1
+            if (j - i) >= min_run_steps:
+                u_start = i * SAMPLE_STEP_M
+                u_end = min(L, j * SAMPLE_STEP_M)
+                absorbed_intervals.append((u_start, u_end))
+            i = j
+
+        if not absorbed_intervals:
             kept.append(entry)
-    if dropped_refs:
+            continue
+
+        # Compute kept intervals = [0, L] minus absorbed.
+        kept_intervals: List[Tuple[float, float]] = []
+        prev_end = 0.0
+        for s, e in absorbed_intervals:
+            if s > prev_end:
+                kept_intervals.append((prev_end, s))
+            prev_end = e
+        if L > prev_end:
+            kept_intervals.append((prev_end, L))
+        kept_intervals = [(s, e) for s, e in kept_intervals
+                          if (e - s) >= MIN_KEPT_M]
+
+        if not kept_intervals:
+            n_full += 1
+            abs_refs.append(ref or "?")
+            continue
+
+        # No-op: kept covers (almost) the full rect.
+        if (len(kept_intervals) == 1
+                and kept_intervals[0][0] <= SAMPLE_STEP_M
+                and kept_intervals[0][1] >= L - SAMPLE_STEP_M):
+            kept.append(entry)
+            continue
+
+        # Build new rects from kept intervals.
+        for u_lo, u_hi in kept_intervals:
+            new_a_mid = (a_mid[0] + u_lo * ux,
+                         a_mid[1] + u_lo * uy)
+            new_b_mid = (a_mid[0] + u_hi * ux,
+                         a_mid[1] + u_hi * uy)
+            new_corners = [
+                (new_a_mid[0] + nx * half_w,
+                 new_a_mid[1] + ny * half_w),
+                (new_b_mid[0] + nx * half_w,
+                 new_b_mid[1] + ny * half_w),
+                (new_b_mid[0] - nx * half_w,
+                 new_b_mid[1] - ny * half_w),
+                (new_a_mid[0] - nx * half_w,
+                 new_a_mid[1] - ny * half_w),
+            ]
+            try:
+                new_rect = Polygon(new_corners)
+                if not new_rect.is_valid:
+                    new_rect = new_rect.buffer(0)
+                if (new_rect.is_empty
+                        or new_rect.geom_type != "Polygon"):
+                    continue
+                new_axis = LineString([new_a_mid, new_b_mid])
+                kept.append((new_rect, new_axis, role, ref))
+            except Exception:
+                continue
+        if len(kept_intervals) >= 2:
+            n_split += 1
+        else:
+            n_clipped += 1
+        abs_refs.append(ref or "?")
+
+    if abs_refs:
         try:
             import sys as _sys
             _sys.stderr.write(
-                f"  [pav-builder] dropped "
-                f"{len(dropped_refs)} sloping rect(s) with junction "
-                f"pavement within 1 m of >10% of a long edge "
-                f"(apron absorbs them): "
-                f"{', '.join(dropped_refs)}.\n")
+                f"  [pav-builder] both-sides-adjacent absorption: "
+                f"{n_full} dropped, {n_split} split, "
+                f"{n_clipped} clipped (refs: "
+                f"{', '.join(abs_refs)}).\n")
         except Exception:
             pass
     return kept
