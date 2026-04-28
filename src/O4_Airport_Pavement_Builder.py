@@ -988,9 +988,23 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # / aprons in the OSM data, providing a stable inland-side
     # bound for diagonal-stub trimming.
     parallel_spines: List[LineString] = []
+    parallel_corridors: List[Tuple[str, Polygon]] = []
     SPINE_EXTEND_M = 800.0  # extend each spine ±800 m past its
                               # OSM-fragment endpoints so it acts
                               # as a guide line through aprons.
+    PARALLEL_CORRIDOR_HALF_WIDTH_M = 30.0
+                              # half-width of the imagined
+                              # primary-parallel pavement corridor.
+                              # Used to TRIM diagonal stubs at the
+                              # corridor's runway-facing edge — so
+                              # B/C/D/E at SPJC stop where they
+                              # enter A's pavement (real or
+                              # imagined-via-apron) rather than
+                              # extending deep into the apron.
+                              # 30 m is wider than a typical taxi
+                              # half-width (22 m) so the corridor
+                              # forgives small OSM/apt.dat
+                              # misalignment.
     if rwy_centerlines:
         # Bearing of the FIRST runway centerline; we use it to
         # decide whether a ref qualifies as a primary parallel
@@ -1036,7 +1050,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 _end = (_ebx + _ux * SPINE_EXTEND_M,
                         _eby + _uy * SPINE_EXTEND_M)
                 try:
-                    parallel_spines.append(LineString([_start, _end]))
+                    _spine = LineString([_start, _end])
+                    parallel_spines.append(_spine)
+                    # Build the corridor polygon: spine buffered to
+                    # PARALLEL_CORRIDOR_HALF_WIDTH_M, square ends so
+                    # the corridor's apron-facing extension stays
+                    # rectangular.
+                    _corridor = _spine.buffer(
+                        PARALLEL_CORRIDOR_HALF_WIDTH_M,
+                        cap_style=2, join_style=2)
+                    if (not _corridor.is_empty
+                            and _corridor.geom_type == "Polygon"):
+                        parallel_corridors.append((_ref, _corridor))
                 except Exception:
                     pass
 
@@ -1298,25 +1323,20 @@ def build_airport_pavement(icao: str, xplane_root: str,
             delta = min(delta, 180.0 - delta)
             return abs(delta - 90.0)
 
-        try:
-            rwy_buffered_diag = layout.runway_union.buffer(
-                RWY_DIAG_BUFFER_M)
-        except Exception:
-            rwy_buffered_diag = layout.runway_union
         trimmed_centerlines: List[Tuple[LineString, str]] = []
         for ls, ref in osm_centerlines:
-            # Pick buffer based on approach angle:
-            #   * perpendicular (perp_diff < 25°)   → 30 m buffer
-            #   * diagonal      (25° ≤ pd < 70°)    → 15 m buffer
-            #   * parallel      (pd ≥ 70°)          → no trim
+            # Only PERPENDICULAR centerlines (perp_diff < 25°)
+            # need this 30 m buffer pull-back.  Diagonals are
+            # handled by the SEPARATE corridor-trim pass below
+            # (which subtracts the imagined primary-parallel
+            # corridor from the diagonal's apron-side end).
+            # Stacking both gave a too-aggressive shortening at
+            # SPJC (B 203 m → 92 m).
             pd = _perp_diff_to_runway(ls)
-            if pd < PERP_TRIM_MAX_DEG:
-                _buf = rwy_buffered
-            elif pd < DIAG_TRIM_MAX_DEG:
-                _buf = rwy_buffered_diag
-            else:
+            if pd >= PERP_TRIM_MAX_DEG:
                 trimmed_centerlines.append((ls, ref))
                 continue
+            _buf = rwy_buffered
             try:
                 diff = ls.difference(_buf)
             except Exception:
@@ -1460,11 +1480,66 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         trimmed_perp.append((ls, ref))
                 osm_centerlines = trimmed_perp
 
-    # NOTE: pavement-edge-aware end-trim was attempted here but
-    # interacted badly with the diagonal centerline assembly
-    # (dropped a valid stub).  Revisit when we need finer-grained
-    # widening detection for diagonals not near any parallel
-    # centerline.
+    # ── Diagonal-stub corridor trim ──────────────────────────────
+    # Per user 2026-04-27: when a diagonal stub (B/C/D/E/G at SPJC)
+    # connects directly to a large apron rather than crossing a
+    # primary parallel's actual rect, the stub's apron-end ends up
+    # floating in the apron (no nearby pavement edge to snap to).
+    # The fix: subtract the IMAGINED PRIMARY PARALLEL CORRIDOR
+    # (spine ± PARALLEL_CORRIDOR_HALF_WIDTH_M, extended through
+    # gaps in the OSM coverage) from each diagonal stub's
+    # centerline.  The diagonal then ends at the corridor's
+    # runway-facing edge — exactly where the imagined primary
+    # parallel's "near" pavement boundary sits.  Downstream rect-
+    # build + corner-snap-to-pavement then puts the rect's apron-
+    # end corners on the pavement edge between runway and apron.
+    if parallel_corridors and ref_overall_bearings:
+        _r0c = list(rwy_centerlines[0].coords)
+        _r0db = math.degrees(math.atan2(
+            _r0c[-1][0] - _r0c[0][0],
+            _r0c[-1][1] - _r0c[0][1])) % 180.0
+        corridor_trimmed: List[Tuple[LineString, str]] = []
+        for ls, ref in osm_centerlines:
+            if not ref:
+                corridor_trimmed.append((ls, ref))
+                continue
+            _b = ref_overall_bearings.get(ref)
+            if _b is None:
+                corridor_trimmed.append((ls, ref))
+                continue
+            _db_local = abs(_b - _r0db)
+            _db_local = min(_db_local, 180.0 - _db_local)
+            # Only diagonal stubs (overall db ∈ [20°, 45°)) need
+            # this corridor trim.  Sub-refs (V3 etc) would also
+            # qualify and benefit, so include them.
+            if not (20.0 <= _db_local < 45.0):
+                corridor_trimmed.append((ls, ref))
+                continue
+            # Subtract every OTHER ref's corridor from this
+            # centerline.  Skip the centerline's own corridor
+            # (so e.g. an A1 stub doesn't subtract A's corridor
+            # from itself if it was somehow classified as
+            # diagonal).
+            current = ls
+            for c_ref, corridor in parallel_corridors:
+                if c_ref == ref:
+                    continue
+                try:
+                    diff = current.difference(corridor)
+                except Exception:
+                    continue
+                if diff.is_empty:
+                    continue
+                if diff.geom_type == "LineString":
+                    if diff.length >= MIN_SEGMENT_LEN_M:
+                        current = diff
+                elif diff.geom_type == "MultiLineString":
+                    longest = max(diff.geoms,
+                                  key=lambda g: g.length)
+                    if longest.length >= MIN_SEGMENT_LEN_M:
+                        current = longest
+            corridor_trimmed.append((current, ref))
+        osm_centerlines = corridor_trimmed
 
     # Per user rule (2026-04-18): "Implement splitting at cross ref
     # crossings" — split every centerline at each multi-ref
@@ -9025,19 +9100,6 @@ def _split_centerlines_at_points(
         # the taxi's axis due to the oblique crossing.
         if not rwy_centerlines:
             return 0.15
-        # Long taxis (refed or not) parallel to the runway use the
-        # primary 15 % margin — the angle-based check below
-        # (perp_diff window 20-75) excludes them from the diagonal-
-        # stub treatment automatically.  Short non-parallel
-        # diagonal connectors get the 30 %/35 % shrinkage.
-        if ls.length >= 250.0:
-            return 0.15
-        # Short unrefed parallel-to-runway rects (between two
-        # diagonal stubs on SPLP's south chain) need extra margin
-        # to avoid overlapping the neighbouring diagonal stubs.
-        # Detect: ref empty, length < 150 m, nearly parallel to
-        # runway (perp_diff > 75°) — emit as half-length primary
-        # by using 30 % margin each side (40 % retained).
         c = list(ls.coords)
         if len(c) < 2:
             return 0.15
@@ -9080,6 +9142,14 @@ def _split_centerlines_at_points(
         # so widen to 20-75 to cover the full "at an angle"
         # band while still excluding pure parallels and
         # perpendiculars.
+        #
+        # Per user 2026-04-27: this used to be gated on length
+        # < 250 m (long diagonals fell back to 15 %).  But long
+        # diagonals like SPJC's B/C/E (575 m / 572 m / 593 m at
+        # ~21° to runway) ARE diagonal stubs in the same sense as
+        # short ones — they should get the same 35 % retention so
+        # the rect doesn't extend deep into the adjacent apron.
+        # Removed the length gate; the angle alone classifies.
         perp_diff = abs(delta - 90.0)
         if 20.0 < perp_diff < 75.0:
             return 0.30
