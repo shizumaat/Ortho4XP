@@ -1242,11 +1242,20 @@ def _drop_primary_parallels_embedded_in_pavement(
         junction_buf = junction_pav.buffer(proximity_m)
     except Exception:
         junction_buf = junction_pav
+    # All sloping-rect roles are subject to the absorption rule.  A
+    # stub (or cross-connector) bordering a junction is just as
+    # constrained as a primary parallel — its long edge has a
+    # uniform slope from short edge to short edge, and any junction
+    # adjacent to that edge has to match the slope or produce a
+    # visible elevation seam.
+    sloping_rect_roles = {ROLE_PRIMARY_PARALLEL,
+                          ROLE_SECONDARY_PARALLEL,
+                          ROLE_STUB, ROLE_CROSS_CONNECTOR}
     kept: List[Tuple[Polygon, LineString, str, str]] = []
     dropped_refs: List[str] = []
     for entry in taxi_rects:
         rect, axis, role, ref = entry
-        if role != ROLE_PRIMARY_PARALLEL:
+        if role not in sloping_rect_roles:
             kept.append(entry)
             continue
         try:
@@ -1294,8 +1303,9 @@ def _drop_primary_parallels_embedded_in_pavement(
             import sys as _sys
             _sys.stderr.write(
                 f"  [pav-builder] dropped "
-                f"{len(dropped_refs)} primary_parallel rect(s) fully "
-                f"embedded in apt.dat pavement (apron absorbs them): "
+                f"{len(dropped_refs)} sloping rect(s) with junction "
+                f"pavement within 1 m of >10% of a long edge "
+                f"(apron absorbs them): "
                 f"{', '.join(dropped_refs)}.\n")
         except Exception:
             pass
