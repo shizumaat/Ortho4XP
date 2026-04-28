@@ -4493,6 +4493,329 @@ def _solve_pavement_mesh(
     # so cache and re-clip rather than calling choose_values.
     seeded = list(mesh.elev)
     mesh.propagate_bounds()
+
+    # ── Apron decoupling (user 2026-04-27, plan A) ──────────────────
+    # Aprons sit on natural terrain and follow DEM, not runway-grade
+    # propagation.  When the airport is on a hillside (CYXY), the
+    # apron is several metres above the runway.  The mesh's 2D
+    # propagate_bounds finds short geometric paths through within-
+    # shape and cross-shape proximity edges (~130 m at CYXY) and
+    # caps the apron at runway+1.5%×130m ≈ runway+2m — far below
+    # the actual terrain (10m above runway at CYXY's SW apron).
+    #
+    # Fix (user direction): identify "apron-class" junction shapes
+    # (large area — a parking apron, not a small taxi connector) and
+    # bias their EXCLUSIVE boundary vertices (those NOT shared with
+    # rect/terminal/runway shapes) toward DEM elevation, subject to
+    # taxi-grade compliance walked along the apron's PERIMETER ring
+    # from the shared-with-taxi vertices (which already have anchor-
+    # propagation-derived elevations).  This matches the user's
+    # phrasing: "we still have to maintain taxi grades which will
+    # determine just how high the apron can be and how much it gets
+    # cut into the hills".
+    #
+    # Algorithm — per apron polygon:
+    #   1. Build the ring-adjacency graph (just ring edges, no
+    #      mesh shortcuts).
+    #   2. Sources are the SHARED-with-anchored-shape vertices,
+    #      using their current mesh elevation as the anchor value.
+    #      If no shared vertex exists, the whole apron is exclusive
+    #      and we anchor at DEM directly.
+    #   3. Dijkstra outward: distance[v] = ring-adjacency length.
+    #   4. Per-vertex interval = ∩ (source_elev ± dist × 1.5 %).
+    #   5. Choose elev = round(clip(DEM, interval), 0.1).
+    #
+    # Per-airport effect:
+    #   * Flat airports (SPJC, KBNA, HECA): DEM ≈ neighbor elevation,
+    #     so DEM falls inside the interval and the override is a
+    #     near-no-op (apron stays where it was).
+    #   * Hillside airports (CYXY, SPLP): apron rises toward DEM,
+    #     up to what the apron's ring perimeter from the shared
+    #     edge allows.  Vertices far from any shared edge reach
+    #     full DEM; vertices near a shared edge stay close to the
+    #     taxi-grade-derived elevation.  The apron's perimeter
+    #     splines smoothly between them.
+    APRON_AREA_THRESHOLD_M2 = 3_000.0
+
+    def _fit_dem_plane(coords: List[Tuple[float, float]],
+                        dems: List[Optional[float]]
+                        ) -> Optional[Tuple[float, float, float]]:
+        """Fit ``z = a*x + b*y + c`` to the DEM samples by ordinary
+        least squares.  Returns ``(a, b, c)`` or ``None`` when fewer
+        than 3 valid samples or the design matrix is singular.
+
+        The plane represents the apron's overall terrain slope while
+        ignoring local DEM noise (buildings, vegetation, SRTM
+        artefacts).  Pinning vertices to plane values rather than
+        individual DEM values gives a smooth ramp that matches the
+        terrain trend without producing 4 m cliffs between
+        physically-close ring vertices whose individual DEM samples
+        happen to differ.
+        """
+        xs = []
+        ys = []
+        zs = []
+        for (cx, cy), d in zip(coords, dems):
+            if d is None:
+                continue
+            xs.append(cx)
+            ys.append(cy)
+            zs.append(float(d))
+        n = len(zs)
+        if n < 3:
+            return None
+        # Normal equations:
+        #   [Σx²  Σxy  Σx ] [a]   [Σxz]
+        #   [Σxy  Σy²  Σy ] [b] = [Σyz]
+        #   [Σx   Σy   N  ] [c]   [Σz ]
+        sx = sum(xs); sy = sum(ys); sz = sum(zs)
+        sxx = sum(x * x for x in xs)
+        syy = sum(y * y for y in ys)
+        sxy = sum(x * y for x, y in zip(xs, ys))
+        sxz = sum(x * z for x, z in zip(xs, zs))
+        syz = sum(y * z for y, z in zip(ys, zs))
+        # Solve via Cramer's rule (3x3).
+        m = [[sxx, sxy, sx],
+             [sxy, syy, sy],
+             [sx,  sy,  float(n)]]
+        rhs = [sxz, syz, sz]
+        def _det3(mm):
+            return (mm[0][0] * (mm[1][1] * mm[2][2] - mm[1][2] * mm[2][1])
+                    - mm[0][1] * (mm[1][0] * mm[2][2] - mm[1][2] * mm[2][0])
+                    + mm[0][2] * (mm[1][0] * mm[2][1] - mm[1][1] * mm[2][0]))
+        det = _det3(m)
+        if abs(det) < 1e-9:
+            # Degenerate (collinear vertices): fall back to plane = mean.
+            mean_z = sz / n
+            return (0.0, 0.0, mean_z)
+        coeffs = []
+        for col in range(3):
+            mc = [row[:] for row in m]
+            for r in range(3):
+                mc[r][col] = rhs[r]
+            coeffs.append(_det3(mc) / det)
+        return (coeffs[0], coeffs[1], coeffs[2])
+
+    rect_like_anchored = {
+        ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+        ROLE_STUB, ROLE_CROSS_CONNECTOR, ROLE_RUNWAY,
+        ROLE_TERMINAL,
+    }
+    anchored_shape_buckets: set = set()
+    for s in layout.shapes:
+        if s.role not in rect_like_anchored:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for (x, y) in coords:
+            anchored_shape_buckets.add(
+                _corner_elevation_bucket(x, y))
+
+    # Build ONE GLOBAL graph spanning every apron-class junction,
+    # with shared boundary vertices stitching adjacent junctions
+    # together.  Per-polygon Dijkstra didn't work because adjacent
+    # junctions share boundary vertices: each polygon's pass would
+    # re-pin the shared vertex with different values, leaving big
+    # cliffs at junction-to-junction borders.  One global Dijkstra
+    # over all apron-class junction polygons treats the whole
+    # apron complex as a single connected surface and produces a
+    # consistent elevation field.
+    apron_node_ids: set = set()
+    apron_graph_adj: Dict[int, List[Tuple[int, float]]] = {}
+    seen_edges_in_apron: set = set()
+
+    def _add_apron_edge(a: int, b: int, length: float) -> None:
+        if a == b:
+            return
+        key = (min(a, b), max(a, b))
+        if key in seen_edges_in_apron:
+            return
+        seen_edges_in_apron.add(key)
+        apron_graph_adj.setdefault(a, []).append((b, length))
+        apron_graph_adj.setdefault(b, []).append((a, length))
+
+    n_apron_polys = 0
+    prox_radius2 = (WITHIN_SHAPE_VIOLATION_RADIUS_M
+                    * WITHIN_SHAPE_VIOLATION_RADIUS_M)
+    # Per-node target elevation = plane fit at the node's (x,y).
+    # Built per-polygon below; merged across the global apron set
+    # via simple averaging when multiple polygons disagree about a
+    # shared vertex (rare — adjacent aprons usually have similar
+    # DEM trends at the shared edge).
+    apron_target: Dict[int, Tuple[float, int]] = {}
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            continue
+        try:
+            if s.polygon.area < APRON_AREA_THRESHOLD_M2:
+                continue
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        n = len(coords)
+        if n < 4:
+            continue
+        nids: List[int] = []
+        for (cx, cy) in coords:
+            b = _corner_elevation_bucket(cx, cy)
+            nid = bucket_to_node.get(b)
+            if nid is None:
+                nids = []
+                break
+            nids.append(nid)
+        if not nids:
+            continue
+        n_apron_polys += 1
+        for nid in nids:
+            apron_node_ids.add(nid)
+        # Ring edges.
+        for i in range(n):
+            ax, ay = coords[i]
+            bx, by = coords[(i + 1) % n]
+            d = math.hypot(bx - ax, by - ay)
+            _add_apron_edge(nids[i], nids[(i + 1) % n], d)
+        # Within-shape 2D-proximity edges (catches non-convex
+        # ring-distant-but-close-in-2D pairs).
+        for i in range(n):
+            ax, ay = coords[i]
+            for j in range(i + 1, n):
+                if (i + 1) % n == j or (j + 1) % n == i:
+                    continue
+                bx, by = coords[j]
+                d2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+                if d2 <= 0 or d2 > prox_radius2:
+                    continue
+                _add_apron_edge(nids[i], nids[j], math.sqrt(d2))
+        # Fit a plane to this polygon's DEM samples, then record the
+        # plane's value at every ring vertex as that vertex's target.
+        # If the plane fit fails (degenerate geometry), fall back to
+        # individual DEM samples.
+        node_dems = [mesh.dem_elev[nid] for nid in nids]
+        plane = _fit_dem_plane(coords, node_dems)
+        if plane is not None:
+            a, b, c = plane
+            for (cx, cy), nid in zip(coords, nids):
+                t = a * cx + b * cy + c
+                acc = apron_target.get(nid)
+                if acc is None:
+                    apron_target[nid] = (t, 1)
+                else:
+                    apron_target[nid] = (acc[0] + t, acc[1] + 1)
+        else:
+            for nid in nids:
+                d = mesh.dem_elev[nid]
+                if d is None:
+                    continue
+                acc = apron_target.get(nid)
+                if acc is None:
+                    apron_target[nid] = (float(d), 1)
+                else:
+                    apron_target[nid] = (acc[0] + float(d), acc[1] + 1)
+
+    # Sources: any apron node whose bucket coincides with an
+    # anchored shape's vertex (taxi rect / runway / terminal corner
+    # that the apron also borders).  These take their CURRENT mesh
+    # elevation (already re-clipped above) as the propagation seed.
+    sources_per_node: Dict[int, float] = {}
+    for nid in apron_node_ids:
+        if mesh.anchor_elev[nid] is not None:
+            sources_per_node[nid] = mesh.anchor_elev[nid]
+            continue
+        # Reverse-look-up: is this node's bucket also a vertex of
+        # any anchored shape?  bucket_to_node maps bucket→nid; we
+        # need nid→bucket.  Iterate (cheaper than reversing once
+        # since this set is small).
+        for b, nb in bucket_to_node.items():
+            if nb == nid and b in anchored_shape_buckets:
+                sources_per_node[nid] = mesh.elev[nid]
+                break
+
+    n_apron_pinned = 0
+    if apron_node_ids:
+        # Multi-source Dijkstra: per_lo/per_hi at each node = ∩ over
+        # all sources of (src_elev ± dist × 1.5%).
+        import heapq
+        INF = float("inf")
+        per_lo: Dict[int, float] = {nid: -INF for nid in apron_node_ids}
+        per_hi: Dict[int, float] = {nid: INF for nid in apron_node_ids}
+        for src_nid, src_elev in sources_per_node.items():
+            dist = {nid: INF for nid in apron_node_ids}
+            dist[src_nid] = 0.0
+            heap = [(0.0, src_nid)]
+            while heap:
+                d, u = heapq.heappop(heap)
+                if d > dist[u]:
+                    continue
+                for v, length in apron_graph_adj.get(u, ()):
+                    nd = d + length
+                    if v in dist and nd < dist[v]:
+                        dist[v] = nd
+                        heapq.heappush(heap, (nd, v))
+            for nid, du in dist.items():
+                if du == INF:
+                    continue
+                band = du * TAXI_MAX_GRADE
+                lo_i = src_elev - band
+                hi_i = src_elev + band
+                if lo_i > per_lo[nid]:
+                    per_lo[nid] = lo_i
+                if hi_i < per_hi[nid]:
+                    per_hi[nid] = hi_i
+
+        # Pin every apron-EXCLUSIVE node (i.e. not already a source).
+        # Target = plane-fit value (smooth across the polygon, free
+        # of DEM noise), clipped to the Dijkstra-from-sources cap.
+        for nid in apron_node_ids:
+            if nid in sources_per_node:
+                continue
+            if mesh.anchor_elev[nid] is not None:
+                continue
+            tgt_acc = apron_target.get(nid)
+            if tgt_acc is None:
+                # Fallback to per-vertex DEM if plane fit didn't
+                # cover this node (shouldn't happen — every apron
+                # vertex contributes to at least one polygon's plane).
+                d = mesh.dem_elev[nid]
+                if d is None:
+                    continue
+                target_pref = float(d)
+            else:
+                target_pref = tgt_acc[0] / tgt_acc[1]
+            lo = per_lo[nid]
+            hi = per_hi[nid]
+            if lo == -INF and hi == INF:
+                target = target_pref
+            elif lo > hi:
+                target = 0.5 * (lo + hi)
+            else:
+                target = target_pref
+                if target < lo:
+                    target = lo
+                elif target > hi:
+                    target = hi
+            target = round(target, 1)
+            mesh.anchor_elev[nid] = target
+            mesh.interval_lo[nid] = target
+            mesh.interval_hi[nid] = target
+            seeded[nid] = target
+            n_apron_pinned += 1
+    if n_apron_pinned:
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] pinned "
+                f"{n_apron_pinned} apron-exclusive vertex(es) "
+                f"across {n_apron_polys} apron polygon(s) at "
+                f"DEM-clipped-to-ring-grade elevation.\n")
+        except Exception:
+            pass
+
     for i in range(len(mesh.nodes)):
         if mesh.anchor_elev[i] is not None:
             mesh.elev[i] = mesh.anchor_elev[i]
