@@ -663,6 +663,230 @@ def _runway_rect_m(runway, to_m) -> Polygon:
     ])
 
 
+def _sample_runway_segment_elev(
+        shape: "BuiltShape",
+        x: float,
+        y: float) -> "Optional[float]":
+    """Linearly interpolate a runway segment's elevation at point
+    ``(x, y)`` from its ``altitude_high`` / ``altitude_low``
+    (sloped 4-corner rect) or ``altitude`` (flat).
+
+    Returns None when the segment carries no elevation info.
+
+    Convention used by :func:`_compute_elevations` segment emit
+    (line ~2742): corners ``[0, 3]`` are the HIGH-elevation short
+    edge, corners ``[1, 2]`` are the LOW-elevation short edge.
+    Point's projection onto the high → low axis gives the
+    interpolation parameter ``t`` (clipped to [0, 1] outside the
+    segment's extent).
+    """
+    if shape.altitude is not None:
+        return float(shape.altitude)
+    if (shape.altitude_high is None
+            or shape.altitude_low is None
+            or shape.polygon is None):
+        return None
+    try:
+        coords = list(shape.polygon.exterior.coords)
+    except Exception:
+        return None
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) < 4:
+        return 0.5 * (float(shape.altitude_high)
+                      + float(shape.altitude_low))
+    high_mid_x = 0.5 * (coords[0][0] + coords[3][0])
+    high_mid_y = 0.5 * (coords[0][1] + coords[3][1])
+    low_mid_x = 0.5 * (coords[1][0] + coords[2][0])
+    low_mid_y = 0.5 * (coords[1][1] + coords[2][1])
+    ax = low_mid_x - high_mid_x
+    ay = low_mid_y - high_mid_y
+    L2 = ax * ax + ay * ay
+    if L2 < 1e-6:
+        return 0.5 * (float(shape.altitude_high)
+                      + float(shape.altitude_low))
+    t = ((x - high_mid_x) * ax + (y - high_mid_y) * ay) / L2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    return (float(shape.altitude_high) + t
+            * (float(shape.altitude_low)
+               - float(shape.altitude_high)))
+
+
+def _resolve_runway_crossings(
+        layout: "PavementLayout",
+        min_overlap_m2: float = 20.0,
+        proximity_buffer_m: float = 2.0,
+        ) -> int:
+    """When two runway segments cross significantly, replace BOTH
+    with a single junction polygon covering their union, with
+    per-vertex altitudes interpolated from the source segments.
+
+    Per user 2026-04-27: the existing overlap-clip pass clips one
+    runway segment against another when they cross, producing a
+    non-rectangular shape (5+ vertices) that still carries
+    ``altitude_high`` / ``altitude_low`` tags — but X-Plane's patch
+    format only renders 4-corner rects with H/L tagging, so the
+    extra vertex breaks the slope rendering.  Crossings need
+    multi-directional sloping which only a junction polygon
+    (with per-vertex altitudes and triangulated rendering) can
+    express.
+
+    Detection uses an STRtree + union-find so transitively-
+    overlapping segment groups are resolved together (e.g. CYXY's
+    crosswind 02/20 crosses BOTH 14R/32L and 14L/32R; all three
+    segment groups merge into one junction at the triple crossing).
+
+    Returns the number of crossing groups resolved.
+    """
+    rwy_indices = [i for i, s in enumerate(layout.shapes)
+                    if s.role == ROLE_RUNWAY
+                    and s.polygon is not None
+                    and not s.polygon.is_empty]
+    if len(rwy_indices) < 2:
+        return 0
+    rwy_polys = [layout.shapes[i].polygon for i in rwy_indices]
+    from shapely.strtree import STRtree
+    try:
+        tree = STRtree(rwy_polys)
+    except Exception:
+        return 0
+
+    # Union-find for transitive grouping.
+    n = len(rwy_indices)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union_uf(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for ai in range(n):
+        pa = rwy_polys[ai]
+        try:
+            cands = tree.query(pa)
+        except Exception:
+            continue
+        for ci in cands:
+            bi = int(ci)
+            if bi <= ai:
+                continue
+            pb = rwy_polys[bi]
+            try:
+                inter = pa.intersection(pb)
+                if inter.is_empty or inter.area < min_overlap_m2:
+                    continue
+                union_uf(ai, bi)
+            except Exception:
+                continue
+
+    # Group by root; ignore singleton groups.
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = find(i)
+        groups.setdefault(r, []).append(i)
+
+    drop_set: set = set()
+    new_shapes: List[BuiltShape] = []
+    n_resolved = 0
+    for members in groups.values():
+        if len(members) <= 1:
+            continue
+        seg_shapes = [layout.shapes[rwy_indices[m]] for m in members]
+        seg_polys = [s.polygon for s in seg_shapes]
+        try:
+            union_poly = unary_union(seg_polys)
+            if not union_poly.is_valid:
+                union_poly = union_poly.buffer(0)
+        except Exception:
+            continue
+        if union_poly.is_empty:
+            continue
+        if union_poly.geom_type != "Polygon":
+            polys = [g for g in getattr(union_poly, "geoms", [])
+                      if g.geom_type == "Polygon"]
+            polys.sort(key=lambda p: -p.area)
+            if not polys:
+                continue
+            union_poly = polys[0]
+        try:
+            coords = list(union_poly.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            continue
+
+        # Per-vertex altitudes: average over segments whose buffered
+        # polygon contains the vertex (i.e. the segments physically
+        # adjacent to that corner).  Falls back to all-segment
+        # average if no segment contains the vertex (defensive — a
+        # corner introduced by Shapely's union may sit ε outside
+        # every input).
+        seg_buffers = []
+        for s in seg_shapes:
+            try:
+                seg_buffers.append(
+                    s.polygon.buffer(proximity_buffer_m))
+            except Exception:
+                seg_buffers.append(None)
+        ring_alts: List[Optional[float]] = []
+        for (cx, cy) in coords:
+            pt = Point(cx, cy)
+            samples: List[float] = []
+            for buf, s in zip(seg_buffers, seg_shapes):
+                if buf is None:
+                    continue
+                try:
+                    if buf.contains(pt):
+                        e = _sample_runway_segment_elev(s, cx, cy)
+                        if e is not None:
+                            samples.append(e)
+                except Exception:
+                    continue
+            if not samples:
+                # Fallback: all segments.
+                for s in seg_shapes:
+                    e = _sample_runway_segment_elev(s, cx, cy)
+                    if e is not None:
+                        samples.append(e)
+            if samples:
+                ring_alts.append(round(
+                    sum(samples) / len(samples), 1))
+            else:
+                ring_alts.append(None)
+        if any(a is None for a in ring_alts):
+            continue
+        # node_altitudes spans the closed ring.
+        closed_alts: List[float] = list(ring_alts) + [ring_alts[0]]
+        ref_combined = "+".join(
+            s.ref for s in seg_shapes if s.ref)
+        new_shape = BuiltShape(
+            polygon=union_poly,
+            role=ROLE_JUNCTION,
+            ref=ref_combined,
+            node_altitudes=closed_alts)
+        new_shapes.append(new_shape)
+        for m in members:
+            drop_set.add(rwy_indices[m])
+        n_resolved += 1
+
+    if drop_set:
+        layout.shapes = [s for i, s in enumerate(layout.shapes)
+                          if i not in drop_set]
+        layout.shapes.extend(new_shapes)
+    return n_resolved
+
+
 def _detect_runway_shoulders(
         runway,
         to_m,
@@ -2877,6 +3101,31 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 layout.shapes = kept_shapes
                 new_runway_polys = kept_polys
 
+        # Resolve runway-runway crossings: when two runway segments
+        # overlap significantly (e.g. CYXY's crosswind 02/20 crossing
+        # both 14R/32L and 14L/32R), drop both and emit a single
+        # junction polygon at the union, with per-vertex altitudes
+        # interpolated from the source segments.  Without this, the
+        # downstream overlap-clip pass would clip one runway against
+        # the other, leaving a 5-vertex shape that still carries
+        # ``altitude_high`` / ``altitude_low`` tags — which X-Plane's
+        # patch format only renders correctly on 4-corner rects.
+        n_crossings = _resolve_runway_crossings(layout)
+        if n_crossings:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] {icao}: resolved "
+                    f"{n_crossings} runway crossing(s) into "
+                    f"junction polygon(s).\n")
+            except Exception:
+                pass
+            new_runway_polys = [
+                s.polygon for s in layout.shapes
+                if s.role == ROLE_RUNWAY
+                and s.polygon is not None
+                and not s.polygon.is_empty]
+
         # Segmented runway boundaries can drift sub-metre from the
         # original single-rect runway that junctions / rects were
         # built against, leaving tiny overlap slivers.  Subtract
@@ -5023,6 +5272,66 @@ def _solve_pavement_mesh(
                 sources_per_node[nid] = mesh.elev[nid]
                 break
 
+    # Cross-shape proximity sources (user 2026-04-27): an apron
+    # polygon and a taxi rect can be physically adjacent (within
+    # a few metres) WITHOUT sharing any boundary vertex — apt.dat
+    # row-110 follows the apron's curved boundary while the taxi
+    # rect uses 4 axis-aligned corners.  Without proximity sourcing,
+    # the apron-decouple Dijkstra has no path from the taxi to the
+    # apron and apron-exclusive vertices climb freely toward DEM
+    # ignoring the taxi-grade cap that should bound them.
+    #
+    # Fix: index every NON-apron mesh node whose bucket belongs to
+    # an anchored shape, then for each apron node, look up nearby
+    # external anchored nodes within ``EXTERNAL_SOURCE_RADIUS_M``
+    # and stitch them into the apron graph.  The external nodes
+    # become additional sources at their current mesh.elev value
+    # (taxi-grade-derived from the centerline propagation),
+    # enabling the multi-source Dijkstra to walk taxi → apron via
+    # a 2-5 m proximity edge.
+    EXTERNAL_SOURCE_RADIUS_M = 5.0
+    external_anchored: Dict[int, float] = {}
+    for b, nid in bucket_to_node.items():
+        if nid in apron_node_ids:
+            continue
+        if b in anchored_shape_buckets:
+            external_anchored[nid] = mesh.elev[nid]
+    if external_anchored:
+        ext_bins: Dict[Tuple[int, int], List[int]] = {}
+        for nid in external_anchored:
+            x, y = mesh.nodes[nid]
+            key = (int(math.floor(x / EXTERNAL_SOURCE_RADIUS_M)),
+                   int(math.floor(y / EXTERNAL_SOURCE_RADIUS_M)))
+            ext_bins.setdefault(key, []).append(nid)
+        radius2 = (EXTERNAL_SOURCE_RADIUS_M
+                   * EXTERNAL_SOURCE_RADIUS_M)
+        linked_externals: set = set()
+        for apron_nid in list(apron_node_ids):
+            ax, ay = mesh.nodes[apron_nid]
+            kx = int(math.floor(ax / EXTERNAL_SOURCE_RADIUS_M))
+            ky = int(math.floor(ay / EXTERNAL_SOURCE_RADIUS_M))
+            for dkx in (-1, 0, 1):
+                for dky in (-1, 0, 1):
+                    cell = ext_bins.get((kx + dkx, ky + dky))
+                    if not cell:
+                        continue
+                    for ext_nid in cell:
+                        ex, ey = mesh.nodes[ext_nid]
+                        d2 = ((ex - ax) * (ex - ax)
+                              + (ey - ay) * (ey - ay))
+                        if d2 > radius2:
+                            continue
+                        d = math.sqrt(d2) if d2 > 0 else 0.0
+                        _add_apron_edge(apron_nid, ext_nid, d)
+                        linked_externals.add(ext_nid)
+        # Bring the linked external nodes into the apron set so the
+        # multi-source Dijkstra relaxes through them; they're
+        # sources at their current mesh elevation.
+        for ext_nid in linked_externals:
+            apron_node_ids.add(ext_nid)
+            sources_per_node.setdefault(
+                ext_nid, external_anchored[ext_nid])
+
     n_apron_pinned = 0
     if apron_node_ids:
         # Single multi-source Dijkstra over the global apron graph.
@@ -5086,6 +5395,25 @@ def _solve_pavement_mesh(
                 target_pref = tgt_acc[0] / tgt_acc[1]
             lo = per_lo[nid]
             hi = per_hi[nid]
+            # Cap by the GLOBAL mesh interval too: that one was
+            # produced by ``propagate_bounds`` over the full mesh
+            # (ring + within-shape + 5 m cross-shape proximity), so
+            # it captures taxi-grade propagation via SMALL junction
+            # polygons sitting between the apron and a taxi rect
+            # (CYXY's SW apron is 100 m+ from any E corner directly
+            # but is bridged by a small connector junction).  Without
+            # this cap, an apron-exclusive vertex with no apron-
+            # graph source within reach would pin freely to plane
+            # DEM, producing a 10+ m discontinuity at the apron-
+            # taxi boundary.  Reading mesh.interval_hi BEFORE we
+            # overwrite it below gives the original Dijkstra-derived
+            # cap.
+            global_hi = mesh.interval_hi[nid]
+            global_lo = mesh.interval_lo[nid]
+            if global_hi != INF and global_hi < hi:
+                hi = global_hi
+            if global_lo != -INF and global_lo > lo:
+                lo = global_lo
             if lo == -INF and hi == INF:
                 target = target_pref
             elif lo > hi:
