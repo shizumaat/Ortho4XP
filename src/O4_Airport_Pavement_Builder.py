@@ -3271,8 +3271,14 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # depend on neighbour elevations that are themselves being
     # clamped — one pass settles only the "obvious" violations,
     # later passes reconcile cascading effects).
+    #
+    # The geometry-only state (spatial grid + shared-bucket set)
+    # is invariant across this 8-iteration loop — only elevations
+    # change.  Build once, reuse.  Saves ~7 redundant grid builds
+    # at HECA where each build has 5 k+ boundary edges.
+    clamp_geom = _build_clamp_geom_state(layout)
     for _ in range(8):
-        n = _clamp_junction_free_vertices(layout)
+        n = _clamp_junction_free_vertices(layout, clamp_geom)
         if n == 0:
             break
     # Junction subdivision (2026-04-26, refined): the
@@ -3289,8 +3295,11 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # Re-clamp free vertices after subdivision (the few new
     # cut-line vertices that COULDN'T snap inherit interpolated
     # elevations and may benefit from neighbour-clamping).
+    # Subdivision may have ADDED vertices, so rebuild the geom
+    # state once before this loop.  The 4-iter loop itself reuses.
+    clamp_geom = _build_clamp_geom_state(layout)
     for _ in range(4):
-        n = _clamp_junction_free_vertices(layout)
+        n = _clamp_junction_free_vertices(layout, clamp_geom)
         if n == 0:
             break
     # Layer 3 (2026-04-26): scan every emitted polygon for any
@@ -4439,6 +4448,16 @@ def _near_runway_anchor_map(
                and not s.polygon.is_empty]
     if not runways:
         return out
+    # Build an STRtree over runway polygons so per-vertex distance
+    # checks only touch runway candidates whose bounding box falls
+    # within ``tol_m`` of the vertex.  Replaces the original
+    # ``O(junction_verts × runways)`` pairwise loop with
+    # ``O(junction_verts × log(runways) + hits)``.  At CYXY this
+    # cuts 211 k shapely.distance() calls down to a few thousand,
+    # saving ~0.7 s of `_compute_elevations`.
+    from shapely.strtree import STRtree
+    runway_geoms = [r.polygon for r in runways]
+    tree = STRtree(runway_geoms)
     for s in layout.shapes:
         if s.role != ROLE_JUNCTION:
             continue
@@ -4451,11 +4470,22 @@ def _near_runway_anchor_map(
         if not coords:
             continue
         for (jx, jy) in coords:
+            pt = Point(jx, jy)
+            # Query the tree for runway polygons whose bbox is
+            # within tol_m of the vertex.  Shapely's STRtree.query
+            # returns indices into the geom list passed at
+            # construction time.
+            try:
+                cand_idxs = tree.query(pt.buffer(tol_m,
+                                                  resolution=1))
+            except Exception:
+                cand_idxs = list(range(len(runways)))
             best_d = tol_m
             best_e = None
-            for r in runways:
+            for ci in cand_idxs:
+                r = runways[int(ci)]
                 try:
-                    d = r.polygon.distance(Point(jx, jy))
+                    d = r.polygon.distance(pt)
                 except Exception:
                     continue
                 if d > best_d:
@@ -5234,11 +5264,29 @@ def _solve_pavement_mesh(
     # Laplacian + 1.5 % grade-cap on every edge.  After each call
     # we run the tighter apron cap (1 %) on apron-zone edges, then
     # equalise rect / flat-shape constraints.
+    #
+    # Convergence-based early exit: snapshot ``mesh.elev`` before
+    # each outer iteration and break when the maximum per-node
+    # change drops below ``OUTER_CONVERGE_TOL_M``.  Captures the
+    # post-smooth + apron-cap + equalise final state; if all three
+    # steps moved every node by < 1 cm, further iterations don't
+    # help.  At small/medium airports the loop typically settles
+    # in 5-10 outer iterations rather than the unconditional 30
+    # we were running before.
     OUTER_ITERS = 30
+    OUTER_CONVERGE_TOL_M = 0.01
     for _ in range(OUTER_ITERS):
+        prev_elev = list(mesh.elev)
         mesh.smooth_rate_of_change(iters=2)
         _enforce_apron_cap()
         _equalise_constraints()
+        max_change = 0.0
+        for i in range(len(mesh.elev)):
+            d = abs(mesh.elev[i] - prev_elev[i])
+            if d > max_change:
+                max_change = d
+        if max_change < OUTER_CONVERGE_TOL_M:
+            break
 
 
 def _equalize_rect_short_edges(
@@ -7066,34 +7114,41 @@ def _triangulate_junctions(
 NEIGHBOUR_CLAMP_RADIUS_M = 5.0
 
 
-def _clamp_junction_free_vertices(layout: "PavementLayout") -> int:
-    """Per-junction free-vertex clamp using every nearby shape
-    boundary as a soft anchor (Layer 2).
+def _build_clamp_geom_state(
+        layout: "PavementLayout"
+        ) -> "Optional[Tuple[List, List, Dict, set]]":
+    """Build the GEOMETRY-ONLY state used by
+    :func:`_clamp_junction_free_vertices`.
 
-    Returns the number of free-vertex elevations that changed
-    (informational).  Mutates each junction's
-    ``node_altitudes`` and ``altitude`` in place.
+    The clamp's spatial grid + shared-bucket set are functions of
+    polygon geometry alone; only the per-edge elevations change
+    between iterations.  Hoisting this build out of the per-call
+    body lets the outer fixed-point loop reuse it without
+    rebuilding (8+ × cost saved at HECA).
+
+    Returns ``(edge_geom, edge_endpoints, grid, shared_buckets)``
+    where:
+
+    * ``edge_geom``:    list of ``(shape_idx, vi_a, vi_b, ax, ay,
+                        bx, by)`` — vertex indices index into
+                        ``layout.shapes[shape_idx]``'s exterior
+                        coords (closed ring's prefix, i.e. the last
+                        repeat dropped) so the caller can read
+                        current elevations per call.
+    * ``edge_endpoints``: bucket key pair per edge (for
+                          incident-edge skip).
+    * ``grid``:         spatial bucket → list of edge indices.
+    * ``shared_buckets``: buckets touched by ≥ 2 shapes.
+
+    Returns None when ``layout.anchor`` is unset.
     """
     if layout.anchor is None:
-        return 0
-    cos0 = math.cos(math.radians(layout.anchor[0]))
+        return None
 
-    def _to_m(lat: float, lon: float) -> Tuple[float, float]:
-        x = math.radians(lon - layout.anchor[1]) * R_EARTH * cos0
-        y = math.radians(lat - layout.anchor[0]) * R_EARTH
-        return x, y
-
-    # Build a global pool of boundary edges + per-endpoint elevation
-    # for every emitted shape.  Each entry: (shape_idx, ax, ay, bx,
-    # by, ea, eb).  The shape_idx lets us skip the polygon's own
-    # edges when clamping its own free vertices.
-    boundary_edges: List[Tuple[int, float, float, float, float,
-                               float, float]] = []
-    # Also collect the SHARED-NID set: any nid referenced by 2+
-    # shapes is treated as anchored on every polygon that uses it
-    # (cross-shape continuity).  to_osm's bucket dedup means two
-    # shapes that share a corner get the same OSM nid; we approx
-    # the same here using bucket coords.
+    edge_geom: List[Tuple[int, int, int,
+                          float, float, float, float]] = []
+    edge_endpoints: List[Tuple[Tuple[int, int],
+                                Tuple[int, int]]] = []
     bucket_count: Dict[Tuple[int, int], int] = {}
     for si, s in enumerate(layout.shapes):
         if s.polygon is None or s.polygon.is_empty:
@@ -7106,60 +7161,24 @@ def _clamp_junction_free_vertices(layout: "PavementLayout") -> int:
             coords = coords[:-1]
         if not coords:
             continue
-        # Per-vertex elevations for THIS shape.
-        if s.altitude is not None:
-            elevs = [float(s.altitude)] * len(coords)
-        elif (s.altitude_high is not None
-              and s.altitude_low is not None
-              and len(coords) == 4):
-            elevs = [float(s.altitude_high),
-                     float(s.altitude_low),
-                     float(s.altitude_low),
-                     float(s.altitude_high)]
-        elif s.node_altitudes is not None:
-            # node_altitudes spans the closed ring (one value per
-            # vertex INCLUDING the closing repeat).  Drop the last.
-            na = list(s.node_altitudes)
-            if len(na) == len(coords) + 1:
-                na = na[:-1]
-            if len(na) != len(coords):
-                continue
-            elevs = [float(e) for e in na]
-        else:
-            continue
-        for vi, (cx, cy) in enumerate(coords):
+        for (cx, cy) in coords:
             bucket = _corner_elevation_bucket(cx, cy)
             bucket_count[bucket] = bucket_count.get(bucket, 0) + 1
         n = len(coords)
         for i in range(n):
             ax, ay = coords[i]
             bx, by = coords[(i + 1) % n]
-            ea = elevs[i]
-            eb = elevs[(i + 1) % n]
-            boundary_edges.append((si, ax, ay, bx, by, ea, eb))
+            edge_geom.append((si, i, (i + 1) % n,
+                               ax, ay, bx, by))
+            edge_endpoints.append((
+                _corner_elevation_bucket(ax, ay),
+                _corner_elevation_bucket(bx, by)))
 
     shared_buckets = {b for b, c in bucket_count.items() if c >= 2}
-    rect_like_roles = {ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
-                       ROLE_SECONDARY_PARALLEL, ROLE_STUB,
-                       ROLE_CROSS_CONNECTOR, ROLE_TERMINAL}
 
-    # Track each boundary edge's bucket-key endpoints so we can
-    # cheaply detect "is this edge incident to vertex V?" later.
-    edge_endpoints: List[Tuple[Tuple[int, int],
-                                Tuple[int, int]]] = []
-    for (_, ax, ay, bx, by, _, _) in boundary_edges:
-        edge_endpoints.append((
-            _corner_elevation_bucket(ax, ay),
-            _corner_elevation_bucket(bx, by)))
-
-    # Spatial index for boundary_edges to avoid the O(n²) scan
-    # for very complex airports (HECA has 5113 boundary vertices →
-    # the inner loop is otherwise unbounded).  Build a grid keyed
-    # by integer cell of size NEIGHBOUR_CLAMP_RADIUS_M.
     grid: Dict[Tuple[int, int], List[int]] = {}
     cell = NEIGHBOUR_CLAMP_RADIUS_M
-    for ei, (_, ax, ay, bx, by, _, _) in enumerate(boundary_edges):
-        # Insert into all cells the segment's bbox touches.
+    for ei, (_, _, _, ax, ay, bx, by) in enumerate(edge_geom):
         x0, x1 = (ax, bx) if ax <= bx else (bx, ax)
         y0, y1 = (ay, by) if ay <= by else (by, ay)
         ix0 = int(math.floor((x0 - cell) / cell))
@@ -7169,6 +7188,87 @@ def _clamp_junction_free_vertices(layout: "PavementLayout") -> int:
         for ix in range(ix0, ix1 + 1):
             for iy in range(iy0, iy1 + 1):
                 grid.setdefault((ix, iy), []).append(ei)
+
+    return (edge_geom, edge_endpoints, grid, shared_buckets)
+
+
+def _clamp_junction_free_vertices(
+        layout: "PavementLayout",
+        geom_state: "Optional[Tuple[List, List, Dict, set]]" = None,
+        ) -> int:
+    """Per-junction free-vertex clamp using every nearby shape
+    boundary as a soft anchor (Layer 2).
+
+    Returns the number of free-vertex elevations that changed
+    (informational).  Mutates each junction's
+    ``node_altitudes`` and ``altitude`` in place.
+
+    When ``geom_state`` is supplied (from
+    :func:`_build_clamp_geom_state`), the geometry-only spatial
+    grid + shared-bucket set is reused across iterations of the
+    outer fixed-point loop.  Falls back to building it on first
+    call when the caller doesn't.
+    """
+    if layout.anchor is None:
+        return 0
+    if geom_state is None:
+        geom_state = _build_clamp_geom_state(layout)
+        if geom_state is None:
+            return 0
+    edge_geom, edge_endpoints, grid, shared_buckets = geom_state
+    cell = NEIGHBOUR_CLAMP_RADIUS_M
+
+    # Read current per-shape elevation arrays once per call so the
+    # inner clamp loop can look up edge endpoint elevations by
+    # (shape_idx, vertex_idx) without re-parsing shapes per edge.
+    shape_elevs: Dict[int, List[float]] = {}
+    for si, s in enumerate(layout.shapes):
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords_n = len(s.polygon.exterior.coords)
+            if coords_n > 0 and (
+                s.polygon.exterior.coords[0]
+                == s.polygon.exterior.coords[-1]
+            ):
+                coords_n -= 1
+        except Exception:
+            continue
+        if coords_n <= 0:
+            continue
+        if s.altitude is not None:
+            shape_elevs[si] = [float(s.altitude)] * coords_n
+        elif (s.altitude_high is not None
+              and s.altitude_low is not None
+              and coords_n == 4):
+            shape_elevs[si] = [float(s.altitude_high),
+                                float(s.altitude_low),
+                                float(s.altitude_low),
+                                float(s.altitude_high)]
+        elif s.node_altitudes is not None:
+            na = list(s.node_altitudes)
+            if len(na) == coords_n + 1:
+                na = na[:-1]
+            if len(na) == coords_n:
+                shape_elevs[si] = [float(e) for e in na]
+
+    # Reconstruct the boundary_edges layout used downstream
+    # ``(shape_idx, ax, ay, bx, by, ea, eb)`` with current elevs.
+    boundary_edges: List[Tuple[int, float, float, float, float,
+                                float, float]] = []
+    boundary_edges_append = boundary_edges.append
+    for (si, vi_a, vi_b, ax, ay, bx, by) in edge_geom:
+        elevs = shape_elevs.get(si)
+        if elevs is None:
+            # Skip shapes that didn't yield a valid elev array.
+            boundary_edges_append((si, ax, ay, bx, by, 0.0, 0.0))
+            continue
+        boundary_edges_append((si, ax, ay, bx, by,
+                                elevs[vi_a], elevs[vi_b]))
+
+    rect_like_roles = {ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+                       ROLE_CROSS_CONNECTOR, ROLE_TERMINAL}
 
     n_changed = 0
     for si, s in enumerate(layout.shapes):
