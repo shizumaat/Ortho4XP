@@ -1133,8 +1133,10 @@ def _drop_primary_parallels_embedded_in_pavement(
         taxi_rects: "List[Tuple[Polygon, LineString, str, str]]",
         apt_pav_union: "Optional[Polygon]",
         runway_polys: "Optional[List[Polygon]]" = None,
-        embed_frac: float = 0.10,
-        long_edge_buffer_m: float = 5.0,
+        adjacency_frac: float = 0.10,
+        proximity_m: float = 1.0,
+        embed_frac: float = 0.95,         # legacy param, unused
+        long_edge_buffer_m: float = 5.0,  # legacy param, unused
         ) -> "List[Tuple[Polygon, LineString, str, str]]":
     """Drop ``primary_parallel`` rects whose long edges sit entirely
     inside apt.dat row-110 pavement.
@@ -1191,28 +1193,55 @@ def _drop_primary_parallels_embedded_in_pavement(
     """
     if apt_pav_union is None or apt_pav_union.is_empty:
         return taxi_rects
-    # Per user 2026-04-28: a sloping rect can't have JUNCTION pavement
-    # adjacent to its long edge for >10% of its length without
-    # producing X-Plane elevation glitches (the rect's long edge has
-    # uniform altitude_high/altitude_low pattern; the adjacent
-    # junction polygon's spline has to match it, but if the slope
-    # along the junction's edge differs, the seam misrenders).  The
-    # right behaviour is to absorb the rect into the junction so the
-    # whole region is one polygon with per-vertex node_altitudes
-    # capturing the slope.  Subtract runway polygons from the
-    # pavement union so RUNWAY adjacency to a parallel taxi (perfectly
-    # normal) doesn't trigger absorption — only JUNCTION-class
-    # pavement (apron, ramp, residue) adjacency triggers it.
+    # Per user 2026-04-28: a sloping rect cannot have any junction
+    # or apron pavement within 1 m of its long edge for >10% of the
+    # edge length.  The slope along the rect's long edge is uniform
+    # (altitude_high at one short edge, altitude_low at the other);
+    # any adjacent junction-class pavement would have to match that
+    # slope along the seam, which produces visible elevation
+    # glitches in X-Plane when the junction's natural DEM slope
+    # differs from the rect's straight-line slope.  Absorb the rect
+    # into the junction so the whole region becomes one polygon
+    # with per-vertex node_altitudes capturing the natural slope.
+    #
+    # "Junction-class pavement" = pav_union − runway_polys − OTHER
+    # taxi rects.  This excludes:
+    #   - Runway adjacency (parallel taxis legitimately run alongside
+    #     a runway; the runway has its own slope already).
+    #   - Other taxi-rect adjacency (two adjacent taxi rects each
+    #     own their slope along their own axes).
     junction_pav = apt_pav_union
     if runway_polys:
         try:
             for r in runway_polys:
                 if r is not None and not r.is_empty:
                     junction_pav = junction_pav.difference(r)
-            if junction_pav.is_empty:
-                return taxi_rects
         except Exception:
             junction_pav = apt_pav_union
+    # Subtract every taxi-rect's footprint (including the rect being
+    # tested — that's CORRECT, because we want to know whether the
+    # JUNCTION polygon will be adjacent after the rect is emitted
+    # and the residue is computed).  After subtraction, the apron
+    # polygon containing the rect has a rect-shaped hole; the hole's
+    # boundary IS within 1 m of the rect's long edge.
+    try:
+        all_taxi_polys = [
+            r for (r, _ax, _role, _ref) in taxi_rects
+            if r is not None and not r.is_empty]
+        if all_taxi_polys:
+            taxi_union = unary_union(all_taxi_polys)
+            if not taxi_union.is_empty:
+                junction_pav = junction_pav.difference(taxi_union)
+    except Exception:
+        pass
+    if junction_pav.is_empty:
+        return taxi_rects
+    # Pre-buffer junction-pav by proximity_m so the long-edge
+    # intersection check counts edge length within proximity_m.
+    try:
+        junction_buf = junction_pav.buffer(proximity_m)
+    except Exception:
+        junction_buf = junction_pav
     kept: List[Tuple[Polygon, LineString, str, str]] = []
     dropped_refs: List[str] = []
     for entry in taxi_rects:
@@ -1233,7 +1262,6 @@ def _drop_primary_parallels_embedded_in_pavement(
         # Long edges per ``_rect_from_axis_extended`` convention
         # (corners 0,1 form one long edge; corners 2,3 the other).
         long_edges = [(rc[0], rc[1]), (rc[2], rc[3])]
-        cx_r, cy_r = rect.centroid.x, rect.centroid.y
         any_embedded = False
         for (e0, e1) in long_edges:
             ex = e1[0] - e0[0]
@@ -1243,44 +1271,15 @@ def _drop_primary_parallels_embedded_in_pavement(
                 continue
             try:
                 edge_line = LineString([e0, e1])
-                # Test 1: the long edge has junction pavement adjacent
-                # for ≥ embed_frac of its length.
-                inside = edge_line.intersection(junction_pav)
+                # 1 m proximity check: edge length within 1 m of
+                # junction-class pavement.
+                inside = edge_line.intersection(junction_buf)
                 if inside.is_empty:
                     continue
                 inside_len = (inside.length
                               if hasattr(inside, "length")
                               else 0.0)
-                if inside_len / mag < embed_frac:
-                    continue
-                # Test 2: the strip just OUTSIDE the long edge is
-                # also pavement (otherwise the rect IS the pavement
-                # boundary on this side, not embedded).  This guard
-                # prevents dropping a primary parallel whose long
-                # edge happens to lie along an apron boundary
-                # (where ``edge_line.intersection(pav_union)`` is
-                # also ≈100 % because the edge is exactly on the
-                # boundary).  Only when the strip JUST BEYOND the
-                # edge is covered are we truly looking at an
-                # embedded rect with junction wrap on this side.
-                ux, uy = ex / mag, ey / mag
-                nx, ny = -uy, ux
-                mid_x = 0.5 * (e0[0] + e1[0])
-                mid_y = 0.5 * (e0[1] + e1[1])
-                if (cx_r - mid_x) * nx + (cy_r - mid_y) * ny > 0:
-                    nx, ny = -nx, -ny
-                strip = Polygon([
-                    e0,
-                    e1,
-                    (e1[0] + nx * long_edge_buffer_m,
-                     e1[1] + ny * long_edge_buffer_m),
-                    (e0[0] + nx * long_edge_buffer_m,
-                     e0[1] + ny * long_edge_buffer_m),
-                ])
-                if not strip.is_valid or strip.is_empty:
-                    continue
-                covered = strip.intersection(junction_pav).area
-                if covered / strip.area < embed_frac:
+                if inside_len / mag < adjacency_frac:
                     continue
                 any_embedded = True
                 break
