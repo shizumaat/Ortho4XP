@@ -80,6 +80,7 @@ ROLE_CROSS_CONNECTOR = PS.ROLE_CROSS_CONNECTOR
 ROLE_APRON = PS.ROLE_APRON
 ROLE_TERMINAL = "terminal"
 ROLE_JUNCTION = "junction"
+ROLE_BOUNDARY = "boundary"
 
 # TEMP 2026-04-20: when False, the builder only emits rects +
 # runways + terminals + aprons, suppressing all junction polygons.
@@ -99,6 +100,7 @@ AEROWAY_FOR_ROLE = {
     ROLE_JUNCTION: "taxiway",
     ROLE_APRON: "apron",
     ROLE_TERMINAL: "building",
+    ROLE_BOUNDARY: "aerodrome",
 }
 
 
@@ -1890,6 +1892,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
 
     layout = PavementLayout(icao=icao, anchor=anchor)
 
+    # Project the apt.dat row-130 airport boundary (in lat/lon) into
+    # meter space so downstream emission has it ready when the
+    # boundary shape is built.
+    if apt.boundary is not None and not apt.boundary.is_empty:
+        try:
+            from shapely.ops import transform as _shp_transform
+            layout.airport_boundary = _shp_transform(
+                lambda lon, lat, z=None: to_m(lon, lat),
+                apt.boundary)
+        except Exception:
+            layout.airport_boundary = None
+
     # ── Runways ──────────────────────────────────────────────────
     runway_polys: List[Polygon] = []
     rwy_bearings: List[float] = []
@@ -3271,6 +3285,26 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # average, since averaging can pull a shared-with-rect
         # bucket away from the rect's tag value.
         _snap_junction_altitudes_to_rect_corners(layout)
+        # Per user 2026-04-28: emit a 5 m-wide ribbon polygon
+        # tracing the airport boundary (apt.dat row-130) with
+        # per-vertex altitudes clamped to ≤ 3 % grade from the
+        # nearest runway within 400 m, falling back to DEM
+        # beyond.  Provides the elevation transition between
+        # airport pavement and surrounding terrain.
+        try:
+            _lat0, _lon0 = layout.anchor
+            _tile_lat = int(math.floor(_lat0))
+            _tile_lon = int(math.floor(_lon0))
+            _dem = _load_airport_dem(_lat0, _lon0)
+            n_b = _emit_airport_boundary_shape(
+                layout, _dem, _tile_lat, _tile_lon)
+            if n_b:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] emitted "
+                    f"{n_b} airport-boundary shape piece(s).\n")
+        except Exception:
+            pass
 
     return layout
 
@@ -4136,6 +4170,244 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # not yet a hard fail (would drop too much coverage at HECA-
     # complexity airports while Layers 1/2 are still maturing).
     _report_within_shape_violations(layout, icao)
+
+
+def _emit_airport_boundary_shape(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        strip_half_width_m: float = 2.5,
+        runway_clamp_radius_m: float = 400.0,
+        runway_clamp_grade: float = 0.03,
+        densify_step_m: float = 25.0,
+        ) -> int:
+    """Emit a node_altitudes polygon tracing the airport boundary
+    (apt.dat row-130) at ``2 × strip_half_width_m`` width.
+
+    Per user 2026-04-28: an airport-perimeter "ribbon" with
+    controlled per-vertex altitudes provides the elevation
+    transition between the airport's pavement and the surrounding
+    DEM.  Vertices within ``runway_clamp_radius_m`` of any runway
+    are clamped to the runway elevation ± ``runway_clamp_grade``
+    × distance (default 3 % grade); vertices beyond the radius
+    follow the DEM directly.
+
+    Implementation:
+      1. Buffer the boundary's exterior LineString by
+         ``strip_half_width_m`` to produce a closed strip polygon.
+         The strip naturally has an interior ring (the airport
+         interior shrunk inward by the buffer).
+      2. Decompose the holed strip into simple non-holed pieces
+         via ``_decompose_polygon_with_holes`` so X-Plane's patch
+         parser (which drops interior rings) renders the strip
+         correctly.
+      3. For each piece, densify boundary segments to
+         ``densify_step_m`` so per-vertex altitude clamping
+         resolves at a useful spatial frequency.
+      4. Compute per-vertex altitudes against the runway-distance
+         rule + DEM.
+      5. Append each piece as a ``ROLE_BOUNDARY`` BuiltShape.
+
+    Returns the number of boundary shape pieces emitted.
+    """
+    if layout.airport_boundary is None or layout.airport_boundary.is_empty:
+        return 0
+    from shapely.geometry import LineString as _LS, Polygon as _Polygon
+    from shapely.geometry import Point as _Point
+    from shapely.ops import nearest_points as _nearest_points
+
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+    def m_to_ll(x: float, y: float) -> Tuple[float, float]:
+        lat = lat0 + math.degrees(y / R)
+        lon = lon0 + math.degrees(x / (R * cos0))
+        return lat, lon
+
+    # Pre-collect runway polygons + their elevation samplers for
+    # the per-vertex distance / clamp lookup.
+    runway_shapes: List[BuiltShape] = [
+        s for s in layout.shapes
+        if s.role == ROLE_RUNWAY
+        and s.polygon is not None
+        and not s.polygon.is_empty]
+    if not runway_shapes:
+        return 0
+
+    def _runway_clamped_alt(x: float, y: float) -> Optional[float]:
+        """Return DEM at (x, y) clamped to ``[runway_e - g·d,
+        runway_e + g·d]`` when within ``runway_clamp_radius_m`` of
+        any runway, else raw DEM, else None."""
+        try:
+            lat, lon = m_to_ll(x, y)
+            dem_e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+        except Exception:
+            dem_e = None
+        # Find nearest runway and its elevation at the nearest point.
+        best_d = float('inf')
+        best_e = None
+        pt = _Point(x, y)
+        for s in runway_shapes:
+            try:
+                d = s.polygon.distance(pt)
+            except Exception:
+                continue
+            if d >= best_d:
+                continue
+            try:
+                if d == 0.0:
+                    np_x, np_y = x, y
+                else:
+                    np = _nearest_points(s.polygon, pt)[0]
+                    np_x, np_y = np.x, np.y
+                e = _sample_runway_segment_elev(s, np_x, np_y)
+            except Exception:
+                e = None
+            if e is None:
+                continue
+            best_d = d
+            best_e = e
+        if best_e is None:
+            return dem_e
+        if best_d > runway_clamp_radius_m:
+            return dem_e
+        band = best_d * runway_clamp_grade
+        lo = best_e - band
+        hi = best_e + band
+        if dem_e is None:
+            return 0.5 * (lo + hi)
+        if dem_e < lo:
+            return lo
+        if dem_e > hi:
+            return hi
+        return dem_e
+
+    def _densify_ring(coords: List[Tuple[float, float]]
+                      ) -> List[Tuple[float, float]]:
+        """Insert intermediate points so consecutive vertices are
+        ≤ ``densify_step_m`` apart.  Closes the ring at the end."""
+        if not coords:
+            return coords
+        if coords[0] == coords[-1]:
+            coords = coords[:-1]
+        out: List[Tuple[float, float]] = []
+        n = len(coords)
+        for i in range(n):
+            a = coords[i]
+            b = coords[(i + 1) % n]
+            out.append(a)
+            d = math.hypot(b[0] - a[0], b[1] - a[1])
+            if d > densify_step_m:
+                steps = max(1, int(d / densify_step_m))
+                for k in range(1, steps):
+                    t = k / steps
+                    out.append((a[0] + t * (b[0] - a[0]),
+                                a[1] + t * (b[1] - a[1])))
+        out.append(out[0])
+        return out
+
+    # 1. Boundary line → 5 m strip polygon (with inner ring if the
+    #    airport is large enough that 2.5 m × 2 < interior radius).
+    boundary_geom = layout.airport_boundary
+    if boundary_geom.geom_type == "Polygon":
+        ext_rings = [boundary_geom.exterior]
+    elif boundary_geom.geom_type == "MultiPolygon":
+        ext_rings = [g.exterior for g in boundary_geom.geoms]
+    else:
+        return 0
+    # Build a union of all existing pavement shapes — the boundary
+    # ribbon is meant to control elevations OUTSIDE the pavement
+    # (grass / approach lights / ramp).  Subtract pavement from the
+    # strip so the boundary doesn't overlap runway / taxi rects /
+    # apron junctions etc. (would otherwise fail the no-self-
+    # overlap regression test and double-up elevation tags at the
+    # airport perimeter).
+    pavement_polys = [
+        s.polygon for s in layout.shapes
+        if s.polygon is not None
+        and not s.polygon.is_empty
+        and s.role != ROLE_BOUNDARY]
+    pavement_union: Optional[Polygon] = None
+    if pavement_polys:
+        try:
+            pavement_union = unary_union(pavement_polys)
+        except Exception:
+            pavement_union = None
+    n_emitted = 0
+    for ring in ext_rings:
+        ring_coords = list(ring.coords)
+        try:
+            line = _LS(ring_coords)
+            strip = line.buffer(strip_half_width_m,
+                                cap_style=2, join_style=2)
+            if not strip.is_valid:
+                strip = strip.buffer(0)
+        except Exception:
+            continue
+        if strip.is_empty:
+            continue
+        if pavement_union is not None and not pavement_union.is_empty:
+            try:
+                strip = strip.difference(pavement_union)
+            except Exception:
+                pass
+            if strip.is_empty:
+                continue
+            if not strip.is_valid:
+                strip = strip.buffer(0)
+        if strip.geom_type == "MultiPolygon":
+            strip_polys = list(strip.geoms)
+        elif strip.geom_type == "Polygon":
+            strip_polys = [strip]
+        else:
+            continue
+        # 2. Decompose any holes.
+        all_pieces: List[Polygon] = []
+        for sp in strip_polys:
+            try:
+                pieces = _decompose_polygon_with_holes(
+                    sp, min_area_m2=10.0, max_depth=8)
+            except Exception:
+                pieces = [sp]
+            for p in pieces:
+                if p.is_empty or p.geom_type != "Polygon":
+                    continue
+                all_pieces.append(p)
+        # 3-5. Densify, compute altitudes, emit.
+        for piece in all_pieces:
+            try:
+                exterior = list(piece.exterior.coords)
+            except Exception:
+                continue
+            dense = _densify_ring(exterior)
+            if len(dense) < 4:
+                continue
+            try:
+                new_poly = _Polygon(dense)
+                if not new_poly.is_valid:
+                    new_poly = new_poly.buffer(0)
+                if (new_poly.is_empty
+                        or new_poly.geom_type != "Polygon"):
+                    continue
+            except Exception:
+                continue
+            # Re-extract the (post-buffer-cleanup) exterior so the
+            # node_altitudes count matches polygon.exterior.coords.
+            new_coords = list(new_poly.exterior.coords)
+            alts: List[float] = []
+            for (cx, cy) in new_coords:
+                e = _runway_clamped_alt(cx, cy)
+                if e is None:
+                    e = 0.0
+                alts.append(round(float(e), 1))
+            layout.shapes.append(BuiltShape(
+                polygon=new_poly,
+                role=ROLE_BOUNDARY,
+                ref="airport_boundary",
+                node_altitudes=alts))
+            n_emitted += 1
+    return n_emitted
 
 
 def _enforce_shared_vertex_altitudes(
