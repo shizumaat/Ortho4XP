@@ -10113,7 +10113,14 @@ def _snap_corners_to_pavement(
     # (2026-04-23): c0 snapped to an apt.dat vertex 5.88 m inside
     # the union, leaving the junction to wrap around V1's short
     # side.
-    BOUNDARY_TOL_M = 0.5
+    #
+    # Per user 2026-04-27: tolerance is STRICT (1 cm).  Snap means
+    # EXACTLY on the boundary, not "close to it" — a 0.36 m offset
+    # at SPJC G's NW corner caused the surrounding junction to
+    # add two extra nodes wrapping around the offset.  Vertices
+    # that aren't on the boundary fall through to Stage 2 (edge
+    # snap), which projects directly onto the boundary line.
+    BOUNDARY_TOL_M = 0.01
     boundary_verts: Optional[List[Tuple[float, float]]] = None
     if apt_vertices:
         boundary_verts = [
