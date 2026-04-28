@@ -3813,6 +3813,25 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         # centerline routes.  Must run BEFORE propagate_bounds so
         # the new edges contribute to per-node feasibility cones.
         _add_junction_bridges(graph, layout)
+        # Per user 2026-04-28: anchor every centerline-graph node
+        # inside a large apron (≥ 5 000 m²) at the apron's plane-
+        # fit DEM.  Without this, a taxi rect inside an apron has
+        # its elevation pulled toward the far-away runway threshold
+        # via 1.5 % grade-cap, which can leave the rect 4+ m below
+        # the surrounding apron's natural DEM elevation.  CYXY's
+        # E south primary parallel was at 712 m (CIFP-cone-derived)
+        # while the surrounding SW apron sits at 715-718 m DEM.
+        n_apron_anchors = _add_apron_anchors(
+            graph, layout, dem, tile_lat, tile_lon, layout.anchor)
+        if n_apron_anchors:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] anchored {n_apron_anchors} "
+                    f"centerline-graph node(s) at apron plane-fit "
+                    f"DEM elevation.\n")
+            except Exception:
+                pass
         graph.propagate_bounds()
         graph.choose_values()
         graph.smooth_rate_of_change(iters=30)
@@ -4978,6 +4997,146 @@ def _add_terminal_anchors(g: "ElevationGraph",
                 cx, cy, anchor=float(shape.altitude))
             for d2, i in cand[:TERMINAL_BRIDGE_MAX_NEIGHBOURS]:
                 g.add_edge(new_idx, i, max(0.5, math.sqrt(d2)))
+            added += 1
+    return added
+
+
+def _fit_dem_plane_module(
+        coords: "List[Tuple[float, float]]",
+        dems: "List[Optional[float]]",
+        ) -> "Optional[Tuple[float, float, float]]":
+    """Module-level mirror of the nested ``_fit_dem_plane`` inside
+    ``_pin_apron_targets``: ordinary least-squares plane fit
+    ``z = a*x + b*y + c`` over the (x, y, dem) triples.  Returns
+    ``(a, b, c)`` or ``None`` if fewer than 3 valid samples or
+    the design matrix is singular.
+    """
+    xs: List[float] = []
+    ys: List[float] = []
+    zs: List[float] = []
+    for (cx, cy), d in zip(coords, dems):
+        if d is None:
+            continue
+        xs.append(cx)
+        ys.append(cy)
+        zs.append(float(d))
+    n = len(zs)
+    if n < 3:
+        return None
+    sx = sum(xs); sy = sum(ys); sz = sum(zs)
+    sxx = sum(x * x for x in xs)
+    syy = sum(y * y for y in ys)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    sxz = sum(x * z for x, z in zip(xs, zs))
+    syz = sum(y * z for y, z in zip(ys, zs))
+    m = [[sxx, sxy, sx],
+         [sxy, syy, sy],
+         [sx,  sy,  float(n)]]
+    rhs = [sxz, syz, sz]
+    def _det3(mm):
+        return (mm[0][0] * (mm[1][1] * mm[2][2] - mm[1][2] * mm[2][1])
+                - mm[0][1] * (mm[1][0] * mm[2][2] - mm[1][2] * mm[2][0])
+                + mm[0][2] * (mm[1][0] * mm[2][1] - mm[1][1] * mm[2][0]))
+    det = _det3(m)
+    if abs(det) < 1e-9:
+        return (0.0, 0.0, sz / n)
+    coeffs = []
+    for col in range(3):
+        mc = [row[:] for row in m]
+        for r in range(3):
+            mc[r][col] = rhs[r]
+        coeffs.append(_det3(mc) / det)
+    return (coeffs[0], coeffs[1], coeffs[2])
+
+
+def _add_apron_anchors(g: "ElevationGraph",
+                       layout: "PavementLayout",
+                       dem,
+                       tile_lat: int,
+                       tile_lon: int,
+                       layout_anchor: "Tuple[float, float]",
+                       min_apron_area_m2: float = 5_000.0,
+                       ) -> int:
+    """For each large apron polygon (≥ ``min_apron_area_m2``), fit a
+    plane to the DEM at its vertices and use that plane to anchor
+    every centerline-graph node CONTAINED in the polygon.
+
+    Per user 2026-04-28: without these anchors, a taxi rect inside
+    or adjacent to a large apron has its elevation propagated only
+    from the FAR-AWAY runway thresholds (CIFP anchors), which can
+    cap the rect's upper bound far below the apron's natural DEM
+    elevation.  CYXY example: E south primary parallel sits next to
+    a 16 k m² apron whose plane-fit DEM is ~715 m, but the rect's
+    cone derives from the 02 threshold (694 m, 1 100 m away) at
+    1.5 % grade ≈ 710.5 m UB — pulling the rect 4 m below the
+    surrounding apron and creating a discontinuity at the apron-
+    rect boundary.
+
+    Anchoring centerline-graph nodes inside the apron polygon at
+    ``plane(x, y)`` brings the apron's DEM into the centerline
+    propagate_bounds calculation as a closer source, lifting the
+    taxi rect's cone toward the natural apron elevation.
+
+    Returns the number of nodes anchored.
+    """
+    if not g.nodes or dem is None:
+        return 0
+    from shapely.geometry import Point
+    lat0, lon0 = layout_anchor[0], layout_anchor[1]
+    cos0 = math.cos(math.radians(lat0))
+    R = 6_378_137.0
+    def m_to_ll(mx: float, my: float) -> Tuple[float, float]:
+        lat = lat0 + math.degrees(my / R)
+        lon = lon0 + math.degrees(mx / (R * cos0))
+        return lat, lon
+
+    added = 0
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            continue
+        if shape.polygon is None or shape.polygon.is_empty:
+            continue
+        if shape.polygon.area < min_apron_area_m2:
+            continue
+        try:
+            coords = list(shape.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            continue
+        dems: List[Optional[float]] = []
+        for cx, cy in coords:
+            try:
+                lat, lon = m_to_ll(cx, cy)
+                d = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+            except Exception:
+                d = None
+            dems.append(d)
+        plane = _fit_dem_plane_module(coords, dems)
+        if plane is None:
+            continue
+        a, b, c = plane
+        # Anchor any UN-ANCHORED graph node inside this apron at the
+        # plane's value.  Skip nodes already anchored from CIFP
+        # (runway thresholds) or terminal pads — those sources take
+        # precedence.
+        for i, (nx, ny) in enumerate(g.nodes):
+            if g.anchor_elev[i] is not None:
+                continue
+            try:
+                if not shape.polygon.contains(Point(nx, ny)):
+                    continue
+            except Exception:
+                continue
+            z = a * nx + b * ny + c
+            # Defensive: clamp to a sane range — DEM samples can
+            # occasionally be wildly out of bounds and the plane
+            # fit then produces nonsense.
+            if not (-100.0 < z < 5_000.0):
+                continue
+            g.anchor_elev[i] = round(z, 1)
             added += 1
     return added
 
