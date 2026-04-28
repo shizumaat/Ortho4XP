@@ -11367,13 +11367,57 @@ def _split_centerlines_at_points(
             # unavoidable).  Override the percentage margin with a
             # small fixed value when the corresponding endpoint of
             # this segment touches a bend-shared end of the
-            # centerline.  ``p0 == 0`` ⇒ start side touches centerline
-            # start; ``p1 == ls.length`` ⇒ end side touches centerline
-            # end.
+            # centerline.
+            #
+            # BUT: cap the extension at the point where the corridor
+            # widens past 1.3 × narrow_hw — past that the rect would
+            # extend deep into an apron, fail the apron-interior
+            # check in ``_build_taxi_rects`` (≥ 2 corners off-
+            # boundary), and never be emitted (e.g. CYXY's North F
+            # bend-extends 57 m into an apron).  Walk inward from
+            # the centerline's end probing the half-width; stop
+            # where the corridor is back to within 1.3 × narrow_hw.
+            CORRIDOR_WIDTH_FACTOR = 1.3
+            def _bend_margin_at(end_param: float, sign: int) -> float:
+                """``end_param`` = 0 (start) or ls.length (end);
+                ``sign`` = +1 (walk forward into the line) or -1
+                (walk backward).  Returns a margin in metres at
+                least ``BEND_ENDPOINT_MARGIN_M`` and at most the
+                point where the corridor narrows back to
+                ``CORRIDOR_WIDTH_FACTOR × narrow_hw``."""
+                base = BEND_ENDPOINT_MARGIN_M
+                if narrow_hw <= 0:
+                    return base
+                target_hw = narrow_hw * CORRIDOR_WIDTH_FACTOR
+                # Walk inward from the bend at 5 m steps up to
+                # gap/2 meters; stop at the first sample where the
+                # local half-width is ≤ target_hw.
+                STEP = 5.0
+                MAX = max(base, gap / 2.0)
+                u = base
+                while u <= MAX:
+                    t = end_param + sign * u
+                    if t < 0 or t > ls.length:
+                        break
+                    try:
+                        hw_here = _avg_perp_halfwidth(ls, t)
+                    except Exception:
+                        hw_here = 0.0
+                    if 0 < hw_here <= target_hw:
+                        return u
+                    u += STEP
+                # Corridor never narrowed to ≤ target_hw within
+                # half the gap — fall back to the percentage margin
+                # so the rect doesn't extend into apron territory.
+                return float('inf')
             if start_is_bend and abs(p0) < 0.5:
-                m_start = min(m_start, BEND_ENDPOINT_MARGIN_M)
+                bm = _bend_margin_at(0.0, +1)
+                if bm != float('inf'):
+                    m_start = min(m_start, bm)
             if end_is_bend and abs(p1 - ls.length) < 0.5:
-                m_end = min(m_end, BEND_ENDPOINT_MARGIN_M)
+                bm = _bend_margin_at(ls.length, -1)
+                if bm != float('inf'):
+                    m_end = min(m_end, bm)
             rect_p0 = p0 + m_start
             rect_p1 = p1 - m_end
             if rect_p1 - rect_p0 < MIN_SEGMENT_LEN_M:
