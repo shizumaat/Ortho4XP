@@ -3626,6 +3626,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # vertex the smoother nudged off-target is restored.
         _enforce_shared_vertex_altitudes(layout)
         _snap_junction_altitudes_to_rect_corners(layout)
+        # Per user 2026-04-29: merge small junction slivers into
+        # adjacent larger junctions.  Polygon-with-holes
+        # decomposition + post-elevation subdivisions can carve
+        # off small (< 1000 m²) pieces sharing a boundary segment
+        # with a much larger neighbour (HECA -10244 = 485 m²
+        # adjacent to -10243 = 30 k m²).  Merge them back so
+        # JOSM doesn't show two near-duplicate polygons.
+        _merge_sliver_junctions_into_neighbours(layout, icao=icao)
         # Final WARN summary — emitted after every elevation pass
         # has run so the count reflects what the OSM emitter will
         # actually write to disk.  Earlier reports (mid-pipeline)
@@ -8982,6 +8990,108 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
         n_subdivided += 1
     layout.shapes = new_shapes
     return n_subdivided
+
+
+def _merge_sliver_junctions_into_neighbours(
+        layout: "PavementLayout",
+        icao: str = "",
+        sliver_area_m2: float = 1000.0,
+        sliver_ratio: float = 0.05,
+        shared_vertex_tol_m: float = 0.5,
+        ) -> int:
+    """Merge small junction polygons into adjacent larger ones.
+
+    A "sliver" is a junction polygon whose area is below
+    ``sliver_area_m2`` AND whose ratio to a neighbour's area is
+    below ``sliver_ratio``.  Two junctions are "adjacent" if they
+    share at least 2 boundary vertices within
+    ``shared_vertex_tol_m``.
+
+    Common cause: ``_decompose_polygon_with_holes`` cuts a
+    polygon-with-holes into simple pieces, occasionally carving
+    off a tiny strip when the cut grazes the polygon's edge.
+    The strip and main piece share a boundary segment (the cut
+    line); the strip should be merged back.  Subdivision passes
+    in ``_compute_elevations`` can produce similar slivers.
+
+    Returns the number of slivers merged.
+    """
+    junction_idxs = [i for i, s in enumerate(layout.shapes)
+                     if s.role == ROLE_JUNCTION
+                     and s.polygon is not None
+                     and not s.polygon.is_empty]
+    if len(junction_idxs) < 2:
+        return 0
+    # Cache per-shape vertex sets in meter coords for fast tests.
+    j_verts: Dict[int, List[Tuple[float, float]]] = {}
+    for i in junction_idxs:
+        try:
+            coords = list(layout.shapes[i].polygon.exterior.coords)
+        except Exception:
+            j_verts[i] = []
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        j_verts[i] = coords
+    tol2 = shared_vertex_tol_m * shared_vertex_tol_m
+    merge_into: Dict[int, int] = {}
+    for i in junction_idxs:
+        ai = layout.shapes[i].polygon.area
+        if ai >= sliver_area_m2:
+            continue
+        best_idx: Optional[int] = None
+        best_area = 0.0
+        for j in junction_idxs:
+            if j == i:
+                continue
+            aj = layout.shapes[j].polygon.area
+            if aj <= ai:
+                continue
+            if (ai / aj) > sliver_ratio:
+                continue
+            shared = 0
+            for vx, vy in j_verts[i]:
+                for ux, uy in j_verts[j]:
+                    if (vx - ux) ** 2 + (vy - uy) ** 2 <= tol2:
+                        shared += 1
+                        break
+                if shared >= 2:
+                    break
+            if shared >= 2 and aj > best_area:
+                best_idx = j
+                best_area = aj
+        if best_idx is not None:
+            merge_into[i] = best_idx
+    if not merge_into:
+        return 0
+    for sliver_i, target_j in merge_into.items():
+        try:
+            merged = unary_union([
+                layout.shapes[target_j].polygon,
+                layout.shapes[sliver_i].polygon])
+            if (merged.geom_type == "Polygon"
+                    and not merged.is_empty):
+                layout.shapes[target_j].polygon = merged
+                # Drop the sliver's node_altitudes — the merged
+                # polygon's vertex count differs and the surviving
+                # shape's node_altitudes should be re-derived
+                # downstream.  A None forces re-derivation.
+                layout.shapes[target_j].node_altitudes = None
+        except Exception:
+            continue
+    sliver_set = set(merge_into.keys())
+    layout.shapes = [
+        s for k, s in enumerate(layout.shapes)
+        if k not in sliver_set]
+    try:
+        import sys as _sys
+        _sys.stderr.write(
+            f"  [pav-builder] {icao}: merged "
+            f"{len(merge_into)} sliver junction(s) into "
+            f"adjacent larger junctions.\n")
+    except Exception:
+        pass
+    return len(merge_into)
 
 
 def _report_within_shape_violations(
