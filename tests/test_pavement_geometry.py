@@ -281,9 +281,15 @@ def test_coverage_within_source_envelope(icao):
     output beyond its sources.
     """
     layout = _build_layout(icao)
+    # Boundary shapes (ROLE_BOUNDARY: airport-perimeter ribbon and
+    # boundary→DEM bridge polygons) are elevation control surfaces,
+    # not pavement.  Excluding them — this test checks that the
+    # PAVEMENT footprint stays close to its sources, which boundary
+    # shapes don't contribute to.
     emitted_polys = [s.polygon for s in layout.shapes
                      if s.polygon is not None
-                     and not s.polygon.is_empty]
+                     and not s.polygon.is_empty
+                     and getattr(s, "role", None) != "boundary"]
     if not emitted_polys:
         return
     try:

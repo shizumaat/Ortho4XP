@@ -4553,13 +4553,17 @@ def _emit_boundary_dem_bridge(
     else:
         return 0
 
-    # Compose existing pavement union (incl. the 5 m ribbon) so the
-    # bridge stays only in the non-pavement, non-ribbon region.  The
-    # bridge is meant to bridge OUTSIDE pavement and OUTSIDE the
-    # ribbon strip, INSIDE the airport boundary.
+    # Compose existing PAVEMENT union (excluding ROLE_BOUNDARY
+    # shapes — the just-emitted 5 m ribbon's centerline IS the
+    # boundary line, so the ribbon would reject every boundary
+    # vertex from the pre-filter below).  The bridge is meant to
+    # avoid overlapping real pavement (runways / taxis / aprons /
+    # terminals); it's placed alongside the ribbon, not on top of
+    # other pavement.
     pavement_polys = [
         s.polygon for s in layout.shapes
-        if s.polygon is not None
+        if s.role != ROLE_BOUNDARY
+        and s.polygon is not None
         and not s.polygon.is_empty]
     pavement_union: Optional[Polygon] = None
     if pavement_polys:
@@ -4567,6 +4571,23 @@ def _emit_boundary_dem_bridge(
             pavement_union = unary_union(pavement_polys)
         except Exception:
             pavement_union = None
+    # Separately track the boundary ribbon — its centerline matches
+    # the boundary line, so the bridge polygon overlaps the ribbon
+    # in its inner 2.5 m by construction.  The bridge must be
+    # trimmed against the ribbon to satisfy the no-self-overlap
+    # geometry test.
+    ribbon_polys = [
+        s.polygon for s in layout.shapes
+        if s.role == ROLE_BOUNDARY
+        and s.ref == "airport_boundary"
+        and s.polygon is not None
+        and not s.polygon.is_empty]
+    ribbon_union: Optional[Polygon] = None
+    if ribbon_polys:
+        try:
+            ribbon_union = unary_union(ribbon_polys)
+        except Exception:
+            ribbon_union = None
 
     n_emitted = 0
     for boundary_poly in rings:
@@ -4716,11 +4737,66 @@ def _emit_boundary_dem_bridge(
                     continue
             if bridge_poly is None:
                 continue
+            # Subtract NON-SLOPING pavement (junctions, terminals)
+            # and the boundary ribbon from the bridge.  These can
+            # overlap the bridge by hundreds of square metres
+            # without sharing vertices with sloping rects, so
+            # subtracting them is safe and necessary for the
+            # no-self-overlap test.
+            non_sloping_pav_polys: List[Polygon] = [
+                s.polygon for s in layout.shapes
+                if s.role in (ROLE_JUNCTION, ROLE_TERMINAL)
+                and s.polygon is not None
+                and not s.polygon.is_empty]
+            for sub_geom in non_sloping_pav_polys:
+                try:
+                    bridge_poly = bridge_poly.difference(sub_geom)
+                except Exception:
+                    pass
+                if bridge_poly.is_empty:
+                    break
+            if (bridge_poly.is_empty
+                    or bridge_poly.geom_type
+                    not in ("Polygon", "MultiPolygon")):
+                continue
+            if not bridge_poly.is_valid:
+                bridge_poly = bridge_poly.buffer(0)
+            if bridge_poly.geom_type == "MultiPolygon":
+                parts = sorted(bridge_poly.geoms,
+                               key=lambda g: -g.area)
+                bridge_poly = parts[0] if parts else None
+            if (bridge_poly is None
+                    or bridge_poly.is_empty
+                    or bridge_poly.geom_type != "Polygon"
+                    or bridge_poly.area < 100.0):
+                continue
+            # Subtract the boundary ribbon so the bridge starts at
+            # the ribbon's INNER edge instead of overlapping the
+            # ribbon's inner half.
+            if (ribbon_union is not None
+                    and not ribbon_union.is_empty):
+                try:
+                    bridge_poly = bridge_poly.difference(ribbon_union)
+                except Exception:
+                    pass
+                if bridge_poly.is_empty:
+                    continue
+                if not bridge_poly.is_valid:
+                    bridge_poly = bridge_poly.buffer(0)
+                if bridge_poly.geom_type == "MultiPolygon":
+                    parts = sorted(bridge_poly.geoms,
+                                   key=lambda g: -g.area)
+                    bridge_poly = parts[0] if parts else None
+                if (bridge_poly is None
+                        or bridge_poly.is_empty
+                        or bridge_poly.geom_type != "Polygon"
+                        or bridge_poly.area < 100.0):
+                    continue
             # If the bridge polygon overlaps any sloping rect, the
             # bridge run extended too close to pavement despite
-            # pre-filtering — skip emission (rather than subtract
-            # and risk creating vertices on a sloping rect's edge
-            # interior, which violates the geometry invariant).
+            # pre-filtering — trim against the rect union with a
+            # 0.1 m safety buffer (rather than risk creating
+            # vertices on a sloping rect's edge interior).
             sloping_rect_polys: List[Polygon] = [
                 s.polygon for s in layout.shapes
                 if s.role in (
@@ -4744,8 +4820,12 @@ def _emit_boundary_dem_bridge(
                 # vertex to its nearest sloping-rect corner.
                 try:
                     rect_union = unary_union(sloping_rect_polys)
+                    # Buffer the rect union by > the
+                    # ``EDGE_PROX_M`` test tolerance (0.5 m) so any
+                    # vertex from the difference operation lands
+                    # outside that proximity band.
                     bridge_poly = bridge_poly.difference(
-                        rect_union.buffer(0.1))
+                        rect_union.buffer(1.0))
                 except Exception:
                     bridge_poly = None
                 if (bridge_poly is None
