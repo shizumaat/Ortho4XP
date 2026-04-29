@@ -1060,64 +1060,138 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     sample_pts.append((p_lat, p_lon, a_elev, True))
                     fractions.append(t)
 
-            # ── Wide-window smoothing of the DEM profile ─────────────
-            # A real runway is a graded surface that approximates the
-            # underlying terrain only on average — local DEM bumps
-            # from buildings, vegetation or surface-model noise do
-            # not belong on the runway profile.  Before the
-            # grade-clamp pass we replace each interior DEM sample
-            # with a moving average over a wide window so the final
-            # elevation profile is a single long gentle slope rather
-            # than a staircase of 1.5 % ramps in alternating
-            # directions following every local DEM bump.
+            # ── Anchor-profile baseline + DEM blend ───────────────────
+            # Per user 2026-04-28: build the runway profile by first
+            # collecting ALL anchors (CIFP thresholds + physical
+            # ends + cross-runway projections), constructing a smooth
+            # FAA-compliant baseline that passes through them, then
+            # blending in DEM up to a bounded deviation.  This
+            # replaces the previous "DEM-seed → envelope clamp" path
+            # that produced V-shaped kinks at hard anchors when DEM
+            # was higher than the anchor (the rate-of-change solver
+            # couldn't smooth the kink because anchored samples are
+            # immutable).
+            #
+            # Order of operations:
+            #   1. Collect all anchored samples as (frac, elev)
+            #      pairs, sorted by frac.
+            #   2. Validate anchor feasibility — warn if any
+            #      adjacent-anchor pair grade exceeds
+            #      MAX_RUNWAY_GRADE.
+            #   3. Build the linear-interpolation anchor profile:
+            #      profile(frac) returns the smooth baseline at any
+            #      fraction along the runway.
+            #   4. For each non-anchor sample, set
+            #         elev[i] = clamp(dem_e, base_e ± DEM_BAND)
+            #      where base_e = profile(fractions[i]) and DEM_BAND
+            #      is the maximum DEM deviation we allow before
+            #      tightening to the baseline.
+            #   5. Existing _pass_hard_cap + _pass_rate_of_change run
+            #      below as a final cleanup; with the baseline-
+            #      driven seed they have very little work to do.
             elevs = [s[2] for s in sample_pts]
             anchored = [s[3] for s in sample_pts]
             n_samples = len(elevs)
-            if n_samples >= 5:
-                half_win = max(4, n_samples // 4)
-                smoothed = list(elevs)
-                for i in range(n_samples):
-                    if anchored[i]:
-                        continue
-                    lo_w = max(0, i - half_win)
-                    hi_w = min(n_samples, i + half_win + 1)
-                    window = elevs[lo_w:hi_w]
-                    smoothed[i] = sum(window) / len(window)
-                elevs = smoothed
 
-            # ── Envelope pre-clamp from every anchor ─────────────────
-            # For each sample i compute the tightest allowed band
-            # [lower, upper] imposed by every anchor at distance d,
-            # using the rule |elev[i] - elev[anchor]| ≤ d × cap.
-            # Clamping DEM to this envelope guarantees the profile
-            # is anchor-consistent before any local smoothing runs,
-            # and collapses the number of local-cap iterations to
-            # near zero.  The remaining local pass only has to
-            # reconcile adjacent DEM samples.
+            # cumulative distance along the centerline (used by
+            # validity check + spans-to-each-anchor logging).
             cum_dist = [0.0]
             for i in range(1, n_samples):
                 cum_dist.append(
                     cum_dist[-1]
                     + abs(fractions[i] - fractions[i - 1]) * phys_dist)
+
+            # 1. Collect anchors.
+            profile_anchors: list = [
+                (fractions[i], elevs[i])
+                for i in range(n_samples)
+                if anchored[i]]
+            profile_anchors.sort()
+
+            # 2. Validate feasibility.
+            for k in range(len(profile_anchors) - 1):
+                f0, e0 = profile_anchors[k]
+                f1, e1 = profile_anchors[k + 1]
+                seg_d = abs(f1 - f0) * phys_dist
+                if seg_d <= 0.5:
+                    continue
+                g = abs(e1 - e0) / seg_d
+                if g > MAX_RUNWAY_GRADE + 1e-6:
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [auto-patch] {icao} runway "
+                            f"{desig_a}/{desig_b}: anchor pair grade "
+                            f"{g * 100:.2f}% > "
+                            f"{MAX_RUNWAY_GRADE * 100:.1f}% between "
+                            f"fractions {f0:.3f} and {f1:.3f} "
+                            f"({seg_d:.0f} m apart, ΔE={e1 - e0:+.2f} m) "
+                            f"— profile will be infeasible at FAA "
+                            f"runway max grade.\n")
+                    except Exception:
+                        pass
+
+            # 3. Linear-interpolation anchor profile.
+            def _anchor_profile(frac: float):
+                if not profile_anchors:
+                    return None
+                if frac <= profile_anchors[0][0]:
+                    return profile_anchors[0][1]
+                if frac >= profile_anchors[-1][0]:
+                    return profile_anchors[-1][1]
+                for k in range(len(profile_anchors) - 1):
+                    f0, e0 = profile_anchors[k]
+                    f1, e1 = profile_anchors[k + 1]
+                    if f0 <= frac <= f1:
+                        if f1 - f0 < 1e-9:
+                            return e0
+                        t = (frac - f0) / (f1 - f0)
+                        return e0 + t * (e1 - e0)
+                return profile_anchors[-1][1]
+
+            # 4. DEM blend with band size tied to FAA absorption capacity.
+            # Per user 2026-04-28: "max DEM following" — let DEM
+            # influence the profile up to whatever the FAA rate-of-
+            # change rule can absorb in a parabolic vertical curve
+            # connecting back to the anchor profile.
+            #
+            # The maximum deviation of a parabolic vertical curve
+            # from its tangent line at distance d from the curve's
+            # PVI (point of vertical intersection) is
+            #     max_dev = 0.5 × K × d²
+            # where K is the rate-of-change constant
+            # (MAX_RUNWAY_GRADE_CHANGE_PER_M = 1/30,000 for runways).
+            # Treating each anchor as a PVI, the band at sample i
+            # is the tightest such limit imposed by ANY anchor.
+            # Near anchors the band is small (forces the profile to
+            # stay near the linear baseline); far from anchors it
+            # widens enough that DEM character can come through.
+            DEM_BAND_M_MAX = 5.0   # absolute cap (sanity ceiling).
             for i in range(n_samples):
                 if anchored[i]:
                     continue
-                upper = float("inf")
-                lower = float("-inf")
+                base_e = _anchor_profile(fractions[i])
+                if base_e is None:
+                    continue
+                # Distance to nearest anchor along centerline.
+                nearest_d = float('inf')
                 for j in range(n_samples):
                     if not anchored[j]:
                         continue
-                    d_ij = abs(cum_dist[i] - cum_dist[j])
-                    upper = min(upper, elevs[j] + d_ij * MAX_RUNWAY_GRADE)
-                    lower = max(lower, elevs[j] - d_ij * MAX_RUNWAY_GRADE)
-                if upper < lower:
-                    # Anchors are inconsistent (shouldn't happen with
-                    # CIFP data but guard anyway) — use midpoint.
-                    elevs[i] = (upper + lower) / 2.0
-                elif elevs[i] > upper:
-                    elevs[i] = upper
-                elif elevs[i] < lower:
-                    elevs[i] = lower
+                    d = abs(cum_dist[i] - cum_dist[j])
+                    if d < nearest_d:
+                        nearest_d = d
+                # FAA vertical-curve absorption capacity.
+                fa_cap = (0.5 * MAX_RUNWAY_GRADE_CHANGE_PER_M
+                           * nearest_d * nearest_d)
+                band = min(DEM_BAND_M_MAX, fa_cap)
+                dem_e = elevs[i]
+                if dem_e > base_e + band:
+                    elevs[i] = base_e + band
+                elif dem_e < base_e - band:
+                    elevs[i] = base_e - band
+                else:
+                    elevs[i] = dem_e
 
             def _pass_hard_cap():
                 for _it in range(GRADE_RELAX_ITERATIONS):
