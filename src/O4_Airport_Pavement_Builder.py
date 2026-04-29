@@ -10000,9 +10000,28 @@ def _terminal_groundside_zone(
                 edge_class[i] = EDGE_GROUNDSIDE
                 continue
             edge_class[i] = EDGE_UNKNOWN
-        # Subtract only edges with EXPLICIT groundside indicator.
+        # Per user 2026-04-29 (latest): on the airside, the apron
+        # SHARES VERTICES with the terminal building (the apron
+        # junction wraps around the building corners).  On the
+        # groundside, NO airport pavement should connect to the
+        # terminal — driveways / parking are typically several
+        # metres higher than the airside apron (CYXY 4 m
+        # difference) for terrain or elevated road decks.
+        #
+        # Identification: airside if OSM aeroway features are
+        # nearby; UNKNOWN if neither aeroway nor highway is
+        # present (typical at airports with sparse OSM road
+        # coverage — most of our test set).  When at least ONE
+        # edge has an airside indicator, every edge that ISN'T
+        # airside is treated as groundside (UNKNOWN promoted).
+        # When no edge is airside, we have no signal to pick
+        # which direction is which — leave the building alone.
+        any_airside = any(c == EDGE_AIRSIDE for c in edge_class)
         for i in range(n):
-            if edge_class[i] != EDGE_GROUNDSIDE:
+            cls = edge_class[i]
+            if cls == EDGE_AIRSIDE:
+                continue
+            if cls == EDGE_UNKNOWN and not any_airside:
                 continue
             geom = edge_geom[i]
             if geom is None:
