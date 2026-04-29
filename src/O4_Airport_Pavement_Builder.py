@@ -552,43 +552,70 @@ def _load_osm_airports(xplane_root: str, icao: str,
             _sys.stderr.write(
                 f"  [pav-builder] WARN: airport OSM download error: "
                 f"{exc}\n")
+    # Per user 2026-04-29: OSM Overpass exports use locally-
+    # generated NEGATIVE IDs that aren't globally unique.  At
+    # HECA (and any airport with adjacent OSM tiles), tile A's
+    # node ``-1`` and tile B's node ``-1`` typically refer to
+    # entirely different geographic coordinates.  The previous
+    # ``nodes.update(n2)`` merge across the 9-tile grid silently
+    # overwrites tile A's coordinates with tile B's whenever
+    # there's an ID collision — leaving every way that
+    # references the colliding ID with the WRONG coordinates.
+    #
+    # At HECA: 2762 node IDs collide between +30+030 and +30+031
+    # (every node ID in +30+030 also appears in +30+031, with
+    # different coordinates).  The post-merge HECA centerlines
+    # spanned 154 km and the 14 explicit ``aeroway=terminal``
+    # ways all had their centroids dragged outside the airport
+    # bbox by the overwritten coordinates.
+    #
+    # Fix: namespace each tile's node IDs by prefixing with the
+    # tile coordinate.  Way node-id references are rewritten to
+    # use the same prefix at load time, so each way only ever
+    # resolves to its own tile's nodes.  After this no ID
+    # collision is possible — and the previous "centroid in
+    # bbox" filter alone is sufficient (no need for the cross-
+    # tile-span guard since corrupted ways no longer exist).
     nodes: Dict[str, Tuple[float, float]] = {}
     ways: List[Tuple[str, List[str], Dict[str, str]]] = []
     relations: List[Tuple[str, List[str], Dict[str, str]]] = []
     seen_paths = set()
     for dlat in (0, -1, 1):
         for dlon in (0, -1, 1):
-            osm_path = _tile_path(base_lat + dlat, base_lon + dlon)
+            tile_lat_n = base_lat + dlat
+            tile_lon_n = base_lon + dlon
+            osm_path = _tile_path(tile_lat_n, tile_lon_n)
             if osm_path in seen_paths or not os.path.isfile(osm_path):
                 continue
             seen_paths.add(osm_path)
             n2, w2, r2 = _load_osm_tile(osm_path)
-            nodes.update(n2)
-            ways.extend(w2)
-            relations.extend(r2)
+            # Namespace this tile's node IDs.
+            tile_prefix = f"t{tile_lat_n:+03d}{tile_lon_n:+04d}:"
+            for nid, coord in n2.items():
+                nodes[tile_prefix + nid] = coord
+            for wid, nds, tags in w2:
+                ways.append(
+                    (tile_prefix + wid,
+                     [tile_prefix + n for n in nds],
+                     tags))
+            for rid, outer_ids, tags in r2:
+                relations.append(
+                    (tile_prefix + rid,
+                     [tile_prefix + w for w in outer_ids],
+                     tags))
     if not nodes:
         return {}, [], []
 
-    # Filter ways using TWO checks:
-    #
-    # 1. Centroid in bbox (legacy): the way's centroid must lie
-    #    within ``radius_deg`` of the airport.
-    # 2. No cross-tile span (per user 2026-04-28): the way's
-    #    OWN bbox (lat-spread, lon-spread) must be ≤
-    #    ``MAX_WAY_SPAN_DEG``.  This catches OSM ID collisions
-    #    that occur when ``nodes.update()`` overwrites a node ID
-    #    in one tile with the coordinates of a same-ID node from
-    #    a different tile, leaving the way with mixed-tile node
-    #    references.
-    #
-    # The collision symptom at HECA: 22 ways spanning 0.1°-2.27°
-    # (11-250 km), including taxiway ``ref=L`` at 250 km — ways
-    # that legitimately should be airport-scale (≤ a few km).
-    # Without the span check the centerline extractor linemerged
-    # them across Egypt, producing 154 km polylines and breaking
-    # taxi rect detection.
-    MAX_WAY_SPAN_DEG = 0.1  # ~11 km at the equator; airport ways
-                             # are at most a few km.
+    # Filter ways: keep only those whose node centroid lies
+    # within ``radius_deg`` of the airport AND whose own bbox
+    # spans no more than ``MAX_WAY_SPAN_DEG``.  With per-tile
+    # node namespacing above, ID collisions can no longer
+    # pollute a way's resolved coordinates — but the span check
+    # is cheap and provides a defensive guard against any other
+    # data quality issues (e.g. cross-tile ways that genuinely
+    # span more than an airport's worth of geography).
+    MAX_WAY_SPAN_DEG = 0.1  # ~11 km; airport ways are at most a few km.
+
     def _in_box(lat, lon):
         return (abs(lat - apt_lat) <= radius_deg and
                 abs(lon - apt_lon) <= radius_deg)
@@ -597,14 +624,12 @@ def _load_osm_airports(xplane_root: str, icao: str,
         pts = [nodes[n] for n in nds if n in nodes]
         if not pts:
             return False
-        clat = sum(p[0] for p in pts) / len(pts)
-        clon = sum(p[1] for p in pts) / len(pts)
-        if not _in_box(clat, clon):
-            return False
-        # Reject ways with cross-tile node-coordinate span (an
-        # OSM negative-ID collision symptom).
         lats = [p[0] for p in pts]
         lons = [p[1] for p in pts]
+        clat = sum(lats) / len(pts)
+        clon = sum(lons) / len(pts)
+        if not _in_box(clat, clon):
+            return False
         if (max(lats) - min(lats) > MAX_WAY_SPAN_DEG
                 or max(lons) - min(lons) > MAX_WAY_SPAN_DEG):
             return False
