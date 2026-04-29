@@ -261,15 +261,22 @@ def test_no_vertex_on_sloping_rect_edge(icao):
                              o.ref or "?", t, d))
                         break
     if violations:
-        summary = "; ".join(
-            f"{v[2]}({v[3]}) vertex on {v[0]}({v[1]}) "
-            f"edge t={v[4]:.3f} d={v[5]:.2f}m"
-            for v in violations[:5])
-        msg = (f"{icao}: {len(violations)} vertex-on-sloping-rect-"
-               f"edge violation(s).  Junction polygons must share "
-               f"only CORNERS with sloping rects, never edge "
-               f"interiors.  First {min(5, len(violations))}: "
-               f"{summary}.")
+        # Two violation tuple shapes:
+        #   non-rect:       (role, ref, "non-rect", n_corners) — len 4
+        #   edge-interior:  (role, ref, o_role, o_ref, t, d)    — len 6
+        def _fmt(v):
+            if len(v) == 4:
+                return (f"{v[0]}({v[1]}) is non-rect "
+                        f"(n_corners={v[3]})")
+            return (f"{v[2]}({v[3]}) vertex on {v[0]}({v[1]}) "
+                    f"edge t={v[4]:.3f} d={v[5]:.2f}m")
+        summary = "; ".join(_fmt(v) for v in violations[:5])
+        msg = (f"{icao}: {len(violations)} sloping-rect "
+               f"invariant violation(s).  Sloping rects must "
+               f"have exactly 4 corners; junction polygons may "
+               f"share only CORNERS with sloping rects, never "
+               f"edge interiors.  First "
+               f"{min(5, len(violations))}: {summary}.")
         assert False, msg
 
 

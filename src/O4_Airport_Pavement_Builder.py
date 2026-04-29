@@ -3353,6 +3353,12 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # vertex the smoother nudged off-target is restored.
         _enforce_shared_vertex_altitudes(layout)
         _snap_junction_altitudes_to_rect_corners(layout)
+        # Final WARN summary — emitted after every elevation pass
+        # has run so the count reflects what the OSM emitter will
+        # actually write to disk.  Earlier reports (mid-pipeline)
+        # over-counted because they ran before the smoother /
+        # shared-vertex agree / rect-corner snap chain converged.
+        _report_within_shape_violations(layout, icao)
         # Per user 2026-04-28: emit a 5 m-wide ribbon polygon
         # tracing the airport boundary (apt.dat row-130) with
         # per-vertex altitudes clamped to ≤ 3 % grade from the
@@ -4052,12 +4058,17 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         layout, icao, dem, tile_lat, tile_lon, m_to_ll)
 
     # ── Phase E: Diagnostics ────────────────────────────────────
-    # Layer 3 (2026-04-26): scan every emitted polygon for any
-    # within-shape vertex pair grade > TAXI_MAX_GRADE.  Surface a
-    # WARN summary so regressions are visible during iteration —
-    # not yet a hard fail (would drop too much coverage at HECA-
-    # complexity airports while Layers 1/2 are still maturing).
-    _report_within_shape_violations(layout, icao)
+    # NOTE: the within-shape grade WARN is intentionally NOT emitted
+    # here.  ``build_airport_pavement`` (the caller) runs a chain of
+    # post-elevation passes — ``_enforce_shared_vertices``,
+    # ``_snap_junction_altitudes_to_rect_corners``,
+    # ``_enforce_shared_vertex_altitudes``,
+    # ``_smooth_within_junction_adjacent_pair_grade``, and a final
+    # snap/agree round — that meaningfully change per-vertex
+    # altitudes after this point.  Reporting here would surface the
+    # MID-pipeline state (often 10×–100× worse than the final
+    # output) and mislead.  The WARN is emitted from
+    # ``build_airport_pavement`` after the smoother converges.
 
 
 def _push_junction_vertices_off_taxi_rect_edges(
