@@ -625,7 +625,7 @@ RUNWAY_SEGMENT_LENGTH = 100.0  # meters — length of each runway segment
 
 
 def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
-                       apt_runways=None):
+                       apt_runways=None, extra_anchors=None):
     """Generate OSM XML content for segmented runway auto-patches.
 
     For each paired runway, samples the DEM along the centerline at
@@ -653,6 +653,17 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             only for threshold elevations.  This keeps the emitted
             runway rectangles pixel-aligned with what X-Plane
             renders, and avoids any geometry-source mismatch.
+        extra_anchors: Optional dict of
+            ``{(desig_a, desig_b): [(lat, lon, elev_m), ...]}`` —
+            additional anchored elevation points along each runway.
+            Each anchor is projected onto the runway centerline and
+            inserted into the sample list as ANCHORED, so the
+            envelope-clamp + grade-cap solver treats it as a hard
+            constraint alongside the CIFP threshold anchors.  Used
+            to inject cross-runway / taxi-crossing constraints —
+            e.g. "where this runway is crossed by a taxi anchored at
+            another runway's threshold, this runway must be at the
+            other threshold's elevation (within taxi-grade × distance)".
 
     Returns:
         str: Complete OSM XML content for the patch file.
@@ -661,6 +672,8 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
         runway_widths = {}
     if apt_runways is None:
         apt_runways = {}
+    if extra_anchors is None:
+        extra_anchors = {}
     node_id = -1
     way_id = -1
     nodes = []  # list of (id, lat, lon)
@@ -737,6 +750,78 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             return tile.dem.alt((lon - tile.lon, lat - tile.lat))
         except Exception:
             return None
+
+    # ── Auto cross-runway anchor pre-pass ──────────────────────
+    # Per user 2026-04-28: project every paired runway's threshold
+    # onto every OTHER paired runway's centerline.  When the
+    # projection falls inside that other runway's length AND the
+    # perpendicular distance is plausibly walkable by a taxi
+    # (≤ ``MAX_CROSS_RUNWAY_LATERAL_M``), the projection becomes
+    # an additional anchor on the other runway with the source
+    # threshold's elevation.  This forces parallel runways with
+    # offset thresholds (e.g. CYXY 14R/32L vs 14L/32R, where
+    # 32R end at 701 m sits ~200 m off 14R/32L's interior) to
+    # respect each other's hard CIFP elevations rather than
+    # letting DEM-seeded interior samples drift to the upper
+    # envelope and break grade for taxi crossings.
+    MAX_CROSS_RUNWAY_LATERAL_M = 300.0
+    auto_extra_anchors: dict = {}
+    paired_list = [(da, dat_a, db, dat_b)
+                   for da, dat_a, db, dat_b in runway_pairs
+                   if db is not None and dat_b is not None]
+    for ti, (da_t, dat_a_t, db_t, dat_b_t) in enumerate(paired_list):
+        # Each pair has two thresholds; project each onto every
+        # OTHER pair's centerline.
+        for src_desig, src_data in (
+                (da_t, dat_a_t), (db_t, dat_b_t)):
+            for ri, (da_r, dat_a_r, db_r, dat_b_r) in enumerate(
+                    paired_list):
+                if ri == ti:
+                    continue
+                # Centerline from dat_a_r → dat_b_r in meters at
+                # the pair's mid-latitude.
+                mid_lat = 0.5 * (dat_a_r["lat"] + dat_b_r["lat"])
+                cl_v = cos(mid_lat * pi / 180.0)
+                if cl_v < 1e-6:
+                    cl_v = 1e-6
+                rdx = (dat_b_r["lon"] - dat_a_r["lon"]) * cl_v * DEG_TO_M
+                rdy = (dat_b_r["lat"] - dat_a_r["lat"]) * DEG_TO_M
+                rL2 = rdx * rdx + rdy * rdy
+                if rL2 < 1.0:
+                    continue
+                vx = (src_data["lon"] - dat_a_r["lon"]) * cl_v * DEG_TO_M
+                vy = (src_data["lat"] - dat_a_r["lat"]) * DEG_TO_M
+                t = (vx * rdx + vy * rdy) / rL2
+                # Skip if projection is outside the threshold span
+                # (with a small inset so we don't double-anchor at
+                # the receiver runway's own threshold).
+                if t <= 0.05 or t >= 0.95:
+                    continue
+                # Perpendicular distance from src threshold to
+                # receiver runway centerline.
+                proj_x = t * rdx
+                proj_y = t * rdy
+                perp = sqrt((vx - proj_x) ** 2 + (vy - proj_y) ** 2)
+                if perp > MAX_CROSS_RUNWAY_LATERAL_M:
+                    continue
+                # Build anchor at the projection lat/lon on the
+                # receiver runway, with the SRC threshold's
+                # elevation.  The receiver runway's solver will
+                # then envelope-clamp itself around this anchor as
+                # an additional hard constraint.
+                p_lat = (dat_a_r["lat"]
+                         + t * (dat_b_r["lat"] - dat_a_r["lat"]))
+                p_lon = (dat_a_r["lon"]
+                         + t * (dat_b_r["lon"] - dat_a_r["lon"]))
+                key = (da_r, db_r)
+                auto_extra_anchors.setdefault(key, []).append(
+                    (p_lat, p_lon, src_data["elevation_m"]))
+    # Merge user-supplied extra_anchors on top of auto-detected
+    # ones — user values take precedence (replace auto if same
+    # exact lat/lon, else append).
+    for k, v in (extra_anchors or {}).items():
+        auto_extra_anchors.setdefault(k, []).extend(v)
+    extra_anchors = auto_extra_anchors
 
     for desig_a, data_a, desig_b, data_b in runway_pairs:
         if desig_b is not None and data_b is not None:
@@ -881,34 +966,88 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     sample_pts.append((s_lat, s_lon, elev_phys_b, True))
                     continue
 
-                # Interior point: linear interpolation between the
-                # physical-end anchors.
-                #
-                # Per user 2026-04-28: previously seeded from DEM
-                # and let the envelope clamp pull samples back into
-                # ±MAX_RUNWAY_GRADE × distance from the anchors.
-                # In mountainous terrain (e.g. CYXY) this leaves
-                # interior samples PINNED to the upper envelope —
-                # at 250 m from the 32L threshold (706.22 m) the
-                # sample sat at 706.22 + 250 × 0.015 = 709.97 m
-                # because the surrounding DEM was high.  A taxiway
-                # crossing the runway near that point starting from
-                # neighbouring runway 32R (701.34 m, ≈150 m away)
-                # could not reach 710 m at < 1.5 %, producing a
-                # taxi-grade violation.
-                #
-                # Seeding from linear interpolation gives a clean
-                # gradual slope: at 250 m from 32L → 706.22 −
-                # (12.19 / 2400) × 250 ≈ 705.0 m, which is reachable
-                # from 701 m at ≈ 1.6 % over 150 m.  DEM informs the
-                # pre-clamp envelope only via the anchor threshold
-                # values themselves.  Real airports heavily grade
-                # their pavement, so a linear runway profile between
-                # CIFP-anchored thresholds is a more faithful
-                # representation than DEM-following.
-                interp = elev_phys_a + frac * (
-                    elev_phys_b - elev_phys_a)
-                sample_pts.append((s_lat, s_lon, interp, False))
+                # Interior point: use DEM if available, else interpolate
+                dem_val = _sample_dem(s_lat, s_lon)
+                if dem_val is not None:
+                    sample_pts.append((s_lat, s_lon, dem_val, False))
+                else:
+                    # Linear interpolation between thresholds
+                    interp = elev_phys_a + frac * (elev_phys_b - elev_phys_a)
+                    sample_pts.append((s_lat, s_lon, interp, False))
+
+            # Per user 2026-04-28: cross-runway anchor injection.
+            # ``extra_anchors`` maps a (desig_a, desig_b) key (with
+            # both orderings) to a list of (lat, lon, elev) anchor
+            # points along this runway that came from intersections
+            # with other runways or taxiways at known elevations.
+            # Each one becomes an ANCHORED sample so the envelope-
+            # clamp + grade-cap solver treats it as a hard
+            # constraint along with the CIFP threshold anchors.
+            ra_key = None
+            extra = []
+            if extra_anchors:
+                for k in (
+                        (desig_a, desig_b),
+                        (desig_b, desig_a),
+                        ("RW" + desig_a.lstrip("RW"),
+                         "RW" + desig_b.lstrip("RW")),
+                        ("RW" + desig_b.lstrip("RW"),
+                         "RW" + desig_a.lstrip("RW"))):
+                    if k in extra_anchors:
+                        extra = extra_anchors[k]
+                        ra_key = k
+                        break
+            for a_lat, a_lon, a_elev in extra:
+                # Project anchor lat/lon onto the runway centerline
+                # parameter (frac in [0, 1] from phys_end_a to
+                # phys_end_b).  Use simple lat/lon-as-Cartesian since
+                # the runway is short.
+                ax = (a_lon - phys_end_a[1]) * cos_lat_v * DEG_TO_M
+                ay = (a_lat - phys_end_a[0]) * DEG_TO_M
+                # rwy direction in meters
+                rdx = dx_phys
+                rdy = dy_phys
+                rL2 = rdx * rdx + rdy * rdy
+                if rL2 <= 0:
+                    continue
+                t = (ax * rdx + ay * rdy) / rL2
+                if t <= 0.001 or t >= 0.999:
+                    continue
+                # Interpolate the lat/lon onto the centerline at t.
+                p_lat = phys_end_a[0] + t * (
+                    phys_end_b[0] - phys_end_a[0])
+                p_lon = phys_end_a[1] + t * (
+                    phys_end_b[1] - phys_end_a[1])
+                # Insert into sample_pts in fraction-order.
+                inserted = False
+                for j in range(len(sample_pts)):
+                    if sample_pts[j][:2] == (p_lat, p_lon):
+                        # Already a sample at this exact point — upgrade
+                        # to anchored with the constraint elevation.
+                        sample_pts[j] = (p_lat, p_lon, a_elev, True)
+                        inserted = True
+                        break
+                if inserted:
+                    continue
+                # Find sorted insertion position.
+                # Recompute frac for each existing sample (they were
+                # appended in fractions order).
+                for j in range(len(sample_pts)):
+                    s_la, s_lo = sample_pts[j][0], sample_pts[j][1]
+                    s_ax = (s_lo - phys_end_a[1]) * cos_lat_v * DEG_TO_M
+                    s_ay = (s_la - phys_end_a[0]) * DEG_TO_M
+                    s_t = (s_ax * rdx + s_ay * rdy) / rL2
+                    if s_t > t:
+                        sample_pts.insert(
+                            j, (p_lat, p_lon, a_elev, True))
+                        # Also extend fractions list to keep ordering
+                        # state consistent.
+                        fractions.insert(j, t)
+                        inserted = True
+                        break
+                if not inserted:
+                    sample_pts.append((p_lat, p_lon, a_elev, True))
+                    fractions.append(t)
 
             # ── Wide-window smoothing of the DEM profile ─────────────
             # A real runway is a graded surface that approximates the
