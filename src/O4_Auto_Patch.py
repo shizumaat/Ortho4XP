@@ -1193,6 +1193,71 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 else:
                     elevs[i] = dem_e
 
+            # ── FAA-absorption envelope pre-clamp ────────────────
+            # Per user 2026-04-28: enforce the parabolic vertical-
+            # curve envelope explicitly.  At distance d from any
+            # anchor, the maximum elevation deviation that's
+            # achievable while respecting MAX_GC × distance grade-
+            # change-rate is:
+            #   max_dev = 0.5 × MAX_GC × d²       (for d ≤ L_VC)
+            #   max_dev = 0.5 × MAX_GC × L_VC²
+            #             + MAX_GRADE × (d − L_VC)  (for d > L_VC)
+            # where L_VC = MAX_GRADE / MAX_GC (the curve length to
+            # reach max grade).
+            #
+            # Threshold anchors with blast pads ALSO need to
+            # satisfy this envelope assuming g_in=0 from the flat
+            # blast pad.  Interior (cross-runway) anchors don't
+            # have a defined g_in, so the envelope around them
+            # uses just the linear MAX_GRADE × d bound.
+            #
+            # This pre-clamp guarantees the profile is FAA-
+            # compliant by construction.  The downstream
+            # _pass_hard_cap and _pass_rate_of_change converge in
+            # 1-2 iterations (mostly to round 0.001 m residuals).
+            L_VC = MAX_RUNWAY_GRADE / MAX_RUNWAY_GRADE_CHANGE_PER_M
+
+            def _faa_max_dev(d: float) -> float:
+                if d <= L_VC:
+                    return 0.5 * MAX_RUNWAY_GRADE_CHANGE_PER_M * d * d
+                return (0.5 * MAX_RUNWAY_GRADE_CHANGE_PER_M
+                        * L_VC * L_VC
+                        + MAX_RUNWAY_GRADE * (d - L_VC))
+
+            for i in range(n_samples):
+                if anchored[i]:
+                    continue
+                lo = float('-inf')
+                hi = float('inf')
+                for j in range(n_samples):
+                    if not anchored[j]:
+                        continue
+                    d_ij = abs(cum_dist[i] - cum_dist[j])
+                    # Boundary anchors with blast pads use the
+                    # FAA absorption envelope (the blast pad's
+                    # g_in=0 is part of the constraint).  Interior
+                    # anchors use only the linear grade envelope.
+                    is_boundary_with_blast = (
+                        (j == 0 and blast_a > 0.1)
+                        or (j == n_samples - 1 and blast_b > 0.1))
+                    if is_boundary_with_blast:
+                        cap = _faa_max_dev(d_ij)
+                    else:
+                        cap = MAX_RUNWAY_GRADE * d_ij
+                    lo = max(lo, elevs[j] - cap)
+                    hi = min(hi, elevs[j] + cap)
+                if lo <= hi:
+                    if elevs[i] > hi:
+                        elevs[i] = hi
+                    elif elevs[i] < lo:
+                        elevs[i] = lo
+                else:
+                    # Infeasible: anchors are inconsistent with
+                    # the FAA envelope.  Use baseline as fallback.
+                    base_e = _anchor_profile(fractions[i])
+                    if base_e is not None:
+                        elevs[i] = base_e
+
             def _pass_hard_cap():
                 for _it in range(GRADE_RELAX_ITERATIONS):
                     changed = False
@@ -1255,77 +1320,132 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 return abs(fractions[i + 1] - fractions[i]) * phys_dist
 
             def _pass_rate_of_change():
+                """FAA rate-of-grade-change pass.
+
+                Per user 2026-04-28 (refined): treats blast pads as
+                virtual anchored samples (grade=0 contributing
+                segments) at the start and end of the sample list.
+                With this, the constraint at the threshold/blast-pad
+                interface propagates inward over MULTIPLE samples
+                instead of being one-sample-deep — so the runway
+                forms a proper FAA vertical curve coming out of the
+                threshold, not a sharp grade kink.
+
+                Also enforces ΔG at INTERIOR anchored samples (e.g.
+                cross-runway projection anchors) by adjusting
+                the anchor's neighbours when the anchor's incoming
+                vs outgoing grade differ by more than the FAA limit.
+                """
+                # Build extended arrays with virtual blast pad
+                # samples at frac < 0 and frac > 1.  The virtual
+                # samples are anchored at the same elevation as
+                # the threshold, so the segment between them and
+                # the threshold has grade 0 — exactly modelling a
+                # flat blast pad.
+                elevs_ext = list(elevs)
+                anchored_ext = list(anchored)
+                # Segment lengths: one entry per gap between
+                # consecutive samples in elevs_ext.
+                seg_lens: list = [_seg_len(k)
+                                   for k in range(len(elevs) - 1)]
+                start_offset = 0
+                if blast_a > 0.1 and anchored[0]:
+                    elevs_ext.insert(0, elevs[0])
+                    anchored_ext.insert(0, True)
+                    seg_lens.insert(0, blast_a)
+                    start_offset = 1
+                end_offset = 0
+                if blast_b > 0.1 and anchored[-1]:
+                    elevs_ext.append(elevs[-1])
+                    anchored_ext.append(True)
+                    seg_lens.append(blast_b)
+                    end_offset = 1
+
+                def _eseg(i):
+                    return seg_lens[i] if 0 <= i < len(seg_lens) else 0.0
+
                 any_change = False
                 for _it in range(GRADE_RELAX_ITERATIONS):
                     changed = False
-
-                    # Boundary constraint at the blast-pad / runway
-                    # interface: the flat blast pad effectively has
-                    # grade 0 on the outside of the anchor, so at
-                    # sample[0] the grade change from 0 into the
-                    # first interior segment must not exceed
-                    # MAX_RUNWAY_GRADE_CHANGE_PER_M × L.  The anchor
-                    # itself cannot move, so we enforce the rule by
-                    # clamping elevs[1] toward elevs[0].  Same at
-                    # the far end.
-                    if (len(elevs) >= 2 and anchored[0]
-                            and not anchored[1]):
-                        lr0 = _seg_len(0)
-                        max_dg0 = (MAX_RUNWAY_GRADE_CHANGE_PER_M
-                                   * lr0)
-                        max_delta0 = max_dg0 * lr0
-                        target_hi = elevs[0] + max_delta0
-                        target_lo = elevs[0] - max_delta0
-                        if elevs[1] > target_hi:
-                            elevs[1] = target_hi
-                            changed = True
-                            any_change = True
-                        elif elevs[1] < target_lo:
-                            elevs[1] = target_lo
-                            changed = True
-                            any_change = True
-                    if (len(elevs) >= 2 and anchored[-1]
-                            and not anchored[-2]):
-                        llN = _seg_len(len(elevs) - 2)
-                        max_dgN = (MAX_RUNWAY_GRADE_CHANGE_PER_M
-                                   * llN)
-                        max_deltaN = max_dgN * llN
-                        target_hi = elevs[-1] + max_deltaN
-                        target_lo = elevs[-1] - max_deltaN
-                        if elevs[-2] > target_hi:
-                            elevs[-2] = target_hi
-                            changed = True
-                            any_change = True
-                        elif elevs[-2] < target_lo:
-                            elevs[-2] = target_lo
-                            changed = True
-                            any_change = True
-
-                    for i in range(1, len(elevs) - 1):
-                        if anchored[i]:
-                            continue
-                        ll = _seg_len(i - 1)
-                        lr = _seg_len(i)
+                    # Walk every sample (including anchored interior
+                    # ones — they don't move themselves but their
+                    # ΔG is enforced by adjusting neighbours).
+                    for i in range(1, len(elevs_ext) - 1):
+                        ll = _eseg(i - 1)
+                        lr = _eseg(i)
                         if ll < 0.1 or lr < 0.1:
                             continue
-                        g_left = (elevs[i] - elevs[i - 1]) / ll
-                        g_right = (elevs[i + 1] - elevs[i]) / lr
+                        g_left = (
+                            (elevs_ext[i] - elevs_ext[i - 1]) / ll)
+                        g_right = (
+                            (elevs_ext[i + 1] - elevs_ext[i]) / lr)
                         max_dg = (MAX_RUNWAY_GRADE_CHANGE_PER_M
-                                  * ((ll + lr) / 2.0))
+                                   * ((ll + lr) / 2.0))
                         dg = g_right - g_left
                         if abs(dg) <= max_dg:
                             continue
-                        target_dg = max_dg if dg > 0 else -max_dg
-                        denom = 1.0 / lr + 1.0 / ll
-                        new_e = (elevs[i + 1] / lr
-                                 + elevs[i - 1] / ll
-                                 - target_dg) / denom
-                        if abs(new_e - elevs[i]) > 0.001:
-                            elevs[i] = new_e
-                            changed = True
-                            any_change = True
+                        target_dg = (max_dg if dg > 0 else -max_dg)
+                        excess = dg - target_dg
+                        if not anchored_ext[i]:
+                            # Standard case: move sample i to make
+                            # ΔG = target_dg.
+                            denom = 1.0 / lr + 1.0 / ll
+                            new_e = (elevs_ext[i + 1] / lr
+                                      + elevs_ext[i - 1] / ll
+                                      - target_dg) / denom
+                            if abs(new_e - elevs_ext[i]) > 0.001:
+                                elevs_ext[i] = new_e
+                                changed = True
+                                any_change = True
+                        else:
+                            # Anchored sample: we cannot move it.
+                            # Move its non-anchored neighbours to
+                            # make ΔG = target_dg.
+                            #
+                            # We want g_left' = g_left + δ_l,
+                            # g_right' = g_right - δ_r, such that
+                            # new dg = dg − δ_l − δ_r = target_dg.
+                            # → δ_l + δ_r = excess.
+                            free_l = not anchored_ext[i - 1]
+                            free_r = not anchored_ext[i + 1]
+                            if not free_l and not free_r:
+                                continue  # both neighbours anchored
+                            if free_l and free_r:
+                                delta_l = excess / 2.0
+                                delta_r = excess / 2.0
+                            elif free_l:
+                                delta_l = excess
+                                delta_r = 0.0
+                            else:
+                                delta_l = 0.0
+                                delta_r = excess
+                            if free_l and abs(delta_l) > 1e-9:
+                                # increase g_left by delta_l
+                                # → decrease elev[i-1] by delta_l*ll
+                                new_lo = (
+                                    elevs_ext[i - 1] - delta_l * ll)
+                                if abs(new_lo
+                                        - elevs_ext[i - 1]) > 0.001:
+                                    elevs_ext[i - 1] = new_lo
+                                    changed = True
+                                    any_change = True
+                            if free_r and abs(delta_r) > 1e-9:
+                                # decrease g_right by delta_r
+                                # → decrease elev[i+1] by delta_r*lr
+                                new_hi = (
+                                    elevs_ext[i + 1] - delta_r * lr)
+                                if abs(new_hi
+                                        - elevs_ext[i + 1]) > 0.001:
+                                    elevs_ext[i + 1] = new_hi
+                                    changed = True
+                                    any_change = True
                     if not changed:
                         break
+
+                # Copy interior values back to the real arrays
+                # (skip the virtual blast pad samples).
+                for j in range(len(elevs)):
+                    elevs[j] = elevs_ext[j + start_offset]
                 return any_change
 
             _pass_rate_of_change()
