@@ -1451,7 +1451,17 @@ def _drop_primary_parallels_embedded_in_pavement(
     #     absorbed.
     SAMPLE_STEP_M = 5.0
     MIN_KEPT_M = 30.0
-    OUTER_PROBE_M = 2.0
+    # Probe distance per user 2026-04-29 (HECA R analysis): a 2 m
+    # probe was too sensitive to tile-imprecision slivers up to
+    # ~3 m past a rect's long edge — at HECA the DSF pavement
+    # along R extends 2–3 m past the rect's natural-half-width
+    # edge, the 2 m probe landed inside that sliver, and the
+    # absorption fired on a perfectly normal taxiway.  5 m skips
+    # those slivers while still catching genuine aprons, which
+    # extend many metres past the rect (CYXY's E parallel apron
+    # is ~12 m past, SPJC's F apron is ~30 m past — both well
+    # within range of the 5 m probe).
+    OUTER_PROBE_M = 5.0
 
     kept: List[Tuple[Polygon, LineString, str, str]] = []
     abs_refs: List[str] = []
@@ -2182,10 +2192,24 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # this is a small fraction, apt.dat is sufficient; skip DSF
     # entirely.
     osm_gap: Optional[Polygon] = None
-    DSF_OSM_GAP_BUFFER_M = 5.0          # widen gap by 5 m so DSF
-                                         # tile alignment can vary
-                                         # slightly without losing
-                                         # legitimate fill.
+    DSF_OSM_GAP_BUFFER_M = 1.0          # widen gap by 1 m for
+                                         # tile-alignment slop.
+                                         # User 2026-04-29 (HECA R
+                                         # absorption): 5 m was too
+                                         # generous; DSF clipped
+                                         # with a 5 m fringe
+                                         # extends ~3 m past the
+                                         # OSM-tagged taxi corridor
+                                         # and trips the long-edge-
+                                         # adjacent absorption probe
+                                         # (which fires at 2 m
+                                         # outside the rect edge).
+                                         # 1 m fringe matches the
+                                         # apt.dat / DSF tile
+                                         # alignment precision
+                                         # without spilling enough
+                                         # to look like apron-
+                                         # adjacency.
     # Coverage threshold: above this, the airport's apt.dat is
     # considered "comprehensive" — apt.dat captures most of what
     # OSM thinks the airport has, so DSF is restricted to filling
