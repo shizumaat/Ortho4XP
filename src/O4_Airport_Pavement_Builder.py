@@ -3303,6 +3303,20 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 _sys.stderr.write(
                     f"  [pav-builder] emitted "
                     f"{n_b} airport-boundary shape piece(s).\n")
+            # Then emit DEM-bridge polygons inside the boundary
+            # wherever the clamped boundary altitude differs from
+            # raw DEM by > 5 m (per user 2026-04-28).
+            try:
+                n_br = _emit_boundary_dem_bridge(
+                    layout, _dem, _tile_lat, _tile_lon)
+                if n_br:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] emitted "
+                        f"{n_br} boundary→DEM bridge "
+                        f"polygon(s).\n")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -4405,6 +4419,394 @@ def _emit_airport_boundary_shape(
                 polygon=new_poly,
                 role=ROLE_BOUNDARY,
                 ref="airport_boundary",
+                node_altitudes=alts))
+            n_emitted += 1
+    return n_emitted
+
+
+def _emit_boundary_dem_bridge(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        gap_threshold_m: float = 5.0,
+        bridge_depth_m: float = 100.0,
+        densify_step_m: float = 25.0,
+        runway_clamp_radius_m: float = 400.0,
+        runway_clamp_grade: float = 0.03,
+        ) -> int:
+    """Emit a wider "bridge" polygon INSIDE the airport boundary
+    where the boundary's clamped altitude differs from the raw DEM
+    by more than ``gap_threshold_m``.
+
+    Per user 2026-04-28: when the boundary ribbon is forced (by the
+    runway-distance clamp at ≤ 3 % grade) to a value that disagrees
+    with the natural terrain DEM by > 5 m, X-Plane renders a
+    valley/cliff between the 5 m boundary ribbon and the surrounding
+    terrain inside the airport perimeter.  The bridge polygon is a
+    larger transition strip whose OUTER edge sits on the airport
+    perimeter at the boundary's clamped altitude and whose INNER
+    edge sits ``bridge_depth_m`` further inside the airport at the
+    raw DEM altitude.  Per-vertex altitudes interpolate linearly
+    between the two edges, giving X-Plane a gradual surface to
+    descend / ascend over instead of a single hard step.
+
+    OUTSIDE the airport boundary X-Plane keeps falling directly to
+    DEM (no bridge needed there) — the user explicitly scoped this
+    feature to the interior side only.
+
+    Implementation:
+      1. Densify the airport-boundary line to ≤ ``densify_step_m``.
+      2. For each densified vertex, sample raw DEM and the
+         runway-clamped altitude (same rule as the 5 m ribbon).
+         Mark vertex if |gap| > ``gap_threshold_m``.
+      3. Group consecutive marked vertices into "bridge runs"
+         (with a 1-vertex slack so isolated unmarked vertices in
+         the middle of a long gap don't split the run).
+      4. For each run, build an inward-offset polygon
+         (``bridge_depth_m`` inward from the boundary line) and
+         clip it against any existing pavement / boundary ribbon.
+      5. Emit per-vertex altitudes: outer edge = clamped, inner
+         edge = DEM, with shape vertices on the boundary side
+         tagged ``clamped`` and inner-edge vertices tagged DEM.
+    """
+    if (layout.airport_boundary is None
+            or layout.airport_boundary.is_empty):
+        return 0
+    from shapely.geometry import LineString as _LS, Point as _Point
+    from shapely.geometry import Polygon as _Polygon
+
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+
+    def m_to_ll(x: float, y: float) -> Tuple[float, float]:
+        lat = lat0 + math.degrees(y / R)
+        lon = lon0 + math.degrees(x / (R * cos0))
+        return lat, lon
+
+    runway_shapes: List[BuiltShape] = [
+        s for s in layout.shapes
+        if s.role == ROLE_RUNWAY
+        and s.polygon is not None
+        and not s.polygon.is_empty]
+    if not runway_shapes:
+        return 0
+
+    def _clamped_alt(x: float, y: float) -> Optional[float]:
+        try:
+            lat, lon = m_to_ll(x, y)
+            dem_e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+        except Exception:
+            dem_e = None
+        best_d = float('inf')
+        best_e = None
+        from shapely.ops import nearest_points as _np
+        pt = _Point(x, y)
+        for s in runway_shapes:
+            try:
+                d = s.polygon.distance(pt)
+            except Exception:
+                continue
+            if d >= best_d:
+                continue
+            try:
+                if d == 0.0:
+                    np_x, np_y = x, y
+                else:
+                    np = _np(s.polygon, pt)[0]
+                    np_x, np_y = np.x, np.y
+                e = _sample_runway_segment_elev(s, np_x, np_y)
+            except Exception:
+                e = None
+            if e is None:
+                continue
+            best_d = d
+            best_e = e
+        if best_e is None:
+            return dem_e
+        if best_d > runway_clamp_radius_m:
+            return dem_e
+        band = best_d * runway_clamp_grade
+        lo = best_e - band
+        hi = best_e + band
+        if dem_e is None:
+            return 0.5 * (lo + hi)
+        if dem_e < lo:
+            return lo
+        if dem_e > hi:
+            return hi
+        return dem_e
+
+    def _dem_alt(x: float, y: float) -> Optional[float]:
+        try:
+            lat, lon = m_to_ll(x, y)
+            return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+        except Exception:
+            return None
+
+    boundary_geom = layout.airport_boundary
+    if boundary_geom.geom_type == "Polygon":
+        rings = [boundary_geom]
+    elif boundary_geom.geom_type == "MultiPolygon":
+        rings = list(boundary_geom.geoms)
+    else:
+        return 0
+
+    # Compose existing pavement union (incl. the 5 m ribbon) so the
+    # bridge stays only in the non-pavement, non-ribbon region.  The
+    # bridge is meant to bridge OUTSIDE pavement and OUTSIDE the
+    # ribbon strip, INSIDE the airport boundary.
+    pavement_polys = [
+        s.polygon for s in layout.shapes
+        if s.polygon is not None
+        and not s.polygon.is_empty]
+    pavement_union: Optional[Polygon] = None
+    if pavement_polys:
+        try:
+            pavement_union = unary_union(pavement_polys)
+        except Exception:
+            pavement_union = None
+
+    n_emitted = 0
+    for boundary_poly in rings:
+        try:
+            ext_coords = list(boundary_poly.exterior.coords)
+        except Exception:
+            continue
+        if len(ext_coords) < 4:
+            continue
+        # Densify the boundary line.
+        if ext_coords[0] == ext_coords[-1]:
+            ext_coords = ext_coords[:-1]
+        dense: List[Tuple[float, float]] = []
+        n = len(ext_coords)
+        for i in range(n):
+            ax, ay = ext_coords[i]
+            bx, by = ext_coords[(i + 1) % n]
+            dense.append((ax, ay))
+            d = math.hypot(bx - ax, by - ay)
+            if d > densify_step_m:
+                steps = max(1, int(d / densify_step_m))
+                for k in range(1, steps):
+                    t = k / steps
+                    dense.append((ax + t * (bx - ax),
+                                  ay + t * (by - ay)))
+        if len(dense) < 4:
+            continue
+        # Per-vertex clamped + DEM + gap.
+        per_vert: List[Tuple[float, float, float, float]] = []
+        for x, y in dense:
+            ca = _clamped_alt(x, y)
+            da = _dem_alt(x, y)
+            if ca is None or da is None:
+                per_vert.append((x, y, float('nan'), float('nan')))
+                continue
+            per_vert.append((x, y, float(ca), float(da)))
+
+        # A vertex is "needs-bridge" only if (a) the gap exceeds
+        # the threshold AND (b) the boundary line at that vertex
+        # is NOT already inside pavement (a runway / taxi rect
+        # extending to the perimeter doesn't need a transition —
+        # pavement is right there).  Pre-filtering on (b) avoids
+        # building bridge polygons that overlap pavement; the
+        # subsequent pavement-difference would otherwise leave
+        # vertices stranded on sloping-rect edges (test
+        # ``test_no_vertex_on_sloping_rect_edge``).
+        from shapely.geometry import Point as _P2
+        marked = []
+        for i, v in enumerate(per_vert):
+            if math.isnan(v[2]) or math.isnan(v[3]):
+                continue
+            if abs(v[2] - v[3]) <= gap_threshold_m:
+                continue
+            if pavement_union is not None and not pavement_union.is_empty:
+                try:
+                    if pavement_union.distance(
+                            _P2(v[0], v[1])) < 5.0:
+                        continue
+                except Exception:
+                    pass
+            marked.append((i, v))
+        if not marked:
+            continue
+        # Group consecutive marked vertices into runs (treat the
+        # boundary as cyclic; allow 1-vertex unmarked slack).
+        marked_idx = sorted(set(m[0] for m in marked))
+        N = len(per_vert)
+        runs: List[List[int]] = []
+        if marked_idx:
+            cur = [marked_idx[0]]
+            for idx in marked_idx[1:]:
+                # Distance along ring, accounting for wrap.
+                gap_idx = idx - cur[-1]
+                if gap_idx <= 2:
+                    cur.append(idx)
+                else:
+                    runs.append(cur)
+                    cur = [idx]
+            runs.append(cur)
+            # Wrap merge: last run end-of-ring + first run
+            # start-of-ring close ⇒ merge.
+            if len(runs) >= 2:
+                tail = runs[-1][-1]
+                head = runs[0][0]
+                if (N - tail) + head <= 2:
+                    runs[0] = runs[-1] + runs[0]
+                    runs.pop()
+
+        for run in runs:
+            if len(run) < 2:
+                continue
+            # Outer edge: the boundary line vertices for the run,
+            # in order.
+            outer_pts = [(per_vert[i][0], per_vert[i][1])
+                         for i in run]
+            if len(outer_pts) < 2:
+                continue
+            try:
+                outer_line = _LS(outer_pts)
+            except Exception:
+                continue
+            if outer_line.is_empty or outer_line.length < 1.0:
+                continue
+            # Build inner offset on whichever side is INSIDE the
+            # airport boundary polygon.
+            inner_line = None
+            for side in ("left", "right"):
+                try:
+                    off = outer_line.parallel_offset(
+                        bridge_depth_m, side=side, join_style=2)
+                except Exception:
+                    off = None
+                if off is None or off.is_empty:
+                    continue
+                # Probe a midpoint of the offset to test
+                # containment in the airport boundary.
+                try:
+                    mid = off.interpolate(0.5, normalized=True)
+                    if boundary_poly.contains(mid):
+                        inner_line = off
+                        break
+                except Exception:
+                    continue
+            if inner_line is None or inner_line.is_empty:
+                continue
+            # Build the bridge polygon: outer line + reversed
+            # inner line.  parallel_offset on the LEFT side returns
+            # a line in REVERSED order; on the RIGHT side it's in
+            # the same order.  Either way, we walk the outer
+            # forward then close along the inner.  Determine
+            # winding by trying both and keeping the valid one.
+            in_coords = list(inner_line.coords)
+            ring1 = list(outer_pts) + list(reversed(in_coords))
+            ring2 = list(outer_pts) + list(in_coords)
+            bridge_poly: Optional[Polygon] = None
+            for cand in (ring1, ring2):
+                try:
+                    p = _Polygon(cand)
+                    if not p.is_valid:
+                        p = p.buffer(0)
+                    if (not p.is_empty
+                            and p.geom_type == "Polygon"
+                            and p.area > 100.0):
+                        bridge_poly = p
+                        break
+                except Exception:
+                    continue
+            if bridge_poly is None:
+                continue
+            # If the bridge polygon overlaps any sloping rect, the
+            # bridge run extended too close to pavement despite
+            # pre-filtering — skip emission (rather than subtract
+            # and risk creating vertices on a sloping rect's edge
+            # interior, which violates the geometry invariant).
+            sloping_rect_polys: List[Polygon] = [
+                s.polygon for s in layout.shapes
+                if s.role in (
+                    ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                    ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+                    ROLE_CROSS_CONNECTOR)
+                and s.polygon is not None
+                and not s.polygon.is_empty]
+            overlaps_rect = False
+            for r in sloping_rect_polys:
+                try:
+                    if (bridge_poly.intersection(r).area > 1.0):
+                        overlaps_rect = True
+                        break
+                except Exception:
+                    continue
+            if overlaps_rect:
+                # Trim the bridge against the sloping-rect union
+                # using buffered-shrink to avoid creating
+                # edge-interior vertices, then snap any near-corner
+                # vertex to its nearest sloping-rect corner.
+                try:
+                    rect_union = unary_union(sloping_rect_polys)
+                    bridge_poly = bridge_poly.difference(
+                        rect_union.buffer(0.1))
+                except Exception:
+                    bridge_poly = None
+                if (bridge_poly is None
+                        or bridge_poly.is_empty):
+                    continue
+                if bridge_poly.geom_type == "MultiPolygon":
+                    parts = sorted(bridge_poly.geoms,
+                                   key=lambda g: -g.area)
+                    bridge_poly = parts[0] if parts else None
+                if (bridge_poly is None
+                        or bridge_poly.geom_type != "Polygon"
+                        or bridge_poly.area < 100.0):
+                    continue
+                try:
+                    bridge_poly = (
+                        _snap_polygon_vertices_to_rect_corners(
+                            bridge_poly,
+                            sloping_rect_polys,
+                            snap_tol_m=5.0))
+                except Exception:
+                    pass
+                if (bridge_poly is None
+                        or bridge_poly.is_empty
+                        or bridge_poly.geom_type != "Polygon"
+                        or bridge_poly.area < 100.0):
+                    continue
+            # Per-vertex altitudes.  For each vertex of the final
+            # polygon, classify as outer (snap to nearest outer_pts
+            # → use clamped) or inner (use DEM at that vertex).
+            outer_set = set((round(x, 1), round(y, 1))
+                            for x, y in outer_pts)
+            new_coords = list(bridge_poly.exterior.coords)
+            alts: List[float] = []
+            for cx, cy in new_coords:
+                key = (round(cx, 1), round(cy, 1))
+                if key in outer_set:
+                    # Pick the matching outer_pts entry to inherit
+                    # its clamped altitude.
+                    best = None
+                    best_d = float('inf')
+                    for idx in run:
+                        ox, oy, ca, _da = per_vert[idx]
+                        d = math.hypot(cx - ox, cy - oy)
+                        if d < best_d:
+                            best_d = d
+                            best = ca
+                    if best is not None and not math.isnan(best):
+                        alts.append(round(float(best), 1))
+                        continue
+                # Inner / non-outer vertex: use DEM (or clamped if
+                # DEM unavailable, as a safe fallback).
+                d = _dem_alt(cx, cy)
+                if d is None:
+                    d = _clamped_alt(cx, cy)
+                if d is None:
+                    d = 0.0
+                alts.append(round(float(d), 1))
+            layout.shapes.append(BuiltShape(
+                polygon=bridge_poly,
+                role=ROLE_BOUNDARY,
+                ref="boundary_dem_bridge",
                 node_altitudes=alts))
             n_emitted += 1
     return n_emitted
