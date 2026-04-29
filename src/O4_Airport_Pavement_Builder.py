@@ -4072,24 +4072,44 @@ def _push_junction_vertices_off_taxi_rect_edges(
     edge would split that edge at render time and break the rect's
     altitude_high/altitude_low slope convention.
 
-    For every junction ring vertex:
-      * If it lies within ``corner_tol_m`` of a rect corner, snap
-        to that exact corner (preserves shared-vertex
-        connectivity at rect ends).
-      * Else if it lies within ``edge_tol_m`` of a rect edge
-        interior, push it perpendicular to the edge by
-        ``edge_gap_m`` so it sits OUTSIDE the rect.
-      * Otherwise: leave it.
+    Per user 2026-04-29: junctions and taxiway/stub/runway rects
+    should be handled the SAME WAY as runway-runway crossings —
+    the junction should connect to either the LOW or HIGH short
+    edge of a rect (i.e. its corners), never to the rect's edge
+    interior.
 
-    Geometric only: doesn't touch elevations.  Returns the number
-    of junction polygons modified.
+    Two-stage policy applied to every junction ring vertex:
+
+      Stage 1 — collapse redundant edge-interior vertices.
+        If a vertex lies on the interior of a rect edge AND its
+        ring-adjacent neighbours are both at corners of the SAME
+        rect (one each, on the two ends of THAT edge), the vertex
+        is redundant.  The junction's ring already connects the
+        two corners; the intermediate vertex just splits a single
+        rect edge into two pieces.  Drop the vertex — the junction
+        edge then runs corner-to-corner along the rect's short
+        edge (HIGH-side or LOW-side) cleanly.
+      Stage 2 — corner snap / push for survivors.
+        For each remaining vertex:
+          * Within ``corner_tol_m`` of a rect corner ⇒ snap to
+            that corner.
+          * Within ``edge_tol_m`` of a rect edge interior ⇒ push
+            ``edge_gap_m`` perpendicular outside the rect.
+          * Otherwise ⇒ leave alone.
+
+    Geometric only: doesn't touch elevations.  Runway corners are
+    treated identically to taxi rect corners so junction vertices
+    snap there too — the user's "same logic for all runway
+    intersections" requirement.
+
+    Returns the number of junction polygons modified.
     """
-    taxi_roles = {
+    rect_roles = {
         ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
-        ROLE_STUB, ROLE_CROSS_CONNECTOR}
+        ROLE_STUB, ROLE_CROSS_CONNECTOR, ROLE_RUNWAY}
     rects: List[Tuple[Polygon, List[Tuple[float, float]]]] = []
     for s in layout.shapes:
-        if s.role not in taxi_roles:
+        if s.role not in rect_roles:
             continue
         if s.polygon is None or s.polygon.is_empty:
             continue
@@ -4107,40 +4127,70 @@ def _push_junction_vertices_off_taxi_rect_edges(
 
     corner_tol2 = corner_tol_m * corner_tol_m
 
-    def _fix(x: float, y: float) -> Tuple[float, float]:
-        for rect_poly, corners in rects:
-            for cx, cy in corners:
-                if (x - cx) ** 2 + (y - cy) ** 2 <= corner_tol2:
-                    return (cx, cy)
-            for i in range(4):
-                ax, ay = corners[i]
-                bx, by = corners[(i + 1) % 4]
-                dx = bx - ax
-                dy = by - ay
-                seg_len_sq = dx * dx + dy * dy
-                if seg_len_sq <= 0.01:
-                    continue
-                t = ((x - ax) * dx + (y - ay) * dy) / seg_len_sq
-                if t <= 0.001 or t >= 0.999:
-                    continue
-                cx_proj = ax + t * dx
-                cy_proj = ay + t * dy
-                d = math.hypot(x - cx_proj, y - cy_proj)
-                if d > edge_tol_m:
-                    continue
-                seg_len = math.sqrt(seg_len_sq)
-                perp_x = -dy / seg_len
-                perp_y = dx / seg_len
-                # Pick the perpendicular direction that lies
-                # OUTSIDE the rect.
-                test_x = cx_proj + perp_x * 0.1
-                test_y = cy_proj + perp_y * 0.1
-                if rect_poly.contains(Point(test_x, test_y)):
-                    perp_x = -perp_x
-                    perp_y = -perp_y
-                return (cx_proj + perp_x * edge_gap_m,
-                        cy_proj + perp_y * edge_gap_m)
-        return (x, y)
+    def _on_edge_between_corners(
+            x: float, y: float,
+            corners: List[Tuple[float, float]],
+            ) -> Optional[int]:
+        """Return the edge index (0-3) the point lies on (within
+        ``edge_tol_m`` of an edge interior, t ∈ (ε, 1-ε)), or
+        None if the point isn't on any rect edge interior."""
+        for i in range(4):
+            ax, ay = corners[i]
+            bx, by = corners[(i + 1) % 4]
+            dx = bx - ax
+            dy = by - ay
+            seg_len_sq = dx * dx + dy * dy
+            if seg_len_sq <= 0.01:
+                continue
+            t = ((x - ax) * dx + (y - ay) * dy) / seg_len_sq
+            if t <= 0.001 or t >= 0.999:
+                continue
+            cx_proj = ax + t * dx
+            cy_proj = ay + t * dy
+            d_sq = ((x - cx_proj) ** 2
+                    + (y - cy_proj) ** 2)
+            if d_sq <= edge_tol_m * edge_tol_m:
+                return i
+        return None
+
+    def _at_corner_index(
+            x: float, y: float,
+            corners: List[Tuple[float, float]],
+            ) -> Optional[int]:
+        """Return the corner index (0-3) the point lies at
+        (within ``corner_tol_m``), or None."""
+        for ci, (cx, cy) in enumerate(corners):
+            if (x - cx) ** 2 + (y - cy) ** 2 <= corner_tol2:
+                return ci
+        return None
+
+    def _push_off(
+            x: float, y: float,
+            rect_poly: Polygon,
+            corners: List[Tuple[float, float]],
+            edge_idx: int,
+            ) -> Tuple[float, float]:
+        """Push the point ``edge_gap_m`` perpendicular to the
+        rect edge ``edge_idx``, toward the OUTSIDE of the rect."""
+        ax, ay = corners[edge_idx]
+        bx, by = corners[(edge_idx + 1) % 4]
+        dx = bx - ax
+        dy = by - ay
+        seg_len = math.sqrt(dx * dx + dy * dy)
+        if seg_len <= 0.01:
+            return (x, y)
+        t = ((x - ax) * dx + (y - ay) * dy) / (seg_len * seg_len)
+        cx_proj = ax + t * dx
+        cy_proj = ay + t * dy
+        perp_x = -dy / seg_len
+        perp_y = dx / seg_len
+        test_x = cx_proj + perp_x * 0.1
+        test_y = cy_proj + perp_y * 0.1
+        if rect_poly.contains(Point(test_x, test_y)):
+            perp_x = -perp_x
+            perp_y = -perp_y
+        return (cx_proj + perp_x * edge_gap_m,
+                cy_proj + perp_y * edge_gap_m)
 
     n_modified = 0
     for shape in layout.shapes:
@@ -4150,23 +4200,146 @@ def _push_junction_vertices_off_taxi_rect_edges(
             ring = list(shape.polygon.exterior.coords)
         except Exception:
             continue
-        new_ring = []
-        changed = False
-        for vx, vy in ring:
-            nx, ny = _fix(vx, vy)
-            if (nx, ny) != (vx, vy):
-                changed = True
-            new_ring.append((nx, ny))
-        if not changed:
+        # Drop closing repeat for ring traversal.
+        if ring and ring[0] == ring[-1]:
+            ring_open = ring[:-1]
+        else:
+            ring_open = ring
+        n_v = len(ring_open)
+        if n_v < 3:
             continue
+
+        # Stage 1: collapse redundant edge-interior vertices.
+        # A vertex v is redundant if its ring-prev and ring-next
+        # neighbours are at the two corners of the same rect edge
+        # AND v itself lies on that edge's interior.
+        keep_mask = [True] * n_v
+        for i in range(n_v):
+            vx, vy = ring_open[i]
+            px, py = ring_open[(i - 1) % n_v]
+            nx, ny = ring_open[(i + 1) % n_v]
+            for rect_poly, corners in rects:
+                p_corner = _at_corner_index(px, py, corners)
+                n_corner = _at_corner_index(nx, ny, corners)
+                if p_corner is None or n_corner is None:
+                    continue
+                # The two neighbour corners must be adjacent
+                # corners (i.e. share an edge).  Adjacent corner
+                # pairs: (0,1), (1,2), (2,3), (3,0).
+                diff = abs(p_corner - n_corner)
+                if diff != 1 and diff != 3:
+                    continue
+                # The edge between them is index = min(...) if
+                # adjacent, but for the wrap (0,3 / 3,0) it's
+                # edge 3.  Just identify by the corner pair.
+                edge_idx = (
+                    min(p_corner, n_corner)
+                    if diff == 1 else 3)
+                v_edge = _on_edge_between_corners(vx, vy, corners)
+                if v_edge != edge_idx:
+                    continue
+                # Vertex v sits on the edge between two corners
+                # that are already in the ring as neighbours.
+                # Drop it — the junction's ring will go
+                # corner-to-corner along the rect edge.
+                keep_mask[i] = False
+                break
+        # Survivor index list lets us drop the matching entries from
+        # ``shape.node_altitudes`` after the rebuild — the dropped
+        # vertices' altitudes are no longer needed but the kept
+        # vertices' altitudes ARE still valid (the solver's elevation
+        # field depends on the polygon being valid AND on per-vertex
+        # values; nuking them all forces re-derivation from scratch
+        # and reintroduces grade violations the solver already fixed).
+        survivor_idx = [i for i in range(n_v) if keep_mask[i]]
+        ring_after_collapse = [ring_open[i] for i in survivor_idx]
+        n_collapsed = n_v - len(ring_after_collapse)
+
+        # Stage 2: corner-snap / edge-push the survivors.
+        new_ring: List[Tuple[float, float]] = []
+        n_snapped = 0
+        n_pushed = 0
+        for vx, vy in ring_after_collapse:
+            target = (vx, vy)
+            for rect_poly, corners in rects:
+                ci = _at_corner_index(vx, vy, corners)
+                if ci is not None:
+                    target = corners[ci]
+                    if target != (vx, vy):
+                        n_snapped += 1
+                    break
+                ei = _on_edge_between_corners(vx, vy, corners)
+                if ei is not None:
+                    target = _push_off(
+                        vx, vy, rect_poly, corners, ei)
+                    if target != (vx, vy):
+                        n_pushed += 1
+                    break
+            new_ring.append(target)
+
+        if n_collapsed == 0 and n_snapped == 0 and n_pushed == 0:
+            continue
+
+        # Re-close the ring and rebuild the polygon.
+        if new_ring and new_ring[0] != new_ring[-1]:
+            new_ring_closed = new_ring + [new_ring[0]]
+        else:
+            new_ring_closed = new_ring
         try:
-            new_poly = Polygon(new_ring,
+            new_poly = Polygon(new_ring_closed,
                                 list(shape.polygon.interiors))
+            buffer_repaired = False
             if not new_poly.is_valid:
-                new_poly = new_poly.buffer(0)
-            if (new_poly.geom_type == "Polygon"
+                # The original ring may already be self-intersecting
+                # — buffer(0) can return a MultiPolygon with one
+                # main piece + tiny artifacts.  Take the largest
+                # Polygon piece so the rect-edge fix still applies.
+                fixed = new_poly.buffer(0)
+                if fixed.geom_type == "Polygon":
+                    new_poly = fixed
+                    buffer_repaired = True
+                elif (fixed.geom_type == "MultiPolygon"
+                        and not fixed.is_empty):
+                    new_poly = max(
+                        fixed.geoms, key=lambda g: g.area)
+                    buffer_repaired = True
+                else:
+                    new_poly = None
+            if (new_poly is not None
+                    and new_poly.geom_type == "Polygon"
                     and not new_poly.is_empty):
                 shape.polygon = new_poly
+                n_new = len(list(new_poly.exterior.coords)) - 1
+                # Preserve per-vertex altitudes where we can.  When
+                # buffer(0) restructured the ring (vertex order /
+                # count not predictable from the input), fall back
+                # to None and let downstream re-derive.  When Stage
+                # 1 collapsed K vertices but Stage 2 only snapped/
+                # pushed in place, the survivor index list maps the
+                # new ring to the original altitudes 1:1.
+                if shape.node_altitudes is None:
+                    pass
+                elif buffer_repaired:
+                    if len(shape.node_altitudes) - 1 != n_new:
+                        shape.node_altitudes = None
+                elif n_new == len(survivor_idx):
+                    # Closing-vertex repeat: keep one trailing slot.
+                    src = shape.node_altitudes
+                    src_open = (
+                        src[:-1]
+                        if len(src) - 1 == n_v
+                        else src[:n_v])
+                    if len(src_open) == n_v:
+                        new_alts = [src_open[i] for i in survivor_idx]
+                        shape.node_altitudes = (
+                            new_alts + [new_alts[0]]
+                            if new_alts else None)
+                    else:
+                        if len(shape.node_altitudes) - 1 != n_new:
+                            shape.node_altitudes = None
+                else:
+                    if len(shape.node_altitudes) - 1 != n_new:
+                        shape.node_altitudes = None
                 n_modified += 1
         except Exception:
             pass
@@ -5269,6 +5442,27 @@ def _emit_boundary_dem_bridge(
                 except Exception:
                     continue
             if bridge_poly is None:
+                continue
+            # Per user 2026-04-29: bridge polygons must stop 5 m
+            # short of any runway — never connect directly to
+            # runway pavement.  The bridge is a transition strip
+            # between the boundary ribbon and natural terrain;
+            # forcing a runway corner / edge into its outline
+            # would re-introduce sloping-rect-edge vertex
+            # violations and create grade conflicts at the
+            # runway interface.  Subtract a 5 m-buffered runway
+            # union so the bridge keeps a clean gap.
+            try:
+                runway_union = unary_union(
+                    [s.polygon for s in runway_shapes])
+                if runway_union is not None and not runway_union.is_empty:
+                    bridge_poly = bridge_poly.difference(
+                        runway_union.buffer(5.0))
+            except Exception:
+                pass
+            if (bridge_poly.is_empty
+                    or bridge_poly.geom_type
+                    not in ("Polygon", "MultiPolygon")):
                 continue
             # Subtract NON-SLOPING pavement (junctions, terminals)
             # and the boundary ribbon from the bridge.  These can
