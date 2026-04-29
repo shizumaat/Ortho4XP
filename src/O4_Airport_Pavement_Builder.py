@@ -3344,6 +3344,12 @@ def build_airport_pavement(icao: str, xplane_root: str,
 #   Apron: max 1.0 % any direction.
 #   Runway longitudinal: max 1.5 % grade (handled by legacy).
 TAXI_MAX_GRADE = 0.015
+APRON_MAX_GRADE = 0.010   # FAA apron cap, used for the apron-side
+                            # multi-source-Dijkstra cone in
+                            # ``_pin_apron_targets`` and the post-
+                            # pin grade reconciliation.  Tighter
+                            # than the taxi cap so apron polygons
+                            # don't slope > 1 % between vertices.
 TAXI_ANCHOR_DIST_M = 30.0   # snap taxi rect end to runway segment
                              # elevation when within this distance
 
@@ -7244,45 +7250,143 @@ def _solve_pavement_mesh(
 
     n_apron_pinned = 0
     if apron_node_ids:
-        # Single multi-source Dijkstra over the global apron graph.
-        # Each node ends up with the cone of its NEAREST source:
-        # ``[src_elev ± nearest_dist × TAXI_MAX_GRADE]``.  Same
-        # algorithmic shift as the centerline ``propagate_bounds``
-        # — we previously did one Dijkstra per source and intersected
-        # cones, which scales as O(sources × (V+E) log V).  At HECA
-        # there are hundreds of sources and the per-source variant
-        # was tens of seconds; the single-pass multi-source pattern
-        # is one graph traversal regardless of source count.
+        # Per user 2026-04-28: multi-anchor INTERSECTION envelope.
+        # Replaces the previous single-multi-source Dijkstra (which
+        # gave each node only its NEAREST source's cone).  That
+        # left adjacent apron vertices anchored to DIFFERENT
+        # sources at incompatible elevations, producing 4-7 %
+        # grade jumps the smoother could not unwind.
+        #
+        # New approach: run Dijkstra from EACH source separately,
+        # accumulating per-node ``[lo, hi]`` as the intersection of
+        # every reachable source's cone.  Cost is O(sources × (V+E)
+        # log V) but bounded in practice by capping per-node
+        # processed sources at MAX_PER_NODE_SRC_DIST_M so HECA-
+        # scale airports don't pay for far anchors that can't
+        # tighten the envelope further than the linear cap allows.
+        #
+        # Tighter envelope ⇒ apron vertex pinning is forced into a
+        # mutually grade-compliant range from the start, and the
+        # downstream smoother + post-pin reconciliation pass
+        # converge without leaving permanent cliffs.
         import heapq
         INF = float("inf")
         per_lo: Dict[int, float] = {nid: -INF for nid in apron_node_ids}
         per_hi: Dict[int, float] = {nid: INF for nid in apron_node_ids}
+        # Track nearest-source distance (used downstream for
+        # diagnostic / fallback) and value.
         nearest_dist: Dict[int, float] = {nid: INF
                                            for nid in apron_node_ids}
         nearest_val: Dict[int, float] = {nid: 0.0
                                           for nid in apron_node_ids}
-        heap: List[Tuple[float, int, float]] = []
+        # Cap on Dijkstra exploration distance per source.  At
+        # 500 m × 1 % = 5 m envelope half-band — anchors farther
+        # than 500 m can only loosen the envelope, never tighten
+        # it tighter than the existing 5 m bound, so cutting them
+        # off keeps the algorithm O(per-source-Dijkstra) for
+        # local effects only.
+        MAX_PER_SOURCE_DIST_M = 500.0
+
+        # For each apron node, also track the per-source
+        # (distance, elevation) tuples so Step 3 can demote a
+        # specific source when the intersection comes out empty.
+        per_node_sources: Dict[int, List[Tuple[float, float]]] = {
+            nid: [] for nid in apron_node_ids}
+
         for src_nid, src_elev in sources_per_node.items():
-            nearest_dist[src_nid] = 0.0
-            nearest_val[src_nid] = src_elev
-            heapq.heappush(heap, (0.0, src_nid, float(src_elev)))
-        while heap:
-            d, u, val = heapq.heappop(heap)
-            if d > nearest_dist[u]:
-                continue
-            for v, length in apron_graph_adj.get(u, ()):
-                nd = d + length
-                if v in nearest_dist and nd < nearest_dist[v]:
-                    nearest_dist[v] = nd
-                    nearest_val[v] = val
-                    heapq.heappush(heap, (nd, v, val))
+            # Single-source Dijkstra from this source over the
+            # apron graph + linked externals, capped at
+            # MAX_PER_SOURCE_DIST_M.  Update per-node [lo, hi]
+            # by intersecting with this source's cone.
+            dist_from_src: Dict[int, float] = {src_nid: 0.0}
+            heap: List[Tuple[float, int]] = [(0.0, src_nid)]
+            while heap:
+                d, u = heapq.heappop(heap)
+                if d > dist_from_src.get(u, INF):
+                    continue
+                for v, length in apron_graph_adj.get(u, ()):
+                    nd = d + length
+                    if nd > MAX_PER_SOURCE_DIST_M:
+                        continue
+                    if nd < dist_from_src.get(v, INF):
+                        dist_from_src[v] = nd
+                        heapq.heappush(heap, (nd, v))
+            # Apply this source's cone to every reached apron node.
+            for nid, d in dist_from_src.items():
+                if nid not in apron_node_ids:
+                    continue
+                band = d * APRON_MAX_GRADE
+                src_lo = float(src_elev) - band
+                src_hi = float(src_elev) + band
+                if src_lo > per_lo[nid]:
+                    per_lo[nid] = src_lo
+                if src_hi < per_hi[nid]:
+                    per_hi[nid] = src_hi
+                if d < nearest_dist[nid]:
+                    nearest_dist[nid] = d
+                    nearest_val[nid] = float(src_elev)
+                per_node_sources[nid].append((d, float(src_elev)))
+
+        # Step 3: when the intersection is empty, the constraint
+        # set is geometrically infeasible at 1% apron grade —
+        # typically because a HIGH anchor (terminal) and a LOW
+        # anchor (runway corner) are both within the apron's
+        # graph reach and the apron's elevation can't match both.
+        #
+        # Per user 2026-04-28: prefer to RAISE the apron interior
+        # toward the higher anchor (terminal level) and accept a
+        # localized cliff near the runway-corner-shared boundary.
+        # The user's "grass between apron and runway" reasoning:
+        # away from runway corners, the apron pavement should sit
+        # at the higher source's level (terminal); near runway
+        # corners, the runway-corner constraint dominates locally.
+        #
+        # Heuristic:
+        #   * Node within ``LOCAL_RUNWAY_RADIUS_M`` of a low source
+        #     ⇒ use that low source's cone (preserve cliff
+        #     localization near the runway).
+        #   * Node farther than that ⇒ use the HIGHEST source's
+        #     cone (raise the apron toward terminal level).
+        # This produces a raised apron interior with a transition
+        # zone right at the runway-corner boundary, instead of
+        # the runway corner pulling the entire apron down.
+        # 20 m: the typical width of a half-rect; nodes within this
+        # of a low source are sharing or right against the rect's
+        # edge and must respect its elevation locally.  Nodes
+        # farther are "interior apron" and should rise to the
+        # higher source (terminal) per the user's "grass absorbs
+        # the gradient" reasoning.
+        LOCAL_RUNWAY_RADIUS_M = 20.0
         for nid in apron_node_ids:
-            d = nearest_dist[nid]
-            if d == INF:
+            if per_lo[nid] <= per_hi[nid]:
                 continue
-            band = d * TAXI_MAX_GRADE
-            per_lo[nid] = nearest_val[nid] - band
-            per_hi[nid] = nearest_val[nid] + band
+            srcs = per_node_sources[nid]
+            if not srcs:
+                continue
+            # Find any source within LOCAL_RUNWAY_RADIUS_M (these
+            # take priority — they represent direct apron-rect
+            # corner sharing where elevation must match).
+            local_sources = [(d, e) for d, e in srcs
+                              if d <= LOCAL_RUNWAY_RADIUS_M]
+            if local_sources:
+                # Use the closest local source's cone.
+                local_sources.sort()
+                d, e = local_sources[0]
+                band = d * APRON_MAX_GRADE
+                per_lo[nid] = e - band
+                per_hi[nid] = e + band
+            else:
+                # No nearby anchor — pin to the highest source
+                # (raise the apron toward terminal level).  This
+                # respects the user's intent that the apron
+                # should sit near terminal elevation in its
+                # interior, accepting the localized transition
+                # near runway corners.
+                srcs_sorted_high = sorted(srcs, key=lambda t: -t[1])
+                d, e = srcs_sorted_high[0]
+                band = d * APRON_MAX_GRADE
+                per_lo[nid] = e - band
+                per_hi[nid] = e + band
 
         # Pin every apron-EXCLUSIVE node (i.e. not already a source).
         # Target = plane-fit value (smooth across the polygon, free
@@ -7398,7 +7502,11 @@ def _solve_pavement_mesh(
                     if not u_free and not v_free:
                         continue
                     diff = eu - ev
-                    dmax = length * TAXI_MAX_GRADE
+                    # Use the FAA apron cap (1 %) for the
+                    # post-pin reconciliation so the apron grade
+                    # rule is enforced on every internal apron
+                    # edge, matching the cone tightness above.
+                    dmax = length * APRON_MAX_GRADE
                     if abs(diff) <= dmax:
                         continue
                     excess = abs(diff) - dmax
