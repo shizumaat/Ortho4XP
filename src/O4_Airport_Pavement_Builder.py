@@ -3270,11 +3270,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
         _enforce_shared_vertices(
             layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
         # Per user 2026-04-28: junction polygon vertices that
-        # coincide with a runway / sloping-rect corner MUST emit
-        # the rect's altitude tag value.  Run this AFTER all the
-        # shared-vertex / overlap-clip passes since they can
-        # rearrange polygon coords and put node_altitudes out of
-        # sync with the rect's emitted altitude tags.
+        # coincide with a runway / sloping-rect / terminal corner
+        # MUST emit that shape's altitude tag value.  Run this
+        # AFTER all the shared-vertex / overlap-clip passes since
+        # they can rearrange polygon coords and put node_altitudes
+        # out of sync with the rect's emitted altitude tags.
         _snap_junction_altitudes_to_rect_corners(layout)
         # Per user 2026-04-28: junctions sharing a boundary vertex
         # MUST agree on its altitude.  Subdivide / clamp passes can
@@ -3845,31 +3845,144 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     if snapped is not None and not snapped.is_empty:
                         shape.polygon = snapped
 
-    # ── Terminal pad elevations (flat, DEM median) ──────────────
-    # Computed BEFORE the elevation graph so terminal corners can be
-    # anchored in the graph as hard 1.5 %-grade constraints on the
-    # surrounding apron.  The DEM-median terminal elevation pulls
-    # the network UP along the apron-to-terminal interface so the
-    # surrounding pavement maintains grade with the (often-elevated)
-    # terminal pad — letting X-Plane render a real cliff between
-    # the apron's edge and the natural DEM beyond, rather than
-    # forcing a 100 %-slope drop INSIDE the pavement (user 2026-04-24).
+    # ── Terminal pad elevations ─────────────────────────────────
+    # Per user 2026-04-28: CIFP runway thresholds are the ONLY
+    # truly authoritative elevations.  Everything else, including
+    # the terminal altitude, should be derived to satisfy FAA
+    # grade rules with the propagated runway / taxi / apron
+    # values.  The previous DEM-median rule placed terminals on
+    # naturally elevated ground (700.8 m at CYXY) when their
+    # actual apron-side neighbours were 6-8 m lower; the apron-
+    # pin then had to bridge that gap producing 4-7 % grade
+    # violations.
+    #
+    # Rule (per user clarification):
+    #   * Terminal altitude = MAX value that respects
+    #     APRON_MAX_GRADE with every nearby HARD anchor (runway /
+    #     taxi rect corner) at each terminal corner.  Specifically
+    #     at each corner C, max allowed = MIN over nearby
+    #     anchors A of (A.elev + APRON_MAX_GRADE × dist(C, A));
+    #     terminal altitude = MIN over corners.
+    #   * Floor at the highest nearby anchor (don't drop below
+    #     the local terrain just because grade allows it).
+    #   * Ceiling at the DEM-median (don't raise above natural
+    #     ground).
+    #   * Fall back to DEM-median if no anchors are available.
+    runway_corner_pts: List[Tuple[float, float, float]] = []
+    for s in layout.shapes:
+        if s.role not in (
+                ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+                ROLE_CROSS_CONNECTOR):
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            r_coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if r_coords and r_coords[0] == r_coords[-1]:
+            r_coords = r_coords[:-1]
+        if len(r_coords) != 4:
+            continue
+        if (s.altitude_high is not None
+                and s.altitude_low is not None):
+            per = [s.altitude_high, s.altitude_low,
+                   s.altitude_low, s.altitude_high]
+        elif s.altitude is not None:
+            per = [float(s.altitude)] * 4
+        else:
+            continue
+        for (x, y), a in zip(r_coords, per):
+            runway_corner_pts.append(
+                (float(x), float(y), float(a)))
+
+    TERMINAL_NEIGHBOUR_RADIUS_M = 250.0
+    INF = float("inf")
     for shape in layout.shapes:
         if shape.role != ROLE_TERMINAL:
             continue
-        samples: List[float] = []
-        for x, y in [
-            (shape.polygon.centroid.x, shape.polygon.centroid.y)
-        ] + list(shape.polygon.exterior.coords)[:-1]:
+        if shape.polygon is None or shape.polygon.is_empty:
+            continue
+        # DEM-median ceiling (legacy rule).
+        dem_samples: List[float] = []
+        try:
+            t_corners = list(shape.polygon.exterior.coords)
+            if t_corners and t_corners[0] == t_corners[-1]:
+                t_corners = t_corners[:-1]
+        except Exception:
+            t_corners = []
+        for x, y in [(shape.polygon.centroid.x,
+                      shape.polygon.centroid.y)] + t_corners:
             lat, lon = m_to_ll(x, y)
             e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
             if e is not None:
-                samples.append(e)
-        if not samples:
+                dem_samples.append(e)
+        if dem_samples:
+            dem_samples.sort()
+            dem_median = dem_samples[len(dem_samples) // 2]
+        else:
+            dem_median = None
+        # Anchor-based max-allowable rule.
+        new_alt: Optional[float] = None
+        if runway_corner_pts and t_corners:
+            per_corner_max: List[float] = []
+            for cx, cy in t_corners:
+                corner_max = INF
+                hits = 0
+                for ax, ay, ae in runway_corner_pts:
+                    d = math.hypot(cx - ax, cy - ay)
+                    if d > TERMINAL_NEIGHBOUR_RADIUS_M:
+                        continue
+                    allowed = ae + APRON_MAX_GRADE * d
+                    if allowed < corner_max:
+                        corner_max = allowed
+                    hits += 1
+                if hits > 0 and corner_max != INF:
+                    per_corner_max.append(corner_max)
+            if per_corner_max:
+                # Terminal altitude must satisfy the MOST
+                # restrictive corner.
+                max_alt_from_anchors = min(per_corner_max)
+                # Floor at the highest nearby anchor: don't
+                # drop terminal below local pavement just
+                # because grade allows it.
+                anchor_floor = -INF
+                for ax, ay, ae in runway_corner_pts:
+                    # Only consider anchors with at least one
+                    # corner within radius.
+                    for cx, cy in t_corners:
+                        if math.hypot(cx - ax,
+                                      cy - ay) <= TERMINAL_NEIGHBOUR_RADIUS_M:
+                            if ae > anchor_floor:
+                                anchor_floor = ae
+                            break
+                candidate = max_alt_from_anchors
+                if anchor_floor != -INF and candidate < anchor_floor:
+                    candidate = anchor_floor
+                # Ceiling at DEM-median (don't raise above
+                # natural ground).
+                if (dem_median is not None
+                        and candidate > dem_median):
+                    candidate = dem_median
+                new_alt = round(float(candidate), 1)
+        if new_alt is None and dem_median is not None:
+            new_alt = round(float(dem_median), 1)
+        if new_alt is None:
             continue
-        samples.sort()
-        median = samples[len(samples) // 2]
-        shape.altitude = round(median, 1)
+        shape.altitude = new_alt
+        try:
+            import sys as _sys
+            dem_str = (f"{dem_median:.1f}" if dem_median is not None
+                       else "n/a")
+            _sys.stderr.write(
+                f"  [pav-builder] terminal({shape.ref or '?'}) "
+                f"altitude {new_alt} m (max grade-compliant from "
+                f"runway corners within "
+                f"{TERMINAL_NEIGHBOUR_RADIUS_M:.0f} m, "
+                f"DEM-median ceiling = {dem_str}).\n")
+        except Exception:
+            pass
 
     # ── Taxi rect elevations via grade-compliant network ────────
     # Build a graph of OSM taxi centerlines + runway segment
@@ -5181,6 +5294,126 @@ def _smooth_within_junction_adjacent_pair_grade(
     return n_changed_total
 
 
+def _rederive_terminal_altitude_from_apron_neighbours(
+        layout: "PavementLayout",
+        sample_radius_m: float = 250.0,
+        ) -> int:
+    """Re-derive each terminal's altitude from the HARD-anchored
+    sloping rect corners (runway / taxi) within
+    ``sample_radius_m`` of the terminal — NOT from DEM under the
+    terminal pad and NOT from apron-pinned vertices (which are
+    self-referential to the old terminal altitude).
+
+    Per user 2026-04-28: at CYXY the terminal's DEM-median was
+    700.8 m, but the apron actually borders runway 02 (694 m) on
+    the south and taxiway F (~692 m) on the north.  The terminal
+    sits on naturally elevated ground that the apron pavement
+    doesn't reach.  Forcing terminal to its DEM altitude forced
+    the apron-pin step to bridge a 7 m gap over short distances,
+    producing 4-7 % grade violations.
+
+    Sampling only HARD-anchored sloping rect corners (whose
+    elevations come from CIFP runway thresholds + chained
+    grade-compliant interpolation, NOT from the terminal) breaks
+    the self-reference.  The median of those anchors gives a
+    terminal altitude consistent with the apron's actual
+    elevation range — the apron's grade then flattens naturally
+    because all four boundary classes (terminal, runway, taxi,
+    junction) end up within a few metres of each other.
+
+    Returns the number of terminal altitudes changed.
+    """
+    sloping_rect_roles = {
+        ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+        ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+        ROLE_CROSS_CONNECTOR,
+    }
+    hard_pts: List[Tuple[float, float, float]] = []
+    for s in layout.shapes:
+        if s.role not in sloping_rect_roles:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        if (s.altitude_high is not None
+                and s.altitude_low is not None):
+            per = [s.altitude_high, s.altitude_low,
+                   s.altitude_low, s.altitude_high]
+        elif s.altitude is not None:
+            per = [float(s.altitude)] * 4
+        else:
+            continue
+        for (x, y), a in zip(coords, per):
+            hard_pts.append((float(x), float(y), float(a)))
+    if not hard_pts:
+        return 0
+
+    n_changed = 0
+    radius2 = sample_radius_m * sample_radius_m
+    for s in layout.shapes:
+        if s.role != ROLE_TERMINAL:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            t_boundary = s.polygon.boundary
+        except Exception:
+            t_boundary = None
+        from shapely.geometry import Point as _P
+        nearby: List[Tuple[float, float]] = []  # (distance, elev)
+        for px, py, pa in hard_pts:
+            try:
+                if t_boundary is not None:
+                    d = t_boundary.distance(_P(px, py))
+                else:
+                    d = math.hypot(
+                        px - s.polygon.centroid.x,
+                        py - s.polygon.centroid.y)
+            except Exception:
+                continue
+            if d * d > radius2:
+                continue
+            nearby.append((d, pa))
+        if not nearby:
+            continue
+        # Median of the elevations weighted by inverse distance —
+        # closer hard anchors carry more weight.  Equivalent to
+        # "what elevation do the closest hard anchors agree on?"
+        # Take the median for robustness against outliers (e.g. a
+        # nearby runway-32L corner at 706 m on the OTHER side of
+        # the airport that happens to fall within the radius via
+        # straight-line distance).
+        nearby.sort()
+        # Use just the closest 6 anchors to anchor on local
+        # terrain rather than the airport-wide elevation range.
+        closest = nearby[:6] if len(nearby) > 6 else nearby
+        elevs = sorted(e for _d, e in closest)
+        median = elevs[len(elevs) // 2]
+        new_alt = round(float(median), 1)
+        old_alt = s.altitude
+        if old_alt is None or abs(old_alt - new_alt) >= 0.05:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [pav-builder] terminal({s.ref or '?'}) "
+                    f"altitude {old_alt} → {new_alt} m "
+                    f"(median of {len(closest)} closest hard "
+                    f"anchors within {sample_radius_m:.0f} m; "
+                    f"replaces DEM-median).\n")
+            except Exception:
+                pass
+            s.altitude = new_alt
+            n_changed += 1
+    return n_changed
+
+
 def _enforce_shared_vertex_altitudes(
         layout: "PavementLayout") -> int:
     """For every vertex bucket shared by ≥ 2 shapes, force every
@@ -5265,6 +5498,12 @@ def _snap_junction_altitudes_to_rect_corners(
         ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
         ROLE_SECONDARY_PARALLEL, ROLE_STUB,
         ROLE_CROSS_CONNECTOR,
+        # Per user 2026-04-28: terminal corners also propagate
+        # to apron / junction vertices at the same bucket.  The
+        # terminal is FLAT at ``s.altitude`` and the apron must
+        # match at every shared corner — otherwise X-Plane
+        # renders a step where the apron meets the terminal pad.
+        ROLE_TERMINAL,
     }
     for s in layout.shapes:
         if s.role not in sloping_rect_roles_for_snap:
@@ -5277,10 +5516,11 @@ def _snap_junction_altitudes_to_rect_corners(
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
-        if len(coords) != 4:
-            continue
+        # Sloping rects (4-corner with altitude_high/low) — apply
+        # per-corner altitudes.
         if (s.altitude_high is not None
-                and s.altitude_low is not None):
+                and s.altitude_low is not None
+                and len(coords) == 4):
             for i, (cx, cy) in enumerate(coords):
                 b = _corner_elevation_bucket(cx, cy)
                 e = (s.altitude_high
@@ -5292,6 +5532,8 @@ def _snap_junction_altitudes_to_rect_corners(
                 # disagreeing about the canonical altitude.
                 rwy_corner_alt.setdefault(b, float(e))
         elif s.altitude is not None:
+            # Flat shapes (terminal pads, pre-elevation rects).
+            # Any number of vertices; all share a single altitude.
             for (cx, cy) in coords:
                 b = _corner_elevation_bucket(cx, cy)
                 rwy_corner_alt.setdefault(b, float(s.altitude))
