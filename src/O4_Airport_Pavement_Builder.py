@@ -3269,6 +3269,13 @@ def build_airport_pavement(icao: str, xplane_root: str,
         _drop_overlap_against_fixed_shapes(layout, icao=icao)
         _enforce_shared_vertices(
             layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
+        # The overlap-clip pass introduces new vertices at
+        # intersection points that may land on a taxi rect's
+        # edge interior (would split the rect's altitude_high/
+        # altitude_low convention at render time).  Push any
+        # such vertex off — pure geometry, doesn't touch
+        # elevations.
+        _push_junction_vertices_off_taxi_rect_edges(layout)
         # Per user 2026-04-28: junction polygon vertices that
         # coincide with a runway / sloping-rect / terminal corner
         # MUST emit that shape's altitude tag value.  Run this
@@ -3984,167 +3991,58 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         except Exception:
             pass
 
-    # ── Taxi rect elevations via grade-compliant network ────────
-    # Build a graph of OSM taxi centerlines + runway segment
-    # endpoints, densified to ≤ 30 m edges.  CIFP runway
-    # thresholds anchor the graph; bounds propagation + Laplacian
-    # smoothing produce a grade-compliant elevation surface over
-    # the network.  Each rect's two short edges take their
-    # altitude from sampling that network at the rect's axis
-    # endpoints.
-    graph = _build_elevation_network(
-        osm_nodes, osm_ways, to_m,
-        runway_segment_chain, layout.anchor, dem, tile_lat, tile_lon)
-    if graph is not None:
-        # Anchor terminal pad corners in the elevation graph so the
-        # surrounding apron is forced grade-compliant w.r.t. the
-        # terminal level.  Each corner becomes a graph node
-        # connected to its nearest existing graph node by a bridge
-        # of length = straight-line distance, capping per-edge
-        # elev diff at 1.5 % × bridge length.
-        _add_terminal_anchors(graph, layout)
-        # Add cross-junction bridges so smoothing enforces 1.5 %
-        # grade across junction diagonals — not just along
-        # centerline routes.  Must run BEFORE propagate_bounds so
-        # the new edges contribute to per-node feasibility cones.
-        _add_junction_bridges(graph, layout)
-        # Per user 2026-04-28: anchor every centerline-graph node
-        # inside a large apron (≥ 5 000 m²) at the apron's plane-
-        # fit DEM.  Without this, a taxi rect inside an apron has
-        # its elevation pulled toward the far-away runway threshold
-        # via 1.5 % grade-cap, which can leave the rect 4+ m below
-        # the surrounding apron's natural DEM elevation.  CYXY's
-        # E south primary parallel was at 712 m (CIFP-cone-derived)
-        # while the surrounding SW apron sits at 715-718 m DEM.
-        n_apron_anchors = _add_apron_anchors(
-            graph, layout, dem, tile_lat, tile_lon, layout.anchor)
-        if n_apron_anchors:
-            try:
-                import sys as _sys
-                _sys.stderr.write(
-                    f"  [pav-builder] anchored {n_apron_anchors} "
-                    f"centerline-graph node(s) at apron plane-fit "
-                    f"DEM elevation.\n")
-            except Exception:
-                pass
-        graph.propagate_bounds()
-        graph.choose_values()
-        graph.smooth_rate_of_change(iters=30)
-        # ── Plateau detection + snap ───────────────────────────
-        # User 2026-04-25: identify shallow regions of the
-        # smoothed surface (edges with grade < PLATEAU_FLATNESS_GRADE)
-        # and snap each connected component to its median elevation.
-        # The result: most of the apron sits at a few discrete
-        # plateau elevations connected by short ramp segments,
-        # rather than continuously varying.  Rects entirely within
-        # a plateau emit as FLAT (single altitude tag); junctions
-        # within a plateau pass the existing FLAT classifier
-        # automatically (vertex elevations all match the plateau).
-        # Triangulation is reserved for compound-slope regions
-        # crossing multiple plateaus.
-        _, _soft_anchored = _snap_plateaus(graph)
-        # Post-plateau bridge enforcement (2026-04-26): each
-        # plateau cluster's boundary check ran while OTHER
-        # clusters were still pre-snap, so cross-cluster bridges
-        # can end up violating after both commit.  Walk every
-        # edge between two anchors; demote SOFT-anchored
-        # endpoints involved in violations so the next smoothing
-        # pass can pull them into compliance.  Hard anchors
-        # (CIFP runway thresholds) are never demoted.
-        n_demoted, n_hard_avg = _demote_violating_soft_anchors(
-            graph, _soft_anchored)
-        if n_demoted or n_hard_avg:
-            try:
-                import sys as _sys
-                _sys.stderr.write(
-                    f"  [pav-builder] {icao}: post-plateau bridge "
-                    f"reconciliation — demoted {n_demoted} soft "
-                    f"anchors, averaged {n_hard_avg} hard-vs-hard "
-                    f"violating pairs.\n")
-            except Exception:
-                pass
-        # Re-smooth ramps between plateaus.  Plateau nodes are
-        # now hard anchors; this run enforces 1.5 % grade on the
-        # transition ramps between them.
-        graph.propagate_bounds()
-        graph.choose_values()
-        graph.smooth_rate_of_change(iters=30)
-        taxi_roles = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
-                      ROLE_STUB, ROLE_CROSS_CONNECTOR}
-        for shape in layout.shapes:
-            if shape.role not in taxi_roles:
-                continue
-            if shape.source_axis is None:
-                continue
-            coords = list(shape.source_axis.coords)
-            if len(coords) < 2:
-                continue
-            p1, p2 = coords[0], coords[-1]
-            e1 = graph.elevation_at(p1[0], p1[1])
-            e2 = graph.elevation_at(p2[0], p2[1])
-            # DEM fallback when network couldn't serve a point
-            # (e.g. walking-exit stubs whose axis sits off-network).
-            if e1 is None:
-                lat, lon = m_to_ll(p1[0], p1[1])
-                e1 = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-            if e2 is None:
-                lat, lon = m_to_ll(p2[0], p2[1])
-                e2 = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-            if e1 is None and e2 is None:
-                continue
-            if e1 is None:
-                e1 = e2
-            if e2 is None:
-                e2 = e1
-            # Defensive within-rect grade cap (should already be
-            # satisfied by network but catches the DEM-fallback
-            # and mixed cases).
-            axis_len = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-            if axis_len > 1.0:
-                dmax = axis_len * TAXI_MAX_GRADE
-                diff = e1 - e2
-                if abs(diff) > dmax:
-                    mean = (e1 + e2) / 2.0
-                    sign = 1 if diff > 0 else -1
-                    e1 = mean + (dmax / 2.0) * sign
-                    e2 = mean - (dmax / 2.0) * sign
-            eh = max(e1, e2)
-            el = min(e1, e2)
-            if abs(eh - el) >= 0.1:
-                shape.altitude_high = round(eh, 1)
-                shape.altitude_low = round(el, 1)
-                # Earlier pipeline stages may have permuted the
-                # polygon ring.  Always re-derive the ring order
-                # from the 4 raw corner positions so that the
-                # X-Plane patch convention (corners 0,3 = high
-                # short edge, 1,2 = low short edge) holds.
-                _orient_rect_for_altitude(shape, p1, p2, e1, e2)
-            else:
-                shape.altitude = round((eh + el) / 2.0, 1)
+    # ── Phase D: Geometric refinement + unified elevation solve ─
+    # Run the geometric polygon-refinement passes (junction edge
+    # push, triangulation, clamp, subdivide) interleaved with two
+    # unified-Laplacian passes — see
+    # ``_apply_geometric_finalization`` for the full sequence.
+    # This replaces the previous bottom-up DEM-driven pipeline
+    # (centerline graph + propagate_bounds + smooth_rate_of_change
+    # + plateau snap + apron-pin + post-pin reconciliation).
+    _apply_geometric_finalization(
+        layout, icao, dem, tile_lat, tile_lon, m_to_ll)
 
-    # ── Keep junction polygons off taxi rect edges ──────────────
-    # User rule (2026-04-24): a junction may join an
-    # altitude_high/altitude_low rect only at the 4 rect corners.
-    # Any junction vertex landing mid-edge of a rect would be
-    # split into the rect's ring at render time and break the
-    # rect's 4-corner slope convention.
-    #
-    # Implementation: walk each junction's ring; for each vertex
-    # that's within ``TAXI_EDGE_TOL_M`` of a taxi rect edge but
-    # NOT within ``TAXI_CORNER_TOL_M`` of one of that rect's four
-    # corners, push the vertex outward by ``TAXI_EDGE_GAP_M``
-    # perpendicular to the offending edge.  Vertices near a
-    # corner snap exactly to the corner instead, preserving
-    # shared-vertex connectivity at rect ends.
-    TAXI_EDGE_TOL_M = 0.5
-    TAXI_CORNER_TOL_M = 2.0
-    TAXI_EDGE_GAP_M = 1.0
-    taxi_roles_set = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
-                      ROLE_STUB, ROLE_CROSS_CONNECTOR}
-    # Collect (polygon, 4 corner tuples) for each taxi rect.
-    taxi_rect_info: List[Tuple[Polygon, List[Tuple[float, float]]]] = []
+    # ── Phase E: Diagnostics ────────────────────────────────────
+    # Layer 3 (2026-04-26): scan every emitted polygon for any
+    # within-shape vertex pair grade > TAXI_MAX_GRADE.  Surface a
+    # WARN summary so regressions are visible during iteration —
+    # not yet a hard fail (would drop too much coverage at HECA-
+    # complexity airports while Layers 1/2 are still maturing).
+    _report_within_shape_violations(layout, icao)
+
+
+def _push_junction_vertices_off_taxi_rect_edges(
+        layout: "PavementLayout",
+        edge_tol_m: float = 0.5,
+        corner_tol_m: float = 2.0,
+        edge_gap_m: float = 1.0,
+        ) -> int:
+    """Per the user 2026-04-24 invariant: a junction polygon may
+    share a vertex with a taxi rect ONLY at one of the rect's 4
+    corners.  A junction vertex landing on the INTERIOR of a rect
+    edge would split that edge at render time and break the rect's
+    altitude_high/altitude_low slope convention.
+
+    For every junction ring vertex:
+      * If it lies within ``corner_tol_m`` of a rect corner, snap
+        to that exact corner (preserves shared-vertex
+        connectivity at rect ends).
+      * Else if it lies within ``edge_tol_m`` of a rect edge
+        interior, push it perpendicular to the edge by
+        ``edge_gap_m`` so it sits OUTSIDE the rect.
+      * Otherwise: leave it.
+
+    Geometric only: doesn't touch elevations.  Returns the number
+    of junction polygons modified.
+    """
+    taxi_roles = {
+        ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+        ROLE_STUB, ROLE_CROSS_CONNECTOR}
+    rects: List[Tuple[Polygon, List[Tuple[float, float]]]] = []
     for s in layout.shapes:
-        if s.role not in taxi_roles_set:
+        if s.role not in taxi_roles:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
             continue
         try:
             coords = list(s.polygon.exterior.coords)
@@ -4154,174 +4052,147 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             continue
         if len(coords) != 4:
             continue
-        taxi_rect_info.append((s.polygon, coords))
+        rects.append((s.polygon, coords))
+    if not rects:
+        return 0
 
-    def _fix_junction_vertex(x: float, y: float) -> Tuple[float, float]:
-        """If (x,y) is close to a taxi rect edge but not close to
-        one of its 4 corners, return a pushed-outward position."""
-        for rect_poly, corners in taxi_rect_info:
-            # Check corners first — if close, snap exactly.
+    corner_tol2 = corner_tol_m * corner_tol_m
+
+    def _fix(x: float, y: float) -> Tuple[float, float]:
+        for rect_poly, corners in rects:
             for cx, cy in corners:
-                if (x - cx) ** 2 + (y - cy) ** 2 <= (
-                        TAXI_CORNER_TOL_M ** 2):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= corner_tol2:
                     return (cx, cy)
-            # For each of 4 edges, check mid-edge proximity.
             for i in range(4):
                 ax, ay = corners[i]
                 bx, by = corners[(i + 1) % 4]
-                dx = bx - ax; dy = by - ay
+                dx = bx - ax
+                dy = by - ay
                 seg_len_sq = dx * dx + dy * dy
                 if seg_len_sq <= 0.01:
                     continue
                 t = ((x - ax) * dx + (y - ay) * dy) / seg_len_sq
                 if t <= 0.001 or t >= 0.999:
-                    continue  # at an endpoint, handled by corner check
+                    continue
                 cx_proj = ax + t * dx
                 cy_proj = ay + t * dy
                 d = math.hypot(x - cx_proj, y - cy_proj)
-                if d > TAXI_EDGE_TOL_M:
+                if d > edge_tol_m:
                     continue
-                # Perpendicular to edge, pointing AWAY from the
-                # rect interior.  Try both ±perp and pick the one
-                # whose (proj + perp) is outside the rect polygon.
                 seg_len = math.sqrt(seg_len_sq)
                 perp_x = -dy / seg_len
                 perp_y = dx / seg_len
-                # Test which side is outside: move a tiny step in
-                # each direction and check containment.
+                # Pick the perpendicular direction that lies
+                # OUTSIDE the rect.
                 test_x = cx_proj + perp_x * 0.1
                 test_y = cy_proj + perp_y * 0.1
                 if rect_poly.contains(Point(test_x, test_y)):
                     perp_x = -perp_x
                     perp_y = -perp_y
-                return (cx_proj + perp_x * TAXI_EDGE_GAP_M,
-                        cy_proj + perp_y * TAXI_EDGE_GAP_M)
+                return (cx_proj + perp_x * edge_gap_m,
+                        cy_proj + perp_y * edge_gap_m)
         return (x, y)
 
-    if taxi_rect_info:
-        for shape in layout.shapes:
-            if shape.role != ROLE_JUNCTION:
-                continue
-            try:
-                ring = list(shape.polygon.exterior.coords)
-            except Exception:
-                continue
-            changed = False
-            new_ring = []
-            for (vx, vy) in ring:
-                nx, ny = _fix_junction_vertex(vx, vy)
-                if (nx, ny) != (vx, vy):
-                    changed = True
-                new_ring.append((nx, ny))
-            if not changed:
-                continue
-            # Rebuild polygon.
-            try:
-                new_poly = Polygon(new_ring,
-                                    list(shape.polygon.interiors))
-                if not new_poly.is_valid:
-                    new_poly = new_poly.buffer(0)
-                if (new_poly.geom_type == "Polygon"
-                        and not new_poly.is_empty):
-                    shape.polygon = new_poly
-            except Exception:
-                pass
-
-    # ── Junction triangulation ──────────────────────────────────
-    # Each junction polygon is replaced with N-2 ear-clip
-    # triangles, each carrying a per-vertex elevation list
-    # (``node_altitudes``).  Vertex elevations come from the
-    # corner-elevation bucket map (rect/runway/terminal corners
-    # share node ids with junction boundary vertices), with
-    # graph and DEM fallbacks for boundary-trace vertices.  X-Plane
-    # interpolates linearly across each triangle, giving the
-    # multi-directional slope behaviour the user requested.
-    _triangulate_junctions(layout, graph, dem, tile_lat, tile_lon, m_to_ll)
-
-    # ── Global pavement mesh ────────────────────────────────────
-    # Build one mesh covering every pavement shape's boundary —
-    # nodes are unique vertex buckets, edges are ring adjacency
-    # plus cross-shape adjacency at shared buckets.  ANCHORED ONLY
-    # on runway corner buckets (CIFP-derived elevations are the
-    # sole HARD truth); every other node is free to be moved by
-    # the smoother to satisfy 2D Euclidean grade compliance with
-    # its neighbours.  After solving, each shape's altitude tags
-    # are rewritten from the mesh values.  Per the user 2026-04-26
-    # principle: only runways are HARD; taxi rect / terminal
-    # altitudes derived earlier from the centerline graph are
-    # initial seeds that the mesh can refine.
-    runway_anchors = _runway_corner_elev_map(layout)
-    # Augment with junction corners that sit close to (but not
-    # exactly at) a runway polygon — see ``_near_runway_anchor_map``.
-    near_runway_anchors = _near_runway_anchor_map(layout)
-    for _b, _e in near_runway_anchors.items():
-        runway_anchors.setdefault(_b, _e)
-    if runway_anchors:
+    n_modified = 0
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            continue
         try:
-            mesh, bucket_to_node = _build_pavement_mesh(
-                layout, runway_anchors, dem,
-                tile_lat, tile_lon)
-            _solve_pavement_mesh(mesh, layout, bucket_to_node)
-            _writeback_pavement_mesh(layout, mesh, bucket_to_node)
-        except Exception as exc:
-            try:
-                import sys as _sys
-                _sys.stderr.write(
-                    f"  [pav-builder] WARN: {icao}: global pavement "
-                    f"mesh solve failed ({exc}); falling back to "
-                    f"per-shape elevations.\n")
-            except Exception:
-                pass
-    # Layer 2 (2026-04-26): clamp each junction's free boundary
-    # vertices to be grade-compliant with EVERY nearby boundary
-    # of EVERY other shape.  Iterate to a fixed point (constraints
-    # depend on neighbour elevations that are themselves being
-    # clamped — one pass settles only the "obvious" violations,
-    # later passes reconcile cascading effects).
-    #
-    # The geometry-only state (spatial grid + shared-bucket set)
-    # is invariant across this 8-iteration loop — only elevations
-    # change.  Build once, reuse.  Saves ~7 redundant grid builds
-    # at HECA where each build has 5 k+ boundary edges.
+            ring = list(shape.polygon.exterior.coords)
+        except Exception:
+            continue
+        new_ring = []
+        changed = False
+        for vx, vy in ring:
+            nx, ny = _fix(vx, vy)
+            if (nx, ny) != (vx, vy):
+                changed = True
+            new_ring.append((nx, ny))
+        if not changed:
+            continue
+        try:
+            new_poly = Polygon(new_ring,
+                                list(shape.polygon.interiors))
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if (new_poly.geom_type == "Polygon"
+                    and not new_poly.is_empty):
+                shape.polygon = new_poly
+                n_modified += 1
+        except Exception:
+            pass
+    return n_modified
+
+
+def _apply_geometric_finalization(
+        layout: "PavementLayout",
+        icao: str,
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        m_to_ll,
+        ) -> None:
+    """Run the geometric polygon-refinement passes interleaved
+    with two unified-solver passes:
+
+      Phase 1: pre-solve geometry
+        * Push junction vertices off taxi-rect edge interiors.
+        * Triangulate junctions (each replaced with N-2 ear-clip
+          triangles, initial node_altitudes from corner-elev map
+          + DEM).
+
+      Phase 2: first unified-solver pass
+        Establishes a grade-compliant elevation field on the
+        existing geometry.  These are the elevations the
+        clamp + subdivide passes use to detect grade violations.
+
+      Phase 3: clamp + subdivide based on real elevations
+        * ``_clamp_junction_free_vertices``: tighten free
+          boundary vertices to grade-comply with neighbours.
+        * ``_subdivide_violating_junctions``: split any junction
+          whose worst-pair grade exceeds the subdivision
+          threshold along a perpendicular cut.
+        * Re-push junction vertices off rect edges (subdivision
+          can add new vertices on rect edges).
+        * Re-clamp.
+
+      Phase 4: second unified-solver pass
+        Re-solves elevations on the refined geometry — produces
+        the final FAA-compliant elevation field.
+    """
+    # Phase 1: pre-solve geometry.
+    _push_junction_vertices_off_taxi_rect_edges(layout)
+    # Triangulate without an elevation-graph (graph=None) — initial
+    # node_altitudes come from corner-elev map + DEM fallback.
+    _triangulate_junctions(
+        layout, None, dem, tile_lat, tile_lon, m_to_ll)
+
+    # Phase 2: first unified-solver pass (real elevations on the
+    # current geometry — clamp + subdivide need these to detect
+    # grade violations, not DEM-noisy fallbacks).
+    _solve_pavement_elevations_unified(layout, icao)
+
+    # Phase 3: clamp + subdivide based on the real elevations.
     clamp_geom = _build_clamp_geom_state(layout)
     for _ in range(8):
         n = _clamp_junction_free_vertices(layout, clamp_geom)
         if n == 0:
             break
-    # Junction subdivision (2026-04-26, refined): the
-    # perpendicular-cut pass now snaps new cut-line vertices to
-    # existing ring vertices within SUBDIVIDE_SNAP_RADIUS_M and
-    # only commits the split when ALL sub-polygons have a smaller
-    # worst within-shape grade than the parent.  Iterates to a
-    # fixed point (cap 4 passes); a sub-polygon may itself need
-    # further subdivision if it still has incompatible anchors.
     for _ in range(4):
         n = _subdivide_violating_junctions(layout)
         if n == 0:
             break
-    # Re-clamp free vertices after subdivision (the few new
-    # cut-line vertices that COULDN'T snap inherit interpolated
-    # elevations and may benefit from neighbour-clamping).
-    # Subdivision may have ADDED vertices, so rebuild the geom
-    # state once before this loop.  The 4-iter loop itself reuses.
+    # Subdivision may introduce vertices on rect edge interiors.
+    _push_junction_vertices_off_taxi_rect_edges(layout)
     clamp_geom = _build_clamp_geom_state(layout)
     for _ in range(4):
         n = _clamp_junction_free_vertices(layout, clamp_geom)
         if n == 0:
             break
-    # Per user 2026-04-28: unified constrained-Laplacian elevation
-    # solver.  Runs after the existing pipeline (overriding its
-    # values for non-runway pavement) to produce a top-down,
-    # CIFP-anchored elevation field that satisfies FAA grade rules
-    # by construction.
-    _solve_pavement_elevations_unified(layout, icao)
 
-    # Layer 3 (2026-04-26): scan every emitted polygon for any
-    # within-shape vertex pair grade > TAXI_MAX_GRADE.  Surface a
-    # WARN summary so regressions are visible during iteration —
-    # not yet a hard fail (would drop too much coverage at HECA-
-    # complexity airports while Layers 1/2 are still maturing).
-    _report_within_shape_violations(layout, icao)
+    # Phase 4: second unified-solver pass (final elevations on
+    # refined geometry).
+    _solve_pavement_elevations_unified(layout, icao)
 
 
 def _solve_pavement_elevations_unified(
