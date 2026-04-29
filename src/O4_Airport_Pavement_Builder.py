@@ -7068,9 +7068,34 @@ def _decompose_polygon_with_holes(polygon: Polygon,
                                   max_depth: int = 8
                                   ) -> List[Polygon]:
     """Return a list of simple (no-hole) polygons that tile the
-    same area as ``polygon``.  Cuts horizontally through each
-    hole's centroid using shapely.ops.split, recursing on each
-    side."""
+    same area as ``polygon``.  Cuts through each hole's centroid
+    along a direction chosen to follow the hole's natural axes (or
+    the centroid-spread of multiple holes), then recurses on each
+    side.
+
+    Per user 2026-04-28: previous implementation always cut
+    horizontally, which produced thin (~2–12 m) strips between
+    parallel taxi-rect holes whose y-centroids happened to be
+    close.  Those strips were arbitrary geometric artifacts —
+    their cut edges didn't follow any real pavement feature —
+    and required a downstream merge band-aid to suppress.  The
+    new policy:
+
+      * Multiple holes ⇒ cut PERPENDICULAR to the centroid-spread
+        direction.  When holes are spread along x (typical
+        parallel-taxiway apron), the cut runs vertically BETWEEN
+        the holes rather than horizontally between two close
+        cut lines.
+      * Single hole ⇒ cut along the hole's MRR long axis.  The
+        cut is collinear with the rect's natural orientation and
+        produces two pieces straddling the rect rather than
+        slicing it across.
+
+    Both rules align cut lines with real geometric features
+    (rect axes, hole-cluster alignment) instead of an arbitrary
+    horizontal direction.  The thin-piece merge fallback is kept
+    at a small threshold purely for floating-point sliver clean-up.
+    """
     from shapely.ops import split as _shp_split
     from shapely.geometry import LineString as _LS
 
@@ -7083,14 +7108,61 @@ def _decompose_polygon_with_holes(polygon: Polygon,
         # rather than retry forever.  Should never trigger for
         # realistic airport geometry.
         return [Polygon(polygon.exterior.coords)]
-    # Pick the largest remaining hole and slice horizontally
-    # through its centroid.
+    # Pick the largest remaining hole — it'll be on one side of
+    # the cut after slicing.
     interiors = list(polygon.interiors)
     interiors.sort(key=lambda h: -Polygon(h).area)
     hole = interiors[0]
+    cx = float(hole.centroid.x)
     cy = float(hole.centroid.y)
     minx, miny, maxx, maxy = polygon.bounds
-    cut = _LS([(minx - 1.0, cy), (maxx + 1.0, cy)])
+
+    # Decide cut direction.  The cut is a line through the hole
+    # centroid; ``angle_rad`` is the angle of the cut LINE (not
+    # the perpendicular), measured from +x.  Default = horizontal.
+    angle_rad = 0.0
+    if len(interiors) >= 2:
+        # Multi-hole: cut perpendicular to the centroid-spread
+        # axis so the cut SEPARATES the holes rather than slicing
+        # parallel to their alignment.  E.g. holes spread along
+        # +x → cut vertically (angle = π/2) between them.
+        cs = [h.centroid for h in interiors]
+        x_spread = max(c.x for c in cs) - min(c.x for c in cs)
+        y_spread = max(c.y for c in cs) - min(c.y for c in cs)
+        # We want the cut LINE to be perpendicular to the spread
+        # direction.  spread_along_x ⇒ cut vertical (π/2);
+        # spread_along_y ⇒ cut horizontal (0).
+        if x_spread > y_spread:
+            angle_rad = math.pi / 2.0  # vertical
+        else:
+            angle_rad = 0.0            # horizontal
+    else:
+        # Single hole: cut along its MRR long-axis direction.
+        try:
+            mrr = hole.minimum_rotated_rectangle
+            if (mrr is not None and not mrr.is_empty
+                    and mrr.geom_type == "Polygon"):
+                mc = list(mrr.exterior.coords)
+                if len(mc) >= 5:
+                    sides = []
+                    for i in range(4):
+                        ax, ay = mc[i]
+                        bx, by = mc[i + 1]
+                        sides.append(
+                            (math.hypot(bx - ax, by - ay),
+                             math.atan2(by - ay, bx - ax)))
+                    sides.sort(reverse=True)
+                    angle_rad = sides[0][1]
+        except Exception:
+            angle_rad = 0.0
+
+    # Build a cut line through (cx, cy) at angle_rad, extended well
+    # past the polygon bounds on both sides.
+    span = max(maxx - minx, maxy - miny) + 2.0
+    dx = math.cos(angle_rad)
+    dy = math.sin(angle_rad)
+    cut = _LS([(cx - span * dx, cy - span * dy),
+               (cx + span * dx, cy + span * dy)])
     try:
         result = _shp_split(polygon, cut)
     except Exception:
@@ -7107,25 +7179,15 @@ def _decompose_polygon_with_holes(polygon: Polygon,
             continue
         pieces.extend(_decompose_polygon_with_holes(
             g, min_area_m2=min_area_m2, max_depth=max_depth - 1))
-    # Per user 2026-04-28: when a polygon has multiple holes at
-    # close y-centroids (typical when widened runway segments +
-    # taxi rects produce nearby holes), the recursive horizontal
-    # cuts can leave thin (~ 2 m thick) horizontal strips between
-    # cut lines.  In X-Plane those strips render as cliffs because
-    # adjacent corners on a 2 m-thick polygon can have several
-    # metres of elevation difference (the apron-pin's nearest-
-    # source cone is ill-conditioned for such thin geometry).
-    # Merge any piece thinner than ``MIN_PIECE_THICKNESS_M`` into
-    # its largest-shared-boundary neighbour so the apron stays
-    # one continuous polygon.
-    # Per user 2026-04-28: bumped from 4 m to 8 m after catching a
-    # 5 m × 67 m strip (CYXY -10110) that sat between two aprons
-    # at very different elevations and rendered a ~5 m cliff in
-    # X-Plane.  Strips up to ~8 m thick can still arise from
-    # multiple horizontal hole-centroid cuts and produce visible
-    # cliffs; merging them all into the larger neighbour is safer
-    # than emitting micro-aprons.
-    MIN_PIECE_THICKNESS_M = 8.0
+    # Sliver clean-up: smart-cut alignment eliminates the most
+    # egregious wide-band strips (5 m × 67 m, 10 m × 119 m) that
+    # appeared with horizontal-only cuts, but recursive splits can
+    # still leave narrow corner slivers when a hole's MRR axis
+    # nearly parallels a polygon edge.  Merge anything thinner
+    # than 12 m into its largest-shared-boundary neighbour so the
+    # apron stays one continuous polygon and we don't get
+    # cliff-rendering on thin corners.
+    MIN_PIECE_THICKNESS_M = 12.0
     pieces = _merge_thin_decomposed_pieces(
         pieces, min_thickness_m=MIN_PIECE_THICKNESS_M)
     return pieces

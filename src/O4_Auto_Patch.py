@@ -881,14 +881,34 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     sample_pts.append((s_lat, s_lon, elev_phys_b, True))
                     continue
 
-                # Interior point: use DEM if available, else interpolate
-                dem_val = _sample_dem(s_lat, s_lon)
-                if dem_val is not None:
-                    sample_pts.append((s_lat, s_lon, dem_val, False))
-                else:
-                    # Linear interpolation between thresholds
-                    interp = elev_phys_a + frac * (elev_phys_b - elev_phys_a)
-                    sample_pts.append((s_lat, s_lon, interp, False))
+                # Interior point: linear interpolation between the
+                # physical-end anchors.
+                #
+                # Per user 2026-04-28: previously seeded from DEM
+                # and let the envelope clamp pull samples back into
+                # ±MAX_RUNWAY_GRADE × distance from the anchors.
+                # In mountainous terrain (e.g. CYXY) this leaves
+                # interior samples PINNED to the upper envelope —
+                # at 250 m from the 32L threshold (706.22 m) the
+                # sample sat at 706.22 + 250 × 0.015 = 709.97 m
+                # because the surrounding DEM was high.  A taxiway
+                # crossing the runway near that point starting from
+                # neighbouring runway 32R (701.34 m, ≈150 m away)
+                # could not reach 710 m at < 1.5 %, producing a
+                # taxi-grade violation.
+                #
+                # Seeding from linear interpolation gives a clean
+                # gradual slope: at 250 m from 32L → 706.22 −
+                # (12.19 / 2400) × 250 ≈ 705.0 m, which is reachable
+                # from 701 m at ≈ 1.6 % over 150 m.  DEM informs the
+                # pre-clamp envelope only via the anchor threshold
+                # values themselves.  Real airports heavily grade
+                # their pavement, so a linear runway profile between
+                # CIFP-anchored thresholds is a more faithful
+                # representation than DEM-following.
+                interp = elev_phys_a + frac * (
+                    elev_phys_b - elev_phys_a)
+                sample_pts.append((s_lat, s_lon, interp, False))
 
             # ── Wide-window smoothing of the DEM profile ─────────────
             # A real runway is a graded surface that approximates the
