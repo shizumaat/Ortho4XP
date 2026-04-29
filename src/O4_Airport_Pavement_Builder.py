@@ -3285,6 +3285,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # average, since averaging can pull a shared-with-rect
         # bucket away from the rect's tag value.
         _snap_junction_altitudes_to_rect_corners(layout)
+        # Per user 2026-04-28: smooth adjacent-vertex pair grade
+        # WITHIN each junction.  Above passes enforce shared-
+        # vertex agreement (across polygons) and rect-corner
+        # alignment (junction ↔ sloping rect), but interior
+        # junction vertices can still violate 1.5 % grade against
+        # their immediate ring neighbours.  Iterate adjacent-pair
+        # smoothing with hard-vertex anchoring to converge those.
+        _smooth_within_junction_adjacent_pair_grade(layout)
+        # Re-run shared-vertex + rect-corner snaps so any seam
+        # vertex the smoother nudged off-target is restored.
+        _enforce_shared_vertex_altitudes(layout)
+        _snap_junction_altitudes_to_rect_corners(layout)
         # Per user 2026-04-28: emit a 5 m-wide ribbon polygon
         # tracing the airport boundary (apt.dat row-130) with
         # per-vertex altitudes clamped to ≤ 3 % grade from the
@@ -4589,6 +4601,67 @@ def _emit_boundary_dem_bridge(
         except Exception:
             ribbon_union = None
 
+    # Pre-collect pavement EDGE points with altitudes — used for
+    # nearest-pavement lookup when assigning per-vertex altitudes
+    # to the bridge polygon.  Per user 2026-04-28: bridge vertices
+    # adjacent to pavement must match the pavement's altitude (not
+    # raw DEM) so the bridge actually FILLS the gap between
+    # boundary and pavement instead of creating its own valley.
+    pav_edge_pts: List[Tuple[float, float, float]] = []
+    for s in layout.shapes:
+        if s.role == ROLE_BOUNDARY:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        # Per-vertex altitudes for junctions / boundary; rect tags
+        # for sloping rects.
+        if s.role in (ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                       ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+                       ROLE_CROSS_CONNECTOR):
+            if len(coords) != 4:
+                continue
+            if (s.altitude_high is not None
+                    and s.altitude_low is not None):
+                per = [s.altitude_high, s.altitude_low,
+                       s.altitude_low, s.altitude_high]
+            elif s.altitude is not None:
+                per = [float(s.altitude)] * 4
+            else:
+                continue
+            for (x, y), a in zip(coords, per):
+                pav_edge_pts.append((float(x), float(y), float(a)))
+        elif s.node_altitudes:
+            for (x, y), a in zip(coords,
+                                  s.node_altitudes[:len(coords)]):
+                pav_edge_pts.append((float(x), float(y), float(a)))
+        elif s.altitude is not None:
+            for x, y in coords:
+                pav_edge_pts.append((float(x), float(y),
+                                     float(s.altitude)))
+
+    def _nearest_pav_alt(x: float, y: float,
+                         max_d_m: float = 500.0
+                         ) -> Optional[Tuple[float, float]]:
+        """Return ``(alt, distance_m)`` for the nearest pavement
+        edge point within ``max_d_m`` of ``(x, y)``, or None when
+        no pavement is in range."""
+        best_d2 = max_d_m * max_d_m
+        best_alt: Optional[float] = None
+        for px, py, pa in pav_edge_pts:
+            d2 = (x - px) * (x - px) + (y - py) * (y - py)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_alt = pa
+        if best_alt is None:
+            return None
+        return (best_alt, math.sqrt(best_d2))
+
     n_emitted = 0
     for boundary_poly in rings:
         try:
@@ -4852,37 +4925,72 @@ def _emit_boundary_dem_bridge(
                         or bridge_poly.geom_type != "Polygon"
                         or bridge_poly.area < 100.0):
                     continue
-            # Per-vertex altitudes.  For each vertex of the final
-            # polygon, classify as outer (snap to nearest outer_pts
-            # → use clamped) or inner (use DEM at that vertex).
+            # Per-vertex altitudes.  Per user 2026-04-28:
+            # the bridge is meant to FILL the gap between the
+            # boundary (at clamped altitude) and the nearest
+            # pavement (at the pavement's emitted altitude).  So
+            # each vertex gets a distance-weighted blend of those
+            # two values:
+            #
+            #   alt(V) = (w_o · clamped_at_outer + w_p · pav_alt)
+            #            / (w_o + w_p)
+            #
+            # with weights w_o = 1 / max(d_outer, ε),
+            # w_p = 1 / max(d_pav, ε) — i.e. inverse-distance
+            # interpolation.  Vertices on the outer edge land at
+            # clamped; vertices touching pavement land at the
+            # pavement altitude; interior vertices smoothly
+            # interpolate.  This eliminates the previous
+            # "DEM-everywhere" inner edge that sat 12–35 m below
+            # the surrounding pavement at CYXY and was the cause
+            # of the persistent valley the user reported.
             outer_set = set((round(x, 1), round(y, 1))
                             for x, y in outer_pts)
             new_coords = list(bridge_poly.exterior.coords)
             alts: List[float] = []
+            EPS_M = 0.5
             for cx, cy in new_coords:
-                key = (round(cx, 1), round(cy, 1))
-                if key in outer_set:
-                    # Pick the matching outer_pts entry to inherit
-                    # its clamped altitude.
-                    best = None
-                    best_d = float('inf')
-                    for idx in run:
-                        ox, oy, ca, _da = per_vert[idx]
-                        d = math.hypot(cx - ox, cy - oy)
-                        if d < best_d:
-                            best_d = d
-                            best = ca
-                    if best is not None and not math.isnan(best):
-                        alts.append(round(float(best), 1))
+                # Nearest clamped (outer-edge) point and its alt.
+                best_o_alt: Optional[float] = None
+                best_o_d = float('inf')
+                for idx in run:
+                    ox, oy, ca, _da = per_vert[idx]
+                    if math.isnan(ca):
                         continue
-                # Inner / non-outer vertex: use DEM (or clamped if
-                # DEM unavailable, as a safe fallback).
-                d = _dem_alt(cx, cy)
-                if d is None:
-                    d = _clamped_alt(cx, cy)
-                if d is None:
-                    d = 0.0
-                alts.append(round(float(d), 1))
+                    d = math.hypot(cx - ox, cy - oy)
+                    if d < best_o_d:
+                        best_o_d = d
+                        best_o_alt = ca
+                # Nearest pavement edge point and its alt.
+                pav_hit = _nearest_pav_alt(cx, cy)
+                key = (round(cx, 1), round(cy, 1))
+                # Quick exits: vertex sits exactly on outer edge or
+                # on a pavement edge.
+                if key in outer_set and best_o_alt is not None:
+                    alts.append(round(float(best_o_alt), 1))
+                    continue
+                if pav_hit is not None and pav_hit[1] < EPS_M:
+                    alts.append(round(float(pav_hit[0]), 1))
+                    continue
+                # Distance-weighted blend.
+                if best_o_alt is None and pav_hit is None:
+                    # No reference — fall back to DEM, then 0.
+                    d = _dem_alt(cx, cy) or _clamped_alt(cx, cy)
+                    alts.append(round(float(d or 0.0), 1))
+                    continue
+                if pav_hit is None:
+                    alts.append(round(float(best_o_alt), 1))
+                    continue
+                if best_o_alt is None:
+                    alts.append(round(float(pav_hit[0]), 1))
+                    continue
+                d_o = max(best_o_d, EPS_M)
+                d_p = max(pav_hit[1], EPS_M)
+                w_o = 1.0 / d_o
+                w_p = 1.0 / d_p
+                blended = ((w_o * best_o_alt + w_p * pav_hit[0])
+                            / (w_o + w_p))
+                alts.append(round(float(blended), 1))
             layout.shapes.append(BuiltShape(
                 polygon=bridge_poly,
                 role=ROLE_BOUNDARY,
@@ -4890,6 +4998,181 @@ def _emit_boundary_dem_bridge(
                 node_altitudes=alts))
             n_emitted += 1
     return n_emitted
+
+
+def _smooth_within_junction_adjacent_pair_grade(
+        layout: "PavementLayout",
+        max_grade: float = 0.015,
+        max_iters: int = 30,
+        convergence_m: float = 0.01,
+        pair_radius_m: float = 60.0,
+        ) -> int:
+    """For each junction polygon, iterate over EVERY vertex pair
+    within ``pair_radius_m`` (not just immediate ring neighbours).
+    When a pair exceeds ``max_grade`` (default 1.5 %, matching the
+    FAA taxiway cap), nudge the un-anchored vertex(es) toward the
+    grade band.
+
+    Per user 2026-04-28: corner alignment between junctions and
+    sloping rects is already enforced by
+    ``_snap_junction_altitudes_to_rect_corners`` and
+    ``_enforce_shared_vertex_altitudes``, but interior junction
+    vertices can still disagree with their immediate neighbours by
+    > 1.5 % over short distances (1217 such pairs at CYXY, worst
+    17.6 %).  These come from the multi-source apron pin step
+    (DEM plane-fit ↔ taxi-graph ↔ apron-pin DEM-clipped-to-ring-
+    grade) where adjacent vertices pull from different sources.
+    Iterating an adjacent-pair smoother after all the bucket-
+    averaging passes have converged the SHARED-vertex constraints
+    is the cleanest way to flatten the remaining within-polygon
+    grade humps.
+
+    Vertex anchoring rules:
+      * A vertex is HARD if its bucket coincides with a sloping
+        rect corner (runway / primary_parallel / secondary_parallel
+        / stub / cross_connector) — its altitude must equal the
+        rect's tag value and CANNOT be modified.
+      * Otherwise the vertex is SOFT and may move.
+
+    Pair handling:
+      * Both HARD ⇒ skip (constraint unsolvable here).
+      * One HARD, one SOFT ⇒ move the soft one to the boundary
+        of the hard one's grade band.
+      * Both SOFT ⇒ average (preserves volume).
+
+    Returns the number of altitude entries adjusted (cumulative
+    across iterations).
+    """
+    sloping_rect_roles = {
+        ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+        ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+        ROLE_CROSS_CONNECTOR,
+    }
+    # Hard-anchored buckets = sloping rect corner buckets.
+    hard_buckets: set = set()
+    for s in layout.shapes:
+        if s.role not in sloping_rect_roles:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for cx, cy in coords:
+            hard_buckets.add(_corner_elevation_bucket(cx, cy))
+
+    n_changed_total = 0
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            continue
+        if not s.node_altitudes:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        n = len(coords)
+        if n < 3 or len(s.node_altitudes) < n:
+            continue
+        alts = [float(a) for a in s.node_altitudes[:n]]
+        # Pre-flag hard vertices.
+        is_hard = [
+            _corner_elevation_bucket(cx, cy) in hard_buckets
+            for cx, cy in coords]
+        # Pre-build pairs (i, j, distance) for every pair within
+        # pair_radius_m.  For ring-adjacent pairs we always include
+        # them (zero-distance edges between the same point are
+        # filtered).  For non-adjacent pairs we filter by Euclidean
+        # distance — distant pairs in the same polygon don't have
+        # a meaningful grade constraint at airport scale.
+        pair_radius2 = pair_radius_m * pair_radius_m
+        pairs: List[Tuple[int, int, float]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                ax, ay = coords[i]
+                bx, by = coords[j]
+                dx = bx - ax
+                dy = by - ay
+                d2 = dx * dx + dy * dy
+                if d2 > pair_radius2:
+                    continue
+                d = math.sqrt(d2)
+                if d < 0.5:
+                    continue
+                pairs.append((i, j, d))
+        if not pairs:
+            continue
+        for _it in range(max_iters):
+            max_change = 0.0
+            for i, j, d in pairs:
+                de = abs(alts[i] - alts[j])
+                grade = de / d
+                if grade <= max_grade:
+                    continue
+                # Compute the maximum permitted |Δalt| at this
+                # separation.
+                max_de = max_grade * d
+                hi = max(alts[i], alts[j])
+                lo = min(alts[i], alts[j])
+                hi_idx = i if alts[i] >= alts[j] else j
+                lo_idx = j if hi_idx == i else i
+                if is_hard[i] and is_hard[j]:
+                    # Both anchored — leave alone (the constraint
+                    # is unresolvable without moving runway/rect
+                    # tags).
+                    continue
+                if is_hard[hi_idx] and not is_hard[lo_idx]:
+                    # Lift the soft (low) vertex up to the band's
+                    # lower edge.
+                    new_lo = hi - max_de
+                    if abs(alts[lo_idx] - new_lo) > convergence_m:
+                        max_change = max(
+                            max_change,
+                            abs(alts[lo_idx] - new_lo))
+                        alts[lo_idx] = new_lo
+                        n_changed_total += 1
+                elif is_hard[lo_idx] and not is_hard[hi_idx]:
+                    # Drop the soft (high) vertex down to the
+                    # band's upper edge.
+                    new_hi = lo + max_de
+                    if abs(alts[hi_idx] - new_hi) > convergence_m:
+                        max_change = max(
+                            max_change,
+                            abs(alts[hi_idx] - new_hi))
+                        alts[hi_idx] = new_hi
+                        n_changed_total += 1
+                else:
+                    # Both soft — split the violation evenly.
+                    avg = (alts[i] + alts[j]) / 2.0
+                    excess = (de - max_de) / 2.0
+                    new_hi = avg + max_de / 2.0
+                    new_lo = avg - max_de / 2.0
+                    if abs(alts[hi_idx] - new_hi) > convergence_m:
+                        max_change = max(
+                            max_change,
+                            abs(alts[hi_idx] - new_hi))
+                        alts[hi_idx] = new_hi
+                        n_changed_total += 1
+                    if abs(alts[lo_idx] - new_lo) > convergence_m:
+                        max_change = max(
+                            max_change,
+                            abs(alts[lo_idx] - new_lo))
+                        alts[lo_idx] = new_lo
+                        n_changed_total += 1
+            if max_change < convergence_m:
+                break
+        # Write back, preserving the closed-ring duplicate at the end.
+        s.node_altitudes = [round(a, 1) for a in alts]
+        if (len(s.node_altitudes) == n
+                and s.polygon.exterior.coords[0]
+                == s.polygon.exterior.coords[-1]):
+            s.node_altitudes.append(s.node_altitudes[0])
+    return n_changed_total
 
 
 def _enforce_shared_vertex_altitudes(
