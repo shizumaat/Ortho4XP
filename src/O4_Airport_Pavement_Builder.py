@@ -569,39 +569,63 @@ def _load_osm_airports(xplane_root: str, icao: str,
     if not nodes:
         return {}, [], []
 
-    # Filter by bbox — keep only ways whose node centroids are near
-    # the airport center.
+    # Filter ways using TWO checks:
+    #
+    # 1. Centroid in bbox (legacy): the way's centroid must lie
+    #    within ``radius_deg`` of the airport.
+    # 2. No cross-tile span (per user 2026-04-28): the way's
+    #    OWN bbox (lat-spread, lon-spread) must be ≤
+    #    ``MAX_WAY_SPAN_DEG``.  This catches OSM ID collisions
+    #    that occur when ``nodes.update()`` overwrites a node ID
+    #    in one tile with the coordinates of a same-ID node from
+    #    a different tile, leaving the way with mixed-tile node
+    #    references.
+    #
+    # The collision symptom at HECA: 22 ways spanning 0.1°-2.27°
+    # (11-250 km), including taxiway ``ref=L`` at 250 km — ways
+    # that legitimately should be airport-scale (≤ a few km).
+    # Without the span check the centerline extractor linemerged
+    # them across Egypt, producing 154 km polylines and breaking
+    # taxi rect detection.
+    MAX_WAY_SPAN_DEG = 0.1  # ~11 km at the equator; airport ways
+                             # are at most a few km.
     def _in_box(lat, lon):
         return (abs(lat - apt_lat) <= radius_deg and
                 abs(lon - apt_lon) <= radius_deg)
+
+    def _way_passes_filters(nds):
+        pts = [nodes[n] for n in nds if n in nodes]
+        if not pts:
+            return False
+        clat = sum(p[0] for p in pts) / len(pts)
+        clon = sum(p[1] for p in pts) / len(pts)
+        if not _in_box(clat, clon):
+            return False
+        # Reject ways with cross-tile node-coordinate span (an
+        # OSM negative-ID collision symptom).
+        lats = [p[0] for p in pts]
+        lons = [p[1] for p in pts]
+        if (max(lats) - min(lats) > MAX_WAY_SPAN_DEG
+                or max(lons) - min(lons) > MAX_WAY_SPAN_DEG):
+            return False
+        return True
 
     kept_ways = []
     way_by_id: Dict[str, Tuple[str, List[str], Dict[str, str]]] = {}
     for wid, nds, tags in ways:
         way_by_id[wid] = (wid, nds, tags)
-        pts = [nodes[n] for n in nds if n in nodes]
-        if not pts:
-            continue
-        clat = sum(p[0] for p in pts) / len(pts)
-        clon = sum(p[1] for p in pts) / len(pts)
-        if _in_box(clat, clon):
+        if _way_passes_filters(nds):
             kept_ways.append((wid, nds, tags))
-    # Relations: keep if ANY member way centroid is in-box
+    # Relations: keep if ANY member way passes the filters.
     kept_rels = []
     for rid, outer_ids, tags in relations:
-        any_in = False
         for wid in outer_ids:
-            if wid in way_by_id:
-                _, nds, _ = way_by_id[wid]
-                pts = [nodes[n] for n in nds if n in nodes]
-                if pts:
-                    clat = sum(p[0] for p in pts) / len(pts)
-                    clon = sum(p[1] for p in pts) / len(pts)
-                    if _in_box(clat, clon):
-                        any_in = True
-                        break
-        if any_in:
-            kept_rels.append((rid, outer_ids, tags))
+            if wid not in way_by_id:
+                continue
+            _, nds, _ = way_by_id[wid]
+            if _way_passes_filters(nds):
+                kept_rels.append((rid, outer_ids, tags))
+                break
     return nodes, kept_ways, kept_rels
 
 
