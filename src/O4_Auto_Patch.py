@@ -757,29 +757,32 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
     # projection falls inside that other runway's length AND the
     # perpendicular distance is plausibly walkable by a taxi
     # (≤ ``MAX_CROSS_RUNWAY_LATERAL_M``), the projection becomes
-    # an additional anchor on the other runway with the source
-    # threshold's elevation.  This forces parallel runways with
-    # offset thresholds (e.g. CYXY 14R/32L vs 14L/32R, where
-    # 32R end at 701 m sits ~200 m off 14R/32L's interior) to
-    # respect each other's hard CIFP elevations rather than
-    # letting DEM-seeded interior samples drift to the upper
-    # envelope and break grade for taxi crossings.
+    # an additional anchor on the receiver runway.
+    #
+    # Per user 2026-04-28 (refined): the anchor's elevation is
+    # NOT pinned to the source threshold's elevation.  Instead it
+    # follows DEM at the projection point, but is CLAMPED so a
+    # connecting taxi at MAX_TAXI_GRADE (1.5 %) over the
+    # perpendicular distance can still reach the source threshold
+    # — i.e. the anchor lies in
+    # ``[src_elev − perp × 0.015, src_elev + perp × 0.015]``.  If
+    # DEM is in band, use DEM; if outside, clamp to the nearest
+    # band edge.  This keeps the receiver runway as close to its
+    # natural terrain as possible while still guaranteeing the
+    # connecting taxi can be built.
     MAX_CROSS_RUNWAY_LATERAL_M = 300.0
+    MAX_TAXI_GRADE_FOR_CROSS = 0.015  # 1.5 % FAA cap for taxiways
     auto_extra_anchors: dict = {}
     paired_list = [(da, dat_a, db, dat_b)
                    for da, dat_a, db, dat_b in runway_pairs
                    if db is not None and dat_b is not None]
     for ti, (da_t, dat_a_t, db_t, dat_b_t) in enumerate(paired_list):
-        # Each pair has two thresholds; project each onto every
-        # OTHER pair's centerline.
         for src_desig, src_data in (
                 (da_t, dat_a_t), (db_t, dat_b_t)):
             for ri, (da_r, dat_a_r, db_r, dat_b_r) in enumerate(
                     paired_list):
                 if ri == ti:
                     continue
-                # Centerline from dat_a_r → dat_b_r in meters at
-                # the pair's mid-latitude.
                 mid_lat = 0.5 * (dat_a_r["lat"] + dat_b_r["lat"])
                 cl_v = cos(mid_lat * pi / 180.0)
                 if cl_v < 1e-6:
@@ -792,30 +795,38 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 vx = (src_data["lon"] - dat_a_r["lon"]) * cl_v * DEG_TO_M
                 vy = (src_data["lat"] - dat_a_r["lat"]) * DEG_TO_M
                 t = (vx * rdx + vy * rdy) / rL2
-                # Skip if projection is outside the threshold span
-                # (with a small inset so we don't double-anchor at
-                # the receiver runway's own threshold).
                 if t <= 0.05 or t >= 0.95:
                     continue
-                # Perpendicular distance from src threshold to
-                # receiver runway centerline.
                 proj_x = t * rdx
                 proj_y = t * rdy
                 perp = sqrt((vx - proj_x) ** 2 + (vy - proj_y) ** 2)
                 if perp > MAX_CROSS_RUNWAY_LATERAL_M:
                     continue
-                # Build anchor at the projection lat/lon on the
-                # receiver runway, with the SRC threshold's
-                # elevation.  The receiver runway's solver will
-                # then envelope-clamp itself around this anchor as
-                # an additional hard constraint.
                 p_lat = (dat_a_r["lat"]
                          + t * (dat_b_r["lat"] - dat_a_r["lat"]))
                 p_lon = (dat_a_r["lon"]
                          + t * (dat_b_r["lon"] - dat_a_r["lon"]))
+                # DEM-preferred elevation, clamped to taxi-grade
+                # band from the source threshold.
+                src_elev = src_data["elevation_m"]
+                band = perp * MAX_TAXI_GRADE_FOR_CROSS
+                lo_band = src_elev - band
+                hi_band = src_elev + band
+                dem_e = _sample_dem(p_lat, p_lon)
+                if dem_e is None:
+                    # No DEM available → midpoint of the band as a
+                    # safe seed (equivalent to "as close to source
+                    # threshold as the grade lets us").
+                    anchor_e = src_elev
+                elif dem_e < lo_band:
+                    anchor_e = lo_band
+                elif dem_e > hi_band:
+                    anchor_e = hi_band
+                else:
+                    anchor_e = dem_e
                 key = (da_r, db_r)
                 auto_extra_anchors.setdefault(key, []).append(
-                    (p_lat, p_lon, src_data["elevation_m"]))
+                    (p_lat, p_lon, anchor_e))
     # Merge user-supplied extra_anchors on top of auto-detected
     # ones — user values take precedence (replace auto if same
     # exact lat/lon, else append).
