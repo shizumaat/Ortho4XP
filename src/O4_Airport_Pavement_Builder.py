@@ -81,6 +81,12 @@ ROLE_APRON = PS.ROLE_APRON
 ROLE_TERMINAL = "terminal"
 ROLE_JUNCTION = "junction"
 ROLE_BOUNDARY = "boundary"
+# Tunnel portals (user 2026-04-29 re-enable).  ``tunnel_ramp``
+# is a sloped 4-corner rect from outside-DEM down to apt-elev-6m
+# at the portal; ``retaining_wall`` is a flat polygon at apt-
+# elev forming the U-shape around the portal LOW end.
+ROLE_TUNNEL_RAMP = "tunnel_ramp"
+ROLE_RETAINING_WALL = "retaining_wall"
 
 # TEMP 2026-04-20: when False, the builder only emits rects +
 # runways + terminals + aprons, suppressing all junction polygons.
@@ -101,6 +107,8 @@ AEROWAY_FOR_ROLE = {
     ROLE_APRON: "apron",
     ROLE_TERMINAL: "building",
     ROLE_BOUNDARY: "aerodrome",
+    ROLE_TUNNEL_RAMP: "taxiway",
+    ROLE_RETAINING_WALL: "building",
 }
 
 
@@ -517,6 +525,23 @@ def _load_osm_tile(path: str) -> Tuple[Dict[str, Tuple[float, float]],
     return nodes, ways, relations
 
 
+def _osm_tile_path(lat_tile: int, lon_tile: int,
+                    cached_suffix: str = "airports") -> str:
+    """Ortho4XP's per-tile cached OSM filename layout."""
+    def _fmt(v, pad):
+        sign = "+" if v >= 0 else "-"
+        return f"{sign}{abs(v):0{pad}d}"
+    lat_group = (lat_tile // 10) * 10
+    lon_group = (lon_tile // 10) * 10
+    return os.path.join(
+        "OSM_data",
+        f"{_fmt(lat_group, 2)}{_fmt(lon_group, 3)}",
+        f"{_fmt(lat_tile, 2)}{_fmt(lon_tile, 3)}",
+        f"{_fmt(lat_tile, 2)}{_fmt(lon_tile, 3)}"
+        f"_{cached_suffix}.osm.bz2",
+    )
+
+
 def _load_osm_airports(xplane_root: str, icao: str,
                        apt_lat: float, apt_lon: float,
                        radius_deg: float = 0.05
@@ -527,21 +552,8 @@ def _load_osm_airports(xplane_root: str, icao: str,
 
     Returns nodes + ways filtered to a bbox around the airport.
     """
-    def _fmt(v, pad):
-        sign = "+" if v >= 0 else "-"
-        return f"{sign}{abs(v):0{pad}d}"
-
     def _tile_path(lat_tile: int, lon_tile: int) -> str:
-        # Ortho4XP's tile layout: e.g. -20-080/-13-078
-        lat_group = (lat_tile // 10) * 10
-        lon_group = (lon_tile // 10) * 10
-        return os.path.join(
-            "OSM_data",
-            f"{_fmt(lat_group, 2)}{_fmt(lon_group, 3)}",
-            f"{_fmt(lat_tile, 2)}{_fmt(lon_tile, 3)}",
-            f"{_fmt(lat_tile, 2)}{_fmt(lon_tile, 3)}"
-            "_airports.osm.bz2",
-        )
+        return _osm_tile_path(lat_tile, lon_tile, "airports")
 
     # An airport near a tile boundary may be cached in an adjacent
     # tile — try the natural tile + all 8 neighbours and merge.
@@ -675,6 +687,72 @@ def _load_osm_airports(xplane_root: str, icao: str,
                 kept_rels.append((rid, outer_ids, tags))
                 break
     return nodes, kept_ways, kept_rels
+
+
+def _load_osm_big_roads(apt_lat: float, apt_lon: float,
+                        radius_deg: float = 0.05
+                        ) -> Tuple[Dict[str, Tuple[float, float]],
+                                   List[Tuple[str, List[str], Dict[str, str]]]]:
+    """Load the ``big_roads`` OSM cache (motorway / trunk / primary /
+    secondary / railway ways with ``tunnel`` and ``bridge`` tag
+    annotations).  Same multi-tile namespace + bbox-filter logic as
+    ``_load_osm_airports``.
+
+    Returns ``(nodes, ways)``.  Relations are not used by the road
+    pipeline.  Returns empty containers when no cache exists at
+    this tile (tile builds without road data — e.g. SPLP, where
+    big_roads.osm.bz2 was never generated — silently skip tunnel
+    emission).
+    """
+    base_lat = int(math.floor(apt_lat))
+    base_lon = int(math.floor(apt_lon))
+    nodes: Dict[str, Tuple[float, float]] = {}
+    ways: List[Tuple[str, List[str], Dict[str, str]]] = []
+    seen_paths = set()
+    for dlat in (0, -1, 1):
+        for dlon in (0, -1, 1):
+            tile_lat_n = base_lat + dlat
+            tile_lon_n = base_lon + dlon
+            osm_path = _osm_tile_path(
+                tile_lat_n, tile_lon_n, "big_roads")
+            if osm_path in seen_paths or not os.path.isfile(osm_path):
+                continue
+            seen_paths.add(osm_path)
+            n2, w2, _r2 = _load_osm_tile(osm_path)
+            tile_prefix = (
+                f"r{tile_lat_n:+03d}{tile_lon_n:+04d}:")
+            for nid, coord in n2.items():
+                nodes[tile_prefix + nid] = coord
+            for wid, nds, tags in w2:
+                ways.append(
+                    (tile_prefix + wid,
+                     [tile_prefix + n for n in nds],
+                     tags))
+    if not nodes:
+        return {}, []
+
+    def _in_box(lat, lon):
+        return (abs(lat - apt_lat) <= radius_deg
+                and abs(lon - apt_lon) <= radius_deg)
+
+    kept = []
+    for wid, nds, tags in ways:
+        pts = [nodes[n] for n in nds if n in nodes]
+        if not pts:
+            continue
+        clat = sum(p[0] for p in pts) / len(pts)
+        clon = sum(p[1] for p in pts) / len(pts)
+        # A road may cross the airport bbox without its centroid
+        # landing inside — keep the way if EITHER (centroid in box)
+        # OR (any vertex within ``radius_deg``).
+        if _in_box(clat, clon):
+            kept.append((wid, nds, tags))
+            continue
+        for lat, lon in pts:
+            if _in_box(lat, lon):
+                kept.append((wid, nds, tags))
+                break
+    return nodes, kept
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -3672,6 +3750,24 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         f"polygon(s).\n")
             except Exception:
                 pass
+            # Per user 2026-04-29: re-enable tunnel-portal emission.
+            # For each big-roads tunnel crossing the airport
+            # boundary, emit a sloped ramp + 3 retaining walls that
+            # transition the road from outside-DEM elevation down
+            # to airport-elevation − 6 m at the portal.  Subtracts
+            # tunnel zones from the boundary ribbon and DEM-bridge
+            # polygons so they don't overlap.
+            try:
+                n_tun = _emit_tunnel_portals(
+                    layout, _dem, _tile_lat, _tile_lon)
+                if n_tun:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] emitted "
+                        f"{n_tun} tunnel-portal cluster(s) "
+                        f"(ramp + 3 walls each).\n")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -5994,6 +6090,376 @@ def _emit_boundary_dem_bridge(
                 ref="boundary_dem_bridge",
                 node_altitudes=alts))
             n_emitted += 1
+    return n_emitted
+
+
+def _emit_tunnel_portals(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        tunnel_depth_m: float = 6.0,
+        carriageway_base_width_m: float = 22.0,
+        retaining_wall_width_m: float = 6.0,
+        wall_gap_m: float = 0.5,
+        portal_cluster_dist_m: float = 40.0,
+        portal_exclusion_radius_m: float = 35.0,
+        ) -> int:
+    """For each ``highway=*`` ``tunnel=yes|building_passage`` way that
+    crosses (or touches) the airport boundary, emit:
+
+      1. A sloped 4-corner ``ROLE_TUNNEL_RAMP`` rect that runs from
+         the OSM tunnel-portal node OUTSIDE the airport (HIGH end at
+         outside DEM) down to the airport-boundary crossing (LOW end
+         at ``apt_elev − tunnel_depth_m``).
+      2. Three flat ``ROLE_RETAINING_WALL`` polygons (a U-shape
+         around the LOW end) at ``apt_elev``: two side walls running
+         alongside the ramp + one end-cap wrapping past the portal.
+
+    Two-carriageway tunnels (divided highways with two parallel OSM
+    ways) get clustered by portal proximity and emitted as ONE wider
+    ramp + walls.
+
+    To avoid overlap with the airport boundary ribbon and DEM-bridge
+    polygons emitted earlier, this helper subtracts a per-portal
+    exclusion zone (a disc of ``portal_exclusion_radius_m``) from
+    every existing ``ROLE_BOUNDARY`` shape before emitting the tunnel
+    polygons.
+
+    Returns the number of tunnel CLUSTERS emitted (= portal count;
+    each cluster contributes 1 ramp + up to 3 walls).
+    """
+    if (layout.airport_boundary is None
+            or layout.airport_boundary.is_empty):
+        return 0
+    # Load big-roads OSM cache for this tile.
+    nodes_r, ways_r = _load_osm_big_roads(
+        layout.anchor[0], layout.anchor[1])
+    if not ways_r:
+        return 0
+    # Project nodes to meter space.
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+    def _to_m(lon: float, lat: float) -> Tuple[float, float]:
+        return (math.radians(lon - lon0) * R * cos0,
+                math.radians(lat - lat0) * R)
+    def _m_to_ll(x: float, y: float) -> Tuple[float, float]:
+        return (lat0 + math.degrees(y / R),
+                lon0 + math.degrees(x / (R * cos0)))
+    nodes_m: Dict[str, Tuple[float, float]] = {}
+    for nid, (lat, lon) in nodes_r.items():
+        nodes_m[nid] = _to_m(lon, lat)
+    boundary_geom = layout.airport_boundary
+    if boundary_geom.geom_type == "Polygon":
+        boundary_polys = [boundary_geom]
+        boundary_line = boundary_geom.boundary
+    elif boundary_geom.geom_type == "MultiPolygon":
+        boundary_polys = list(boundary_geom.geoms)
+        boundary_line = unary_union(
+            [g.boundary for g in boundary_geom.geoms])
+    else:
+        return 0
+    boundary_union = unary_union(boundary_polys)
+    if (boundary_line.geom_type == "MultiLineString"
+            and boundary_line.length > 0):
+        # Use the longest connected boundary loop as the reference.
+        boundary_line = max(
+            boundary_line.geoms, key=lambda g: g.length)
+    HW_TUNNEL_TYPES = {
+        "motorway", "trunk", "primary", "secondary",
+        "tertiary", "motorway_link", "trunk_link",
+        "primary_link", "residential", "service",
+    }
+    TUNNEL_VALUES = {"yes", "building_passage"}
+    # Collect ramps.
+    ramps: List[Tuple[Tuple[float, float],
+                       Tuple[float, float], float, str]] = []
+    for _wid, nrefs, tags in ways_r:
+        if tags.get("tunnel") not in TUNNEL_VALUES:
+            continue
+        hw = tags.get("highway")
+        if hw not in HW_TUNNEL_TYPES:
+            continue
+        pts = [nodes_m[n] for n in nrefs if n in nodes_m]
+        if len(pts) < 2:
+            continue
+        try:
+            ls = LineString(pts)
+        except Exception:
+            continue
+        if ls.is_empty or ls.length < 5.0:
+            continue
+        if boundary_line.distance(ls) > 100.0:
+            continue
+        try:
+            outside = ls.difference(boundary_union)
+        except Exception:
+            continue
+        if outside.is_empty:
+            continue
+        pieces = (list(outside.geoms)
+                   if hasattr(outside, "geoms")
+                   else [outside])
+        for piece in pieces:
+            if (piece.is_empty
+                    or piece.geom_type != "LineString"
+                    or piece.length < 5.0):
+                continue
+            coords = list(piece.coords)
+            p0 = coords[0]
+            p1 = coords[-1]
+            d0 = boundary_line.distance(Point(p0))
+            d1 = boundary_line.distance(Point(p1))
+            if min(d0, d1) > 5.0:
+                continue
+            if d0 <= d1:
+                portal_xy, outside_xy = p0, p1
+            else:
+                portal_xy, outside_xy = p1, p0
+            ramps.append(
+                (portal_xy, outside_xy, piece.length, hw))
+    if not ramps:
+        return 0
+    # Cluster ramps that share a portal location.
+    clusters: List[List[Tuple[Tuple[float, float],
+                                 Tuple[float, float],
+                                 float, str]]] = []
+    for ramp in ramps:
+        pxy = ramp[0]
+        placed = False
+        for cl in clusters:
+            cref = cl[0][0]
+            if (math.hypot(cref[0] - pxy[0], cref[1] - pxy[1])
+                    < portal_cluster_dist_m):
+                cl.append(ramp)
+                placed = True
+                break
+        if not placed:
+            clusters.append([ramp])
+    # Helper: airport surface elevation at (cx, cy).  Use the
+    # boundary-ribbon ``node_altitudes`` (which already encode the
+    # CIFP-anchored, grade-clamped surface model) when a vertex
+    # lies within 10 m of (cx, cy), else fall back to DEM.
+    def _airport_elevation_at(cx: float, cy: float) -> Optional[float]:
+        best_d = float('inf')
+        best_alt: Optional[float] = None
+        for s in layout.shapes:
+            if s.role != ROLE_BOUNDARY:
+                continue
+            if s.ref != "airport_boundary":
+                continue
+            if not s.node_altitudes:
+                continue
+            try:
+                rcoords = list(s.polygon.exterior.coords)
+            except Exception:
+                continue
+            if rcoords and rcoords[0] == rcoords[-1]:
+                rcoords = rcoords[:-1]
+            for k, (vx, vy) in enumerate(rcoords):
+                if k >= len(s.node_altitudes):
+                    break
+                d = math.hypot(vx - cx, vy - cy)
+                if d < best_d:
+                    best_d = d
+                    best_alt = s.node_altitudes[k]
+        if best_alt is not None and best_d <= 50.0:
+            return float(best_alt)
+        # Fall back to DEM at the portal point.
+        try:
+            lat, lon = _m_to_ll(cx, cy)
+            return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+        except Exception:
+            return None
+    # Track tunnel exclusion zones (used to clip boundary shapes).
+    exclusion_zones: List[Polygon] = []
+    n_emitted = 0
+    for cluster in clusters:
+        cpx = sum(r[0][0] for r in cluster) / len(cluster)
+        cpy = sum(r[0][1] for r in cluster) / len(cluster)
+        cox = sum(r[1][0] for r in cluster) / len(cluster)
+        coy = sum(r[1][1] for r in cluster) / len(cluster)
+        dxr = cpx - cox
+        dyr = cpy - coy
+        dlen = math.hypot(dxr, dyr)
+        if dlen < 5.0:
+            continue
+        ramp_dir = (dxr / dlen, dyr / dlen)
+        perp = (-ramp_dir[1], ramp_dir[0])
+        # Combined width = base + perpendicular spread of portal points.
+        projs = [
+            ((r[0][0] - cpx) * perp[0]
+             + (r[0][1] - cpy) * perp[1])
+            for r in cluster]
+        span = max(projs) - min(projs) if projs else 0.0
+        ramp_width = carriageway_base_width_m + span
+        apt_elev = _airport_elevation_at(cpx, cpy)
+        if apt_elev is None:
+            continue
+        try:
+            o_lat, o_lon = _m_to_ll(cox, coy)
+            out_elev = _sample_dem(
+                dem, tile_lat, tile_lon, o_lat, o_lon)
+        except Exception:
+            out_elev = apt_elev
+        if out_elev is None:
+            out_elev = apt_elev
+        elev_high = float(out_elev)
+        elev_low = float(apt_elev) - tunnel_depth_m
+        # Build the ramp rect.  altitude_high applies to corners
+        # 0,3 (the OUTSIDE/high short edge); altitude_low to
+        # corners 1,2 (the PORTAL/low short edge).
+        half_w = 0.5 * ramp_width
+        ramp_corners = [
+            (cox + perp[0] * half_w, coy + perp[1] * half_w),  # 0
+            (cpx + perp[0] * half_w, cpy + perp[1] * half_w),  # 1
+            (cpx - perp[0] * half_w, cpy - perp[1] * half_w),  # 2
+            (cox - perp[0] * half_w, coy - perp[1] * half_w),  # 3
+        ]
+        try:
+            ramp_poly = Polygon(ramp_corners)
+            if not ramp_poly.is_valid:
+                ramp_poly = ramp_poly.buffer(0)
+            if ramp_poly.is_empty or ramp_poly.geom_type != "Polygon":
+                continue
+        except Exception:
+            continue
+        layout.shapes.append(BuiltShape(
+            polygon=ramp_poly,
+            role=ROLE_TUNNEL_RAMP,
+            ref="tunnel",
+            altitude_high=round(elev_high, 1),
+            altitude_low=round(elev_low, 1)))
+        # Build U-shaped retaining walls.
+        wall_off = (half_w + wall_gap_m
+                    + retaining_wall_width_m / 2.0)
+        cap_back = wall_gap_m + retaining_wall_width_m / 2.0
+        # End-cap centre (one wall-thickness past the portal,
+        # INSIDE the airport).
+        ccx = cpx + ramp_dir[0] * cap_back
+        ccy = cpy + ramp_dir[1] * cap_back
+        cap_len = ramp_width + 2 * wall_gap_m
+        cap_corners = [
+            (ccx + perp[0] * cap_len / 2.0
+             + ramp_dir[0] * retaining_wall_width_m / 2.0,
+             ccy + perp[1] * cap_len / 2.0
+             + ramp_dir[1] * retaining_wall_width_m / 2.0),
+            (ccx - perp[0] * cap_len / 2.0
+             + ramp_dir[0] * retaining_wall_width_m / 2.0,
+             ccy - perp[1] * cap_len / 2.0
+             + ramp_dir[1] * retaining_wall_width_m / 2.0),
+            (ccx - perp[0] * cap_len / 2.0
+             - ramp_dir[0] * retaining_wall_width_m / 2.0,
+             ccy - perp[1] * cap_len / 2.0
+             - ramp_dir[1] * retaining_wall_width_m / 2.0),
+            (ccx + perp[0] * cap_len / 2.0
+             - ramp_dir[0] * retaining_wall_width_m / 2.0,
+             ccy + perp[1] * cap_len / 2.0
+             - ramp_dir[1] * retaining_wall_width_m / 2.0),
+        ]
+        try:
+            cap_poly = Polygon(cap_corners)
+            if not cap_poly.is_valid:
+                cap_poly = cap_poly.buffer(0)
+            if (cap_poly.geom_type == "Polygon"
+                    and not cap_poly.is_empty):
+                layout.shapes.append(BuiltShape(
+                    polygon=cap_poly,
+                    role=ROLE_RETAINING_WALL,
+                    ref="tunnel_cap",
+                    altitude=round(apt_elev, 1)))
+        except Exception:
+            pass
+        for side in (1.0, -1.0):
+            s_sx = cox + side * perp[0] * wall_off
+            s_sy = coy + side * perp[1] * wall_off
+            s_ex = (cpx + ramp_dir[0] * cap_back
+                    + side * perp[0] * wall_off)
+            s_ey = (cpy + ramp_dir[1] * cap_back
+                    + side * perp[1] * wall_off)
+            sxx = s_ex - s_sx
+            syy = s_ey - s_sy
+            slen = math.hypot(sxx, syy)
+            if slen < 1.0:
+                continue
+            sux = sxx / slen
+            suy = syy / slen
+            spx = -suy
+            spy = sux
+            half_wall = retaining_wall_width_m / 2.0
+            wall_corners = [
+                (s_sx + spx * half_wall,
+                 s_sy + spy * half_wall),
+                (s_ex + spx * half_wall,
+                 s_ey + spy * half_wall),
+                (s_ex - spx * half_wall,
+                 s_ey - spy * half_wall),
+                (s_sx - spx * half_wall,
+                 s_sy - spy * half_wall),
+            ]
+            try:
+                wall_poly = Polygon(wall_corners)
+                if not wall_poly.is_valid:
+                    wall_poly = wall_poly.buffer(0)
+                if (wall_poly.geom_type == "Polygon"
+                        and not wall_poly.is_empty):
+                    layout.shapes.append(BuiltShape(
+                        polygon=wall_poly,
+                        role=ROLE_RETAINING_WALL,
+                        ref="tunnel_wall",
+                        altitude=round(apt_elev, 1)))
+            except Exception:
+                continue
+        # Portal exclusion disc (used to clip boundary shapes).
+        try:
+            exclusion_zones.append(
+                Point(cpx, cpy).buffer(portal_exclusion_radius_m))
+        except Exception:
+            pass
+        n_emitted += 1
+    # Subtract exclusion zones from existing ROLE_BOUNDARY shapes
+    # so the tunnel ramp + walls don't overlap the boundary ribbon
+    # or DEM-bridge polygons.
+    if exclusion_zones:
+        excl_union = unary_union(exclusion_zones)
+        kept_shapes: List[BuiltShape] = []
+        for s in layout.shapes:
+            if s.role != ROLE_BOUNDARY:
+                kept_shapes.append(s)
+                continue
+            try:
+                new_poly = s.polygon.difference(excl_union)
+            except Exception:
+                kept_shapes.append(s)
+                continue
+            if new_poly.is_empty:
+                continue
+            if new_poly.geom_type == "Polygon":
+                # The ribbon's per-vertex node_altitudes refer to
+                # the ORIGINAL ring; after a difference clip the
+                # vertex count typically changes.  Drop them so
+                # downstream emission falls back to the shape's
+                # ``altitude`` (or treats it as flat at the average)
+                # rather than emitting a stale per-vertex list with
+                # the wrong length.
+                s.polygon = new_poly
+                s.node_altitudes = None
+                kept_shapes.append(s)
+            elif new_poly.geom_type == "MultiPolygon":
+                # Split the boundary shape into the resulting pieces.
+                for g in new_poly.geoms:
+                    if (g.geom_type != "Polygon"
+                            or g.is_empty
+                            or g.area < 5.0):
+                        continue
+                    kept_shapes.append(BuiltShape(
+                        polygon=g,
+                        role=s.role,
+                        ref=s.ref,
+                        altitude=s.altitude,
+                        node_altitudes=None))
+        layout.shapes = kept_shapes
     return n_emitted
 
 
