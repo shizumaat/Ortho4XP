@@ -160,6 +160,10 @@ class PavementLayout:
     # ancillary:
     airport_boundary: Optional[Polygon] = None
     runway_union: Optional[Polygon] = None
+    # Path to the apt.dat file the layout was built from.  Used by
+    # the bridge-detection step to walk the same scenery pack's
+    # DSF and check for taxi-bridge OBJ placements.
+    apt_dat_path: Optional[str] = None
 
     # ---- coordinate helpers ------------------------------------------
     def m_to_ll(self, x: float, y: float) -> Tuple[float, float]:
@@ -2053,7 +2057,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
     anchor = _airport_anchor(apt)
     to_m = _projection(anchor)
 
-    layout = PavementLayout(icao=icao, anchor=anchor)
+    layout = PavementLayout(icao=icao, anchor=anchor,
+                             apt_dat_path=apt_path)
 
     # Project the apt.dat row-130 airport boundary (in lat/lon) into
     # meter space so downstream emission has it ready when the
@@ -3830,26 +3835,46 @@ def build_airport_pavement(icao: str, xplane_root: str,
             # taxi bridges (KBNA Taxiway A, KPHX taxis over
             # Sky Harbor Blvd) and road-following approach
             # shapes that descend from outside-DEM down to
-            # apt_elev − 8 m under the bridge.
+            # apt_elev − 8 m under the bridge.  When the
+            # scenery pack already includes 3D bridge OBJs
+            # (KBNA), the user wants the road to cut straight
+            # through and let the OBJ be the bridge — skip our
+            # walls and emit the under-bridge flat polygon.
+            # When it doesn't (KPHX), keep the terrain flat
+            # for the taxiway and only ramp the road up to the
+            # bridge edge — emit walls + skip under-bridge.
+            try:
+                _scn_bridge = _scenery_has_bridge_objects(layout)
+            except Exception:
+                _scn_bridge = False
             try:
                 n_brg = _emit_taxi_bridges(
-                    layout, _dem, _tile_lat, _tile_lon)
+                    layout, _dem, _tile_lat, _tile_lon,
+                    scenery_has_bridge_objects=_scn_bridge)
                 if n_brg:
                     import sys as _sys
                     _sys.stderr.write(
                         f"  [pav-builder] emitted "
                         f"{n_brg} taxi-bridge wall pair(s).\n")
+                elif _scn_bridge:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] {icao}: scenery has "
+                        f"3D bridge OBJ(s); skipping wall "
+                        f"emission.\n")
             except Exception:
                 pass
             try:
                 n_app = _emit_underpass_road_approaches(
-                    layout, _dem, _tile_lat, _tile_lon)
+                    layout, _dem, _tile_lat, _tile_lon,
+                    scenery_has_bridge_objects=_scn_bridge)
                 if n_app:
                     import sys as _sys
                     _sys.stderr.write(
                         f"  [pav-builder] emitted underpass-"
                         f"road approaches for {n_app} "
-                        f"surface(s).\n")
+                        f"surface(s)"
+                        f"{' (cut through under bridge OBJ)' if _scn_bridge else ' (ramp up to bridge edge)'}.\n")
             except Exception:
                 pass
         except Exception:
@@ -6521,26 +6546,25 @@ def _emit_tunnel_portals(
             except Exception:
                 continue
         n_emitted += 1
-    # Boundary coordination: only the INSIDE-airport portion of
-    # the tunnel footprint causes a boundary conflict.  The HIGH
-    # side of the ramp slopes up to outside DEM in non-airport
-    # territory — no boundary shape exists there to overlap.
-    # Walls and the LOW side of the ramp inside the airport
-    # conflict with the boundary ribbon (at apt_elev) and the
-    # DEM-bridge polygons (at clamped boundary altitude), so
-    # those inside-airport pieces get buffered by 0.5 m and
-    # subtracted from each ROLE_BOUNDARY shape.
+    # Boundary coordination: clip every ROLE_BOUNDARY shape so
+    # it doesn't overlap the actual tunnel-polygon footprint.
+    # The boundary ribbon is built by line-buffering the apt.dat
+    # row-130 line, which extends ~2.5 m to either side of the
+    # boundary line — so when a tunnel ramp crosses the boundary,
+    # the ribbon overlaps both the inside-airport (LOW-end) and
+    # outside-airport (HIGH-end) parts of the ramp.  Subtracting
+    # the actual ramp+walls union (buffered by 0.5 m for a small
+    # visible gap) handles both cases without carving exclusion
+    # discs outside the tunnel's footprint — the boundary still
+    # traces the rest of the perimeter unchanged.
     if exclusion_zones:
         try:
             tunnel_union = unary_union(exclusion_zones)
-            inside_part = tunnel_union.intersection(boundary_union)
         except Exception:
-            inside_part = None
-        if inside_part is None or inside_part.is_empty:
-            # Tunnel(s) entirely outside (or trivially missing) the
-            # airport boundary — no boundary clip required.
+            tunnel_union = None
+        if tunnel_union is None or tunnel_union.is_empty:
             return n_emitted
-        excl_union = inside_part.buffer(boundary_clearance_m)
+        excl_union = tunnel_union.buffer(boundary_clearance_m)
         kept_shapes: List[BuiltShape] = []
         for s in layout.shapes:
             if s.role != ROLE_BOUNDARY:
@@ -6581,6 +6605,127 @@ def _emit_tunnel_portals(
     return n_emitted
 
 
+def _scenery_has_bridge_objects(
+        layout: "PavementLayout",
+        bridge_proximity_m: float = 30.0,
+        ) -> bool:
+    """Return True when the X-Plane scenery pack containing
+    ``layout.apt_dat_path`` places at least one taxi-bridge OBJ
+    near a bridge taxi rect.
+
+    Detection logic (per user 2026-04-29):
+      1. Find the DSF for the scenery pack via
+         ``O4_DSF_Reader.find_associated_dsf``.
+      2. Convert it to text (cached alongside the .dsf as
+         ``.dsf.text``) using DSFTool when not already cached.
+      3. Walk OBJECT_DEF lines.  Mark a def as a "bridge def" when
+         its path matches ``bridge|elevated|viaduct|overpass``
+         AND does NOT match ``sign|signage|trafficsign|wall|
+         truss|crane`` — KPHX has 3 ``lib/g10/roadsigns/SignBridge
+         *.obj`` defs that are road sign gantries, NOT taxi
+         bridges, and the exclude regex filters them out.
+      4. Walk OBJECT placement lines.  When a placement uses a
+         "bridge def" AND its lat/lon lies within
+         ``bridge_proximity_m`` of any taxi rect with
+         ``is_bridge=True``, return True.
+
+    Confirmed signal at the test set:
+      KBNA  — 23 OBJECT_DEFs match ``Objects/KBNA Bridges/...``
+              (KBNA_Bridge_Taxiway-L_p1..p6, KBNA_Crossing_Bridge,
+              elevated_edge_twy_B, ...) — many placements within
+              the bridge taxi rect → True.
+      KPHX  — only ``lib/g10/roadsigns/SignBridge*`` defs which
+              the exclude regex drops → False.
+    """
+    if not layout.apt_dat_path:
+        return False
+    bridge_rects = [s.polygon for s in layout.shapes
+                     if getattr(s, "is_bridge", False)
+                     and s.polygon is not None
+                     and not s.polygon.is_empty]
+    if not bridge_rects:
+        return False
+    try:
+        import O4_DSF_Reader as _DSFR
+    except Exception:
+        return False
+    dsf_path = _DSFR.find_associated_dsf(
+        layout.apt_dat_path,
+        layout.anchor[0], layout.anchor[1])
+    if dsf_path is None or not os.path.isfile(dsf_path):
+        return False
+    text_path = dsf_path + ".text"
+    needs_convert = (
+        not os.path.isfile(text_path)
+        or os.path.getmtime(text_path) < os.path.getmtime(dsf_path))
+    if needs_convert:
+        tool = _DSFR._dsftool_path()
+        if tool is None:
+            return False
+        try:
+            import subprocess as _sp
+            _sp.run(
+                [tool, "--dsf2text", dsf_path, text_path],
+                check=True, capture_output=True, timeout=120)
+        except Exception:
+            return False
+    BRIDGE_RE = re.compile(
+        r"(?i)bridge|elevated|viaduct|overpass")
+    EXCLUDE_RE = re.compile(
+        r"(?i)sign|signage|trafficsign|truss|crane")
+    bridge_def_idx: set = set()
+    object_def_count = 0
+    placements: List[Tuple[int, float, float]] = []
+    try:
+        with open(text_path, "r", encoding="utf-8",
+                  errors="replace") as f:
+            for line in f:
+                if line.startswith("OBJECT_DEF"):
+                    parts = line.strip().split(maxsplit=1)
+                    path = parts[1] if len(parts) > 1 else ""
+                    if (BRIDGE_RE.search(path)
+                            and not EXCLUDE_RE.search(path)):
+                        bridge_def_idx.add(object_def_count)
+                    object_def_count += 1
+                elif line.startswith("OBJECT "):
+                    tok = line.split()
+                    if len(tok) >= 4:
+                        try:
+                            idx = int(tok[1])
+                            lon = float(tok[2])
+                            lat = float(tok[3])
+                            placements.append((idx, lon, lat))
+                        except ValueError:
+                            continue
+    except Exception:
+        return False
+    if not bridge_def_idx or not placements:
+        return False
+    # Project bridge rects to lat/lon for proximity check.  The
+    # rects' polygons are in meter space anchored at the layout —
+    # convert each placement to meters and test against the
+    # buffered rect union.
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+
+    def _to_m(lon_v: float, lat_v: float) -> Tuple[float, float]:
+        return (math.radians(lon_v - lon0) * R * cos0,
+                math.radians(lat_v - lat0) * R)
+    try:
+        bridge_buf = unary_union(bridge_rects).buffer(
+            bridge_proximity_m)
+    except Exception:
+        return False
+    for idx, lon_v, lat_v in placements:
+        if idx not in bridge_def_idx:
+            continue
+        x, y = _to_m(lon_v, lat_v)
+        if bridge_buf.contains(Point(x, y)):
+            return True
+    return False
+
+
 def _emit_taxi_bridges(
         layout: "PavementLayout",
         dem,
@@ -6589,12 +6734,20 @@ def _emit_taxi_bridges(
         retaining_wall_width_m: float = 1.0,
         wall_gap_m: float = 0.5,
         boundary_clearance_m: float = 0.5,
+        scenery_has_bridge_objects: bool = False,
         ) -> int:
-    """For each taxi rect marked ``is_bridge=True``, emit two flat
-    retaining walls along its long edges at the rect's average
-    elevation (the bridge deck altitude).  The walls form the
-    visible side faces of the bridge; the deck itself is the
-    existing taxi rect.
+    """For each taxi rect marked ``is_bridge=True``, optionally
+    emit two flat retaining walls along its long edges at the
+    rect's average elevation (the bridge deck altitude).
+
+    Per user 2026-04-29 (KBNA vs KPHX): when the X-Plane scenery
+    pack ALREADY contains a 3D taxi-bridge OBJ (detected by
+    ``_scenery_has_bridge_objects``, e.g. KBNA's
+    ``Objects/KBNA Bridges/KBNA_Bridge_Taxiway-L_*.obj``), the
+    scenery's own bridge model is the visible structure — we
+    skip the wall emission entirely so we don't double up.  When
+    the scenery has NO bridge OBJ (KPHX), our emitted walls
+    provide the only visible side-face structure.
 
     No end-cap walls — the bridge's short edges connect to
     adjacent taxis or junctions at apt_elev (the deck continues
@@ -6608,13 +6761,20 @@ def _emit_taxi_bridges(
     subtracted from each ``ROLE_BOUNDARY`` shape — same pattern
     as ``_emit_tunnel_portals``.
 
-    Returns the number of bridge rects whose walls were emitted.
+    Returns the number of bridge rects whose walls were emitted
+    (0 when the scenery already has bridge OBJs).
     """
     bridge_shapes = [s for s in layout.shapes
                      if getattr(s, "is_bridge", False)
                      and s.polygon is not None
                      and not s.polygon.is_empty]
     if not bridge_shapes:
+        return 0
+    if scenery_has_bridge_objects:
+        # The scenery's own 3D bridge OBJs are the visible
+        # structure.  Emit nothing here — the deck itself
+        # already exists as the taxi rect, and the surrounding
+        # mesh is handled by the road-approach helper.
         return 0
     n_emitted = 0
     exclusion_zones: List[Polygon] = []
@@ -6690,22 +6850,17 @@ def _emit_taxi_bridges(
         # below also clears the deck area.
         exclusion_zones.append(s.polygon)
         n_emitted += 1
-    # Boundary coordination: subtract inside-airport portion of
-    # (rect ∪ walls) from each ROLE_BOUNDARY shape.  Same pattern
-    # as ``_emit_tunnel_portals``.  Outside-airport bridges (rare)
-    # produce an empty intersection and no changes.
-    if (exclusion_zones
-            and layout.airport_boundary is not None
-            and not layout.airport_boundary.is_empty):
+    # Boundary coordination: subtract the actual (rect ∪ walls)
+    # footprint, buffered by 0.5 m, from each ROLE_BOUNDARY shape.
+    # Same pattern as ``_emit_tunnel_portals``.
+    if exclusion_zones:
         try:
             bridge_union = unary_union(exclusion_zones)
-            inside_part = bridge_union.intersection(
-                layout.airport_boundary)
         except Exception:
-            inside_part = None
-        if inside_part is not None and not inside_part.is_empty:
+            bridge_union = None
+        if bridge_union is not None and not bridge_union.is_empty:
             try:
-                excl = inside_part.buffer(boundary_clearance_m)
+                excl = bridge_union.buffer(boundary_clearance_m)
                 kept_shapes: List[BuiltShape] = []
                 for s in layout.shapes:
                     if s.role != ROLE_BOUNDARY:
@@ -6748,6 +6903,7 @@ def _emit_underpass_road_approaches(
         approach_length_m: float = 80.0,
         road_width_m: float = 22.0,
         ramp_step_m: float = 20.0,
+        scenery_has_bridge_objects: bool = False,
         ) -> int:
     """For each underpass case (taxi BRIDGE rect or road TUNNEL
     portal), emit a chain of sloped road-following polygons that
@@ -6870,20 +7026,26 @@ def _emit_underpass_road_approaches(
                 inside = max(cand, key=lambda g: g.length)
             elif inside.geom_type != "LineString":
                 continue
-            # Inside-bridge flat polygon at low_elev.
-            try:
-                inside_buf = inside.buffer(
-                    road_width_m / 2.0,
-                    cap_style=2, join_style=2)
-                if (inside_buf.geom_type == "Polygon"
-                        and not inside_buf.is_empty):
-                    layout.shapes.append(BuiltShape(
-                        polygon=inside_buf,
-                        role=ROLE_TUNNEL_RAMP,
-                        ref="bridge_underpass",
-                        altitude=round(low_elev, 1)))
-            except Exception:
-                pass
+            # Inside-bridge flat polygon at low_elev — only emit
+            # when the scenery has a 3D bridge OBJ (KBNA case).
+            # In that case the road cuts straight through under
+            # the bridge model.  Without a bridge OBJ (KPHX
+            # case) the taxi rect itself acts as a flat plate
+            # and the road approaches stop at the bridge edge.
+            if scenery_has_bridge_objects:
+                try:
+                    inside_buf = inside.buffer(
+                        road_width_m / 2.0,
+                        cap_style=2, join_style=2)
+                    if (inside_buf.geom_type == "Polygon"
+                            and not inside_buf.is_empty):
+                        layout.shapes.append(BuiltShape(
+                            polygon=inside_buf,
+                            role=ROLE_TUNNEL_RAMP,
+                            ref="bridge_underpass",
+                            altitude=round(low_elev, 1)))
+                except Exception:
+                    pass
             # Approach + departure ramp chains.  Find the parts
             # of the road OUTSIDE the bridge polygon, then walk
             # each in ramp_step_m steps emitting one sloped rect
