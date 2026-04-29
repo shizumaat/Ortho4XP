@@ -4805,38 +4805,68 @@ def _push_junction_vertices_off_taxi_rect_edges(
             if (new_poly is not None
                     and new_poly.geom_type == "Polygon"
                     and not new_poly.is_empty):
+                # Capture the OLD ring + per-vertex altitudes before
+                # we overwrite the polygon — needed for the nearest-
+                # neighbour fallback below when the new ring's
+                # vertex count differs.
+                _old_alts = (list(shape.node_altitudes)
+                              if shape.node_altitudes else None)
+                _old_open = list(ring_open)  # captured pre-rebuild
                 shape.polygon = new_poly
                 n_new = len(list(new_poly.exterior.coords)) - 1
                 # Preserve per-vertex altitudes where we can.  When
-                # buffer(0) restructured the ring (vertex order /
-                # count not predictable from the input), fall back
-                # to None and let downstream re-derive.  When Stage
-                # 1 collapsed K vertices but Stage 2 only snapped/
-                # pushed in place, the survivor index list maps the
-                # new ring to the original altitudes 1:1.
-                if shape.node_altitudes is None:
-                    pass
-                elif buffer_repaired:
-                    if len(shape.node_altitudes) - 1 != n_new:
-                        shape.node_altitudes = None
-                elif n_new == len(survivor_idx):
-                    # Closing-vertex repeat: keep one trailing slot.
-                    src = shape.node_altitudes
-                    src_open = (
-                        src[:-1]
-                        if len(src) - 1 == n_v
-                        else src[:n_v])
-                    if len(src_open) == n_v:
-                        new_alts = [src_open[i] for i in survivor_idx]
-                        shape.node_altitudes = (
-                            new_alts + [new_alts[0]]
-                            if new_alts else None)
-                    else:
-                        if len(shape.node_altitudes) - 1 != n_new:
-                            shape.node_altitudes = None
-                else:
-                    if len(shape.node_altitudes) - 1 != n_new:
-                        shape.node_altitudes = None
+                # Stage 1 collapsed K vertices but Stage 2 only
+                # snapped/pushed in place, the survivor index list
+                # maps the new ring to the original altitudes 1:1.
+                # When buffer(0) restructured the ring or vertex
+                # counts otherwise don't match, fall back to a
+                # NEAREST-NEIGHBOUR resampling against the old
+                # ring so the polygon retains its elevation field.
+                # Per user 2026-04-29 (CYXY apron regression):
+                # just setting ``node_altitudes = None`` left
+                # CYXY's 174 k m² apron junction with no altitude
+                # at all — every X-Plane interpolation neighbour
+                # was at a different elevation, producing the
+                # "terrain all over the place" the user saw.
+                # Nearest-neighbour resample of the new ring against
+                # the captured OLD ring vertices.  Per user
+                # 2026-04-29 (CYXY apron regression): the prior
+                # behaviour of setting ``node_altitudes = None``
+                # whenever the vertex count changed left the giant
+                # 174 k m² apron junction with no altitude at all,
+                # producing the "terrain all over the place" the
+                # user saw.  NN resampling preserves the elevation
+                # field through Stage-1 collapse, Stage-2 push, AND
+                # buffer(0) MultiPolygon repair.
+                if not _old_alts or not _old_open:
+                    n_modified += 1
+                    continue
+                src_alts_open = (
+                    _old_alts[:-1]
+                    if (len(_old_alts) == len(_old_open) + 1
+                        and _old_alts[0] == _old_alts[-1])
+                    else _old_alts[:len(_old_open)])
+                if not src_alts_open:
+                    n_modified += 1
+                    continue
+                new_open = list(new_poly.exterior.coords)
+                if new_open and new_open[0] == new_open[-1]:
+                    new_open = new_open[:-1]
+                new_alts: List[float] = []
+                for nx, ny in new_open:
+                    best_d2 = float("inf")
+                    best_a = src_alts_open[0]
+                    for k, (sx, sy) in enumerate(_old_open):
+                        if k >= len(src_alts_open):
+                            break
+                        d2 = (nx - sx) ** 2 + (ny - sy) ** 2
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_a = src_alts_open[k]
+                    new_alts.append(round(float(best_a), 1))
+                if new_alts:
+                    shape.node_altitudes = (
+                        new_alts + [new_alts[0]])
                 n_modified += 1
         except Exception:
             pass
@@ -10238,17 +10268,86 @@ def _merge_sliver_junctions_into_neighbours(
         return 0
     for sliver_i, target_j in merge_into.items():
         try:
+            target_shape = layout.shapes[target_j]
+            sliver_shape = layout.shapes[sliver_i]
             merged = unary_union([
-                layout.shapes[target_j].polygon,
-                layout.shapes[sliver_i].polygon])
+                target_shape.polygon,
+                sliver_shape.polygon])
             if (merged.geom_type == "Polygon"
                     and not merged.is_empty):
-                layout.shapes[target_j].polygon = merged
-                # Drop the sliver's node_altitudes — the merged
-                # polygon's vertex count differs and the surviving
-                # shape's node_altitudes should be re-derived
-                # downstream.  A None forces re-derivation.
-                layout.shapes[target_j].node_altitudes = None
+                # Build a per-vertex elevation lookup from the
+                # ORIGINAL target + sliver vertices, then re-derive
+                # node_altitudes for the merged polygon by nearest-
+                # neighbour match.  Per user 2026-04-29 (CYXY apron
+                # regression): just setting ``node_altitudes = None``
+                # leaves the merged polygon with NO elevation at all
+                # (no downstream re-derivation step exists), which
+                # makes X-Plane interpolate from neighbour shapes
+                # and produces the "terrain all over the place"
+                # apron the user saw.
+                lookup: List[Tuple[float, float, float]] = []
+                for src_shape in (target_shape, sliver_shape):
+                    if not src_shape.node_altitudes:
+                        # Sloped or flat alternatives.
+                        if (src_shape.altitude_high is not None
+                                and src_shape.altitude_low is not None):
+                            avg = 0.5 * (
+                                src_shape.altitude_high
+                                + src_shape.altitude_low)
+                        elif src_shape.altitude is not None:
+                            avg = float(src_shape.altitude)
+                        else:
+                            continue
+                        try:
+                            sc = list(
+                                src_shape.polygon.exterior.coords)
+                        except Exception:
+                            continue
+                        if sc and sc[0] == sc[-1]:
+                            sc = sc[:-1]
+                        for sx, sy in sc:
+                            lookup.append((sx, sy, float(avg)))
+                        continue
+                    src_alts = list(src_shape.node_altitudes)
+                    try:
+                        sc = list(src_shape.polygon.exterior.coords)
+                    except Exception:
+                        continue
+                    if sc and sc[0] == sc[-1]:
+                        sc = sc[:-1]
+                    if (len(src_alts) == len(sc) + 1
+                            and src_alts[0] == src_alts[-1]):
+                        src_alts = src_alts[:-1]
+                    for k, (sx, sy) in enumerate(sc):
+                        if k >= len(src_alts):
+                            break
+                        lookup.append(
+                            (sx, sy, float(src_alts[k])))
+                if not lookup:
+                    layout.shapes[target_j].polygon = merged
+                    layout.shapes[target_j].node_altitudes = None
+                    continue
+                merged_coords = list(merged.exterior.coords)
+                if (merged_coords
+                        and merged_coords[0] == merged_coords[-1]):
+                    merged_coords_open = merged_coords[:-1]
+                else:
+                    merged_coords_open = merged_coords
+                new_alts: List[float] = []
+                for mx, my in merged_coords_open:
+                    best_d2 = float("inf")
+                    best_alt = 0.0
+                    for sx, sy, sa in lookup:
+                        d2 = (mx - sx) ** 2 + (my - sy) ** 2
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_alt = sa
+                    new_alts.append(round(best_alt, 1))
+                # Closing-vertex repeat for the ring.
+                if new_alts:
+                    new_alts.append(new_alts[0])
+                target_shape.polygon = merged
+                target_shape.node_altitudes = new_alts
         except Exception:
             continue
     sliver_set = set(merge_into.keys())
