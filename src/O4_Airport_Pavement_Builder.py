@@ -6103,7 +6103,7 @@ def _emit_tunnel_portals(
         retaining_wall_width_m: float = 6.0,
         wall_gap_m: float = 0.5,
         portal_cluster_dist_m: float = 40.0,
-        portal_exclusion_radius_m: float = 35.0,
+        boundary_clearance_m: float = 0.5,
         ) -> int:
     """For each ``highway=*`` ``tunnel=yes|building_passage`` way that
     crosses (or touches) the airport boundary, emit:
@@ -6111,7 +6111,9 @@ def _emit_tunnel_portals(
       1. A sloped 4-corner ``ROLE_TUNNEL_RAMP`` rect that runs from
          the OSM tunnel-portal node OUTSIDE the airport (HIGH end at
          outside DEM) down to the airport-boundary crossing (LOW end
-         at ``apt_elev − tunnel_depth_m``).
+         at ``apt_elev − tunnel_depth_m``).  The ramp can — and
+         must — cross the airport boundary; that's the whole point
+         of the transition.
       2. Three flat ``ROLE_RETAINING_WALL`` polygons (a U-shape
          around the LOW end) at ``apt_elev``: two side walls running
          alongside the ramp + one end-cap wrapping past the portal.
@@ -6120,11 +6122,28 @@ def _emit_tunnel_portals(
     ways) get clustered by portal proximity and emitted as ONE wider
     ramp + walls.
 
-    To avoid overlap with the airport boundary ribbon and DEM-bridge
-    polygons emitted earlier, this helper subtracts a per-portal
-    exclusion zone (a disc of ``portal_exclusion_radius_m``) from
-    every existing ``ROLE_BOUNDARY`` shape before emitting the tunnel
-    polygons.
+    Boundary coordination (user 2026-04-29 SPJC review): tunnels
+    can come right up to the airport boundary or sit fully inside
+    or fully outside — the ramp and walls are emitted at their
+    natural locations.  Only when a tunnel polygon CROSSES the
+    boundary (Case C) does the boundary need adjustment:
+
+      * The retaining walls are at ``apt_elev`` and conflict with
+        the boundary ribbon if they overlap → boundary wraps
+        around them with a 0.5 m gap.
+      * The HIGH side of the ramp slopes up to outside-DEM and
+        sits in non-airport territory → no clip needed there.
+      * The LOW (portal-side) part of the ramp inside the airport
+        is at ``apt_elev − 6 m``, which conflicts with the
+        boundary ribbon at ``apt_elev`` → boundary wraps around
+        that inside-airport portion too.
+
+    Implementation: intersect the union of (ramp + walls) with
+    the airport boundary polygon — only the INSIDE-airport
+    portion remains.  Buffer by ``boundary_clearance_m`` (default
+    0.5 m) and subtract from each ``ROLE_BOUNDARY`` shape.
+    Tunnels that don't cross the boundary at all naturally
+    produce an empty intersection and nothing changes.
 
     Returns the number of tunnel CLUSTERS emitted (= portal count;
     each cluster contributes 1 ramp + up to 3 walls).
@@ -6358,6 +6377,10 @@ def _emit_tunnel_portals(
              ccy + perp[1] * cap_len / 2.0
              - ramp_dir[1] * retaining_wall_width_m / 2.0),
         ]
+        # Track every tunnel polygon (ramp + walls) so the
+        # boundary ribbon / DEM-bridge polygons can be clipped to
+        # wrap tightly around them at the end.
+        exclusion_zones.append(ramp_poly)
         try:
             cap_poly = Polygon(cap_corners)
             if not cap_poly.is_valid:
@@ -6369,6 +6392,7 @@ def _emit_tunnel_portals(
                     role=ROLE_RETAINING_WALL,
                     ref="tunnel_cap",
                     altitude=round(apt_elev, 1)))
+                exclusion_zones.append(cap_poly)
         except Exception:
             pass
         for side in (1.0, -1.0):
@@ -6409,20 +6433,30 @@ def _emit_tunnel_portals(
                         role=ROLE_RETAINING_WALL,
                         ref="tunnel_wall",
                         altitude=round(apt_elev, 1)))
+                    exclusion_zones.append(wall_poly)
             except Exception:
                 continue
-        # Portal exclusion disc (used to clip boundary shapes).
-        try:
-            exclusion_zones.append(
-                Point(cpx, cpy).buffer(portal_exclusion_radius_m))
-        except Exception:
-            pass
         n_emitted += 1
-    # Subtract exclusion zones from existing ROLE_BOUNDARY shapes
-    # so the tunnel ramp + walls don't overlap the boundary ribbon
-    # or DEM-bridge polygons.
+    # Boundary coordination: only the INSIDE-airport portion of
+    # the tunnel footprint causes a boundary conflict.  The HIGH
+    # side of the ramp slopes up to outside DEM in non-airport
+    # territory — no boundary shape exists there to overlap.
+    # Walls and the LOW side of the ramp inside the airport
+    # conflict with the boundary ribbon (at apt_elev) and the
+    # DEM-bridge polygons (at clamped boundary altitude), so
+    # those inside-airport pieces get buffered by 0.5 m and
+    # subtracted from each ROLE_BOUNDARY shape.
     if exclusion_zones:
-        excl_union = unary_union(exclusion_zones)
+        try:
+            tunnel_union = unary_union(exclusion_zones)
+            inside_part = tunnel_union.intersection(boundary_union)
+        except Exception:
+            inside_part = None
+        if inside_part is None or inside_part.is_empty:
+            # Tunnel(s) entirely outside (or trivially missing) the
+            # airport boundary — no boundary clip required.
+            return n_emitted
+        excl_union = inside_part.buffer(boundary_clearance_m)
         kept_shapes: List[BuiltShape] = []
         for s in layout.shapes:
             if s.role != ROLE_BOUNDARY:
