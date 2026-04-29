@@ -2268,27 +2268,49 @@ def build_airport_pavement(icao: str, xplane_root: str,
                             continue
                     # apt.dat-priority gate (user 2026-04-29):
                     # when apt.dat is comprehensive (covers ≥ 80%
-                    # of the OSM-aeroway footprint), restrict DSF
-                    # additions to the buffered OSM-vs-apt.dat
-                    # gap.  This keeps decorative DSF ground
-                    # tiles out — anything outside the gap is
-                    # either an apt.dat overlay (handled below)
-                    # or non-pavement texture filling between
-                    # runways and taxiways (HECA case).  When
-                    # apt.dat is SPARSE (covers < 80 % of OSM),
-                    # we don't apply the gap filter — apt.dat
-                    # alone is too thin and OSM is also
-                    # incomplete; DSF is the primary source
-                    # there (CYXY, SPLP).  Overlay-elimination
-                    # below still drops DSF that's redundant
-                    # with apt.dat.
+                    # of the OSM-aeroway footprint), CLIP each DSF
+                    # polygon to the buffered OSM-vs-apt.dat gap.
+                    # An intersect-test alone is too lax: a wide
+                    # DSF polygon that grazes the gap by 1 m² gets
+                    # kept entirely, and its 50–80 m extension
+                    # past the gap drags non-pavement coverage
+                    # into pav_union (HECA F case where the DSF
+                    # along F's corridor extends 80 m onto the
+                    # adjacent ramp, inflating ``_natural_half_
+                    # width`` to ~50 m and triggering the apron-
+                    # interior corner check on every F segment).
+                    # Clipping keeps only the part of the DSF
+                    # polygon that's actually filling an OSM-
+                    # tagged corridor apt.dat happens to miss.
+                    # When apt.dat is SPARSE (< 80 % of OSM), we
+                    # skip the clip — apt.dat alone is too thin
+                    # and OSM is also incomplete, so DSF is the
+                    # primary source and we trust it broadly
+                    # (CYXY, SPLP).
                     if (apt_is_comprehensive
                             and osm_gap is not None
                             and not osm_gap.is_empty):
                         try:
-                            if not pm.intersects(osm_gap):
+                            clipped_pm = pm.intersection(osm_gap)
+                            if clipped_pm.is_empty:
                                 n_dsf_dropped_outside_osm_gap += 1
                                 continue
+                            # Take the largest Polygon piece if
+                            # the clip produced a MultiPolygon —
+                            # narrow slivers from a wide DSF
+                            # polygon grazing the gap aren't
+                            # useful pavement either.
+                            if (clipped_pm.geom_type
+                                    == "MultiPolygon"):
+                                clipped_pm = max(
+                                    clipped_pm.geoms,
+                                    key=lambda g: g.area)
+                            if (clipped_pm.geom_type != "Polygon"
+                                    or clipped_pm.is_empty
+                                    or clipped_pm.area < 5.0):
+                                n_dsf_dropped_outside_osm_gap += 1
+                                continue
+                            pm = clipped_pm
                         except Exception:
                             pass
                     # Oversized-vs-apt.dat gate: a DSF polygon
