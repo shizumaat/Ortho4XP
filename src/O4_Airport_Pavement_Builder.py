@@ -147,6 +147,9 @@ class BuiltShape:
     altitude_high: Optional[float] = None
     altitude_low: Optional[float] = None
     node_altitudes: Optional[List[float]] = None
+    # OSM ``bridge=yes`` flag.  Set on taxi rects whose source
+    # OSM way is tagged as a bridge — see ``_emit_taxi_bridges``.
+    is_bridge: bool = False
 
 
 @dataclass
@@ -3420,12 +3423,67 @@ def build_airport_pavement(icao: str, xplane_root: str,
     taxi_rects = _drop_primary_parallels_embedded_in_pavement(
         taxi_rects, pav_union, runway_polys=runway_polys)
 
+    # ── Detect bridge taxi rects from OSM (user 2026-04-29) ───────
+    # Per OSM convention, bridge taxiways carry ``bridge=yes`` (or
+    # any non-empty bridge=*) on their parent way.  Build a list of
+    # raw OSM bridge-tagged taxiway LineStrings; a rect is a
+    # "bridge rect" if its axis lies within a small lateral
+    # tolerance of one of those LineStrings.  We use spatial
+    # proximity rather than tag-pass-through because
+    # ``_extract_osm_taxi_centerlines`` linemerges per-ref, which
+    # loses the per-way bridge tag.
+    bridge_lines: List[LineString] = []
+    for _wid, _nds, _tags in ways:
+        if _tags.get("aeroway") != "taxiway":
+            continue
+        b = _tags.get("bridge", "")
+        if not b or b == "no":
+            continue
+        _pts = []
+        for _n in _nds:
+            if _n in nodes:
+                _lat, _lon = nodes[_n]
+                _pts.append(to_m(_lon, _lat))
+        if len(_pts) < 2:
+            continue
+        try:
+            _ls = LineString(_pts)
+        except Exception:
+            continue
+        if _ls.is_empty or _ls.length < 5.0:
+            continue
+        bridge_lines.append(_ls)
+    bridge_rect_indices: set = set()
+    BRIDGE_AXIS_PROXIMITY_M = 5.0
+    if bridge_lines:
+        for ri, (_rect, _axis, _role, _ref) in enumerate(taxi_rects):
+            if _axis is None or _axis.is_empty:
+                continue
+            for _bl in bridge_lines:
+                # An axis is on a bridge if it lies within
+                # BRIDGE_AXIS_PROXIMITY_M of the bridge LineString
+                # along most of its length AND has overlap.
+                try:
+                    if _axis.distance(_bl) > BRIDGE_AXIS_PROXIMITY_M:
+                        continue
+                    inter = _axis.intersection(
+                        _bl.buffer(BRIDGE_AXIS_PROXIMITY_M))
+                    if (not inter.is_empty
+                            and hasattr(inter, "length")
+                            and inter.length
+                            >= 0.5 * _axis.length):
+                        bridge_rect_indices.add(ri)
+                        break
+                except Exception:
+                    continue
+
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
-    for rect, axis, role, ref in taxi_rects:
+    for ri, (rect, axis, role, ref) in enumerate(taxi_rects):
         emitted_taxi_rects.append(rect)
         layout.shapes.append(BuiltShape(
-            polygon=rect, role=role, ref=ref, source_axis=axis))
+            polygon=rect, role=role, ref=ref, source_axis=axis,
+            is_bridge=(ri in bridge_rect_indices)))
 
     # ── Junction emission (user 2026-04-23): junctions and
     # aprons are treated identically going forward — both will
@@ -3766,6 +3824,32 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         f"  [pav-builder] emitted "
                         f"{n_tun} tunnel-portal cluster(s) "
                         f"(ramp + 3 walls each).\n")
+            except Exception:
+                pass
+            # Per user 2026-04-29: emit retaining walls along
+            # taxi bridges (KBNA Taxiway A, KPHX taxis over
+            # Sky Harbor Blvd) and road-following approach
+            # shapes that descend from outside-DEM down to
+            # apt_elev − 8 m under the bridge.
+            try:
+                n_brg = _emit_taxi_bridges(
+                    layout, _dem, _tile_lat, _tile_lon)
+                if n_brg:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] emitted "
+                        f"{n_brg} taxi-bridge wall pair(s).\n")
+            except Exception:
+                pass
+            try:
+                n_app = _emit_underpass_road_approaches(
+                    layout, _dem, _tile_lat, _tile_lon)
+                if n_app:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] emitted underpass-"
+                        f"road approaches for {n_app} "
+                        f"surface(s).\n")
             except Exception:
                 pass
         except Exception:
@@ -6098,9 +6182,9 @@ def _emit_tunnel_portals(
         dem,
         tile_lat: int,
         tile_lon: int,
-        tunnel_depth_m: float = 6.0,
+        tunnel_depth_m: float = 8.0,
         carriageway_base_width_m: float = 22.0,
-        retaining_wall_width_m: float = 6.0,
+        retaining_wall_width_m: float = 1.0,
         wall_gap_m: float = 0.5,
         portal_cluster_dist_m: float = 40.0,
         boundary_clearance_m: float = 0.5,
@@ -6495,6 +6579,432 @@ def _emit_tunnel_portals(
                         node_altitudes=None))
         layout.shapes = kept_shapes
     return n_emitted
+
+
+def _emit_taxi_bridges(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        retaining_wall_width_m: float = 1.0,
+        wall_gap_m: float = 0.5,
+        boundary_clearance_m: float = 0.5,
+        ) -> int:
+    """For each taxi rect marked ``is_bridge=True``, emit two flat
+    retaining walls along its long edges at the rect's average
+    elevation (the bridge deck altitude).  The walls form the
+    visible side faces of the bridge; the deck itself is the
+    existing taxi rect.
+
+    No end-cap walls — the bridge's short edges connect to
+    adjacent taxis or junctions at apt_elev (the deck continues
+    onto the surrounding airport surface), so an end-cap would
+    visually block that join.
+
+    Boundary coordination: when a bridge rect lies inside the
+    airport boundary (typical at SPJC / KBNA / KPHX), the walls
+    are also inside.  The inside-airport portion of (rect ∪
+    walls) gets buffered by ``boundary_clearance_m`` (0.5 m) and
+    subtracted from each ``ROLE_BOUNDARY`` shape — same pattern
+    as ``_emit_tunnel_portals``.
+
+    Returns the number of bridge rects whose walls were emitted.
+    """
+    bridge_shapes = [s for s in layout.shapes
+                     if getattr(s, "is_bridge", False)
+                     and s.polygon is not None
+                     and not s.polygon.is_empty]
+    if not bridge_shapes:
+        return 0
+    n_emitted = 0
+    exclusion_zones: List[Polygon] = []
+    for s in bridge_shapes:
+        rc = list(s.polygon.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        # Per ``_rect_from_axis_extended`` corner convention:
+        # corners 0,3 = one short edge, corners 1,2 = other.
+        # Long edges: corners (0,1) and (2,3).
+        # Compute the deck elevation for the wall: average of
+        # altitude_high/altitude_low on a sloped rect, or
+        # altitude on a flat rect.  Walls match the deck so the
+        # join is seamless.
+        if (s.altitude_high is not None
+                and s.altitude_low is not None):
+            deck_elev = 0.5 * (s.altitude_high + s.altitude_low)
+        elif s.altitude is not None:
+            deck_elev = s.altitude
+        else:
+            # No elevation set yet — skip.  The post-elevation
+            # pass calls _emit_taxi_bridges after rect altitudes
+            # are filled in by the unified solver.
+            continue
+        for (a, b) in ((0, 1), (2, 3)):
+            ax, ay = rc[a]
+            bx, by = rc[b]
+            ex = bx - ax
+            ey = by - ay
+            elen = math.hypot(ex, ey)
+            if elen < 1.0:
+                continue
+            ux = ex / elen
+            uy = ey / elen
+            # Outward normal — flip if the test point is INSIDE
+            # the rect.
+            n_x = -uy
+            n_y = ux
+            mid_x = 0.5 * (ax + bx)
+            mid_y = 0.5 * (ay + by)
+            if s.polygon.contains(
+                    Point(mid_x + n_x * 0.1,
+                          mid_y + n_y * 0.1)):
+                n_x = -n_x
+                n_y = -n_y
+            # Wall sits ``wall_gap_m`` outboard of the rect's
+            # long edge, ``retaining_wall_width_m`` thick.
+            inner = wall_gap_m
+            outer = wall_gap_m + retaining_wall_width_m
+            wc = [
+                (ax + n_x * inner, ay + n_y * inner),
+                (bx + n_x * inner, by + n_y * inner),
+                (bx + n_x * outer, by + n_y * outer),
+                (ax + n_x * outer, ay + n_y * outer),
+            ]
+            try:
+                wall_poly = Polygon(wc)
+                if not wall_poly.is_valid:
+                    wall_poly = wall_poly.buffer(0)
+                if (wall_poly.geom_type == "Polygon"
+                        and not wall_poly.is_empty):
+                    layout.shapes.append(BuiltShape(
+                        polygon=wall_poly,
+                        role=ROLE_RETAINING_WALL,
+                        ref="bridge_wall",
+                        altitude=round(float(deck_elev), 1)))
+                    exclusion_zones.append(wall_poly)
+            except Exception:
+                continue
+        # Track the bridge rect itself so the boundary subtraction
+        # below also clears the deck area.
+        exclusion_zones.append(s.polygon)
+        n_emitted += 1
+    # Boundary coordination: subtract inside-airport portion of
+    # (rect ∪ walls) from each ROLE_BOUNDARY shape.  Same pattern
+    # as ``_emit_tunnel_portals``.  Outside-airport bridges (rare)
+    # produce an empty intersection and no changes.
+    if (exclusion_zones
+            and layout.airport_boundary is not None
+            and not layout.airport_boundary.is_empty):
+        try:
+            bridge_union = unary_union(exclusion_zones)
+            inside_part = bridge_union.intersection(
+                layout.airport_boundary)
+        except Exception:
+            inside_part = None
+        if inside_part is not None and not inside_part.is_empty:
+            try:
+                excl = inside_part.buffer(boundary_clearance_m)
+                kept_shapes: List[BuiltShape] = []
+                for s in layout.shapes:
+                    if s.role != ROLE_BOUNDARY:
+                        kept_shapes.append(s)
+                        continue
+                    try:
+                        new_poly = s.polygon.difference(excl)
+                    except Exception:
+                        kept_shapes.append(s)
+                        continue
+                    if new_poly.is_empty:
+                        continue
+                    if new_poly.geom_type == "Polygon":
+                        s.polygon = new_poly
+                        s.node_altitudes = None
+                        kept_shapes.append(s)
+                    elif new_poly.geom_type == "MultiPolygon":
+                        for g in new_poly.geoms:
+                            if (g.geom_type != "Polygon"
+                                    or g.is_empty
+                                    or g.area < 5.0):
+                                continue
+                            kept_shapes.append(BuiltShape(
+                                polygon=g, role=s.role,
+                                ref=s.ref,
+                                altitude=s.altitude,
+                                node_altitudes=None))
+                layout.shapes = kept_shapes
+            except Exception:
+                pass
+    return n_emitted
+
+
+def _emit_underpass_road_approaches(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        clearance_depth_m: float = 8.0,
+        approach_length_m: float = 80.0,
+        road_width_m: float = 22.0,
+        ramp_step_m: float = 20.0,
+        ) -> int:
+    """For each underpass case (taxi BRIDGE rect or road TUNNEL
+    portal), emit a chain of sloped road-following polygons that
+    transition the road surface from outside-DEM elevation down
+    to ``apt_elev − clearance_depth_m`` near the underpass and
+    back up to DEM after.
+
+    Per user 2026-04-29 (KBNA / KPHX taxi-bridge case): without
+    these polygons, the patch's mesh under a bridge sits at
+    apt_elev (interpolated from the surrounding airport pavement),
+    and OSM-tagged roads rendered at DEM elevation by Ortho4XP's
+    road layer get buried.  Emitting a chain of road-following
+    polygons forces the mesh under the road to step down to a
+    height low enough for the road to clear the bridge underside
+    (default 8 m below airport surface), then ramp back up to DEM
+    away from the airport.
+
+    Algorithm per underpass surface (bridge rect or tunnel portal
+    region):
+
+      1. Find OSM road LineStrings that cross the surface's
+         footprint (or pass within 5 m of its long edges, for
+         tunnel portals where the road just barely touches).
+      2. For each crossing road, find the exterior segments
+         immediately approaching and departing the surface.
+      3. Walk each approach segment in ``ramp_step_m`` (20 m)
+         increments, emitting a sloped 4-corner rect per step
+         where elevation interpolates between DEM (start) and
+         ``apt_elev − clearance_depth_m`` (end).
+      4. Inside the underpass surface itself, emit a flat road-
+         following polygon at ``apt_elev − clearance_depth_m``.
+
+    Width of every emitted road polygon: ``road_width_m``
+    (22 m by default; matches tunnel-ramp width).
+
+    Returns the number of UNDERPASS surfaces processed.
+    """
+    # Collect underpass surfaces.
+    bridge_shapes = [s for s in layout.shapes
+                     if getattr(s, "is_bridge", False)
+                     and s.polygon is not None
+                     and not s.polygon.is_empty]
+    if not bridge_shapes:
+        return 0
+    nodes_r, ways_r = _load_osm_big_roads(
+        layout.anchor[0], layout.anchor[1])
+    if not ways_r:
+        return 0
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+    def _to_m(lon: float, lat: float) -> Tuple[float, float]:
+        return (math.radians(lon - lon0) * R * cos0,
+                math.radians(lat - lat0) * R)
+    def _m_to_ll(x: float, y: float) -> Tuple[float, float]:
+        return (lat0 + math.degrees(y / R),
+                lon0 + math.degrees(x / (R * cos0)))
+    nodes_m: Dict[str, Tuple[float, float]] = {}
+    for nid, (lat, lon) in nodes_r.items():
+        nodes_m[nid] = _to_m(lon, lat)
+    HW_TYPES = {
+        "motorway", "trunk", "primary", "secondary",
+        "tertiary", "motorway_link", "trunk_link",
+        "primary_link", "residential", "service",
+    }
+    # Collect candidate road LineStrings (not bridge or tunnel
+    # tagged — those are special cases).  A road that PASSES
+    # UNDER a taxi bridge typically isn't tagged bridge=yes
+    # itself; only the airport surface is.  But a ROAD that
+    # itself bridges over something else IS tagged bridge=yes;
+    # we skip those because we don't want to emit road shapes
+    # for road-on-road bridges.
+    road_lines: List[LineString] = []
+    for _wid, nrefs, tags in ways_r:
+        if tags.get("highway") not in HW_TYPES:
+            continue
+        if tags.get("bridge") and tags.get("bridge") != "no":
+            continue
+        if (tags.get("tunnel")
+                and tags.get("tunnel") != "no"):
+            continue
+        pts = [nodes_m[n] for n in nrefs if n in nodes_m]
+        if len(pts) < 2:
+            continue
+        try:
+            ls = LineString(pts)
+        except Exception:
+            continue
+        if ls.is_empty or ls.length < 5.0:
+            continue
+        road_lines.append(ls)
+    if not road_lines:
+        return 0
+    n_processed = 0
+    for s in bridge_shapes:
+        # Bridge deck elevation.
+        if (s.altitude_high is not None
+                and s.altitude_low is not None):
+            deck_elev = 0.5 * (s.altitude_high + s.altitude_low)
+        elif s.altitude is not None:
+            deck_elev = s.altitude
+        else:
+            continue
+        low_elev = float(deck_elev) - clearance_depth_m
+        # Find road LineStrings that cross the bridge footprint.
+        for road_ls in road_lines:
+            try:
+                inside = road_ls.intersection(s.polygon)
+            except Exception:
+                continue
+            if inside.is_empty:
+                continue
+            # Pick the longest contiguous piece if multiple.
+            if hasattr(inside, "geoms"):
+                cand = [g for g in inside.geoms
+                        if g.geom_type == "LineString"
+                        and g.length > 1.0]
+                if not cand:
+                    continue
+                inside = max(cand, key=lambda g: g.length)
+            elif inside.geom_type != "LineString":
+                continue
+            # Inside-bridge flat polygon at low_elev.
+            try:
+                inside_buf = inside.buffer(
+                    road_width_m / 2.0,
+                    cap_style=2, join_style=2)
+                if (inside_buf.geom_type == "Polygon"
+                        and not inside_buf.is_empty):
+                    layout.shapes.append(BuiltShape(
+                        polygon=inside_buf,
+                        role=ROLE_TUNNEL_RAMP,
+                        ref="bridge_underpass",
+                        altitude=round(low_elev, 1)))
+            except Exception:
+                pass
+            # Approach + departure ramp chains.  Find the parts
+            # of the road OUTSIDE the bridge polygon, then walk
+            # each in ramp_step_m steps emitting one sloped rect
+            # per step.
+            try:
+                outside = road_ls.difference(s.polygon)
+            except Exception:
+                outside = None
+            if outside is None or outside.is_empty:
+                continue
+            outside_pieces = (
+                list(outside.geoms)
+                if hasattr(outside, "geoms")
+                else [outside])
+            for piece in outside_pieces:
+                if (piece.is_empty
+                        or piece.geom_type != "LineString"):
+                    continue
+                # Decide which end of the piece TOUCHES the bridge.
+                pcoords = list(piece.coords)
+                if len(pcoords) < 2:
+                    continue
+                p_start = Point(pcoords[0])
+                p_end = Point(pcoords[-1])
+                d_start = s.polygon.distance(p_start)
+                d_end = s.polygon.distance(p_end)
+                if d_start <= d_end:
+                    # piece runs FROM bridge edge OUT to far end —
+                    # walk it as approach (low → high).
+                    # Cap to approach_length_m.
+                    walk_len = min(piece.length, approach_length_m)
+                    bridge_end_pt = piece.interpolate(0.0)
+                    far_end_pt = piece.interpolate(walk_len)
+                    walk = LineString([(bridge_end_pt.x,
+                                          bridge_end_pt.y),
+                                        (far_end_pt.x,
+                                          far_end_pt.y)])
+                    # Use the actual sub-LineString shape for
+                    # better following; but for simplicity use the
+                    # straight sub-segment for ramp emission.
+                    walk = LineString(pcoords[:])
+                    # Trim walk to first ``walk_len`` metres.
+                else:
+                    walk_len = min(piece.length, approach_length_m)
+                    walk = LineString(list(reversed(pcoords)))
+                # Step through walk_len in ramp_step_m steps.
+                # Each step is a sloped rect of (low_elev → DEM).
+                u_prev = 0.0
+                while u_prev < walk_len - 1.0:
+                    u_next = min(walk_len, u_prev + ramp_step_m)
+                    p0 = walk.interpolate(u_prev)
+                    p1 = walk.interpolate(u_next)
+                    seg_len = math.hypot(p1.x - p0.x, p1.y - p0.y)
+                    if seg_len < 1.0:
+                        break
+                    # Tangent + perpendicular.
+                    tx = (p1.x - p0.x) / seg_len
+                    ty = (p1.y - p0.y) / seg_len
+                    nx = -ty
+                    ny = tx
+                    half_w = road_width_m / 2.0
+                    # Elevation interpolation: u_prev → low_elev
+                    # at the bridge, DEM at the far end.
+                    frac0 = u_prev / walk_len
+                    frac1 = u_next / walk_len
+                    try:
+                        lat0_p, lon0_p = _m_to_ll(p0.x, p0.y)
+                        lat1_p, lon1_p = _m_to_ll(p1.x, p1.y)
+                        dem0 = _sample_dem(
+                            dem, tile_lat, tile_lon,
+                            lat0_p, lon0_p)
+                        dem1 = _sample_dem(
+                            dem, tile_lat, tile_lon,
+                            lat1_p, lon1_p)
+                    except Exception:
+                        dem0 = dem1 = None
+                    if dem0 is None or dem1 is None:
+                        break
+                    e0 = (1.0 - frac0) * low_elev + frac0 * dem0
+                    e1 = (1.0 - frac1) * low_elev + frac1 * dem1
+                    corners = [
+                        (p0.x + nx * half_w,
+                         p0.y + ny * half_w),
+                        (p1.x + nx * half_w,
+                         p1.y + ny * half_w),
+                        (p1.x - nx * half_w,
+                         p1.y - ny * half_w),
+                        (p0.x - nx * half_w,
+                         p0.y - ny * half_w),
+                    ]
+                    try:
+                        seg_poly = Polygon(corners)
+                        if not seg_poly.is_valid:
+                            seg_poly = seg_poly.buffer(0)
+                        if (seg_poly.geom_type == "Polygon"
+                                and not seg_poly.is_empty):
+                            # corners 0,3 = "high" end vs corners
+                            # 1,2 = "low" end depends on which
+                            # end is closer to the bridge.  e0
+                            # (start = bridge side) is lower.
+                            if abs(e0 - e1) >= 0.1:
+                                layout.shapes.append(BuiltShape(
+                                    polygon=seg_poly,
+                                    role=ROLE_TUNNEL_RAMP,
+                                    ref="bridge_approach",
+                                    altitude_high=round(
+                                        max(e0, e1), 1),
+                                    altitude_low=round(
+                                        min(e0, e1), 1)))
+                            else:
+                                layout.shapes.append(BuiltShape(
+                                    polygon=seg_poly,
+                                    role=ROLE_TUNNEL_RAMP,
+                                    ref="bridge_approach",
+                                    altitude=round(
+                                        0.5 * (e0 + e1), 1)))
+                    except Exception:
+                        pass
+                    u_prev = u_next
+        n_processed += 1
+    return n_processed
 
 
 def _smooth_within_junction_adjacent_pair_grade(
