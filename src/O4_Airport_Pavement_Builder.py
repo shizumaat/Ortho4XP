@@ -4631,6 +4631,20 @@ def _solve_pavement_elevations_unified(
         # Terminal, junction, apron — apron rule.
         return APRON_MAX_GRADE
 
+    # Per user 2026-04-29: in addition to ring-edge connectivity,
+    # add a "spatial-pair" edge between every pair of vertices
+    # WITHIN THE SAME SHAPE that are ≤ ``WITHIN_SHAPE_VIOLATION_
+    # RADIUS_M`` apart in EUCLIDEAN distance.  The audit /
+    # smoother both check spatial distance, not graph distance —
+    # so without this, a junction with 100 ring vertices can have
+    # vertex pair (i, j) that is 5 m apart spatially but 50 ring-
+    # hops away.  The Laplacian's ring-edge cap then permits up
+    # to 50 × per-edge cap of cumulative drift across the chain,
+    # which the audit reports as a 100 % grade cliff.  Adding
+    # the spatial pair as a direct edge constrains the pair the
+    # same way the audit will check it.
+    spatial_radius_m = WITHIN_SHAPE_VIOLATION_RADIUS_M
+    spatial_radius2 = spatial_radius_m * spatial_radius_m
     for s in layout.shapes:
         if s.role not in pavement_roles:
             continue
@@ -4646,26 +4660,63 @@ def _solve_pavement_elevations_unified(
             continue
         gr = _role_grade(s.role)
         m = len(coords)
+        # Pre-compute this shape's vertex node indices so we can
+        # cheaply emit ring + spatial pairs.
+        node_idx: List[Optional[int]] = []
+        for x, y in coords:
+            b = _corner_elevation_bucket(x, y)
+            node_idx.append(bucket_to_idx.get(b))
+        # Ring edges (i ↔ i+1).
         for i in range(m):
+            ui = node_idx[i]
+            uj = node_idx[(i + 1) % m]
+            if ui is None or uj is None or ui == uj:
+                continue
             x1, y1 = coords[i]
             x2, y2 = coords[(i + 1) % m]
-            b1 = _corner_elevation_bucket(x1, y1)
-            b2 = _corner_elevation_bucket(x2, y2)
-            if b1 not in bucket_to_idx or b2 not in bucket_to_idx:
-                continue
-            u = bucket_to_idx[b1]
-            v = bucket_to_idx[b2]
-            if u == v:
-                continue
-            key = (u, v) if u < v else (v, u)
             length = math.hypot(x2 - x1, y2 - y1)
             if length < 0.1:
                 continue
+            key = (ui, uj) if ui < uj else (uj, ui)
             cur_g = edge_grade.get(key, float("inf"))
             if gr < cur_g:
                 edge_grade[key] = gr
             cur_l = edge_length.get(key, length)
             edge_length[key] = min(cur_l, length)
+        # Spatial pairs (i, j) with j > i + 1 and Euclidean ≤
+        # spatial_radius_m.  Skip pairs already connected as ring
+        # edges (handled above) — the dict-min logic would just
+        # repeat them.
+        for i in range(m):
+            xi, yi = coords[i]
+            ui = node_idx[i]
+            if ui is None:
+                continue
+            # Start at i+2 to skip the ring-adjacent pair that's
+            # already added (and the i,i identity).  Treat the
+            # ring-wrap pair (m-1, 0) as already covered too.
+            for j in range(i + 2, m):
+                # Skip the wrap-around ring edge.
+                if i == 0 and j == m - 1:
+                    continue
+                uj = node_idx[j]
+                if uj is None or ui == uj:
+                    continue
+                xj, yj = coords[j]
+                dx = xj - xi
+                dy = yj - yi
+                d2 = dx * dx + dy * dy
+                if d2 > spatial_radius2:
+                    continue
+                length = math.sqrt(d2)
+                if length < 0.1:
+                    continue
+                key = (ui, uj) if ui < uj else (uj, ui)
+                cur_g = edge_grade.get(key, float("inf"))
+                if gr < cur_g:
+                    edge_grade[key] = gr
+                cur_l = edge_length.get(key, length)
+                edge_length[key] = min(cur_l, length)
 
     # Adjacency for Jacobi step.
     adj: List[List[Tuple[int, float, float]]] = [[] for _ in range(n)]
