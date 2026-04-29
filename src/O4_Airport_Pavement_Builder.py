@@ -9038,8 +9038,39 @@ def _extract_osm_terminals(
     relations: List[Tuple[str, List[str], Dict[str, str]]],
     to_m,
 ) -> List[Polygon]:
-    """Extract aeroway=terminal polygons (ways OR multipolygon
-    relations with outer rings) in meter space."""
+    """Extract terminal-class building polygons (ways OR
+    multipolygon relations with outer rings) in meter space.
+
+    Per user 2026-04-28: also recognize ``aeroway=hangar`` and
+    ``aeroway=tower`` because OSM mappers at some airports
+    (notably HECA Cairo) tag passenger-terminal-class buildings
+    as hangars rather than terminals.  Functionally these are
+    identical for the pavement-grading pipeline: flat, fixed-
+    altitude structures on apron pavement that the surrounding
+    apron should grade to.
+
+    Guard against false positives: ``aeroway=hangar`` /
+    ``aeroway=tower`` are only used when the airport has NO
+    ``aeroway=terminal`` items.  At airports where mappers DID
+    use ``aeroway=terminal`` (e.g. SPJC), the explicit terminals
+    are authoritative and the hangar/tower buildings are likely
+    actual hangars / towers that overlap pavement and would
+    cause overlap-clip to malform sloping rects.
+
+    All accepted categories are emitted as ROLE_TERMINAL.
+    """
+    # Detect whether this airport uses explicit aeroway=terminal.
+    has_explicit_terminal = any(
+        tags.get("aeroway") == "terminal"
+        for _wid, _nds, tags in ways)
+    has_explicit_terminal = has_explicit_terminal or any(
+        tags.get("aeroway") == "terminal"
+        for _rid, _wids, tags in relations)
+    if has_explicit_terminal:
+        terminal_aeroway_tags = {"terminal"}
+    else:
+        terminal_aeroway_tags = {"terminal", "hangar", "tower"}
+    TERMINAL_AEROWAY_TAGS = terminal_aeroway_tags
     out: List[Polygon] = []
     way_by_id = {wid: (nds, tags) for wid, nds, tags in ways}
 
@@ -9063,7 +9094,7 @@ def _extract_osm_terminals(
 
     # Way terminals
     for wid, nds, tags in ways:
-        if tags.get("aeroway") != "terminal":
+        if tags.get("aeroway") not in TERMINAL_AEROWAY_TAGS:
             continue
         p = _ring_polygon(nds)
         if p is not None and p.area >= 100.0:
@@ -9091,7 +9122,7 @@ def _extract_osm_terminals(
     MIN_TERMINAL_COMPONENT_M2 = 500.0
     LARGEST_DOMINATES_FRAC = 0.7
     for rid, outer_wids, tags in relations:
-        if tags.get("aeroway") != "terminal":
+        if tags.get("aeroway") not in TERMINAL_AEROWAY_TAGS:
             continue
         rings = []
         for wid in outer_wids:
