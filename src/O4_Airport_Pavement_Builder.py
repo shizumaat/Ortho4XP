@@ -2129,12 +2129,34 @@ def build_airport_pavement(icao: str, xplane_root: str,
     #      contribute substantially NEW coverage are appended.
     DSF_OVERLAY_FRAC = 0.80
     DSF_AIRPORT_RADIUS_M = 5_000.0
+    # Per user 2026-04-29: drop DSF pavement polygons whose area
+    # exceeds the largest apt.dat pavement polygon by more than
+    # DSF_MAX_AREA_VS_APT_DAT_RATIO×.  Real airport pavement
+    # polygons (taxiways, aprons, runway aprons) are bounded in
+    # scale by the largest features apt.dat already represents at
+    # the airport.  A DSF polygon dramatically larger than apt.dat's
+    # biggest is a coarse "ground tile" — pavement-textured
+    # decorative geometry painted across the whole airport surface
+    # rather than a real pavement feature.  Confirmed at HECA
+    # (Tai Models scenery), where ``lib/airport/ground/pavement/
+    # asphalt/patched.pol`` instances of 3.5 M m² (with only 22
+    # vertices, perimeter ~8 km) and 1.25 M m² (36 verts) overlay
+    # the entire airport, dwarfing apt.dat's largest pavement
+    # polygon at 378 k m² and inflating the rect-detection's
+    # half-width probes to 100 m+ across what should be a 30 m
+    # taxi corridor.  Safe at SPJC / CYXY / SPLP: their largest
+    # legitimate DSF pavement polygons are within 2.2× apt.dat's
+    # largest, well under the 3× cap.
+    DSF_MAX_AREA_VS_APT_DAT_RATIO = 3.0
     apt_pav_union: Optional[Polygon] = None
+    apt_pav_largest_area: float = 0.0
     if pav_polys:
         try:
             apt_pav_union = unary_union(pav_polys)
         except Exception:
             apt_pav_union = None
+        apt_pav_largest_area = max(
+            (p.area for p in pav_polys), default=0.0)
     # Compute the airport's bounding box from runway corners +
     # apt.dat pavement.  DSF polygons farther than
     # DSF_AIRPORT_RADIUS_M from this bbox are not this airport's.
@@ -2158,6 +2180,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         n_dsf_kept = 0
         n_dsf_dropped_overlay = 0
         n_dsf_dropped_far = 0
+        n_dsf_dropped_oversized = 0
         for ad in all_apt_dats:
             dsf = _DSFR.find_associated_dsf(ad, anchor[0], anchor[1])
             if dsf is None or dsf in seen_dsf:
@@ -2186,6 +2209,20 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                 or py_min > apt_bbox_m[3]):
                             n_dsf_dropped_far += 1
                             continue
+                    # Oversized-vs-apt.dat gate: a DSF polygon
+                    # dramatically larger than the airport's
+                    # biggest apt.dat pavement polygon is a coarse
+                    # "ground tile" overlay, not real pavement —
+                    # drop it.  Only meaningful when apt.dat has
+                    # ANY pavement; airports with no apt.dat
+                    # pavement (CYXY-style sparse data) are
+                    # unaffected.
+                    if (apt_pav_largest_area > 0
+                            and pm.area
+                            > (apt_pav_largest_area
+                               * DSF_MAX_AREA_VS_APT_DAT_RATIO)):
+                        n_dsf_dropped_oversized += 1
+                        continue
                     # Overlay check: drop the polygon if most of its
                     # area lies inside the existing apt.dat pavement
                     # union (it's a decorative overlay rather than
@@ -2206,14 +2243,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 except Exception:
                     continue
         if (n_dsf_kept or n_dsf_dropped_overlay
-                or n_dsf_dropped_far):
+                or n_dsf_dropped_far or n_dsf_dropped_oversized):
             try:
                 import sys as _sys
-                _sys.stderr.write(
-                    f"  [pav-builder] {icao}: DSF pavement: "
-                    f"{n_dsf_kept} kept, "
-                    f"{n_dsf_dropped_overlay} dropped as overlay, "
-                    f"{n_dsf_dropped_far} dropped as off-airport.\n")
+                msg = (f"  [pav-builder] {icao}: DSF pavement: "
+                       f"{n_dsf_kept} kept, "
+                       f"{n_dsf_dropped_overlay} dropped as overlay, "
+                       f"{n_dsf_dropped_far} dropped as off-airport")
+                if n_dsf_dropped_oversized:
+                    msg += (f", {n_dsf_dropped_oversized} dropped "
+                            f"as oversized-vs-apt.dat")
+                _sys.stderr.write(msg + ".\n")
             except Exception:
                 pass
     except Exception:
