@@ -2157,6 +2157,62 @@ def build_airport_pavement(icao: str, xplane_root: str,
             apt_pav_union = None
         apt_pav_largest_area = max(
             (p.area for p in pav_polys), default=0.0)
+
+    # ── OSM-aeroway-footprint vs apt.dat coverage check ───────────
+    # Per user 2026-04-29: prioritize apt.dat as the pavement
+    # source.  Only fall back to DSF when there's a meaningful
+    # discrepancy between apt.dat and what OSM aeroway data tells
+    # us the airport actually has.  The OSM aeroway tags
+    # (aeroway=apron, taxiway, taxi_lane, stand) are the user-
+    # mapped truth about the airport's pavement extent.  If
+    # apt.dat already covers that extent, DSF additions are at
+    # best decorative overlays and at worst inflated ground tiles
+    # filling non-pavement areas (HECA, where DSF added pavement
+    # between runways and taxiways).  When apt.dat is missing
+    # significant OSM-known pavement, DSF is admitted only inside
+    # the gap.
+    #
+    # Load OSM here (early) so the DSF loop below can use the
+    # aeroway footprint to gate DSF additions.
+    nodes, ways, relations = _load_osm_airports(
+        xplane_root, icao, anchor[0], anchor[1])
+    osm_aeroway_footprint = _build_osm_aeroway_footprint(
+        nodes, ways, to_m)
+    # Gap = OSM-known pavement that apt.dat doesn't cover.  When
+    # this is a small fraction, apt.dat is sufficient; skip DSF
+    # entirely.
+    osm_gap: Optional[Polygon] = None
+    DSF_OSM_GAP_BUFFER_M = 5.0          # widen gap by 5 m so DSF
+                                         # tile alignment can vary
+                                         # slightly without losing
+                                         # legitimate fill.
+    # Coverage threshold: above this, the airport's apt.dat is
+    # considered "comprehensive" — apt.dat captures most of what
+    # OSM thinks the airport has, so DSF is restricted to filling
+    # the small remaining gap (typically a couple of taxi corridors
+    # apt.dat happens to miss).  Below this threshold, apt.dat is
+    # sparse (e.g. CYXY where apt.dat has ~52% of OSM) and OSM is
+    # also incomplete; DSF is the primary pavement source there
+    # and we trust it broadly (drop overlays only).
+    APT_COMPREHENSIVE_OSM_FRAC = 0.80
+    apt_is_comprehensive = False
+    if (osm_aeroway_footprint is not None
+            and not osm_aeroway_footprint.is_empty
+            and apt_pav_union is not None
+            and not apt_pav_union.is_empty):
+        try:
+            apt_in_osm = apt_pav_union.intersection(
+                osm_aeroway_footprint).area
+            osm_area = osm_aeroway_footprint.area
+            if osm_area > 1.0:
+                apt_is_comprehensive = (
+                    apt_in_osm / osm_area
+                    >= APT_COMPREHENSIVE_OSM_FRAC)
+            gap = osm_aeroway_footprint.difference(apt_pav_union)
+            if not gap.is_empty:
+                osm_gap = gap.buffer(DSF_OSM_GAP_BUFFER_M)
+        except Exception:
+            pass
     # Compute the airport's bounding box from runway corners +
     # apt.dat pavement.  DSF polygons farther than
     # DSF_AIRPORT_RADIUS_M from this bbox are not this airport's.
@@ -2181,6 +2237,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         n_dsf_dropped_overlay = 0
         n_dsf_dropped_far = 0
         n_dsf_dropped_oversized = 0
+        n_dsf_dropped_outside_osm_gap = 0
         for ad in all_apt_dats:
             dsf = _DSFR.find_associated_dsf(ad, anchor[0], anchor[1])
             if dsf is None or dsf in seen_dsf:
@@ -2209,6 +2266,31 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                 or py_min > apt_bbox_m[3]):
                             n_dsf_dropped_far += 1
                             continue
+                    # apt.dat-priority gate (user 2026-04-29):
+                    # when apt.dat is comprehensive (covers ≥ 80%
+                    # of the OSM-aeroway footprint), restrict DSF
+                    # additions to the buffered OSM-vs-apt.dat
+                    # gap.  This keeps decorative DSF ground
+                    # tiles out — anything outside the gap is
+                    # either an apt.dat overlay (handled below)
+                    # or non-pavement texture filling between
+                    # runways and taxiways (HECA case).  When
+                    # apt.dat is SPARSE (covers < 80 % of OSM),
+                    # we don't apply the gap filter — apt.dat
+                    # alone is too thin and OSM is also
+                    # incomplete; DSF is the primary source
+                    # there (CYXY, SPLP).  Overlay-elimination
+                    # below still drops DSF that's redundant
+                    # with apt.dat.
+                    if (apt_is_comprehensive
+                            and osm_gap is not None
+                            and not osm_gap.is_empty):
+                        try:
+                            if not pm.intersects(osm_gap):
+                                n_dsf_dropped_outside_osm_gap += 1
+                                continue
+                        except Exception:
+                            pass
                     # Oversized-vs-apt.dat gate: a DSF polygon
                     # dramatically larger than the airport's
                     # biggest apt.dat pavement polygon is a coarse
@@ -2243,7 +2325,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 except Exception:
                     continue
         if (n_dsf_kept or n_dsf_dropped_overlay
-                or n_dsf_dropped_far or n_dsf_dropped_oversized):
+                or n_dsf_dropped_far or n_dsf_dropped_oversized
+                or n_dsf_dropped_outside_osm_gap):
             try:
                 import sys as _sys
                 msg = (f"  [pav-builder] {icao}: DSF pavement: "
@@ -2253,6 +2336,9 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 if n_dsf_dropped_oversized:
                     msg += (f", {n_dsf_dropped_oversized} dropped "
                             f"as oversized-vs-apt.dat")
+                if n_dsf_dropped_outside_osm_gap:
+                    msg += (f", {n_dsf_dropped_outside_osm_gap} "
+                            f"dropped: outside OSM-aeroway gap")
                 _sys.stderr.write(msg + ".\n")
             except Exception:
                 pass
@@ -2353,9 +2439,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _rc = _rc[:-1]
         apt_pav_vertices.extend(_rc)
 
-    # ── Load OSM centerlines + relations ─────────────────────────
-    nodes, ways, relations = _load_osm_airports(
-        xplane_root, icao, anchor[0], anchor[1])
+    # ── OSM centerlines from already-loaded OSM ──────────────────
+    # ``nodes`` / ``ways`` / ``relations`` were loaded earlier so
+    # the DSF-loading loop could compare apt.dat coverage against
+    # the OSM-aeroway footprint.
     osm_centerlines = _extract_osm_taxi_centerlines(
         nodes, ways, to_m, rwy_centerlines=rwy_centerlines)
 
@@ -9418,6 +9505,95 @@ def _terminal_pad_from_building(
     if building.is_empty:
         return None
     return building
+
+
+def _build_osm_aeroway_footprint(
+    nodes: Dict[str, Tuple[float, float]],
+    ways: List[Tuple[str, List[str], Dict[str, str]]],
+    to_m,
+    taxi_half_width_m: float = 15.0,
+) -> Optional[Polygon]:
+    """Return the OSM-known pavement footprint as a Polygon /
+    MultiPolygon in meter coordinates.
+
+    Sources:
+      * ``aeroway=apron`` / ``stand`` / ``parking_position`` /
+        ``hangar_apron`` closed ways → polygons
+      * ``aeroway=taxiway`` / ``taxi_lane`` / ``runway`` open ways
+        → linestrings buffered by ``taxi_half_width_m`` (covers
+        the typical taxi corridor when no width tag is present)
+      * If the way IS closed (apron-style polygon tagged taxiway),
+        treat as a polygon — covers airports where mappers drew
+        taxiway extents instead of centerlines.
+
+    Used by the DSF-loading gate to decide whether apt.dat
+    already covers the airport's user-mapped pavement.  When
+    apt.dat covers ≥ 85 % of this footprint, DSF additions are
+    refused.  When apt.dat has gaps, DSF is admitted only inside
+    the gap.
+    """
+    AREA_AEROWAYS = {
+        "apron", "stand", "parking_position",
+        "hangar_apron",
+    }
+    LINEAR_AEROWAYS = {
+        "taxiway", "taxi_lane", "runway",
+    }
+    pieces: List[Polygon] = []
+    for _wid, nrefs, tags in ways:
+        ay = tags.get("aeroway", "")
+        if ay not in AREA_AEROWAYS and ay not in LINEAR_AEROWAYS:
+            continue
+        pts: List[Tuple[float, float]] = []
+        for n in nrefs:
+            if n in nodes:
+                lat, lon = nodes[n]
+                pts.append(to_m(lon, lat))
+        if len(pts) < 2:
+            continue
+        is_closed = (
+            len(pts) >= 3
+            and abs(pts[0][0] - pts[-1][0]) < 0.5
+            and abs(pts[0][1] - pts[-1][1]) < 0.5)
+        try:
+            if ay in AREA_AEROWAYS or is_closed:
+                if len(pts) < 3:
+                    continue
+                p = Polygon(pts).buffer(0)
+                if (p.geom_type == "Polygon"
+                        and not p.is_empty
+                        and p.area >= 1.0):
+                    pieces.append(p)
+                elif p.geom_type == "MultiPolygon":
+                    for g in p.geoms:
+                        if (g.geom_type == "Polygon"
+                                and not g.is_empty
+                                and g.area >= 1.0):
+                            pieces.append(g)
+            else:
+                ls = LineString(pts)
+                if ls.is_empty:
+                    continue
+                buf = ls.buffer(taxi_half_width_m)
+                if (buf.geom_type == "Polygon"
+                        and not buf.is_empty):
+                    pieces.append(buf)
+                elif buf.geom_type == "MultiPolygon":
+                    for g in buf.geoms:
+                        if (g.geom_type == "Polygon"
+                                and not g.is_empty):
+                            pieces.append(g)
+        except Exception:
+            continue
+    if not pieces:
+        return None
+    try:
+        merged = unary_union(pieces)
+        if merged.is_empty:
+            return None
+        return merged
+    except Exception:
+        return None
 
 
 def _terminal_groundside_zone(
