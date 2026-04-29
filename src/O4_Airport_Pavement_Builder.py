@@ -2359,6 +2359,83 @@ def build_airport_pavement(icao: str, xplane_root: str,
     osm_centerlines = _extract_osm_taxi_centerlines(
         nodes, ways, to_m, rwy_centerlines=rwy_centerlines)
 
+    # ── Terminal groundside-pavement subtraction (user 2026-04-29):
+    # remove curbside / drop-off / parking pavement from pav_union
+    # before downstream rect / junction construction sees it.
+    # Groundside pavement sits at a different elevation than the
+    # building's airside apron, so allowing it to become an apron
+    # junction grade-clamps the building to the wrong altitude.
+    # Subtract a perpendicular outward strip from each terminal
+    # building's groundside edges (classified by OSM aeroway /
+    # highway adjacency + apt.dat-pavement connectivity).
+    try:
+        _osm_terminal_buildings = _extract_osm_terminals(
+            nodes, ways, relations, to_m)
+        _ground_zone = _terminal_groundside_zone(
+            _osm_terminal_buildings, nodes, ways, to_m,
+            apt_pavement_seeds=runway_polys)
+        if _ground_zone is not None and not _ground_zone.is_empty:
+            try:
+                pav_union = pav_union.difference(_ground_zone)
+                if hasattr(layout, "_pav_union_for_rects"):
+                    layout._pav_union_for_rects = (
+                        layout._pav_union_for_rects.difference(
+                            _ground_zone))
+                # Also subtract from the granular polygon list so
+                # downstream apron-merged-runway / rect-corner
+                # detection sees a consistent pavement footprint.
+                _new_pav_polys: List[Polygon] = []
+                for _p in pav_polys:
+                    try:
+                        _q = _p.difference(_ground_zone)
+                    except Exception:
+                        _new_pav_polys.append(_p)
+                        continue
+                    if _q.is_empty:
+                        continue
+                    if _q.geom_type == "Polygon":
+                        _new_pav_polys.append(_q)
+                    elif _q.geom_type == "MultiPolygon":
+                        for _g in _q.geoms:
+                            if (_g.geom_type == "Polygon"
+                                    and not _g.is_empty
+                                    and _g.area >= 1.0):
+                                _new_pav_polys.append(_g)
+                pav_polys[:] = _new_pav_polys
+                # Same for apt_only_pav_polys (used for terminal
+                # containment + rect-corner snapping).
+                _new_apt_only: List[Polygon] = []
+                for _p in apt_only_pav_polys:
+                    try:
+                        _q = _p.difference(_ground_zone)
+                    except Exception:
+                        _new_apt_only.append(_p)
+                        continue
+                    if _q.is_empty:
+                        continue
+                    if _q.geom_type == "Polygon":
+                        _new_apt_only.append(_q)
+                    elif _q.geom_type == "MultiPolygon":
+                        for _g in _q.geoms:
+                            if (_g.geom_type == "Polygon"
+                                    and not _g.is_empty
+                                    and _g.area >= 1.0):
+                                _new_apt_only.append(_g)
+                apt_only_pav_polys[:] = _new_apt_only
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] {icao}: subtracted "
+                        f"{_ground_zone.area:,.0f} m² of "
+                        f"groundside pavement (terminal "
+                        f"curbside / drop-off / parking).\n")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # ── Per-ref OVERALL chord bearings (pre-split) ───────────────
     # Used by ``_classify_role`` to disambiguate diagonal-overall
     # taxis whose curving ends happen to align near-parallel to
@@ -9325,32 +9402,281 @@ def _terminal_pad_from_building(
     building: Polygon,
     pav_polys: List[Polygon],
 ) -> Optional[Polygon]:
-    """Expand an OSM building outline into the terminal pad.
+    """Return the OSM building outline as the terminal pad.
 
-    The pad is the apt.dat pavement polygon that **contains** the
-    building (the pavement area dedicated to the terminal).  If no
-    pavement polygon contains the building centroid, fall back to
-    a buffered version of the building.
+    Per user 2026-04-29: the terminal shape must sit right at the
+    building edge — no padding, no expansion to the containing
+    apt.dat polygon, no fallback buffer.  The earlier behaviour
+    (expand to smallest containing apt.dat polygon, or buffer 20 m
+    if none) pushed the terminal border out beyond the building
+    footprint.
+
+    ``pav_polys`` is unused but kept in the signature so callers
+    don't need to change.
     """
+    del pav_polys  # intentionally unused
     if building.is_empty:
         return None
-    ctr = building.centroid
-    best = None
-    best_area = -1.0
-    for pav in pav_polys:
-        if pav.contains(ctr):
-            # Prefer the SMALLEST containing polygon (most specific).
-            if best is None or pav.area < best_area:
-                best = pav
-                best_area = pav.area
-    if best is not None:
-        return best
-    # Fallback: buffered building
+    return building
+
+
+def _terminal_groundside_zone(
+    buildings: List[Polygon],
+    nodes: Dict[str, Tuple[float, float]],
+    ways: List[Tuple[str, List[str], Dict[str, str]]],
+    to_m,
+    edge_classify_radius_m: float = 30.0,
+    groundside_extent_m: float = 100.0,
+    apt_pavement_seeds: Optional[List[Polygon]] = None,
+) -> Optional[Polygon]:
+    """Identify pavement strips on the GROUNDSIDE of terminal
+    buildings — the road/curbside frontage where access roads,
+    drop-off lanes, and parking sit on pavement at a different
+    elevation than the airside apron.  Returns a Polygon /
+    MultiPolygon to subtract from ``pav_union`` so groundside
+    pavement does NOT become an apron junction grade-clamped to
+    the terminal altitude.
+
+    Per user 2026-04-29: combines two airside / groundside
+    indicators on each building edge:
+
+      1. APRON ADJACENCY (approach 1).  If the apt.dat polygon
+         abutting the edge is connected (touching, transitive)
+         to a runway-bearing polygon — i.e. the pavement chain
+         from this edge reaches the runway — it's airside.
+         Implemented by passing ``apt_pavement_seeds`` and
+         testing whether the probe area intersects the
+         airside-reachable subset.
+      2. OSM TAGS (approach 3).  ``aeroway`` features
+         (apron / taxiway / taxi_lane / stand / runway / gate)
+         within ``edge_classify_radius_m`` of an outward-edge
+         probe → AIRSIDE.  ``highway`` road-class features
+         (anything but footway / path / pedestrian / steps)
+         within the same probe → GROUNDSIDE.
+
+    An edge is GROUNDSIDE only when at least one groundside
+    indicator fires AND no airside indicator does.  An edge with
+    NEITHER indicator (most common at airports with sparse OSM
+    coverage) defaults to airside (no subtraction) — the safer
+    choice when the data can't tell us.
+
+    For each groundside edge a perpendicular outward rectangle
+    (depth ``groundside_extent_m``, width = edge length) is added
+    to the subtraction zone.  The result is the union of all such
+    rectangles; subtracting it from ``pav_union`` keeps the
+    airside apron intact while removing the curbside / drop-off
+    pavement that should not grade-clamp to the building.
+    """
+    if not buildings:
+        return None
+    AIRSIDE_AEROWAY = {
+        "apron", "taxiway", "taxi_lane", "stand",
+        "runway", "gate", "parking_position",
+    }
+    # Highway road classes — exclude pedestrian-class tags
+    # (footway / path / steps / pedestrian / corridor) which
+    # commonly trace airside pedestrian routes ON the apron.
+    GROUNDSIDE_HIGHWAY = {
+        "primary", "secondary", "tertiary",
+        "residential", "unclassified", "service",
+        "motorway", "trunk", "primary_link",
+        "secondary_link", "tertiary_link",
+        "motorway_link", "trunk_link", "living_street",
+        "raceway", "road",
+    }
+    # Build airside / groundside OSM geometry catalogs (meter
+    # coords).  Polygons (closed ways) become Polygon; open ways
+    # become LineString.
+    airside_geoms: List = []
+    groundside_geoms: List = []
+    for _wid, nrefs, tags in ways:
+        ay = tags.get("aeroway", "")
+        hw = tags.get("highway", "")
+        is_airside = ay in AIRSIDE_AEROWAY
+        is_groundside = hw in GROUNDSIDE_HIGHWAY
+        if not is_airside and not is_groundside:
+            continue
+        pts: List[Tuple[float, float]] = []
+        for n in nrefs:
+            if n in nodes:
+                lat, lon = nodes[n]
+                pts.append(to_m(lon, lat))
+        if len(pts) < 2:
+            continue
+        try:
+            if (len(pts) >= 3
+                    and abs(pts[0][0] - pts[-1][0]) < 0.5
+                    and abs(pts[0][1] - pts[-1][1]) < 0.5):
+                g = Polygon(pts).buffer(0)
+            else:
+                g = LineString(pts)
+            if g.is_empty:
+                continue
+        except Exception:
+            continue
+        if is_airside:
+            airside_geoms.append(g)
+        else:
+            groundside_geoms.append(g)
+    # Approach 1: build the airside-reachable subset of apt.dat
+    # pavement.  Two polygons are "connected" if their boundaries
+    # touch (intersect within a small buffer).  Seeds are polygons
+    # that contain or touch a runway centerline (passed in as
+    # ``apt_pavement_seeds`` — the caller's runway / aeroway
+    # marker geometries).  BFS from seeds; reachable = airside.
+    airside_apt_polys: List[Polygon] = []
+    if apt_pavement_seeds:
+        # Find apt.dat polys that touch a seed.
+        TOUCH_TOL_M = 1.0
+        airside_set: set = set()
+        # Caller passes seeds as a flat list; use them as-is.
+        seed_geoms = apt_pavement_seeds
+        # Mark each seed-touching polygon as airside.
+        # (Caller is responsible for passing the apt.dat polygon
+        # list as the same object so identity comparison works;
+        # to be robust, just check touch directly inside the
+        # per-edge loop below.)
+        airside_apt_polys = list(seed_geoms)
+    if (not airside_geoms
+            and not groundside_geoms
+            and not airside_apt_polys):
+        # No data to classify with — bail out, conservative.
+        return None
+    # STRtree indexes for fast spatial query.
     try:
-        buf = building.buffer(20.0)
+        from shapely.strtree import STRtree
     except Exception:
-        return building
-    return buf if buf.geom_type == "Polygon" else None
+        STRtree = None
+    air_tree = (STRtree(airside_geoms)
+                if STRtree and airside_geoms else None)
+    grd_tree = (STRtree(groundside_geoms)
+                if STRtree and groundside_geoms else None)
+    apt_air_tree = (STRtree(airside_apt_polys)
+                    if STRtree and airside_apt_polys else None)
+    zones: List[Polygon] = []
+    for bldg in buildings:
+        if bldg is None or bldg.is_empty:
+            continue
+        try:
+            coords = list(bldg.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        n = len(coords)
+        if n < 3:
+            continue
+        # Per-building two-pass classification.  An edge becomes
+        # GROUNDSIDE only when the OSM data gives us an EXPLICIT
+        # indicator on that edge — either ``highway=*`` (road
+        # class) immediately outward (approach 3) or the apt.dat
+        # polygon at that edge is NOT reachable from any runway
+        # via touching connectivity (approach 1, future work).
+        # An edge with NO clear indicator stays UNKNOWN and is
+        # NOT subtracted — promoting unknown to groundside on a
+        # building that has at least one airside edge proved too
+        # aggressive at HECA, where apron-tagging is patchy and
+        # several airside edges look UNKNOWN to OSM.
+        EDGE_AIRSIDE = 1
+        EDGE_GROUNDSIDE = 2
+        EDGE_UNKNOWN = 0
+        edge_class: List[int] = [EDGE_UNKNOWN] * n
+        edge_geom: List[Optional[Tuple[float, float, float, float,
+                                         float, float]]] = [None] * n
+        for i in range(n):
+            ax, ay = coords[i]
+            bx, by = coords[(i + 1) % n]
+            edge_len = math.hypot(bx - ax, by - ay)
+            if edge_len < 1.0:
+                continue
+            tx = (bx - ax) / edge_len
+            ty = (by - ay) / edge_len
+            n_x = ty
+            n_y = -tx
+            mid_x = 0.5 * (ax + bx)
+            mid_y = 0.5 * (ay + by)
+            if bldg.contains(
+                    Point(mid_x + n_x * 1.0,
+                          mid_y + n_y * 1.0)):
+                n_x = -n_x
+                n_y = -n_y
+            edge_geom[i] = (ax, ay, bx, by, n_x, n_y)
+            try:
+                probe = Polygon([
+                    (ax, ay), (bx, by),
+                    (bx + n_x * edge_classify_radius_m,
+                     by + n_y * edge_classify_radius_m),
+                    (ax + n_x * edge_classify_radius_m,
+                     ay + n_y * edge_classify_radius_m),
+                ])
+                if not probe.is_valid:
+                    probe = probe.buffer(0)
+                if probe.is_empty:
+                    continue
+            except Exception:
+                continue
+            airside = False
+            groundside = False
+            # STRtree.query in Shapely 2.x returns numpy int64
+            # indices into the original geometry list — always
+            # index back to fetch the geometry.
+            if air_tree is not None:
+                for hit in air_tree.query(probe):
+                    g = airside_geoms[int(hit)]
+                    if g.intersects(probe):
+                        airside = True
+                        break
+            if not airside and apt_air_tree is not None:
+                for hit in apt_air_tree.query(probe):
+                    g = airside_apt_polys[int(hit)]
+                    if g.intersects(probe):
+                        airside = True
+                        break
+            if airside:
+                edge_class[i] = EDGE_AIRSIDE
+                continue
+            if grd_tree is not None:
+                for hit in grd_tree.query(probe):
+                    g = groundside_geoms[int(hit)]
+                    if g.intersects(probe):
+                        groundside = True
+                        break
+            if groundside:
+                edge_class[i] = EDGE_GROUNDSIDE
+                continue
+            edge_class[i] = EDGE_UNKNOWN
+        # Subtract only edges with EXPLICIT groundside indicator.
+        for i in range(n):
+            if edge_class[i] != EDGE_GROUNDSIDE:
+                continue
+            geom = edge_geom[i]
+            if geom is None:
+                continue
+            ax, ay, bx, by, n_x, n_y = geom
+            try:
+                zone = Polygon([
+                    (ax, ay), (bx, by),
+                    (bx + n_x * groundside_extent_m,
+                     by + n_y * groundside_extent_m),
+                    (ax + n_x * groundside_extent_m,
+                     ay + n_y * groundside_extent_m),
+                ])
+                if not zone.is_valid:
+                    zone = zone.buffer(0)
+                if (zone.geom_type == "Polygon"
+                        and not zone.is_empty):
+                    zones.append(zone)
+            except Exception:
+                continue
+    if not zones:
+        return None
+    try:
+        merged = unary_union(zones)
+        if merged.is_empty:
+            return None
+        return merged
+    except Exception:
+        return None
 
 
 def _extract_osm_terminals(
