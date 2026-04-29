@@ -281,6 +281,102 @@ def test_no_vertex_on_sloping_rect_edge(icao):
 
 
 @pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
+def test_rect_short_edges_connect(icao):
+    """Per user 2026-04-29: a sloping rect (primary_parallel,
+    secondary_parallel, stub, cross_connector) has TWO short
+    edges, and each short edge represents an end where the
+    corridor meets something else — a junction, a runway, a
+    terminal, or another rect via shared vertices.  A short edge
+    with both corners *un*shared with any other shape means the
+    rect is ending in the middle of nowhere — usually an
+    artifact of the long-edge-adjacent absorption clipping the
+    rect mid-corridor and not extending the surrounding junction
+    polygon to share the new clip-boundary corners.
+
+    For each rect, check that EACH of its two short edges has at
+    least one corner shared (within ``CORNER_SHARE_TOL_M``) with
+    a non-rect-self vertex.  An entirely-disconnected short edge
+    is the failure case.
+    """
+    import math
+    CORNER_SHARE_TOL_M = 0.5
+    layout = _build_layout(icao)
+    rect_roles = {"primary_parallel", "secondary_parallel",
+                  "stub", "cross_connector"}
+    # Collect every vertex from every shape with its source shape
+    # id, then for each rect check both short-edge corners against
+    # all OTHER shapes' vertices.
+    all_vertices: list = []  # list of (x, y, shape_index)
+    for si, s in enumerate(layout.shapes):
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for x, y in coords:
+            all_vertices.append((x, y, si))
+    failures = []
+    tol2 = CORNER_SHARE_TOL_M * CORNER_SHARE_TOL_M
+    for ri, r in enumerate(layout.shapes):
+        if r.role not in rect_roles:
+            continue
+        if r.polygon is None or r.polygon.is_empty:
+            continue
+        try:
+            rc = list(r.polygon.exterior.coords)
+        except Exception:
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        # Short edges per ``_rect_from_axis_extended`` convention:
+        #   short edge A = corners 0 + 3 (one end)
+        #   short edge B = corners 1 + 2 (other end)
+        for end_label, (i_a, i_b) in (("end_A", (0, 3)),
+                                        ("end_B", (1, 2))):
+            ax, ay = rc[i_a]
+            bx, by = rc[i_b]
+            shared_a = False
+            shared_b = False
+            for vx, vy, vsi in all_vertices:
+                if vsi == ri:
+                    continue
+                if (not shared_a
+                        and (vx - ax) ** 2 + (vy - ay) ** 2 <= tol2):
+                    shared_a = True
+                if (not shared_b
+                        and (vx - bx) ** 2 + (vy - by) ** 2 <= tol2):
+                    shared_b = True
+                if shared_a and shared_b:
+                    break
+            if not shared_a and not shared_b:
+                failures.append({
+                    "ref": r.ref or "?",
+                    "role": r.role,
+                    "end": end_label,
+                    "corner_a": (ax, ay),
+                    "corner_b": (bx, by),
+                })
+    if failures:
+        summary = "; ".join(
+            f"{f['role']}({f['ref']}) {f['end']}: "
+            f"({f['corner_a'][0]:.1f},{f['corner_a'][1]:.1f}) and "
+            f"({f['corner_b'][0]:.1f},{f['corner_b'][1]:.1f}) "
+            f"both unshared"
+            for f in failures[:5])
+        msg = (f"{icao}: {len(failures)} rect short edge(s) with "
+               f"both corners disconnected from any other shape.  "
+               f"A taxi rect's short edge always meets something "
+               f"(junction / runway / terminal / other rect).  "
+               f"First {min(5, len(failures))}: {summary}.")
+        assert False, msg
+
+
+@pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
 def test_coverage_within_source_envelope(icao):
     """Emitted pavement union must not exceed apt.dat + runway
     coverage by more than the airport's allowed fraction.  Catches

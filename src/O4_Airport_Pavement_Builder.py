@@ -404,11 +404,34 @@ class PavementLayout:
         rel_blocks: List[Tuple[int, List[Tuple[int, str]],
                                Dict[str, str]]] = []
 
+        # Determine which interned nodes are actually referenced by
+        # any emitted way (via ``way_blocks`` or ``rel_blocks``
+        # member ways).  Per user 2026-04-29: discarded ring builds
+        # — short rings that ``_ring_to_nids`` returned None for,
+        # or rings whose nodes were dedup'd out of the final ring —
+        # leave orphan entries in ``node_id_to_ll``.  Emitting
+        # those produces "floating nodes" next to a polygon in
+        # JOSM that aren't part of any geometry.  Filter to
+        # referenced nids only.
+        referenced_nids: set = set()
+        for _wid, _nids, _tags in way_blocks:
+            referenced_nids.update(_nids)
+        # rel_blocks is currently empty in this emitter but be
+        # forward-compatible if multipolygons return.
+        for _rid, _members, _tags in rel_blocks:
+            for _mwid, _role in _members:
+                # Member ways' nids — find them in way_blocks.
+                for w_id, n_list, _t in way_blocks:
+                    if w_id == _mwid:
+                        referenced_nids.update(n_list)
+                        break
         lines = [
             "<?xml version='1.0' encoding='UTF-8'?>",
             "<osm version='0.6' upload='false' generator='O4_Airport_Pavement_Builder'>",
         ]
         for nid, (lat, lon) in sorted(node_id_to_ll.items(), reverse=True):
+            if nid not in referenced_nids:
+                continue
             lines.append(
                 f"  <node id='{nid}' action='modify' visible='true' "
                 f"lat='{lat:.11f}' lon='{lon:.11f}' />"
