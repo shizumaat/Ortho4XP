@@ -30,6 +30,8 @@ import pytest
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
+from conftest import airports_under_test, xplane_available, xplane_root
+
 _HERE = Path(__file__).resolve().parent
 _TOOLS = _HERE.parent / "tools"
 if str(_TOOLS) not in sys.path:
@@ -37,13 +39,11 @@ if str(_TOOLS) not in sys.path:
 
 
 def _xplane_root() -> str:
-    return os.environ.get("XPLANE_ROOT", "/Users/noah/X-Plane 12")
+    return xplane_root()
 
 
 def _xplane_available() -> bool:
-    root = _xplane_root()
-    return (Path(root).is_dir()
-            and (Path(root) / "Custom Data" / "CIFP").is_dir())
+    return xplane_available()
 
 
 pytestmark = pytest.mark.skipif(
@@ -52,15 +52,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Self-overlap caps: total area of overlap between any pair of
-# emitted shapes (pairs > 1 m² each, summed).  A clean layout has
-# zero overlap; small residuals from float precision or apt.dat /
-# DSF stitching are tolerated below the cap.
-SELF_OVERLAP_CAP_M2 = {
-    "SPJC": 100.0,
-    "CYXY": 100.0,
-    "SPLP": 100.0,
-}
+# Per user 2026-04-30: zero overlap, no exceptions, no rounding-
+# error allowance.  An emitted layout where any two shapes overlap
+# is a hard invariant violation — X-Plane mesh generation can't
+# handle overlapping pavement shapes.  Catches the recent KPHX taxi-
+# bridge regression that emitted bridge polygons overlapping the
+# adjacent rect / apron.
+SELF_OVERLAP_CAP_M2 = 0.0
 
 # Coverage envelope: the union of every emitted pavement shape's
 # polygon must not exceed the source pavement's union by more than
@@ -137,9 +135,19 @@ def _source_pavement_union(icao: str):
         return None
 
 
-@pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
+@pytest.mark.parametrize("icao", airports_under_test() or [
+    pytest.param("(no airports)", marks=pytest.mark.skip(
+        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
 def test_no_self_overlap(icao):
-    """No emitted pavement shape may overlap another by > 1 m²."""
+    """Per user 2026-04-30 hard invariant: NO two emitted pavement
+    shapes may overlap, ever.  No floating-point allowance.
+
+    Catches: KPHX taxi-bridge regression where bridge polygons
+    overlapped adjacent rect / apron pavement; SPJC DSF visual
+    overlay regression where ``zannespol`` polygons duplicated
+    apt.dat row-110 coverage; any future absorption / clip pass
+    that fails to remove an absorbed sub-rect.
+    """
     layout = _build_layout(icao)
     polys = [(s.role, s.polygon) for s in layout.shapes
              if s.polygon is not None and not s.polygon.is_empty]
@@ -155,27 +163,29 @@ def test_no_self_overlap(icao):
             role_b, pb = polys[j]
             try:
                 inter = pa.intersection(pb)
-                if inter.is_empty:
-                    continue
-                a = inter.area
-                if a < 1.0:
-                    continue
-                overlap_pairs.append((a, role_a, role_b))
-                overlap_area += a
             except Exception:
-                pass
-    cap = SELF_OVERLAP_CAP_M2.get(icao, 100.0)
+                continue
+            if inter.is_empty:
+                continue
+            a = inter.area
+            if a <= 0.0:
+                continue
+            overlap_pairs.append((a, role_a, role_b))
+            overlap_area += a
     overlap_pairs.sort(reverse=True)
     summary = ", ".join(
-        f"{a:.0f} m² ({ra}/{rb})"
-        for a, ra, rb in overlap_pairs[:5])
-    assert overlap_area <= cap, (
-        f"{icao}: {len(overlap_pairs)} overlapping shape pairs "
-        f"(>1 m² each), total {overlap_area:,.0f} m² "
-        f"exceeds cap {cap:.0f} m².  Worst: {summary}.")
+        f"{a:.4f} m² ({ra}/{rb})"
+        for a, ra, rb in overlap_pairs[:10])
+    assert overlap_area <= SELF_OVERLAP_CAP_M2, (
+        f"{icao}: {len(overlap_pairs)} overlapping shape pair(s), "
+        f"total {overlap_area:,.4f} m² (cap "
+        f"{SELF_OVERLAP_CAP_M2:.0f} m² — zero tolerance).  "
+        f"Worst: {summary}.")
 
 
-@pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
+@pytest.mark.parametrize("icao", airports_under_test() or [
+    pytest.param("(no airports)", marks=pytest.mark.skip(
+        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
 def test_no_vertex_on_sloping_rect_edge(icao):
     """Per user 2026-04-28 invariant: a junction (or any non-rect)
     polygon vertex can only land on a sloping rect's CORNER, never
@@ -280,7 +290,9 @@ def test_no_vertex_on_sloping_rect_edge(icao):
         assert False, msg
 
 
-@pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
+@pytest.mark.parametrize("icao", airports_under_test() or [
+    pytest.param("(no airports)", marks=pytest.mark.skip(
+        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
 def test_rect_short_edges_connect(icao):
     """Per user 2026-04-29: a sloping rect (primary_parallel,
     secondary_parallel, stub, cross_connector) has TWO short
@@ -376,7 +388,9 @@ def test_rect_short_edges_connect(icao):
         assert False, msg
 
 
-@pytest.mark.parametrize("icao", ["SPJC", "CYXY", "SPLP"])
+@pytest.mark.parametrize("icao", airports_under_test() or [
+    pytest.param("(no airports)", marks=pytest.mark.skip(
+        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
 def test_coverage_within_source_envelope(icao):
     """Emitted pavement union must not exceed apt.dat + runway
     coverage by more than the airport's allowed fraction.  Catches
