@@ -87,10 +87,40 @@ ROLE_BOUNDARY = "boundary"
 # elev forming the U-shape around the portal LOW end.
 ROLE_TUNNEL_RAMP = "tunnel_ramp"
 ROLE_RETAINING_WALL = "retaining_wall"
+# Groundside terminal pavement (curbside / drop-off / parking) —
+# emitted with per-vertex DEM altitudes and a 0.1 m gap from the
+# terminal building so it follows local terrain instead of being
+# flattened to airside-apron elevation (per user 2026-04-29).
+ROLE_GROUNDSIDE_PAVEMENT = "groundside_pavement"
+
+# Per user 2026-04-30: bridge / tunnel emission disabled while we
+# stabilise the core pavement-geometry pipeline.  The recent KPHX
+# work emitted ``tunnel_ramp`` polygons that overlapped junction
+# and groundside_pavement geometry (130 overlap pairs, 75K m²
+# total at KPHX, caught by ``test_no_self_overlap``).
+#
+# TODO(bridges): once core geometry is stable + refactored, revisit
+# the four feature emit calls gated by this flag in
+# ``build_airport_pavement``:
+#   * ``_emit_through_airport_depressed_roads``
+#   * ``_emit_tunnel_portals``
+#   * ``_emit_taxi_bridges``
+#   * ``_emit_underpass_road_approaches``
+# Each must carve its footprint out of overlapping airside / ground
+# side pavement before emitting, or the no-overlap invariant
+# (``tests/test_pavement_geometry.py::test_no_self_overlap``) will
+# fail again.
+EMIT_BRIDGES_AND_TUNNELS = False
 
 # TEMP 2026-04-20: when False, the builder only emits rects +
 # runways + terminals + aprons, suppressing all junction polygons.
 # User requested this while iterating on rect correctness.
+# Per user 2026-04-30 (revert): combine apt.dat with DSF
+# pavement polygons.  The smart-apt.dat selector
+# (``_pick_best_apt_dat_against_osm``) still runs to choose
+# between custom-pack and global apt.dat candidates against OSM
+# coverage; DSF polygons supplement whichever apt.dat is picked.
+LOAD_DSF_PAVEMENT = True
 EMIT_JUNCTIONS = True
 # TEMP 2026-04-21: when False, aprons are also suppressed so we can
 # focus exclusively on getting taxiway rects right.  Junctions and
@@ -109,6 +139,7 @@ AEROWAY_FOR_ROLE = {
     ROLE_BOUNDARY: "aerodrome",
     ROLE_TUNNEL_RAMP: "taxiway",
     ROLE_RETAINING_WALL: "building",
+    ROLE_GROUNDSIDE_PAVEMENT: "apron",
 }
 
 
@@ -696,6 +727,259 @@ def _load_osm_airports(xplane_root: str, icao: str,
     return nodes, kept_ways, kept_rels
 
 
+def _score_apt_dat_against_osm(
+        apt_path: str,
+        icao: str,
+        nodes: Dict[str, Tuple[float, float]],
+        ways: List[Tuple[str, List[str], Dict[str, str]]],
+        taxi_buffer_m: float = 5.0,
+        ) -> Tuple[float, float]:
+    """Score how well ``apt_path`` covers OSM-known features at
+    this airport.
+
+    Returns ``(apron_coverage, taxi_coverage)`` where:
+
+      * ``apron_coverage`` = (area of OSM ``aeroway=apron`` polygons
+        that lies inside the apt.dat row-110 pavement union) /
+        (total area of OSM apron polygons).  1.0 = perfect, 0.0 =
+        no apt.dat coverage of OSM-known apron areas.
+
+      * ``taxi_coverage`` = (length of OSM ``aeroway=taxiway``
+        centerline LineStrings within ``taxi_buffer_m`` of any
+        apt.dat pavement) / (total length of OSM taxi
+        centerlines).  Buffer matches typical taxiway half-width.
+        1.0 = every OSM-known taxiway centerline has apt.dat
+        pavement underneath it.
+
+    Returns (1.0, 1.0) if no OSM apron / taxi data exists (the
+    apt.dat passes by default).  Returns (0.0, 0.0) if the apt.dat
+    can't be loaded.
+
+    Per user 2026-04-30: when a custom-scenery apt.dat scores
+    below 0.7 on either metric, it's "missing a lot vs OSM" and
+    we fall back to the global apt.dat instead.
+    """
+    try:
+        apt = APR.load_airport(apt_path, icao)
+    except Exception:
+        return (0.0, 0.0)
+    if apt is None:
+        return (0.0, 0.0)
+    if not apt.pavements and not apt.runways:
+        return (0.0, 0.0)
+    # Anchor + projection (use first runway threshold).
+    if not apt.runways:
+        return (1.0, 1.0)
+    r0 = apt.runways[0]
+    lat0, lon0 = r0.lat_a, r0.lon_a
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+
+    def to_m(lon: float, lat: float) -> Tuple[float, float]:
+        return (math.radians(lon - lon0) * R * cos0,
+                math.radians(lat - lat0) * R)
+    # Build apt.dat pavement union in meter space.  apt.dat
+    # polygons are stored in lat/lon — project to meters for
+    # consistent area / distance math.
+    from shapely.ops import transform as shp_transform
+    pav_polys_m: List[Polygon] = []
+    for pav in apt.pavements:
+        if pav.polygon is None or pav.polygon.is_empty:
+            continue
+        try:
+            pm = shp_transform(
+                lambda lon, lat, z=None:
+                    to_m(lon, lat) if z is None
+                    else (*to_m(lon, lat), z),
+                pav.polygon)
+            if pm.is_empty:
+                continue
+            if not pm.is_valid:
+                pm = pm.buffer(0)
+            if pm.geom_type == "Polygon" and not pm.is_empty:
+                pav_polys_m.append(pm)
+            elif pm.geom_type == "MultiPolygon":
+                for g in pm.geoms:
+                    if (g.geom_type == "Polygon"
+                            and not g.is_empty):
+                        pav_polys_m.append(g)
+        except Exception:
+            continue
+    # Also include runway rects so a taxi centerline that ends on
+    # the runway counts as covered.
+    for rwy in apt.runways:
+        try:
+            rect = _runway_rect_m(rwy, to_m)
+            if rect is not None and not rect.is_empty:
+                pav_polys_m.append(rect)
+        except Exception:
+            continue
+    if not pav_polys_m:
+        return (0.0, 0.0)
+    try:
+        pav_union = unary_union(pav_polys_m)
+    except Exception:
+        return (0.0, 0.0)
+    if pav_union.is_empty:
+        return (0.0, 0.0)
+    pav_buf = pav_union.buffer(taxi_buffer_m)
+    # Apron coverage: OSM apron polygons (closed ways tagged
+    # aeroway=apron) → fraction inside pav_union.
+    apron_total = 0.0
+    apron_inside = 0.0
+    taxi_total = 0.0
+    taxi_inside = 0.0
+    for wid, nrefs, tags in ways:
+        ay = tags.get("aeroway", "")
+        if ay == "apron":
+            pts = []
+            for n in nrefs:
+                if n in nodes:
+                    la, lo = nodes[n]
+                    pts.append(to_m(lo, la))
+            if (len(pts) >= 4
+                    and abs(pts[0][0] - pts[-1][0]) < 0.5
+                    and abs(pts[0][1] - pts[-1][1]) < 0.5):
+                try:
+                    poly = Polygon(pts)
+                    if not poly.is_valid:
+                        poly = poly.buffer(0)
+                    if (poly.is_empty
+                            or poly.geom_type != "Polygon"):
+                        continue
+                    apron_total += poly.area
+                    inter = poly.intersection(pav_union)
+                    if not inter.is_empty:
+                        apron_inside += inter.area
+                except Exception:
+                    continue
+        elif ay == "taxiway":
+            # Open ways (centerlines).  Closed taxi polygons are
+            # rare in OSM; treat as line either way.
+            pts = []
+            for n in nrefs:
+                if n in nodes:
+                    la, lo = nodes[n]
+                    pts.append(to_m(lo, la))
+            if len(pts) < 2:
+                continue
+            try:
+                from shapely.geometry import LineString as _LS
+                ls = _LS(pts)
+                if ls.is_empty or ls.length < 1.0:
+                    continue
+                taxi_total += ls.length
+                inter = ls.intersection(pav_buf)
+                if not inter.is_empty:
+                    if hasattr(inter, "length"):
+                        taxi_inside += inter.length
+                    elif hasattr(inter, "geoms"):
+                        for g in inter.geoms:
+                            if hasattr(g, "length"):
+                                taxi_inside += g.length
+            except Exception:
+                continue
+    apron_cov = (apron_inside / apron_total
+                  if apron_total > 0 else 1.0)
+    taxi_cov = (taxi_inside / taxi_total
+                 if taxi_total > 0 else 1.0)
+    return (apron_cov, taxi_cov)
+
+
+def _pick_best_apt_dat_against_osm(
+        xplane_root: str,
+        icao: str,
+        apron_threshold: float = 0.7,
+        taxi_threshold: float = 0.7,
+        ) -> Optional[str]:
+    """Find the best apt.dat for ``icao``, falling back from a
+    sparse custom-scenery pack to the global apt.dat when the
+    custom one is missing too much OSM-known geometry.
+
+    Per user 2026-04-30: when a custom apt.dat is missing a lot
+    of pavement vs OSM, the X-Plane global definition often has
+    more complete row-110 polygons.  This selector evaluates
+    every candidate apt.dat (custom packs in priority order,
+    then global, then default) by computing apron + taxi
+    coverage against OSM, and picks the first candidate whose
+    coverage clears both thresholds.  Falls back to the
+    legacy first-with-pavement selection if no candidate
+    qualifies.
+
+    Thresholds:
+      ``apron_threshold`` = 0.7 — apron polygons should be 70 %
+        covered by apt.dat row-110 pavement.
+      ``taxi_threshold`` = 0.7 — OSM taxi centerlines should be
+        70 % covered by apt.dat row-110 pavement (buffered 5 m).
+    """
+    candidates = APR.find_all_airport_apt_dats(xplane_root, icao)
+    if not candidates:
+        return APR.find_airport_apt_dat(xplane_root, icao)
+    if len(candidates) == 1:
+        return candidates[0]
+    # Load OSM data once (use first candidate's airport as the
+    # anchor — OSM tile loading needs a lat/lon hint).
+    anchor_apt = None
+    for cand in candidates:
+        try:
+            anchor_apt = APR.load_airport(cand, icao)
+            if (anchor_apt is not None
+                    and anchor_apt.runways):
+                break
+        except Exception:
+            continue
+    if anchor_apt is None or not anchor_apt.runways:
+        return APR.find_airport_apt_dat(xplane_root, icao)
+    r0 = anchor_apt.runways[0]
+    try:
+        nodes_o, ways_o, _ = _load_osm_airports(
+            xplane_root, icao, r0.lat_a, r0.lon_a)
+    except Exception:
+        return APR.find_airport_apt_dat(xplane_root, icao)
+    if not ways_o:
+        return APR.find_airport_apt_dat(xplane_root, icao)
+    scores: List[Tuple[str, float, float]] = []
+    for cand in candidates:
+        ac, tc = _score_apt_dat_against_osm(
+            cand, icao, nodes_o, ways_o)
+        scores.append((cand, ac, tc))
+    # Walk in priority order; pick the first that clears both
+    # thresholds.  Log every candidate's score.
+    chosen: Optional[str] = None
+    for cand, ac, tc in scores:
+        passed = ac >= apron_threshold and tc >= taxi_threshold
+        if passed and chosen is None:
+            chosen = cand
+        try:
+            import sys as _sys
+            label = "PICK" if (passed and cand == chosen) else (
+                "ok" if passed else "skip")
+            _sys.stderr.write(
+                f"  [pav-builder] {icao}: apt.dat candidate "
+                f"[{label}] apron={ac:.0%} taxi={tc:.0%}  "
+                f"{cand}\n")
+        except Exception:
+            pass
+    if chosen is not None:
+        return chosen
+    # Nothing qualified — pick whichever has the highest
+    # combined coverage to avoid emitting nothing.
+    if scores:
+        scores.sort(key=lambda s: -(s[1] + s[2]))
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] {icao}: no apt.dat met "
+                f"thresholds (apron≥{apron_threshold:.0%}, "
+                f"taxi≥{taxi_threshold:.0%}); falling back to "
+                f"highest combined coverage: "
+                f"apron={scores[0][1]:.0%} taxi={scores[0][2]:.0%}.\n")
+        except Exception:
+            pass
+        return scores[0][0]
+    return APR.find_airport_apt_dat(xplane_root, icao)
+
+
 def _load_osm_big_roads(apt_lat: float, apt_lon: float,
                         radius_deg: float = 0.05
                         ) -> Tuple[Dict[str, Tuple[float, float]],
@@ -1102,42 +1386,43 @@ def _resolve_runway_crossings(
         if len(coords) < 3:
             continue
 
-        # Per-vertex altitudes: average over segments whose buffered
-        # polygon contains the vertex (i.e. the segments physically
-        # adjacent to that corner).  Falls back to all-segment
-        # average if no segment contains the vertex (defensive — a
-        # corner introduced by Shapely's union may sit ε outside
-        # every input).
-        seg_buffers = []
-        for s in seg_shapes:
-            try:
-                seg_buffers.append(
-                    s.polygon.buffer(proximity_buffer_m))
-            except Exception:
-                seg_buffers.append(None)
+        # Per-vertex altitudes — INVERSE-DISTANCE-WEIGHTED average
+        # across EVERY crossing segment.  Per user 2026-04-29
+        # (CYXY -10075 ridge): the previous "buffer-containment"
+        # selection picked a single nearest segment per vertex,
+        # so two adjacent ring vertices on opposite sides of a
+        # cross-runway gap could pick up different source-runway
+        # altitudes (e.g. 14R/32L's 696.7 m vs 02/20's 693.7 m),
+        # producing local steps as steep as 10 % between
+        # neighbours and a +3.2 m ridge across runway 32L/16R.
+        # Inverse-distance weighting blends every vertex's
+        # altitude smoothly between all crossing runways — the
+        # vertex that's right on a 14R/32L edge gets near-100 %
+        # weight from that segment (d→0 ⇒ w→∞), while a vertex
+        # equidistant between two runways gets a 50/50 average,
+        # and the transition between the two regimes is smooth.
         ring_alts: List[Optional[float]] = []
         for (cx, cy) in coords:
             pt = Point(cx, cy)
-            samples: List[float] = []
-            for buf, s in zip(seg_buffers, seg_shapes):
-                if buf is None:
+            weighted_sum = 0.0
+            weight_sum = 0.0
+            for s in seg_shapes:
+                e = _sample_runway_segment_elev(s, cx, cy)
+                if e is None:
                     continue
                 try:
-                    if buf.contains(pt):
-                        e = _sample_runway_segment_elev(s, cx, cy)
-                        if e is not None:
-                            samples.append(e)
+                    d = s.polygon.distance(pt)
                 except Exception:
                     continue
-            if not samples:
-                # Fallback: all segments.
-                for s in seg_shapes:
-                    e = _sample_runway_segment_elev(s, cx, cy)
-                    if e is not None:
-                        samples.append(e)
-            if samples:
-                ring_alts.append(round(
-                    sum(samples) / len(samples), 1))
+                # ε floor so a vertex exactly on a segment edge
+                # still has a finite weight (just very large).
+                d_eff = max(d, 0.1)
+                w = 1.0 / (d_eff ** 2)
+                weighted_sum += float(e) * w
+                weight_sum += w
+            if weight_sum > 0:
+                ring_alts.append(
+                    round(weighted_sum / weight_sum, 1))
             else:
                 ring_alts.append(None)
         if any(a is None for a in ring_alts):
@@ -1161,6 +1446,235 @@ def _resolve_runway_crossings(
                           if i not in drop_set]
         layout.shapes.extend(new_shapes)
     return n_resolved
+
+
+def _insert_runway_chain_bridges(
+        layout: "PavementLayout",
+        min_gap_m: float = 5.0,
+        max_gap_m: float = 500.0,
+        ) -> int:
+    """For each runway designation, find pairs of surviving
+    runway segments whose facing short edges are head-to-head
+    with a gap > ``min_gap_m`` and < ``max_gap_m``, and insert a
+    bridging RUNWAY shape between them with linearly
+    interpolated altitudes.
+
+    Per user 2026-04-30 (CYXY runway 32L/16R ridge): when one
+    runway is absorbed into another via the runway-crossing
+    resolver (or into a big apron via the apron-merge drop), the
+    remaining runway segments leave a gap in the chain.  The
+    surrounding apron-junction polygon's altitudes (DEM-derived,
+    700+m at CYXY) then dominate the surface at the gap, sitting
+    several metres above the runway's CIFP profile (693-697m at
+    CYXY).  X-Plane renders this as a ridge crossing the runway.
+
+    Inserting a bridging runway shape with altitudes anchored at
+    the surviving segments' adjacent corners restores a runway-
+    altitude plate at the gap.  The shape is emitted as
+    ``ROLE_RUNWAY`` so downstream snap passes treat it the same
+    way they treat a normal runway segment (corner-bucket
+    altitude propagation, sloping rect H/L tagging, etc.).
+
+    Detection algorithm (works at any airport):
+      1. Group runway segments by their ``ref`` value (CIFP
+         designation, e.g. "RW14R/RW32L").
+      2. Within each group, sort segments along their shared
+         axis direction.
+      3. For each consecutive pair in axis order, measure the
+         distance between the FIRST segment's "far" short edge
+         and the SECOND segment's "near" short edge.  If
+         ``min_gap_m < distance < max_gap_m`` AND the bridging
+         rect's footprint is empty of any other runway segment
+         (so we don't bridge across an active crossing), emit
+         a bridge.
+
+    Returns the number of bridge segments inserted.
+    """
+    rwy_shapes = [s for s in layout.shapes
+                   if s.role == ROLE_RUNWAY
+                   and s.polygon is not None
+                   and not s.polygon.is_empty
+                   and s.ref]
+    if len(rwy_shapes) < 2:
+        return 0
+    # Group by ref.
+    by_ref: Dict[str, List[BuiltShape]] = {}
+    for s in rwy_shapes:
+        by_ref.setdefault(s.ref, []).append(s)
+    n_inserted = 0
+    other_rwy_polys = [s.polygon for s in rwy_shapes]
+    try:
+        from shapely.strtree import STRtree as _STRtree
+        rwy_tree = _STRtree(other_rwy_polys)
+    except Exception:
+        rwy_tree = None
+    new_shapes: List[BuiltShape] = []
+    for ref, segs in by_ref.items():
+        if len(segs) < 2:
+            continue
+        # Determine the runway's axis direction from the FIRST
+        # segment's altitude_high → altitude_low axis (corners
+        # 0,3 = HIGH, 1,2 = LOW).
+        s0 = segs[0]
+        try:
+            c0 = list(s0.polygon.exterior.coords)
+        except Exception:
+            continue
+        if c0 and c0[0] == c0[-1]:
+            c0 = c0[:-1]
+        if len(c0) != 4:
+            continue
+        h_mid_0 = (0.5 * (c0[0][0] + c0[3][0]),
+                   0.5 * (c0[0][1] + c0[3][1]))
+        l_mid_0 = (0.5 * (c0[1][0] + c0[2][0]),
+                   0.5 * (c0[1][1] + c0[2][1]))
+        ax = l_mid_0[0] - h_mid_0[0]
+        ay = l_mid_0[1] - h_mid_0[1]
+        alen = math.hypot(ax, ay)
+        if alen < 1.0:
+            continue
+        ux = ax / alen
+        uy = ay / alen
+        # Project each segment's centroid onto the axis to sort.
+        def axis_pos(seg: BuiltShape) -> float:
+            cx, cy = seg.polygon.centroid.x, seg.polygon.centroid.y
+            return (cx - h_mid_0[0]) * ux + (cy - h_mid_0[1]) * uy
+        segs_sorted = sorted(segs, key=axis_pos)
+        # Walk consecutive pairs.
+        for i in range(len(segs_sorted) - 1):
+            a, b = segs_sorted[i], segs_sorted[i + 1]
+            try:
+                ca = list(a.polygon.exterior.coords)
+                cb = list(b.polygon.exterior.coords)
+            except Exception:
+                continue
+            if ca and ca[0] == ca[-1]:
+                ca = ca[:-1]
+            if cb and cb[0] == cb[-1]:
+                cb = cb[:-1]
+            if len(ca) != 4 or len(cb) != 4:
+                continue
+            # Find a's "far end" (the short edge facing b) and
+            # b's "near end" (the short edge facing a).  Use
+            # axis projection: a's far end has higher axis_pos,
+            # b's near end has lower axis_pos.
+            a_h_mid = (0.5 * (ca[0][0] + ca[3][0]),
+                        0.5 * (ca[0][1] + ca[3][1]))
+            a_l_mid = (0.5 * (ca[1][0] + ca[2][0]),
+                        0.5 * (ca[1][1] + ca[2][1]))
+            b_h_mid = (0.5 * (cb[0][0] + cb[3][0]),
+                        0.5 * (cb[0][1] + cb[3][1]))
+            b_l_mid = (0.5 * (cb[1][0] + cb[2][0]),
+                        0.5 * (cb[1][1] + cb[2][1]))
+            ah_pos = ((a_h_mid[0] - h_mid_0[0]) * ux
+                       + (a_h_mid[1] - h_mid_0[1]) * uy)
+            al_pos = ((a_l_mid[0] - h_mid_0[0]) * ux
+                       + (a_l_mid[1] - h_mid_0[1]) * uy)
+            bh_pos = ((b_h_mid[0] - h_mid_0[0]) * ux
+                       + (b_h_mid[1] - h_mid_0[1]) * uy)
+            bl_pos = ((b_l_mid[0] - h_mid_0[0]) * ux
+                       + (b_l_mid[1] - h_mid_0[1]) * uy)
+            # a's far short edge: whichever of (a_h_mid, a_l_mid)
+            # has higher axis_pos.  Same for b's near edge: whichever
+            # has lower axis_pos.
+            if ah_pos > al_pos:
+                a_far_corners = (ca[0], ca[3])
+                a_far_alt = a.altitude_high
+            else:
+                a_far_corners = (ca[1], ca[2])
+                a_far_alt = a.altitude_low
+            if bh_pos < bl_pos:
+                b_near_corners = (cb[0], cb[3])
+                b_near_alt = b.altitude_high
+            else:
+                b_near_corners = (cb[1], cb[2])
+                b_near_alt = b.altitude_low
+            if (a_far_alt is None and a.altitude is not None):
+                a_far_alt = a.altitude
+            if (b_near_alt is None and b.altitude is not None):
+                b_near_alt = b.altitude
+            if a_far_alt is None or b_near_alt is None:
+                continue
+            # Distance between a's far midpoint and b's near
+            # midpoint.
+            a_far_mid = (0.5 * (a_far_corners[0][0]
+                                  + a_far_corners[1][0]),
+                          0.5 * (a_far_corners[0][1]
+                                  + a_far_corners[1][1]))
+            b_near_mid = (0.5 * (b_near_corners[0][0]
+                                   + b_near_corners[1][0]),
+                           0.5 * (b_near_corners[0][1]
+                                   + b_near_corners[1][1]))
+            gap = math.hypot(b_near_mid[0] - a_far_mid[0],
+                             b_near_mid[1] - a_far_mid[1])
+            if gap < min_gap_m or gap > max_gap_m:
+                continue
+            # Build bridge polygon.  Corners:
+            #   0,3 = HIGH end (whichever of a/b has higher alt)
+            #   1,2 = LOW end
+            if a_far_alt >= b_near_alt:
+                # a's far end is HIGH, b's near end is LOW.
+                bridge_corners = [
+                    a_far_corners[0],   # 0: A-side corner 1 (HIGH)
+                    b_near_corners[0],  # 1: B-side corner 1 (LOW)
+                    b_near_corners[1],  # 2: B-side corner 2 (LOW)
+                    a_far_corners[1],   # 3: A-side corner 2 (HIGH)
+                ]
+                eh, el = float(a_far_alt), float(b_near_alt)
+            else:
+                bridge_corners = [
+                    b_near_corners[0],
+                    a_far_corners[0],
+                    a_far_corners[1],
+                    b_near_corners[1],
+                ]
+                eh, el = float(b_near_alt), float(a_far_alt)
+            try:
+                poly = Polygon(bridge_corners)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_empty or poly.geom_type != "Polygon":
+                    continue
+            except Exception:
+                continue
+            # Reject if the bridge polygon overlaps any OTHER
+            # runway segment (we'd be bridging across an active
+            # crossing).
+            overlap_with_other = False
+            if rwy_tree is not None:
+                try:
+                    for hit in rwy_tree.query(poly):
+                        idx = (int(hit) if hasattr(hit, "__int__")
+                               else hit)
+                        if not isinstance(idx, int):
+                            continue
+                        other = other_rwy_polys[idx]
+                        if other is a.polygon or other is b.polygon:
+                            continue
+                        try:
+                            inter = poly.intersection(other)
+                            if (not inter.is_empty
+                                    and inter.area > 1.0):
+                                overlap_with_other = True
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            if overlap_with_other:
+                continue
+            shape = BuiltShape(
+                polygon=poly, role=ROLE_RUNWAY, ref=ref)
+            if abs(eh - el) >= 0.1:
+                shape.altitude_high = round(eh, 1)
+                shape.altitude_low = round(el, 1)
+            else:
+                shape.altitude = round(0.5 * (eh + el), 1)
+            new_shapes.append(shape)
+            n_inserted += 1
+    if new_shapes:
+        layout.shapes.extend(new_shapes)
+    return n_inserted
 
 
 def _detect_runway_shoulders(
@@ -1516,16 +2030,25 @@ def _drop_primary_parallels_embedded_in_pavement(
     sloping_rect_roles = {ROLE_PRIMARY_PARALLEL,
                           ROLE_SECONDARY_PARALLEL,
                           ROLE_STUB, ROLE_CROSS_CONNECTOR}
-
-    # Per user 2026-04-28 (final): absorb wherever EITHER long edge
-    # has junction-class pavement running alongside it.  Sloping
-    # rects cannot share a long edge with an apron/junction polygon
-    # — the rect's straight-line slope along the long edge has to
-    # match the junction's natural DEM slope along the seam, which
-    # it generally won't.  Whether the apron sits on one side or
-    # both, the violation is the same.  Apply PARTIAL absorption —
-    # only the axial range where adjacency holds gets absorbed; the
-    # rest of the rect survives as shorter rect(s).
+    # Per user 2026-04-30: absorb wherever EITHER long edge has
+    # junction-class pavement running alongside it.  Sloping
+    # rects cannot share a long edge with an apron/junction
+    # polygon — the rect's straight-line slope along the long
+    # edge has to match the junction's natural DEM slope along
+    # the seam, which it generally won't.  Whether the apron
+    # sits on one side or both, the violation is the same.
+    #
+    # A separate CORRIDOR HEURISTIC above this loop preserves
+    # rects that connect to a runway at one of their short
+    # edges (e.g. CYXY Taxiway F: ref-tagged corridor running
+    # apron→runway), so corridors aren't swallowed even when
+    # they're embedded in apron pavement.  Only ``alongside``
+    # rects (E primary parallel: both short edges 160+ m from
+    # any runway) fall through to absorption.
+    #
+    # Apply PARTIAL absorption — only the axial range where
+    # adjacency holds gets absorbed; the rest of the rect
+    # survives as shorter rect(s).
     #
     # Probe semantics: at every 5 m axis step, compute a point
     # ``OUTER_PROBE_M`` METRES OUTSIDE each long edge and ask
@@ -1538,11 +2061,12 @@ def _drop_primary_parallels_embedded_in_pavement(
     # are polygon-imprecision noise, NOT real apron adjacency, and
     # spuriously absorbed every rect at CYXY.
     #
-    # Walk each rect's axis at 5 m steps.  At each step, sample the
-    # 2 m-outside-left and 2 m-outside-right points.  A step is
-    # "adjacent" when EITHER outside point is in junction-pav.  Find
-    # contiguous adjacent runs ≥ 10 % of axial length; keep non-
-    # adjacent intervals (≥ 30 m fragments) as new rects.
+    # Walk each rect's axis at 5 m steps.  At each step, sample
+    # the outside-left and outside-right points.  A step is
+    # "adjacent" when EITHER outside point is in junction-pav
+    # (rect along an apron edge, on either side).  Find
+    # contiguous adjacent runs ≥ 10 % of axial length; keep
+    # non-adjacent intervals (≥ 30 m fragments) as new rects.
     #
     # Use cases:
     #   - F primary parallel at CYXY: south 30 % is INSIDE the apron
@@ -1630,7 +2154,7 @@ def _drop_primary_parallels_embedded_in_pavement(
             except Exception:
                 continue
 
-        # Find contiguous "either adjacent" runs ≥ 10 % of axis.
+        # Find contiguous "either-side adjacent" runs ≥ 10 % of axis.
         min_run_steps = max(1, int(adjacency_frac * n_steps))
         absorbed_intervals: List[Tuple[float, float]] = []
         i = 0
@@ -2047,7 +2571,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         triangulator interpolates them from neighbouring shared
         vertices).
     """
-    apt_path = APR.find_airport_apt_dat(xplane_root, icao)
+    apt_path = _pick_best_apt_dat_against_osm(xplane_root, icao)
     if apt_path is None:
         raise RuntimeError(f"No apt.dat found for {icao}")
     apt = APR.load_airport(apt_path, icao)
@@ -2363,6 +2887,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
         except Exception:
             apt_bbox_m = None
     try:
+        if not LOAD_DSF_PAVEMENT:
+            raise StopIteration  # skip the DSF block entirely
         import O4_DSF_Reader as _DSFR
         seen_dsf: set = set()
         all_apt_dats = APR.find_all_airport_apt_dats(xplane_root, icao)
@@ -2497,6 +3023,15 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 _sys.stderr.write(msg + ".\n")
             except Exception:
                 pass
+    except StopIteration:
+        # DSF read intentionally disabled.
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"  [pav-builder] {icao}: DSF pavement read "
+                f"disabled (LOAD_DSF_PAVEMENT=False).\n")
+        except Exception:
+            pass
     except Exception:
         pass
     pav_union = unary_union(pav_polys) if pav_polys else None
@@ -2613,10 +3148,51 @@ def build_airport_pavement(icao: str, xplane_root: str,
     try:
         _osm_terminal_buildings = _extract_osm_terminals(
             nodes, ways, relations, to_m)
+        # Per user 2026-04-30 (CYXY -10123 NW phantom groundside):
+        # pass the FULL apt.dat pavement polygon list so the
+        # classifier can BFS from runway-touching polys through
+        # transitive touches.  Without this, edges of the
+        # terminal next to apron pavement that's not directly
+        # touching a runway (e.g. the apron extends NW past the
+        # terminal) classified UNKNOWN and got mis-promoted to
+        # groundside.
         _ground_zone = _terminal_groundside_zone(
             _osm_terminal_buildings, nodes, ways, to_m,
-            apt_pavement_seeds=runway_polys)
+            apt_pavement_seeds=runway_polys,
+            apt_pavement_polys=apt_only_pav_polys)
         if _ground_zone is not None and not _ground_zone.is_empty:
+            # Capture the groundside-only visible pavement BEFORE
+            # the subtraction below empties pav_union of it.  Per
+            # user 2026-04-29: groundside pavement should remain
+            # in the output but follow DEM (with a 0.1 m gap from
+            # the terminal building) rather than being flattened
+            # to airside-apron elevation.  The shapes captured
+            # here are emitted later with per-vertex DEM altitudes;
+            # the 0.1 m terminal gap is enforced inside the emit
+            # function using the LAYOUT's terminal shapes (which
+            # may differ slightly from the OSM source extracts due
+            # to apt.dat row-110 / DSF residue absorption).
+            try:
+                _groundside_visible = pav_union.intersection(
+                    _ground_zone)
+                _gs_polys: List[Polygon] = []
+                if _groundside_visible is not None:
+                    if _groundside_visible.geom_type == "Polygon":
+                        if (not _groundside_visible.is_empty
+                                and _groundside_visible.area >= 5.0):
+                            _gs_polys.append(_groundside_visible)
+                    elif (_groundside_visible.geom_type
+                            == "MultiPolygon"):
+                        for _g in _groundside_visible.geoms:
+                            if (_g.geom_type == "Polygon"
+                                    and not _g.is_empty
+                                    and _g.area >= 5.0):
+                                _gs_polys.append(_g)
+                # Stash on the layout so the elevation pass can
+                # find them once DEM is loaded.
+                layout._groundside_polys = _gs_polys
+            except Exception:
+                layout._groundside_polys = []
             try:
                 pav_union = pav_union.difference(_ground_zone)
                 if hasattr(layout, "_pav_union_for_rects"):
@@ -2664,6 +3240,33 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                     and _g.area >= 1.0):
                                 _new_apt_only.append(_g)
                 apt_only_pav_polys[:] = _new_apt_only
+                # Also subtract from apron_candidates — captured at
+                # line 2519 BEFORE this subtract — so apron-junction
+                # construction in _compute_elevations can't wrap
+                # around the terminal into the groundside zone (per
+                # user 2026-04-29 / way -10125 vs -10111: the apron
+                # junction was extending past the terminal to the
+                # upper-side roads, sharing an edge with the new
+                # DEM-following groundside pavement and creating a
+                # 7 m vertical cliff at CYXY).
+                _new_apron_cand: List[Polygon] = []
+                for _p in apron_candidates:
+                    try:
+                        _q = _p.difference(_ground_zone)
+                    except Exception:
+                        _new_apron_cand.append(_p)
+                        continue
+                    if _q.is_empty:
+                        continue
+                    if _q.geom_type == "Polygon":
+                        _new_apron_cand.append(_q)
+                    elif _q.geom_type == "MultiPolygon":
+                        for _g in _q.geoms:
+                            if (_g.geom_type == "Polygon"
+                                    and not _g.is_empty
+                                    and _g.area >= 1.0):
+                                _new_apron_cand.append(_g)
+                apron_candidates[:] = _new_apron_cand
                 try:
                     import sys as _sys
                     _sys.stderr.write(
@@ -3799,6 +4402,46 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 _sys.stderr.write(
                     f"  [pav-builder] emitted "
                     f"{n_b} airport-boundary shape piece(s).\n")
+            # Per user 2026-04-29: re-emit groundside pavement
+            # captured before the airside-apron subtraction, with
+            # per-vertex DEM altitudes and a 0.1 m gap from the
+            # terminal building.  Lets curbside / drop-off /
+            # parking pavement render at local terrain elevation
+            # (CYXY: terminal cut into hill, ~4 m higher than the
+            # airside apron).
+            try:
+                n_gs = _emit_groundside_pavement_dem(
+                    layout, _dem, _tile_lat, _tile_lon)
+                if n_gs:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] emitted "
+                        f"{n_gs} groundside pavement "
+                        f"polygon(s) with DEM altitudes.\n")
+            except Exception:
+                pass
+            # Per user 2026-04-29 (CYXY -10111 / -10115): drop
+            # junction polygons that are connected ONLY to non-
+            # airside pavement (groundside polygons or each
+            # other), with no shared vertices on any airside
+            # rect/terminal/runway.  These slivers got assigned
+            # the airside-flat altitude during the Laplacian
+            # solver but visually they're not airside — they
+            # share an edge with the DEM-following groundside
+            # at a different elevation, creating "valleys" that
+            # X-Plane renders as cliffs.  Eliminating them lets
+            # the boundary ribbon and the groundside polygon
+            # define the surface in that area.
+            try:
+                n_orph = _drop_groundside_orphan_junctions(layout)
+                if n_orph:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"  [pav-builder] dropped {n_orph} "
+                        f"junction(s) sharing vertices with "
+                        f"groundside pavement.\n")
+            except Exception:
+                pass
             # Then emit DEM-bridge polygons inside the boundary
             # wherever the clamped boundary altitude differs from
             # raw DEM by > 5 m (per user 2026-04-28).
@@ -3813,70 +4456,103 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         f"polygon(s).\n")
             except Exception:
                 pass
-            # Per user 2026-04-29: re-enable tunnel-portal emission.
-            # For each big-roads tunnel crossing the airport
-            # boundary, emit a sloped ramp + 3 retaining walls that
-            # transition the road from outside-DEM elevation down
-            # to airport-elevation − 6 m at the portal.  Subtracts
-            # tunnel zones from the boundary ribbon and DEM-bridge
-            # polygons so they don't overlap.
-            try:
-                n_tun = _emit_tunnel_portals(
-                    layout, _dem, _tile_lat, _tile_lon)
-                if n_tun:
-                    import sys as _sys
-                    _sys.stderr.write(
-                        f"  [pav-builder] emitted "
-                        f"{n_tun} tunnel-portal cluster(s) "
-                        f"(ramp + 3 walls each).\n")
-            except Exception:
-                pass
-            # Per user 2026-04-29: emit retaining walls along
-            # taxi bridges (KBNA Taxiway A, KPHX taxis over
-            # Sky Harbor Blvd) and road-following approach
-            # shapes that descend from outside-DEM down to
-            # apt_elev − 8 m under the bridge.  When the
-            # scenery pack already includes 3D bridge OBJs
-            # (KBNA), the user wants the road to cut straight
-            # through and let the OBJ be the bridge — skip our
-            # walls and emit the under-bridge flat polygon.
-            # When it doesn't (KPHX), keep the terrain flat
-            # for the taxiway and only ramp the road up to the
-            # bridge edge — emit walls + skip under-bridge.
-            try:
-                _scn_bridge = _scenery_has_bridge_objects(layout)
-            except Exception:
-                _scn_bridge = False
-            try:
-                n_brg = _emit_taxi_bridges(
-                    layout, _dem, _tile_lat, _tile_lon,
-                    scenery_has_bridge_objects=_scn_bridge)
-                if n_brg:
-                    import sys as _sys
-                    _sys.stderr.write(
-                        f"  [pav-builder] emitted "
-                        f"{n_brg} taxi-bridge wall pair(s).\n")
-                elif _scn_bridge:
-                    import sys as _sys
-                    _sys.stderr.write(
-                        f"  [pav-builder] {icao}: scenery has "
-                        f"3D bridge OBJ(s); skipping wall "
-                        f"emission.\n")
-            except Exception:
-                pass
-            try:
-                n_app = _emit_underpass_road_approaches(
-                    layout, _dem, _tile_lat, _tile_lon,
-                    scenery_has_bridge_objects=_scn_bridge)
-                if n_app:
-                    import sys as _sys
-                    _sys.stderr.write(
-                        f"  [pav-builder] emitted underpass-"
-                        f"road approaches for {n_app} "
-                        f"surface(s)"
-                        f"{' (cut through under bridge OBJ)' if _scn_bridge else ' (ramp up to bridge edge)'}.\n")
-            except Exception:
-                pass
+            # TODO(bridges): re-enable bridge / tunnel emission
+            # after core pavement geometry is stable + refactored.
+            # See ``EMIT_BRIDGES_AND_TUNNELS`` at module top for
+            # the full to-do list.  Each gated call must carve its
+            # footprint out of overlapping airside / groundside
+            # pavement before emitting, or
+            # ``test_no_self_overlap`` will fail.
+            if EMIT_BRIDGES_AND_TUNNELS:
+                # Per user 2026-04-29 (KPHX Sky Harbor Blvd): when
+                # a public road passes under any airport bridge,
+                # its ENTIRE inside-airport stretch must be at
+                # apt_elev − 8 m, not just at the bridge crossings.
+                # Run BEFORE _emit_tunnel_portals so the latter can
+                # skip OSM ways already depressed here.
+                _depressed_way_ids: set = set()
+                try:
+                    n_dep, _depressed_way_ids = (
+                        _emit_through_airport_depressed_roads(
+                            layout, _dem, _tile_lat, _tile_lon,
+                            xplane_root=xplane_root, icao=icao))
+                    if n_dep:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [pav-builder] emitted "
+                            f"{n_dep} through-airport depressed "
+                            f"road segment(s).\n")
+                except Exception:
+                    _depressed_way_ids = set()
+                # Per user 2026-04-29: re-enable tunnel-portal
+                # emission.  For each big-roads tunnel crossing the
+                # airport boundary, emit a sloped ramp + 3
+                # retaining walls that transition the road from
+                # outside-DEM elevation down to airport-elevation
+                # − 6 m at the portal.  Subtracts tunnel zones from
+                # the boundary ribbon and DEM-bridge polygons so
+                # they don't overlap.  OSM way ids handled by the
+                # through-airport depressed-road emit are excluded
+                # so we don't double-emit on Sky-Harbor-style
+                # multi-bridge crossings.
+                try:
+                    n_tun = _emit_tunnel_portals(
+                        layout, _dem, _tile_lat, _tile_lon,
+                        excluded_way_ids=_depressed_way_ids)
+                    if n_tun:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [pav-builder] emitted "
+                            f"{n_tun} tunnel-portal cluster(s) "
+                            f"(ramp + walls along approach).\n")
+                except Exception:
+                    pass
+                # Per user 2026-04-29: emit retaining walls along
+                # taxi bridges (KBNA Taxiway A, KPHX taxis over
+                # Sky Harbor Blvd) and road-following approach
+                # shapes that descend from outside-DEM down to
+                # apt_elev − 8 m under the bridge.  When the
+                # scenery pack already includes 3D bridge OBJs
+                # (KBNA), the user wants the road to cut straight
+                # through and let the OBJ be the bridge — skip our
+                # walls and emit the under-bridge flat polygon.
+                # When it doesn't (KPHX), keep the terrain flat
+                # for the taxiway and only ramp the road up to the
+                # bridge edge — emit walls + skip under-bridge.
+                try:
+                    _scn_bridge = _scenery_has_bridge_objects(layout)
+                except Exception:
+                    _scn_bridge = False
+                try:
+                    n_brg = _emit_taxi_bridges(
+                        layout, _dem, _tile_lat, _tile_lon,
+                        scenery_has_bridge_objects=_scn_bridge)
+                    if n_brg:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [pav-builder] emitted "
+                            f"{n_brg} taxi-bridge wall pair(s).\n")
+                    elif _scn_bridge:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [pav-builder] {icao}: scenery has "
+                            f"3D bridge OBJ(s); skipping wall "
+                            f"emission.\n")
+                except Exception:
+                    pass
+                try:
+                    n_app = _emit_underpass_road_approaches(
+                        layout, _dem, _tile_lat, _tile_lon,
+                        scenery_has_bridge_objects=_scn_bridge)
+                    if n_app:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"  [pav-builder] emitted underpass-"
+                            f"road approaches for {n_app} "
+                            f"surface(s)"
+                            f"{' (cut through under bridge OBJ)' if _scn_bridge else ' (ramp up to bridge edge)'}.\n")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -4215,6 +4891,25 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                             and drop_apron is not None):
                         dropped_with_apron.append(
                             (sh.polygon, drop_apron))
+                    # Per user 2026-04-29 (CYXY runway 32L/16R
+                    # ridge): preserve the dropped segment's
+                    # altitude info on the layout so a later
+                    # pass can imprint the runway's slope onto
+                    # any apron-junction polygon that ends up
+                    # covering this segment's footprint.  Without
+                    # this, the surrounding apron junction's
+                    # vertices are 4-5 m higher than the runway
+                    # at the same XY, producing a "ridge across
+                    # the runway" the user reported.
+                    if (sh.polygon is not None
+                            and not sh.polygon.is_empty
+                            and (sh.altitude_high is not None
+                                 or sh.altitude is not None)):
+                        if not hasattr(
+                                layout,
+                                "_apron_merged_runway_drops"):
+                            layout._apron_merged_runway_drops = []
+                        layout._apron_merged_runway_drops.append(sh)
                     continue
                 kept_shapes.append(sh)
                 if sh.polygon is not None and not sh.polygon.is_empty:
@@ -4265,6 +4960,15 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 if s.role == ROLE_RUNWAY
                 and s.polygon is not None
                 and not s.polygon.is_empty]
+        # Per user 2026-04-30: bridge-segment insertion was
+        # tried (option c) but produced worse results — the
+        # inserted bridges overlap apron junctions whose
+        # altitudes weren't synchronized, creating 10m+ range
+        # junctions with 141 % worst-edge grades.  Function
+        # ``_insert_runway_chain_bridges`` is left in place but
+        # not called pending a different approach.
+        if False:
+            n_bridges = _insert_runway_chain_bridges(layout)
 
         # Segmented runway boundaries can drift sub-metre from the
         # original single-rect runway that junctions / rects were
@@ -4555,6 +5259,60 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # MID-pipeline state (often 10×–100× worse than the final
     # output) and mislead.  The WARN is emitted from
     # ``build_airport_pavement`` after the smoother converges.
+
+
+def _resample_node_altitudes_nn(
+        new_poly: Polygon,
+        old_open: List[Tuple[float, float]],
+        old_alts_closed: Optional[List[float]],
+        ) -> Optional[List[float]]:
+    """Given a new polygon (post geometry edit) and the OLD ring's
+    open-form coords + closed-form altitudes, return a fresh
+    ``node_altitudes`` list (closed) for ``new_poly`` by nearest-
+    neighbour sampling each new ring vertex against the old ring.
+
+    Used wherever a polygon edit (boundary clip, buffer(0) repair,
+    push-off, sliver merge, etc.) changes the vertex count and we
+    would otherwise have to drop ``node_altitudes`` — a bare drop
+    leaves the polygon with no elevation guidance, which X-Plane
+    can render as a terrain spike (or, for very large boundary
+    polygons, crash on load — see HECA's 1066-vertex airport
+    boundary that lost altitudes during tunnel-clip).
+
+    Returns None if the inputs are insufficient to resample.
+    """
+    if not old_alts_closed or not old_open:
+        return None
+    if new_poly is None or new_poly.is_empty:
+        return None
+    src_alts_open = (
+        old_alts_closed[:-1]
+        if (len(old_alts_closed) == len(old_open) + 1
+            and old_alts_closed[0] == old_alts_closed[-1])
+        else old_alts_closed[:len(old_open)])
+    if not src_alts_open:
+        return None
+    try:
+        new_open = list(new_poly.exterior.coords)
+    except Exception:
+        return None
+    if new_open and new_open[0] == new_open[-1]:
+        new_open = new_open[:-1]
+    if not new_open:
+        return None
+    new_alts: List[float] = []
+    for nx, ny in new_open:
+        best_d2 = float("inf")
+        best_a = src_alts_open[0]
+        for k, (sx, sy) in enumerate(old_open):
+            if k >= len(src_alts_open):
+                break
+            d2 = (nx - sx) ** 2 + (ny - sy) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_a = src_alts_open[k]
+        new_alts.append(round(float(best_a), 1))
+    return new_alts + [new_alts[0]]
 
 
 def _push_junction_vertices_off_taxi_rect_edges(
@@ -5647,6 +6405,357 @@ def _emit_airport_boundary_shape(
     return n_emitted
 
 
+def _emit_groundside_pavement_dem(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        densify_step_m: float = 15.0,
+        terminal_gap_m: float = 0.1,
+        ) -> int:
+    """Emit each saved groundside pavement polygon as a DEM-following
+    shape with per-vertex altitudes.
+
+    Per user 2026-04-29: pavement that wraps around the GROUNDSIDE
+    of a terminal building (curbside, drop-off, parking) sits at a
+    different elevation than the airside apron — at CYXY the
+    terminal is cut into the hill so the airside apron is several
+    metres lower than the road frontage.  The earlier subtraction
+    pass (see ``_terminal_groundside_zone``) keeps the airside
+    pavement clean of these strips, but they still belong in the
+    output: they should render at local DEM elevation and should
+    NOT touch the terminal building footprint (a 0.1 m gap is
+    already applied during capture).
+
+    Implementation:
+      1. Iterate ``layout._groundside_polys`` (captured during
+         ``build_airport_pavement`` immediately before the
+         groundside subtraction).
+      2. Densify each polygon's exterior to ``densify_step_m`` so
+         per-vertex altitudes resolve at the same spatial
+         frequency as the boundary ribbon (15 m step → typical
+         curbside has 5–10 vertices per side).
+      3. Sample DEM at every vertex; emit as ``BuiltShape`` with
+         role ``ROLE_GROUNDSIDE_PAVEMENT``, ``node_altitudes`` set,
+         and ``altitude``/``altitude_high``/``altitude_low`` left
+         None so the OSM emitter writes per-vertex altitude tags.
+
+    Returns the number of polygons emitted.
+    """
+    polys = list(getattr(layout, "_groundside_polys", []) or [])
+    if not polys:
+        return 0
+    # Build a buffered union of every emitted terminal shape — we
+    # subtract this from each groundside polygon so the result
+    # leaves a ``terminal_gap_m`` clearance to every actual
+    # terminal polygon in the final layout.  Using layout shapes
+    # (not OSM source) handles cases where apt.dat row-110 /
+    # DSF residue absorption produced a slightly different ring.
+    _term_buf = None
+    try:
+        _t_polys = [s.polygon for s in layout.shapes
+                    if s.role == ROLE_TERMINAL
+                    and s.polygon is not None
+                    and not s.polygon.is_empty]
+        if _t_polys:
+            _term_buf = unary_union(
+                [tp.buffer(terminal_gap_m) for tp in _t_polys])
+            if _term_buf.is_empty:
+                _term_buf = None
+    except Exception:
+        _term_buf = None
+    # Also subtract every other pavement-bearing layout shape so
+    # the groundside pavement never overlaps a rect / junction /
+    # apron / runway / terminal / wall / ramp.  The boundary
+    # ribbon is excluded — by design it traces over everything.
+    NON_OVERLAP_ROLES = {
+        ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+        ROLE_STUB, ROLE_CROSS_CONNECTOR, ROLE_APRON, ROLE_JUNCTION,
+        ROLE_TUNNEL_RAMP, ROLE_RETAINING_WALL,
+    }
+    _other_buf = None
+    try:
+        _other_polys = [s.polygon for s in layout.shapes
+                        if s.role in NON_OVERLAP_ROLES
+                        and s.polygon is not None
+                        and not s.polygon.is_empty]
+        if _other_polys:
+            _other_buf = unary_union(_other_polys)
+            if _other_buf.is_empty:
+                _other_buf = None
+    except Exception:
+        _other_buf = None
+    cuts = []
+    if _term_buf is not None:
+        cuts.append(_term_buf)
+    if _other_buf is not None:
+        cuts.append(_other_buf)
+    if cuts:
+        try:
+            cut_union = unary_union(cuts) if len(cuts) > 1 else cuts[0]
+        except Exception:
+            cut_union = None
+        if cut_union is not None and not cut_union.is_empty:
+            clipped: List[Polygon] = []
+            for p in polys:
+                try:
+                    q = p.difference(cut_union)
+                except Exception:
+                    continue
+                if q is None or q.is_empty:
+                    continue
+                if q.geom_type == "Polygon":
+                    if q.area >= 5.0:
+                        clipped.append(q)
+                elif q.geom_type == "MultiPolygon":
+                    for g in q.geoms:
+                        if (g.geom_type == "Polygon"
+                                and not g.is_empty
+                                and g.area >= 5.0):
+                            clipped.append(g)
+            polys = clipped
+    if not polys:
+        return 0
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+
+    def _m_to_ll(x: float, y: float) -> Tuple[float, float]:
+        return (lat0 + math.degrees(y / R),
+                lon0 + math.degrees(x / (R * cos0)))
+
+    def _dem_at(x: float, y: float) -> Optional[float]:
+        try:
+            lat, lon = _m_to_ll(x, y)
+            return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+        except Exception:
+            return None
+    n_emitted = 0
+    for p in polys:
+        if p is None or p.is_empty or p.geom_type != "Polygon":
+            continue
+        try:
+            ring = list(p.exterior.coords)
+        except Exception:
+            continue
+        if not ring:
+            continue
+        # Drop trailing repeat to operate on open ring; we'll
+        # re-close at the end.
+        if ring[0] == ring[-1]:
+            ring = ring[:-1]
+        if len(ring) < 3:
+            continue
+        # Densify so per-vertex altitudes resolve well across long
+        # straight edges.
+        densified: List[Tuple[float, float]] = []
+        n_r = len(ring)
+        for i in range(n_r):
+            ax, ay = ring[i]
+            bx, by = ring[(i + 1) % n_r]
+            densified.append((ax, ay))
+            edge_len = math.hypot(bx - ax, by - ay)
+            if edge_len <= densify_step_m:
+                continue
+            n_intermediate = int(edge_len // densify_step_m)
+            for k in range(1, n_intermediate + 1):
+                t = (k * densify_step_m) / edge_len
+                if t >= 1.0:
+                    break
+                densified.append((ax + (bx - ax) * t,
+                                  ay + (by - ay) * t))
+        if len(densified) < 3:
+            continue
+        # Sample DEM at every densified vertex.  Fall back to the
+        # nearest neighbour with a valid sample if a single point
+        # lands outside the DEM tile.
+        alts: List[Optional[float]] = []
+        for x, y in densified:
+            alts.append(_dem_at(x, y))
+        if all(a is None for a in alts):
+            continue
+        for k, a in enumerate(alts):
+            if a is not None:
+                continue
+            # Walk outward from k looking for the closest valid
+            # sample.
+            found: Optional[float] = None
+            for off in range(1, len(alts)):
+                left = (k - off) % len(alts)
+                right = (k + off) % len(alts)
+                if alts[left] is not None:
+                    found = alts[left]
+                    break
+                if alts[right] is not None:
+                    found = alts[right]
+                    break
+            alts[k] = found if found is not None else 0.0
+        # Rebuild the polygon from densified coords (so it matches
+        # the node_altitudes list 1-for-1) and append the closing
+        # repeat.
+        try:
+            new_poly = Polygon(densified)
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if (new_poly.geom_type != "Polygon"
+                    or new_poly.is_empty):
+                continue
+        except Exception:
+            continue
+        # The buffer(0) cleanup may rebuild the ring; re-extract
+        # coords and re-sample DEM if the vertex count changed.
+        rebuilt = list(new_poly.exterior.coords)
+        if rebuilt and rebuilt[0] == rebuilt[-1]:
+            rebuilt = rebuilt[:-1]
+        if len(rebuilt) != len(densified):
+            alts = []
+            for x, y in rebuilt:
+                a = _dem_at(x, y)
+                alts.append(round(float(a), 1) if a is not None
+                            else 0.0)
+        else:
+            alts = [round(float(a), 1) for a in alts]
+        # Closing repeat for the OSM emitter's convention.
+        node_alts = alts + [alts[0]]
+        layout.shapes.append(BuiltShape(
+            polygon=new_poly,
+            role=ROLE_GROUNDSIDE_PAVEMENT,
+            ref="groundside",
+            node_altitudes=node_alts))
+        n_emitted += 1
+    return n_emitted
+
+
+def _drop_groundside_orphan_junctions(
+        layout: "PavementLayout",
+        vertex_match_tol_m: float = 0.5,
+        ) -> int:
+    """Drop junction polygons that connect ONLY to groundside
+    pavement (no path through shared vertices to any airside
+    rect / runway / terminal).
+
+    Per user 2026-04-29 (CYXY -10111 + -10115): the rect/
+    junction tessellator can leave small junction polygons
+    sitting next to a groundside polygon when the apt.dat
+    row-110 union has a thin strip outside the groundside-
+    zone subtraction's perpendicular extent.  Those junctions
+    get assigned the airside-flat altitude during the unified
+    Laplacian solver (because they were classified as airside
+    junctions even though they don't actually touch any
+    airside pavement), then they share an edge with the DEM-
+    following groundside polygon at a 7 m altitude mismatch —
+    X-Plane renders that as a cliff.
+
+    Detection rule:
+      A junction is dropped if BOTH:
+        1. It shares ≥1 vertex with a
+           ``ROLE_GROUNDSIDE_PAVEMENT`` polygon.
+        2. It does NOT share any vertex with an airside seed
+           shape (runway / primary_parallel / secondary_parallel
+           / stub / cross_connector / terminal), whether
+           directly or transitively through other junction
+           polygons (BFS over junction-junction shared vertices).
+
+      Rationale: a junction between the groundside polygon and
+      surrounding terrain is the cliff-creating sliver — drop
+      it.  But a junction that legitimately connects an apron
+      to a runway or terminal must be kept even if its outer
+      edge happens to touch a groundside polygon, otherwise we
+      tear a hole in the airside surface (SPJC primary_parallels
+      U and M had their short edges become disconnected when
+      the simpler rule dropped their connecting junctions).
+
+    Returns the number of junctions dropped.
+    """
+    AIRSIDE_SEED_ROLES = {
+        ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+        ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+        ROLE_CROSS_CONNECTOR, ROLE_TERMINAL,
+    }
+    bucket_size = vertex_match_tol_m
+
+    def _verts_buckets(s: "BuiltShape") -> List[Tuple[int, int]]:
+        if s.polygon is None or s.polygon.is_empty:
+            return []
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            return []
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        out = []
+        for x, y in coords:
+            out.append((int(round(x / bucket_size)),
+                        int(round(y / bucket_size))))
+        return out
+    # Index every junction's vertex buckets (1-bucket halo so
+    # near-misses still match neighbours).
+    junction_idxs = [i for i, s in enumerate(layout.shapes)
+                      if s.role == ROLE_JUNCTION
+                      and s.polygon is not None
+                      and not s.polygon.is_empty]
+    if not junction_idxs:
+        return 0
+    junction_buckets: Dict[int, set] = {}
+    bucket_to_jidx: Dict[Tuple[int, int], List[int]] = {}
+    for ji in junction_idxs:
+        bs = _verts_buckets(layout.shapes[ji])
+        halo: set = set()
+        for bx, by in bs:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    halo.add((bx + dx, by + dy))
+        junction_buckets[ji] = halo
+        for b in bs:
+            bucket_to_jidx.setdefault(b, []).append(ji)
+    # Airside seeds (rect / runway / terminal vertex buckets).
+    seed_buckets: set = set()
+    for s in layout.shapes:
+        if s.role not in AIRSIDE_SEED_ROLES:
+            continue
+        for b in _verts_buckets(s):
+            seed_buckets.add(b)
+    # Build airside connectivity component over junctions: BFS
+    # starting from junctions that share a bucket with any
+    # airside seed, propagating through junction-junction
+    # shared buckets.
+    airside_set: set = set()
+    for ji in junction_idxs:
+        if junction_buckets[ji] & seed_buckets:
+            airside_set.add(ji)
+    queue = list(airside_set)
+    while queue:
+        ji = queue.pop()
+        for b in junction_buckets[ji]:
+            for kj in bucket_to_jidx.get(b, []):
+                if kj in airside_set:
+                    continue
+                airside_set.add(kj)
+                queue.append(kj)
+    # Groundside vertex buckets (1-bucket halo).
+    gs_buckets: set = set()
+    for s in layout.shapes:
+        if s.role != ROLE_GROUNDSIDE_PAVEMENT:
+            continue
+        for bx, by in _verts_buckets(s):
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    gs_buckets.add((bx + dx, by + dy))
+    if not gs_buckets:
+        return 0
+    drop_set: set = set()
+    for ji in junction_idxs:
+        if ji in airside_set:
+            continue
+        if junction_buckets[ji] & gs_buckets:
+            drop_set.add(ji)
+    if not drop_set:
+        return 0
+    layout.shapes = [s for i, s in enumerate(layout.shapes)
+                     if i not in drop_set]
+    return len(drop_set)
+
+
 def _emit_boundary_dem_bridge(
         layout: "PavementLayout",
         dem,
@@ -6238,58 +7347,67 @@ def _emit_tunnel_portals(
         tile_lat: int,
         tile_lon: int,
         tunnel_depth_m: float = 8.0,
-        carriageway_base_width_m: float = 22.0,
+        max_ramp_grade: float = 0.04,
+        ramp_min_length_m: float = 200.0,
+        arm_max_length_m: float = 500.0,
+        carriageway_width_m: float = 22.0,
         retaining_wall_width_m: float = 1.0,
         wall_gap_m: float = 0.5,
         portal_cluster_dist_m: float = 40.0,
-        boundary_clearance_m: float = 0.5,
+        boundary_clearance_m: float = 1.0,
+        excluded_way_ids: Optional[set] = None,
         ) -> int:
-    """For each ``highway=*`` ``tunnel=yes|building_passage`` way that
-    crosses (or touches) the airport boundary, emit:
+    """For each tunnel portal (each end of an OSM ``aeroway=*``
+    ``tunnel=yes|building_passage`` way), emit the visible road-
+    surface structure that transitions outside-DEM elevation down
+    to ``apt_elev − tunnel_depth_m`` at the portal:
 
-      1. A sloped 4-corner ``ROLE_TUNNEL_RAMP`` rect that runs from
-         the OSM tunnel-portal node OUTSIDE the airport (HIGH end at
-         outside DEM) down to the airport-boundary crossing (LOW end
-         at ``apt_elev − tunnel_depth_m``).  The ramp can — and
-         must — cross the airport boundary; that's the whole point
-         of the transition.
-      2. Three flat ``ROLE_RETAINING_WALL`` polygons (a U-shape
-         around the LOW end) at ``apt_elev``: two side walls running
-         alongside the ramp + one end-cap wrapping past the portal.
+      1. A flat ``ROLE_RETAINING_WALL`` CAP polygon AT the portal
+         node (perpendicular to road direction at portal).  The
+         cap's centre line is the portal node — its width spans
+         the road (carriageway width + wall_gap on each side),
+         its thickness is ``retaining_wall_width_m`` (1 m).
+      2. Two flat ``ROLE_RETAINING_WALL`` ARM polygons reaching
+         OUTWARD from the cap along the surface roadway, on each
+         side of the carriageway.  The arms follow the OSM
+         surface road's polyline — multi-segment when the road
+         curves.  Arm length adapts to terrain: we first walk up
+         to ``arm_max_length_m`` (default 500 m), sample DEM at
+         the far end, then truncate the walk so the grade from
+         ``apt_elev − tunnel_depth_m`` (portal) up to that DEM
+         height never exceeds ``max_ramp_grade``.  Floor at
+         ``ramp_min_length_m`` (default 200 m) so a flat road
+         still gets a substantial visible approach.
+      3. A chain of sloped ``ROLE_TUNNEL_RAMP`` polygons matching
+         the surface-road segments under the arms.  Each segment's
+         elevation interpolates linearly from
+         ``apt_elev − tunnel_depth_m`` at the portal to outside
+         DEM at the far end of the walk, in proportion to its
+         cumulative distance from the portal.
 
-    Two-carriageway tunnels (divided highways with two parallel OSM
-    ways) get clustered by portal proximity and emitted as ONE wider
-    ramp + walls.
+    Per user 2026-04-29 (SPJC review): the previous geometry put
+    the cap PAST the portal INSIDE the airport, with arms going
+    AWAY from the tunnel only as far as the OSM way extended
+    outside the airport.  That made SPJC's SW tunnel "too short
+    and inside the tunnel" because the OSM way ended right at the
+    boundary.  Walking the SURFACE road OUTWARD from the OSM
+    portal node correctly lands the cap at the tunnel mouth and
+    the arms on the highway approach.
 
-    Boundary coordination (user 2026-04-29 SPJC review): tunnels
-    can come right up to the airport boundary or sit fully inside
-    or fully outside — the ramp and walls are emitted at their
-    natural locations.  Only when a tunnel polygon CROSSES the
-    boundary (Case C) does the boundary need adjustment:
+    Two-carriageway tunnels (divided highways) cluster by portal-
+    node proximity (within ``portal_cluster_dist_m``).  Each
+    carriageway in a cluster gets its own arm pair; the caps form
+    a perpendicular line across all member portals.
 
-      * The retaining walls are at ``apt_elev`` and conflict with
-        the boundary ribbon if they overlap → boundary wraps
-        around them with a 0.5 m gap.
-      * The HIGH side of the ramp slopes up to outside-DEM and
-        sits in non-airport territory → no clip needed there.
-      * The LOW (portal-side) part of the ramp inside the airport
-        is at ``apt_elev − 6 m``, which conflicts with the
-        boundary ribbon at ``apt_elev`` → boundary wraps around
-        that inside-airport portion too.
+    Boundary coordination: subtract the tunnel-polygon union
+    (buffered by ``boundary_clearance_m``, default 1 m which
+    exceeds the OSM-emit vertex bucket size of 0.5 m so boundary
+    nodes never collapse onto wall nodes) from every
+    ``ROLE_BOUNDARY`` shape.
 
-    Implementation: intersect the union of (ramp + walls) with
-    the airport boundary polygon — only the INSIDE-airport
-    portion remains.  Buffer by ``boundary_clearance_m`` (default
-    0.5 m) and subtract from each ``ROLE_BOUNDARY`` shape.
-    Tunnels that don't cross the boundary at all naturally
-    produce an empty intersection and nothing changes.
-
-    Returns the number of tunnel CLUSTERS emitted (= portal count;
-    each cluster contributes 1 ramp + up to 3 walls).
+    Returns the number of tunnel PORTALS emitted (each contributing
+    1 cap + 2 arm walls + a ramp chain).
     """
-    if (layout.airport_boundary is None
-            or layout.airport_boundary.is_empty):
-        return 0
     # Load big-roads OSM cache for this tile.
     nodes_r, ways_r = _load_osm_big_roads(
         layout.anchor[0], layout.anchor[1])
@@ -6299,106 +7417,46 @@ def _emit_tunnel_portals(
     lat0, lon0 = layout.anchor
     cos0 = math.cos(math.radians(lat0))
     R = R_EARTH
+
     def _to_m(lon: float, lat: float) -> Tuple[float, float]:
         return (math.radians(lon - lon0) * R * cos0,
                 math.radians(lat - lat0) * R)
+
     def _m_to_ll(x: float, y: float) -> Tuple[float, float]:
         return (lat0 + math.degrees(y / R),
                 lon0 + math.degrees(x / (R * cos0)))
     nodes_m: Dict[str, Tuple[float, float]] = {}
     for nid, (lat, lon) in nodes_r.items():
         nodes_m[nid] = _to_m(lon, lat)
-    boundary_geom = layout.airport_boundary
-    if boundary_geom.geom_type == "Polygon":
-        boundary_polys = [boundary_geom]
-        boundary_line = boundary_geom.boundary
-    elif boundary_geom.geom_type == "MultiPolygon":
-        boundary_polys = list(boundary_geom.geoms)
-        boundary_line = unary_union(
-            [g.boundary for g in boundary_geom.geoms])
-    else:
-        return 0
-    boundary_union = unary_union(boundary_polys)
-    if (boundary_line.geom_type == "MultiLineString"
-            and boundary_line.length > 0):
-        # Use the longest connected boundary loop as the reference.
-        boundary_line = max(
-            boundary_line.geoms, key=lambda g: g.length)
     HW_TUNNEL_TYPES = {
         "motorway", "trunk", "primary", "secondary",
         "tertiary", "motorway_link", "trunk_link",
         "primary_link", "residential", "service",
     }
     TUNNEL_VALUES = {"yes", "building_passage"}
-    # Collect ramps.
-    ramps: List[Tuple[Tuple[float, float],
-                       Tuple[float, float], float, str]] = []
-    for _wid, nrefs, tags in ways_r:
-        if tags.get("tunnel") not in TUNNEL_VALUES:
-            continue
-        hw = tags.get("highway")
-        if hw not in HW_TUNNEL_TYPES:
-            continue
-        pts = [nodes_m[n] for n in nrefs if n in nodes_m]
-        if len(pts) < 2:
-            continue
-        try:
-            ls = LineString(pts)
-        except Exception:
-            continue
-        if ls.is_empty or ls.length < 5.0:
-            continue
-        if boundary_line.distance(ls) > 100.0:
-            continue
-        try:
-            outside = ls.difference(boundary_union)
-        except Exception:
-            continue
-        if outside.is_empty:
-            continue
-        pieces = (list(outside.geoms)
-                   if hasattr(outside, "geoms")
-                   else [outside])
-        for piece in pieces:
-            if (piece.is_empty
-                    or piece.geom_type != "LineString"
-                    or piece.length < 5.0):
-                continue
-            coords = list(piece.coords)
-            p0 = coords[0]
-            p1 = coords[-1]
-            d0 = boundary_line.distance(Point(p0))
-            d1 = boundary_line.distance(Point(p1))
-            if min(d0, d1) > 5.0:
-                continue
-            if d0 <= d1:
-                portal_xy, outside_xy = p0, p1
-            else:
-                portal_xy, outside_xy = p1, p0
-            ramps.append(
-                (portal_xy, outside_xy, piece.length, hw))
-    if not ramps:
-        return 0
-    # Cluster ramps that share a portal location.
-    clusters: List[List[Tuple[Tuple[float, float],
-                                 Tuple[float, float],
-                                 float, str]]] = []
-    for ramp in ramps:
-        pxy = ramp[0]
-        placed = False
-        for cl in clusters:
-            cref = cl[0][0]
-            if (math.hypot(cref[0] - pxy[0], cref[1] - pxy[1])
-                    < portal_cluster_dist_m):
-                cl.append(ramp)
-                placed = True
-                break
-        if not placed:
-            clusters.append([ramp])
+    # Build node-to-way and way-by-id indices for surface-road walking.
+    way_by_id: Dict[str, Tuple[List[str], Dict[str, str]]] = {}
+    node_to_ways: Dict[str, List[str]] = {}
+    for wid, nrefs, tags in ways_r:
+        way_by_id[wid] = (nrefs, tags)
+        for n in nrefs:
+            node_to_ways.setdefault(n, []).append(wid)
+    # We walk a generous maximum, then truncate per-portal based
+    # on actual DEM at the far end so the resulting grade never
+    # exceeds ``max_ramp_grade``.  The truncated length is at
+    # least ``ramp_min_length_m`` so even flat-road portals get
+    # a recognisable approach.  The planning grade is reduced by
+    # 0.005 to leave headroom for the 0.1 m altitude rounding —
+    # without it, short segments (e.g. 9 m) could round up to
+    # ~4.4 % when the design grade is exactly 4 %.
+    grade_safety_margin = 0.005
+    plan_grade = max(max_ramp_grade - grade_safety_margin, 1e-3)
+    arm_walk_max_m = max(arm_max_length_m,
+                         ramp_min_length_m,
+                         tunnel_depth_m / plan_grade)
     # Helper: airport surface elevation at (cx, cy).  Use the
-    # boundary-ribbon ``node_altitudes`` (which already encode the
-    # CIFP-anchored, grade-clamped surface model) when a vertex
-    # lies within 10 m of (cx, cy), else fall back to DEM.
+    # boundary-ribbon ``node_altitudes`` (CIFP-anchored, grade-
+    # clamped) when a vertex is nearby, else fall back to DEM.
     def _airport_elevation_at(cx: float, cy: float) -> Optional[float]:
         best_d = float('inf')
         best_alt: Optional[float] = None
@@ -6422,106 +7480,329 @@ def _emit_tunnel_portals(
                 if d < best_d:
                     best_d = d
                     best_alt = s.node_altitudes[k]
-        if best_alt is not None and best_d <= 50.0:
+        if best_alt is not None and best_d <= 200.0:
             return float(best_alt)
-        # Fall back to DEM at the portal point.
+        # Fall back to DEM at the point.
         try:
             lat, lon = _m_to_ll(cx, cy)
             return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
         except Exception:
             return None
-    # Track tunnel exclusion zones (used to clip boundary shapes).
+    # Helper: from a portal node, walk the connecting non-tunnel
+    # surface road OUTWARD for ``length_m`` metres.  Returns the
+    # walked path as a list of (x, y) points starting at the
+    # portal, or None if no valid surface way connects.
+    def _walk_surface(portal_nid: str,
+                      tunnel_wid: str,
+                      length_m: float
+                      ) -> Optional[List[Tuple[float, float]]]:
+        if portal_nid not in nodes_m:
+            return None
+        # Look at every way that shares this node.  Prefer surface
+        # roads (highway tag, not tunnel-tagged); skip the tunnel
+        # way itself.  When multiple candidates exist (e.g., a
+        # roundabout), pick the first valid one.
+        for other_wid in node_to_ways.get(portal_nid, []):
+            if other_wid == tunnel_wid:
+                continue
+            if other_wid not in way_by_id:
+                continue
+            o_nrefs, o_tags = way_by_id[other_wid]
+            if o_tags.get("tunnel") in TUNNEL_VALUES:
+                continue
+            if o_tags.get("highway") not in HW_TUNNEL_TYPES:
+                continue
+            try:
+                idx = o_nrefs.index(portal_nid)
+            except ValueError:
+                continue
+            # Decide which direction to walk (away from tunnel).
+            forward = o_nrefs[idx:]
+            backward = list(reversed(o_nrefs[:idx + 1]))
+            # If portal is at one end, walk the other way.  If
+            # mid-way, walk the longer side.
+            walk_refs: List[str]
+            if idx == 0:
+                walk_refs = forward
+            elif idx == len(o_nrefs) - 1:
+                walk_refs = backward
+            else:
+                fl = sum(
+                    math.hypot(
+                        nodes_m[forward[i + 1]][0]
+                        - nodes_m[forward[i]][0],
+                        nodes_m[forward[i + 1]][1]
+                        - nodes_m[forward[i]][1])
+                    for i in range(len(forward) - 1)
+                    if (forward[i] in nodes_m
+                        and forward[i + 1] in nodes_m))
+                bl = sum(
+                    math.hypot(
+                        nodes_m[backward[i + 1]][0]
+                        - nodes_m[backward[i]][0],
+                        nodes_m[backward[i + 1]][1]
+                        - nodes_m[backward[i]][1])
+                    for i in range(len(backward) - 1)
+                    if (backward[i] in nodes_m
+                        and backward[i + 1] in nodes_m))
+                walk_refs = forward if fl >= bl else backward
+            # Collect walk points up to length_m.
+            pts: List[Tuple[float, float]] = []
+            cum = 0.0
+            for ni, n in enumerate(walk_refs):
+                if n not in nodes_m:
+                    break
+                p = nodes_m[n]
+                if pts:
+                    seg_len = math.hypot(
+                        p[0] - pts[-1][0], p[1] - pts[-1][1])
+                    if cum + seg_len >= length_m:
+                        # Truncate the last segment to hit length_m
+                        if seg_len > 0:
+                            t = (length_m - cum) / seg_len
+                            tx = pts[-1][0] + t * (p[0] - pts[-1][0])
+                            ty = pts[-1][1] + t * (p[1] - pts[-1][1])
+                            pts.append((tx, ty))
+                        cum = length_m
+                        break
+                    cum += seg_len
+                pts.append(p)
+            if len(pts) >= 2 and cum > 5.0:
+                return pts
+            # Surface way too short — could chain to next way at
+            # the far end, but for simplicity we accept short walks
+            # if we got at least 5 m.
+            if len(pts) >= 2:
+                return pts
+        return None
+    # Collect portal data: (portal_node_id, tunnel_wid, walk_pts,
+    # hw_type, apt_elev_at_portal, dem_at_far_end).
+    portal_data: List[Tuple[str, str, List[Tuple[float, float]],
+                              str, float, float]] = []
+    excluded = excluded_way_ids or set()
+    for tw_id, t_nrefs, t_tags in ways_r:
+        if t_tags.get("tunnel") not in TUNNEL_VALUES:
+            continue
+        hw = t_tags.get("highway")
+        if hw not in HW_TUNNEL_TYPES:
+            continue
+        if len(t_nrefs) < 2:
+            continue
+        # Skip OSM way IDs already handled by the through-
+        # airport depressed-road emit (which produces a single
+        # uniform depression instead of per-bridge ramps).
+        if tw_id in excluded:
+            continue
+        for portal_idx in (0, len(t_nrefs) - 1):
+            portal_nid = t_nrefs[portal_idx]
+            if portal_nid not in nodes_m:
+                continue
+            walk = _walk_surface(portal_nid, tw_id, arm_walk_max_m)
+            if walk is None or len(walk) < 2:
+                continue
+            # Merge very short consecutive segments so altitude
+            # rounding to 0.1 m can't push the per-segment grade
+            # above ``max_ramp_grade``.  At a 0.05 m worst-case
+            # round-up, a 15 m segment rounds to ≤ 0.33 %/error.
+            min_segment_m = 15.0
+            merged: List[Tuple[float, float]] = [walk[0]]
+            for k in range(1, len(walk)):
+                d = math.hypot(walk[k][0] - merged[-1][0],
+                               walk[k][1] - merged[-1][1])
+                if d < min_segment_m and k != len(walk) - 1:
+                    continue
+                merged.append(walk[k])
+            walk = merged
+            if len(walk) < 2:
+                continue
+            portal_xy = walk[0]
+            apt_elev = _airport_elevation_at(*portal_xy)
+            if apt_elev is None:
+                continue
+            elev_low = apt_elev - tunnel_depth_m
+            # Find the truncation point that keeps grade ≤
+            # max_ramp_grade.  Walk along the polyline summing
+            # cumulative distance; sample DEM at each vertex; the
+            # required-length-so-far is (DEM - elev_low) /
+            # max_ramp_grade.  Stop walking once the actual walk
+            # length matches or exceeds that requirement (i.e. the
+            # grade from portal to here is ≤ max_ramp_grade).
+            cum = 0.0
+            kept_pts: List[Tuple[float, float]] = [walk[0]]
+            grade_ok_at: float = 0.0  # cum dist where grade is OK
+            for i in range(1, len(walk)):
+                seg_len = math.hypot(
+                    walk[i][0] - walk[i - 1][0],
+                    walk[i][1] - walk[i - 1][1])
+                cum += seg_len
+                kept_pts.append(walk[i])
+                try:
+                    plat, plon = _m_to_ll(*walk[i])
+                    dem_h = _sample_dem(
+                        dem, tile_lat, tile_lon, plat, plon)
+                except Exception:
+                    dem_h = None
+                if dem_h is None:
+                    continue
+                drop = float(dem_h) - elev_low
+                req = (drop / plan_grade if drop > 0 else 0.0)
+                if cum >= req and cum >= ramp_min_length_m:
+                    grade_ok_at = cum
+                    break
+                grade_ok_at = cum
+            # Truncate walk to the OK length (or to last vertex
+            # reached if we never satisfied the grade — best
+            # effort, the resulting ramp will be the gentlest
+            # achievable on the available roadway).
+            walk = kept_pts
+            far_xy = walk[-1]
+            try:
+                far_lat, far_lon = _m_to_ll(*far_xy)
+                far_dem = _sample_dem(
+                    dem, tile_lat, tile_lon, far_lat, far_lon)
+            except Exception:
+                far_dem = None
+            if far_dem is None:
+                far_dem = apt_elev
+            # If the resulting ramp would still violate grade
+            # (DEM very high, road too short), cap far_dem at
+            # elev_low + grade*length so we still emit something
+            # sensible.  The visible top edge then sits LOWER
+            # than DEM (subtle terrain dip) — preferable to a
+            # spike or a mid-tunnel cap.
+            max_drop = plan_grade * grade_ok_at
+            if (far_dem - elev_low) > max_drop:
+                far_dem = elev_low + max_drop
+            portal_data.append(
+                (portal_nid, tw_id, walk, hw,
+                 float(apt_elev), float(far_dem)))
+    if not portal_data:
+        return 0
+    # Cluster portals by node-coord proximity (divided highways).
+    clusters: List[List[int]] = []
+    used: set = set()
+    for i in range(len(portal_data)):
+        if i in used:
+            continue
+        nid_i = portal_data[i][0]
+        cl = [i]
+        used.add(i)
+        pi = nodes_m[nid_i]
+        for j in range(i + 1, len(portal_data)):
+            if j in used:
+                continue
+            pj = nodes_m[portal_data[j][0]]
+            if (math.hypot(pi[0] - pj[0], pi[1] - pj[1])
+                    < portal_cluster_dist_m):
+                cl.append(j)
+                used.add(j)
+        clusters.append(cl)
+    # Per-cluster: build cap + arm walls + ramp chain.
     exclusion_zones: List[Polygon] = []
     n_emitted = 0
-    for cluster in clusters:
-        cpx = sum(r[0][0] for r in cluster) / len(cluster)
-        cpy = sum(r[0][1] for r in cluster) / len(cluster)
-        cox = sum(r[1][0] for r in cluster) / len(cluster)
-        coy = sum(r[1][1] for r in cluster) / len(cluster)
-        dxr = cpx - cox
-        dyr = cpy - coy
-        dlen = math.hypot(dxr, dyr)
-        if dlen < 5.0:
+    half_carriage = 0.5 * carriageway_width_m
+    half_wall_w = retaining_wall_width_m / 2.0
+    for cl in clusters:
+        # All portals in cluster share approximately the same
+        # location.  Use the first portal's walk as the canonical
+        # arm path; combine widths for divided highways.
+        head = portal_data[cl[0]]
+        portal_nid, _wid_unused, walk_pts, _hw, apt_elev, far_dem = head
+        if len(walk_pts) < 2:
             continue
-        ramp_dir = (dxr / dlen, dyr / dlen)
-        perp = (-ramp_dir[1], ramp_dir[0])
-        # Combined width = base + perpendicular spread of portal points.
-        projs = [
-            ((r[0][0] - cpx) * perp[0]
-             + (r[0][1] - cpy) * perp[1])
-            for r in cluster]
-        span = max(projs) - min(projs) if projs else 0.0
-        ramp_width = carriageway_base_width_m + span
-        apt_elev = _airport_elevation_at(cpx, cpy)
-        if apt_elev is None:
+        elev_low = apt_elev - tunnel_depth_m
+        elev_high = far_dem
+        # Compute the walk's cumulative distance for elevation
+        # interpolation.
+        cum_dists = [0.0]
+        for i in range(1, len(walk_pts)):
+            cum_dists.append(cum_dists[-1] + math.hypot(
+                walk_pts[i][0] - walk_pts[i - 1][0],
+                walk_pts[i][1] - walk_pts[i - 1][1]))
+        total_walk = cum_dists[-1]
+        if total_walk < 5.0:
             continue
-        try:
-            o_lat, o_lon = _m_to_ll(cox, coy)
-            out_elev = _sample_dem(
-                dem, tile_lat, tile_lon, o_lat, o_lon)
-        except Exception:
-            out_elev = apt_elev
-        if out_elev is None:
-            out_elev = apt_elev
-        elev_high = float(out_elev)
-        elev_low = float(apt_elev) - tunnel_depth_m
-        # Build the ramp rect.  altitude_high applies to corners
-        # 0,3 (the OUTSIDE/high short edge); altitude_low to
-        # corners 1,2 (the PORTAL/low short edge).
-        half_w = 0.5 * ramp_width
-        ramp_corners = [
-            (cox + perp[0] * half_w, coy + perp[1] * half_w),  # 0
-            (cpx + perp[0] * half_w, cpy + perp[1] * half_w),  # 1
-            (cpx - perp[0] * half_w, cpy - perp[1] * half_w),  # 2
-            (cox - perp[0] * half_w, coy - perp[1] * half_w),  # 3
-        ]
-        try:
-            ramp_poly = Polygon(ramp_corners)
-            if not ramp_poly.is_valid:
-                ramp_poly = ramp_poly.buffer(0)
-            if ramp_poly.is_empty or ramp_poly.geom_type != "Polygon":
+        # Cluster spread for combined width: project each cluster
+        # member's portal node onto the perpendicular at the head
+        # portal.
+        first_seg = (walk_pts[1][0] - walk_pts[0][0],
+                     walk_pts[1][1] - walk_pts[0][1])
+        first_len = math.hypot(*first_seg)
+        if first_len < 0.1:
+            continue
+        first_dir = (first_seg[0] / first_len,
+                     first_seg[1] / first_len)
+        first_perp = (-first_dir[1], first_dir[0])
+        spans = []
+        for k in cl:
+            ni = portal_data[k][0]
+            if ni not in nodes_m:
                 continue
-        except Exception:
-            continue
-        layout.shapes.append(BuiltShape(
-            polygon=ramp_poly,
-            role=ROLE_TUNNEL_RAMP,
-            ref="tunnel",
-            altitude_high=round(elev_high, 1),
-            altitude_low=round(elev_low, 1)))
-        # Build U-shaped retaining walls.
-        wall_off = (half_w + wall_gap_m
-                    + retaining_wall_width_m / 2.0)
-        cap_back = wall_gap_m + retaining_wall_width_m / 2.0
-        # End-cap centre (one wall-thickness past the portal,
-        # INSIDE the airport).
-        ccx = cpx + ramp_dir[0] * cap_back
-        ccy = cpy + ramp_dir[1] * cap_back
-        cap_len = ramp_width + 2 * wall_gap_m
-        cap_corners = [
-            (ccx + perp[0] * cap_len / 2.0
-             + ramp_dir[0] * retaining_wall_width_m / 2.0,
-             ccy + perp[1] * cap_len / 2.0
-             + ramp_dir[1] * retaining_wall_width_m / 2.0),
-            (ccx - perp[0] * cap_len / 2.0
-             + ramp_dir[0] * retaining_wall_width_m / 2.0,
-             ccy - perp[1] * cap_len / 2.0
-             + ramp_dir[1] * retaining_wall_width_m / 2.0),
-            (ccx - perp[0] * cap_len / 2.0
-             - ramp_dir[0] * retaining_wall_width_m / 2.0,
-             ccy - perp[1] * cap_len / 2.0
-             - ramp_dir[1] * retaining_wall_width_m / 2.0),
-            (ccx + perp[0] * cap_len / 2.0
-             - ramp_dir[0] * retaining_wall_width_m / 2.0,
-             ccy + perp[1] * cap_len / 2.0
-             - ramp_dir[1] * retaining_wall_width_m / 2.0),
-        ]
-        # Track every tunnel polygon (ramp + walls) so the
-        # boundary ribbon / DEM-bridge polygons can be clipped to
-        # wrap tightly around them at the end.
-        exclusion_zones.append(ramp_poly)
+            p = nodes_m[ni]
+            spans.append(
+                (p[0] - walk_pts[0][0]) * first_perp[0]
+                + (p[1] - walk_pts[0][1]) * first_perp[1])
+        cluster_span = max(spans) - min(spans) if spans else 0.0
+        combined_half = half_carriage + 0.5 * cluster_span
+
+        def _build_wall_segment(p_a: Tuple[float, float],
+                                 p_b: Tuple[float, float],
+                                 perp_off: float
+                                 ) -> Optional[Polygon]:
+            """4-corner wall polygon parallel to segment ``a-b``,
+            offset by ``perp_off`` from the segment's centre line,
+            ``retaining_wall_width_m`` thick."""
+            seg = (p_b[0] - p_a[0], p_b[1] - p_a[1])
+            slen = math.hypot(*seg)
+            if slen < 0.1:
+                return None
+            ux, uy = seg[0] / slen, seg[1] / slen
+            nx, ny = -uy, ux
+            # Sign of perp_off picks which side.  Inner edge of
+            # wall is at perp_off, outer edge at perp_off ± width.
+            inner = perp_off
+            outer = (perp_off + half_wall_w * 2.0
+                     if perp_off >= 0
+                     else perp_off - half_wall_w * 2.0)
+            corners = [
+                (p_a[0] + nx * inner, p_a[1] + ny * inner),
+                (p_b[0] + nx * inner, p_b[1] + ny * inner),
+                (p_b[0] + nx * outer, p_b[1] + ny * outer),
+                (p_a[0] + nx * outer, p_a[1] + ny * outer),
+            ]
+            try:
+                p = Polygon(corners)
+                if not p.is_valid:
+                    p = p.buffer(0)
+                if p.geom_type == "Polygon" and not p.is_empty:
+                    return p
+            except Exception:
+                return None
+            return None
+        # 1) Cap wall AT the portal node, perpendicular to the
+        #    first segment.  The cap's centre line passes through
+        #    the portal; its width spans the carriageway + 2 ×
+        #    wall_gap; its thickness is retaining_wall_width_m.
+        cap_half_len = combined_half + wall_gap_m
+        portal_xy = walk_pts[0]
+        # Cap polygon: centred at portal, perpendicular to first
+        # segment direction, thickness facing INTO the tunnel
+        # (opposite first_dir).  We put the cap's outer face
+        # right at the portal node so the back of the wall is at
+        # OSM's tunnel-portal point.
+        c0 = (portal_xy[0] + first_perp[0] * cap_half_len,
+              portal_xy[1] + first_perp[1] * cap_half_len)
+        c1 = (portal_xy[0] - first_perp[0] * cap_half_len,
+              portal_xy[1] - first_perp[1] * cap_half_len)
+        # Move cap thickness INTO the tunnel direction (negative
+        # first_dir) — cap occupies the strip from portal back
+        # by retaining_wall_width_m.
+        c0_back = (c0[0] - first_dir[0] * retaining_wall_width_m,
+                   c0[1] - first_dir[1] * retaining_wall_width_m)
+        c1_back = (c1[0] - first_dir[0] * retaining_wall_width_m,
+                   c1[1] - first_dir[1] * retaining_wall_width_m)
         try:
-            cap_poly = Polygon(cap_corners)
+            cap_poly = Polygon([c0, c1, c1_back, c0_back])
             if not cap_poly.is_valid:
                 cap_poly = cap_poly.buffer(0)
             if (cap_poly.geom_type == "Polygon"
@@ -6534,47 +7815,147 @@ def _emit_tunnel_portals(
                 exclusion_zones.append(cap_poly)
         except Exception:
             pass
-        for side in (1.0, -1.0):
-            s_sx = cox + side * perp[0] * wall_off
-            s_sy = coy + side * perp[1] * wall_off
-            s_ex = (cpx + ramp_dir[0] * cap_back
-                    + side * perp[0] * wall_off)
-            s_ey = (cpy + ramp_dir[1] * cap_back
-                    + side * perp[1] * wall_off)
-            sxx = s_ex - s_sx
-            syy = s_ey - s_sy
-            slen = math.hypot(sxx, syy)
-            if slen < 1.0:
+        # 2) Arm walls + 3) Ramp polygons — one per walk segment.
+        # Pre-compute per-vertex offset corners using the bisector
+        # of adjacent segments at interior bends.  This makes
+        # consecutive segments share their boundary vertices
+        # exactly — no overlap, no gap.
+        arm_off = combined_half + wall_gap_m + half_wall_w
+        n_w = len(walk_pts)
+        # Per-vertex perpendicular direction (unit vector).
+        verts_perp: List[Tuple[float, float]] = []
+        verts_scale: List[float] = []  # extension scale (1/cos(θ/2))
+        for i in range(n_w):
+            if i == 0:
+                s = (walk_pts[1][0] - walk_pts[0][0],
+                     walk_pts[1][1] - walk_pts[0][1])
+                sl = math.hypot(*s)
+                verts_perp.append((-s[1] / sl, s[0] / sl))
+                verts_scale.append(1.0)
+            elif i == n_w - 1:
+                s = (walk_pts[i][0] - walk_pts[i - 1][0],
+                     walk_pts[i][1] - walk_pts[i - 1][1])
+                sl = math.hypot(*s)
+                verts_perp.append((-s[1] / sl, s[0] / sl))
+                verts_scale.append(1.0)
+            else:
+                s1 = (walk_pts[i][0] - walk_pts[i - 1][0],
+                      walk_pts[i][1] - walk_pts[i - 1][1])
+                s2 = (walk_pts[i + 1][0] - walk_pts[i][0],
+                      walk_pts[i + 1][1] - walk_pts[i][1])
+                l1 = math.hypot(*s1)
+                l2 = math.hypot(*s2)
+                u1 = (s1[0] / l1, s1[1] / l1)
+                u2 = (s2[0] / l2, s2[1] / l2)
+                avg = ((u1[0] + u2[0]) / 2.0,
+                       (u1[1] + u2[1]) / 2.0)
+                al = math.hypot(*avg)
+                if al < 1e-6:
+                    # Near-180° doubleback — use first segment's
+                    # perpendicular and scale 1.
+                    verts_perp.append((-u1[1], u1[0]))
+                    verts_scale.append(1.0)
+                    continue
+                tangent = (avg[0] / al, avg[1] / al)
+                perp = (-tangent[1], tangent[0])
+                # Adjust offset to compensate for bend angle.
+                # cos(θ/2) ≈ sqrt((1 + u1·u2) / 2).
+                dot = u1[0] * u2[0] + u1[1] * u2[1]
+                cos_half = max(0.1, math.sqrt(
+                    max(0.0, (1.0 + dot) / 2.0)))
+                verts_perp.append(perp)
+                verts_scale.append(1.0 / cos_half)
+
+        def _vertex_offset(idx: int, off: float
+                           ) -> Tuple[float, float]:
+            px, py = walk_pts[idx]
+            nx, ny = verts_perp[idx]
+            scaled = off * verts_scale[idx]
+            return (px + nx * scaled, py + ny * scaled)
+
+        for i in range(n_w - 1):
+            p_a = walk_pts[i]
+            p_b = walk_pts[i + 1]
+            d_a = cum_dists[i]
+            d_b = cum_dists[i + 1]
+            seg_len = d_b - d_a
+            if seg_len < 0.5:
                 continue
-            sux = sxx / slen
-            suy = syy / slen
-            spx = -suy
-            spy = sux
-            half_wall = retaining_wall_width_m / 2.0
-            wall_corners = [
-                (s_sx + spx * half_wall,
-                 s_sy + spy * half_wall),
-                (s_ex + spx * half_wall,
-                 s_ey + spy * half_wall),
-                (s_ex - spx * half_wall,
-                 s_ey - spy * half_wall),
-                (s_sx - spx * half_wall,
-                 s_sy - spy * half_wall),
-            ]
+            frac_a = d_a / total_walk if total_walk > 0 else 0.0
+            frac_b = d_b / total_walk if total_walk > 0 else 0.0
+            e_a = (1 - frac_a) * elev_low + frac_a * elev_high
+            e_b = (1 - frac_b) * elev_low + frac_b * elev_high
+            # Arm walls (one per side).  Inner edge at +/- (arm_off
+            # − half_wall_w); outer edge at +/- (arm_off +
+            # half_wall_w).  Using the per-vertex bisector so
+            # adjacent segments share their join.
+            for sign in (+1, -1):
+                inner = sign * (arm_off - half_wall_w)
+                outer = sign * (arm_off + half_wall_w)
+                ai = _vertex_offset(i, inner)
+                bi = _vertex_offset(i + 1, inner)
+                bo = _vertex_offset(i + 1, outer)
+                ao = _vertex_offset(i, outer)
+                try:
+                    wp = Polygon([ai, bi, bo, ao])
+                    if not wp.is_valid:
+                        wp = wp.buffer(0)
+                    if (wp.geom_type == "Polygon"
+                            and not wp.is_empty
+                            and wp.area > 0.5):
+                        layout.shapes.append(BuiltShape(
+                            polygon=wp,
+                            role=ROLE_RETAINING_WALL,
+                            ref="tunnel_wall",
+                            altitude=round(apt_elev, 1)))
+                        exclusion_zones.append(wp)
+                except Exception:
+                    continue
+            # Ramp polygon (single segment, sloped).  Corners
+            # share with adjacent segments via verts_perp.
+            ra = _vertex_offset(i, +combined_half)
+            rb = _vertex_offset(i + 1, +combined_half)
+            rc = _vertex_offset(i + 1, -combined_half)
+            rd = _vertex_offset(i, -combined_half)
+            # Rect convention (see _sample_runway_segment_elev):
+            # corners [0, 3] are the HIGH-elevation short edge
+            # (across the road at the high end), corners [1, 2]
+            # are the LOW-elevation short edge.  ra/rb sit on
+            # the +side, rd/rc on the -side; ra/rd are at walk[i]
+            # and rb/rc at walk[i+1].  Order corners so the slope
+            # axis runs ALONG the road (i ↔ i+1), not across it.
+            if e_b >= e_a:
+                # walk[i+1] = HIGH end → corners 0,3 at i+1
+                ramp_corners = [rb, ra, rd, rc]
+                eh, el = e_b, e_a
+            else:
+                # walk[i] = HIGH end → corners 0,3 at i
+                ramp_corners = [ra, rb, rc, rd]
+                eh, el = e_a, e_b
             try:
-                wall_poly = Polygon(wall_corners)
-                if not wall_poly.is_valid:
-                    wall_poly = wall_poly.buffer(0)
-                if (wall_poly.geom_type == "Polygon"
-                        and not wall_poly.is_empty):
-                    layout.shapes.append(BuiltShape(
-                        polygon=wall_poly,
-                        role=ROLE_RETAINING_WALL,
-                        ref="tunnel_wall",
-                        altitude=round(apt_elev, 1)))
-                    exclusion_zones.append(wall_poly)
+                rp = Polygon(ramp_corners)
+                if not rp.is_valid:
+                    rp = rp.buffer(0)
+                if (rp.geom_type == "Polygon"
+                        and not rp.is_empty
+                        and rp.area > 0.5):
+                    if abs(eh - el) >= 0.1:
+                        layout.shapes.append(BuiltShape(
+                            polygon=rp,
+                            role=ROLE_TUNNEL_RAMP,
+                            ref="tunnel_ramp",
+                            altitude_high=round(eh, 1),
+                            altitude_low=round(el, 1)))
+                    else:
+                        layout.shapes.append(BuiltShape(
+                            polygon=rp,
+                            role=ROLE_TUNNEL_RAMP,
+                            ref="tunnel_ramp",
+                            altitude=round(
+                                0.5 * (eh + el), 1)))
+                    exclusion_zones.append(rp)
             except Exception:
-                continue
+                pass
         n_emitted += 1
     # Boundary coordination: clip every ROLE_BOUNDARY shape so
     # it doesn't overlap the actual tunnel-polygon footprint.
@@ -6600,6 +7981,20 @@ def _emit_tunnel_portals(
             if s.role != ROLE_BOUNDARY:
                 kept_shapes.append(s)
                 continue
+            # Capture the old ring + altitudes BEFORE the clip so
+            # we can NN-resample altitudes for the new ring.  Per
+            # user 2026-04-29 (HECA crash investigation): leaving
+            # the boundary ribbon with no altitudes after a clip
+            # made X-Plane crash on load — the 1066-vertex polygon
+            # without elevation guidance was unrenderable.
+            try:
+                _old_ring = list(s.polygon.exterior.coords)
+            except Exception:
+                _old_ring = []
+            if _old_ring and _old_ring[0] == _old_ring[-1]:
+                _old_ring = _old_ring[:-1]
+            _old_alts = (list(s.node_altitudes)
+                          if s.node_altitudes else None)
             try:
                 new_poly = s.polygon.difference(excl_union)
             except Exception:
@@ -6608,15 +8003,13 @@ def _emit_tunnel_portals(
             if new_poly.is_empty:
                 continue
             if new_poly.geom_type == "Polygon":
-                # The ribbon's per-vertex node_altitudes refer to
-                # the ORIGINAL ring; after a difference clip the
-                # vertex count typically changes.  Drop them so
-                # downstream emission falls back to the shape's
-                # ``altitude`` (or treats it as flat at the average)
-                # rather than emitting a stale per-vertex list with
-                # the wrong length.
                 s.polygon = new_poly
-                s.node_altitudes = None
+                resampled = _resample_node_altitudes_nn(
+                    new_poly, _old_ring, _old_alts)
+                if resampled is not None:
+                    s.node_altitudes = resampled
+                # else: keep existing s.altitude / node_altitudes
+                # (possibly mismatched but better than nothing).
                 kept_shapes.append(s)
             elif new_poly.geom_type == "MultiPolygon":
                 # Split the boundary shape into the resulting pieces.
@@ -6625,12 +8018,15 @@ def _emit_tunnel_portals(
                             or g.is_empty
                             or g.area < 5.0):
                         continue
+                    resampled = _resample_node_altitudes_nn(
+                        g, _old_ring, _old_alts)
                     kept_shapes.append(BuiltShape(
                         polygon=g,
                         role=s.role,
                         ref=s.ref,
-                        altitude=s.altitude,
-                        node_altitudes=None))
+                        altitude=(s.altitude if resampled is None
+                                  else None),
+                        node_altitudes=resampled))
         layout.shapes = kept_shapes
     return n_emitted
 
@@ -6763,7 +8159,7 @@ def _emit_taxi_bridges(
         tile_lon: int,
         retaining_wall_width_m: float = 1.0,
         wall_gap_m: float = 0.5,
-        boundary_clearance_m: float = 0.5,
+        boundary_clearance_m: float = 1.0,
         scenery_has_bridge_objects: bool = False,
         ) -> int:
     """For each taxi rect marked ``is_bridge=True``, optionally
@@ -6897,6 +8293,15 @@ def _emit_taxi_bridges(
                         kept_shapes.append(s)
                         continue
                     try:
+                        _old_ring = list(s.polygon.exterior.coords)
+                    except Exception:
+                        _old_ring = []
+                    if (_old_ring
+                            and _old_ring[0] == _old_ring[-1]):
+                        _old_ring = _old_ring[:-1]
+                    _old_alts = (list(s.node_altitudes)
+                                  if s.node_altitudes else None)
+                    try:
                         new_poly = s.polygon.difference(excl)
                     except Exception:
                         kept_shapes.append(s)
@@ -6905,7 +8310,10 @@ def _emit_taxi_bridges(
                         continue
                     if new_poly.geom_type == "Polygon":
                         s.polygon = new_poly
-                        s.node_altitudes = None
+                        resampled = _resample_node_altitudes_nn(
+                            new_poly, _old_ring, _old_alts)
+                        if resampled is not None:
+                            s.node_altitudes = resampled
                         kept_shapes.append(s)
                     elif new_poly.geom_type == "MultiPolygon":
                         for g in new_poly.geoms:
@@ -6913,11 +8321,15 @@ def _emit_taxi_bridges(
                                     or g.is_empty
                                     or g.area < 5.0):
                                 continue
+                            resampled = _resample_node_altitudes_nn(
+                                g, _old_ring, _old_alts)
                             kept_shapes.append(BuiltShape(
                                 polygon=g, role=s.role,
                                 ref=s.ref,
-                                altitude=s.altitude,
-                                node_altitudes=None))
+                                altitude=(s.altitude
+                                          if resampled is None
+                                          else None),
+                                node_altitudes=resampled))
                 layout.shapes = kept_shapes
             except Exception:
                 pass
@@ -7197,6 +8609,595 @@ def _emit_underpass_road_approaches(
                     u_prev = u_next
         n_processed += 1
     return n_processed
+
+
+def _emit_through_airport_depressed_roads(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        xplane_root: str,
+        icao: str,
+        depression_depth_m: float = 8.0,
+        max_ramp_grade: float = 0.04,
+        ramp_min_length_m: float = 200.0,
+        arm_max_length_m: float = 500.0,
+        road_width_m: float = 22.0,
+        retaining_wall_width_m: float = 1.0,
+        wall_gap_m: float = 0.5,
+        boundary_clearance_m: float = 1.0,
+        ) -> Tuple[int, set]:
+    """For each public road that ENTERS the airport boundary
+    AND passes under a tagged ``aeroway=*, bridge=yes`` way (or
+    is connected via OSM-graph node-sharing to a road that does)
+    inside the airport, emit:
+
+      1. A flat road-following polygon along the entire inside-
+         boundary stretch at ``apt_elev − depression_depth_m``.
+         Subsequent OSM road rendering (Ortho4XP's own road
+         layer) sits on top of this flat plate.
+      2. At each boundary entry/exit point, a ramp polygon
+         OUTSIDE the airport that climbs from the depressed
+         level back up to the local DEM, capped at
+         ``max_ramp_grade`` (default 4 %).
+
+    Per user 2026-04-29 (KPHX Sky Harbor Blvd): when a road
+    passes under multiple airport bridges, the road MUST be
+    depressed for its entire inside-airport stretch — not just
+    at the bridges.  Two bridges spanning the same continuous
+    road imply the road can never come back up between them.
+    The general solution: any road that enters the airport
+    boundary and crosses any aeroway=bridge inside is treated
+    this way, plus any road CONNECTED to it via shared OSM
+    nodes within the boundary (so on/off ramps inside the
+    airport stay coherent with the main road).
+
+    OSM tags consulted:
+      * ``aeroway=*, bridge=yes|viaduct`` — bridge LineStrings
+        (the airport surface above the depression).
+      * ``highway=*`` (motorway, trunk, primary, secondary,
+        tertiary, residential, service + their *_link forms) —
+        the road network candidates.
+      * ``bridge=yes|viaduct`` on a highway — that road is
+        ITSELF a bridge over something else (skip; we're
+        looking for the road UNDERNEATH).
+      * ``tunnel=yes|building_passage`` on a highway — INCLUDED
+        as seeds (the airport-bridge case typically tags the
+        under-bridge road segment as building_passage in OSM).
+        ``_emit_tunnel_portals`` is told to skip every OSM way
+        depressed here so we don't double-emit.
+
+    Boundary coordination: the union of every emitted polygon
+    is buffered by ``boundary_clearance_m`` and subtracted from
+    each ``ROLE_BOUNDARY`` shape (same pattern as the tunnel
+    and taxi-bridge emitters), with NN-resampling of per-vertex
+    altitudes so the boundary ribbon retains its altitude tags
+    after the clip.
+
+    Returns ``(n_emitted, depressed_way_ids)``.  The way-id
+    set is intended for ``_emit_tunnel_portals`` to skip — it
+    contains every OSM highway way (raw road network) handled
+    by this pass, so the explicit-tunnel emitter doesn't
+    double-process the same building_passage segments.
+    """
+    if (layout.airport_boundary is None
+            or layout.airport_boundary.is_empty):
+        return (0, set())
+    boundary = layout.airport_boundary
+    # Build a slightly contracted boundary for inside-vs-outside
+    # tests so a road point exactly ON the boundary doesn't bounce
+    # between true / false on numeric jitter.
+    try:
+        boundary_strict = boundary.buffer(-0.5)
+        if boundary_strict.is_empty:
+            boundary_strict = boundary
+    except Exception:
+        boundary_strict = boundary
+
+    # Load OSM airport-layer tile (for aeroway=bridge LineStrings).
+    try:
+        nodes_a, ways_a, _ = _load_osm_airports(
+            xplane_root, icao,
+            layout.anchor[0], layout.anchor[1])
+    except Exception:
+        return (0, set())
+    if not ways_a:
+        return (0, set())
+    # Load OSM big_roads (for highway ways).
+    nodes_r, ways_r = _load_osm_big_roads(
+        layout.anchor[0], layout.anchor[1])
+    if not ways_r:
+        return (0, set())
+
+    grade_safety_margin = 0.005
+    plan_grade = max(max_ramp_grade - grade_safety_margin, 1e-3)
+    arm_walk_max_m = max(arm_max_length_m, ramp_min_length_m,
+                         depression_depth_m / plan_grade)
+
+    lat0, lon0 = layout.anchor
+    cos0 = math.cos(math.radians(lat0))
+    R = R_EARTH
+
+    def _to_m(lon: float, lat: float) -> Tuple[float, float]:
+        return (math.radians(lon - lon0) * R * cos0,
+                math.radians(lat - lat0) * R)
+
+    def _m_to_ll(x: float, y: float) -> Tuple[float, float]:
+        return (lat0 + math.degrees(y / R),
+                lon0 + math.degrees(x / (R * cos0)))
+
+    def _airport_elevation_at(cx: float, cy: float) -> Optional[float]:
+        # Reuse pattern from _emit_tunnel_portals: prefer the
+        # boundary-ribbon's per-vertex altitude near the point,
+        # fall back to DEM.
+        best_d = float('inf')
+        best_alt: Optional[float] = None
+        for s in layout.shapes:
+            if s.role != ROLE_BOUNDARY:
+                continue
+            if s.ref != "airport_boundary":
+                continue
+            if not s.node_altitudes:
+                continue
+            try:
+                rcoords = list(s.polygon.exterior.coords)
+            except Exception:
+                continue
+            if rcoords and rcoords[0] == rcoords[-1]:
+                rcoords = rcoords[:-1]
+            for k, (vx, vy) in enumerate(rcoords):
+                if k >= len(s.node_altitudes):
+                    break
+                d = math.hypot(vx - cx, vy - cy)
+                if d < best_d:
+                    best_d = d
+                    best_alt = s.node_altitudes[k]
+        if best_alt is not None and best_d <= 400.0:
+            return float(best_alt)
+        try:
+            lat, lon = _m_to_ll(cx, cy)
+            return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+        except Exception:
+            return None
+
+    # ── Bridge LineStrings (airport-layer OSM) ─────────────────
+    bridge_lines: List[LineString] = []
+    nodes_a_m: Dict[str, Tuple[float, float]] = {}
+    for nid, (lat, lon) in nodes_a.items():
+        nodes_a_m[nid] = _to_m(lon, lat)
+    for wid, nrefs, tags in ways_a:
+        if not tags.get("aeroway"):
+            continue
+        if tags.get("bridge", "") not in ("yes", "viaduct"):
+            continue
+        pts = [nodes_a_m[n] for n in nrefs if n in nodes_a_m]
+        if len(pts) < 2:
+            continue
+        try:
+            ls = LineString(pts)
+        except Exception:
+            continue
+        if ls.is_empty or ls.length < 5.0:
+            continue
+        bridge_lines.append(ls)
+    if not bridge_lines:
+        return (0, set())
+
+    # ── Highway candidates (big_roads OSM) ─────────────────────
+    HW_TYPES = {
+        "motorway", "trunk", "primary", "secondary",
+        "tertiary", "motorway_link", "trunk_link",
+        "primary_link", "secondary_link", "tertiary_link",
+        "residential", "service", "unclassified",
+    }
+    nodes_r_m: Dict[str, Tuple[float, float]] = {}
+    for nid, (lat, lon) in nodes_r.items():
+        nodes_r_m[nid] = _to_m(lon, lat)
+    way_data: List[Tuple[str, LineString, List[str]]] = []
+    for wid, nrefs, tags in ways_r:
+        if tags.get("highway") not in HW_TYPES:
+            continue
+        if tags.get("bridge", "") in ("yes", "viaduct"):
+            # The road IS the bridge, not what's under — skip.
+            continue
+        # tunnel=building_passage tagging is INCLUDED.  At KPHX,
+        # the under-bridge road segments use this tag; they're
+        # exactly the seeds we want.
+        pts = [nodes_r_m[n] for n in nrefs if n in nodes_r_m]
+        if len(pts) < 2:
+            continue
+        try:
+            ls = LineString(pts)
+        except Exception:
+            continue
+        if ls.is_empty or ls.length < 5.0:
+            continue
+        way_data.append((wid, ls, list(nrefs)))
+    if not way_data:
+        return (0, set())
+
+    # ── Seed: ways whose inside-boundary section crosses a bridge ──
+    BRIDGE_PROXIMITY_M = 5.0
+    seed_depressed: set = set()
+    inside_geom_by_wid: Dict[str, "BaseGeometry"] = {}
+    for wid, ls, _nrefs in way_data:
+        try:
+            inside = ls.intersection(boundary)
+        except Exception:
+            continue
+        if inside.is_empty:
+            continue
+        inside_geom_by_wid[wid] = inside
+        # Iterate inside segments and check bridge proximity.
+        segs = []
+        if inside.geom_type == "LineString":
+            segs = [inside]
+        elif inside.geom_type == "MultiLineString":
+            segs = list(inside.geoms)
+        for seg in segs:
+            if seg.is_empty or seg.length < 1.0:
+                continue
+            for bls in bridge_lines:
+                try:
+                    if seg.distance(bls) < BRIDGE_PROXIMITY_M:
+                        seed_depressed.add(wid)
+                        break
+                except Exception:
+                    continue
+            if wid in seed_depressed:
+                break
+    if not seed_depressed:
+        return (0, set())
+
+    # ── BFS over OSM-graph node-sharing INSIDE the boundary ────
+    # On-ramps/off-ramps inside the airport are separate OSM
+    # ways; if they connect to a depressed seed at any node
+    # INSIDE the boundary, they must be depressed too (otherwise
+    # the seed and the connecting way disagree on altitude at
+    # their shared node and X-Plane renders a cliff).
+    node_to_ways: Dict[str, List[str]] = {}
+    way_lookup: Dict[str, Tuple[LineString, List[str]]] = {}
+    for wid, ls, nrefs in way_data:
+        way_lookup[wid] = (ls, nrefs)
+        for n in nrefs:
+            node_to_ways.setdefault(n, []).append(wid)
+    depressed_set: set = set(seed_depressed)
+    queue: List[str] = list(seed_depressed)
+    while queue:
+        wid = queue.pop()
+        ls, nrefs = way_lookup[wid]
+        for n in nrefs:
+            n_xy = nodes_r_m.get(n)
+            if n_xy is None:
+                continue
+            try:
+                if not boundary_strict.contains(Point(n_xy)):
+                    continue
+            except Exception:
+                continue
+            for other_wid in node_to_ways.get(n, []):
+                if other_wid in depressed_set:
+                    continue
+                # Only propagate if the other way also has an
+                # inside-boundary portion (otherwise it's just a
+                # surface road glancing the boundary node).
+                _o_ls, _o_nrefs = way_lookup[other_wid]
+                try:
+                    if _o_ls.intersection(boundary).is_empty:
+                        continue
+                except Exception:
+                    continue
+                depressed_set.add(other_wid)
+                queue.append(other_wid)
+
+    # ── Emit one set of polygons per depressed way ─────────────
+    n_emitted = 0
+    exclusion_zones: List[Polygon] = []
+    half_w = road_width_m / 2.0
+
+    def _smooth_walk(pts: List[Tuple[float, float]],
+                      min_segment_m: float = 15.0
+                      ) -> List[Tuple[float, float]]:
+        """Drop near-colinear / closely-spaced intermediate
+        vertices so altitude rounding can't push per-segment
+        grade above the design limit."""
+        if len(pts) < 3:
+            return list(pts)
+        merged: List[Tuple[float, float]] = [pts[0]]
+        for k in range(1, len(pts)):
+            d = math.hypot(pts[k][0] - merged[-1][0],
+                           pts[k][1] - merged[-1][1])
+            if d < min_segment_m and k != len(pts) - 1:
+                continue
+            merged.append(pts[k])
+        return merged
+
+    for wid in sorted(depressed_set):
+        ls, nrefs = way_lookup[wid]
+        # 1) Inside-boundary flat plate(s).
+        try:
+            inside = ls.intersection(boundary)
+        except Exception:
+            continue
+        if inside.is_empty:
+            continue
+        inside_segs = []
+        if inside.geom_type == "LineString":
+            inside_segs = [inside]
+        elif inside.geom_type == "MultiLineString":
+            inside_segs = list(inside.geoms)
+        for seg in inside_segs:
+            if seg.is_empty or seg.length < 5.0:
+                continue
+            ctr = seg.centroid
+            apt_elev = _airport_elevation_at(ctr.x, ctr.y)
+            if apt_elev is None:
+                continue
+            elev_low = apt_elev - depression_depth_m
+            try:
+                flat_poly = seg.buffer(
+                    half_w, cap_style=2, join_style=2)
+                if not flat_poly.is_valid:
+                    flat_poly = flat_poly.buffer(0)
+            except Exception:
+                continue
+            if (flat_poly.is_empty
+                    or flat_poly.geom_type != "Polygon"):
+                continue
+            layout.shapes.append(BuiltShape(
+                polygon=flat_poly,
+                role=ROLE_TUNNEL_RAMP,
+                ref="depressed_road",
+                altitude=round(elev_low, 1)))
+            exclusion_zones.append(flat_poly)
+            n_emitted += 1
+
+        # 2) Outside-boundary ramp(s) — one per side of the
+        #    boundary the way crosses.  Take the OSM polyline
+        #    OUTSIDE the boundary; for each outside piece, walk
+        #    OUTWARD from the boundary edge, truncate where the
+        #    grade requirement is satisfied, then emit ramp
+        #    polygons with bisector vertex sharing at bends.
+        try:
+            outside = ls.difference(boundary)
+        except Exception:
+            outside = None
+        if outside is None or outside.is_empty:
+            continue
+        outside_pieces = ([outside]
+                          if outside.geom_type == "LineString"
+                          else (list(outside.geoms)
+                                if outside.geom_type == "MultiLineString"
+                                else []))
+        for piece in outside_pieces:
+            if piece.is_empty or piece.length < 5.0:
+                continue
+            coords = list(piece.coords)
+            # Order coords so coords[0] is at the boundary,
+            # coords[-1] is far outside.  The boundary edge is
+            # the closest of the two endpoints to the boundary
+            # exterior (distance 0 vs distance > 0).
+            try:
+                d_start = boundary.exterior.distance(
+                    Point(coords[0]))
+            except Exception:
+                d_start = float('inf')
+            try:
+                d_end = boundary.exterior.distance(
+                    Point(coords[-1]))
+            except Exception:
+                d_end = float('inf')
+            if d_end < d_start:
+                coords = list(reversed(coords))
+            walk = _smooth_walk(coords)
+            if len(walk) < 2:
+                continue
+            # Truncate the walk to a length whose grade keeps
+            # ≤ plan_grade given DEM at the far end.
+            apt_elev = _airport_elevation_at(*walk[0])
+            if apt_elev is None:
+                continue
+            elev_low = apt_elev - depression_depth_m
+            cum = 0.0
+            kept_pts: List[Tuple[float, float]] = [walk[0]]
+            grade_ok_at: float = 0.0
+            for i in range(1, len(walk)):
+                seg_len = math.hypot(
+                    walk[i][0] - walk[i - 1][0],
+                    walk[i][1] - walk[i - 1][1])
+                cum += seg_len
+                kept_pts.append(walk[i])
+                if cum > arm_walk_max_m:
+                    grade_ok_at = cum
+                    break
+                try:
+                    plat, plon = _m_to_ll(*walk[i])
+                    dem_h = _sample_dem(
+                        dem, tile_lat, tile_lon, plat, plon)
+                except Exception:
+                    dem_h = None
+                if dem_h is None:
+                    continue
+                drop = float(dem_h) - elev_low
+                req = (drop / plan_grade if drop > 0 else 0.0)
+                if cum >= req and cum >= ramp_min_length_m:
+                    grade_ok_at = cum
+                    break
+                grade_ok_at = cum
+            walk = kept_pts
+            if len(walk) < 2:
+                continue
+            far_xy = walk[-1]
+            try:
+                far_lat, far_lon = _m_to_ll(*far_xy)
+                far_dem = _sample_dem(
+                    dem, tile_lat, tile_lon, far_lat, far_lon)
+            except Exception:
+                far_dem = None
+            if far_dem is None:
+                far_dem = apt_elev
+            max_drop = plan_grade * grade_ok_at
+            if (far_dem - elev_low) > max_drop:
+                far_dem = elev_low + max_drop
+            elev_high = far_dem
+            cum_dists = [0.0]
+            for i in range(1, len(walk)):
+                cum_dists.append(cum_dists[-1] + math.hypot(
+                    walk[i][0] - walk[i - 1][0],
+                    walk[i][1] - walk[i - 1][1]))
+            total_walk = cum_dists[-1]
+            if total_walk < 5.0:
+                continue
+            # Per-vertex bisector perpendicular for shared corners
+            # at bends (same pattern as _emit_tunnel_portals).
+            n_w = len(walk)
+            verts_perp: List[Tuple[float, float]] = []
+            verts_scale: List[float] = []
+            for i in range(n_w):
+                if i == 0:
+                    s = (walk[1][0] - walk[0][0],
+                         walk[1][1] - walk[0][1])
+                    sl = math.hypot(*s) or 1e-6
+                    verts_perp.append((-s[1] / sl, s[0] / sl))
+                    verts_scale.append(1.0)
+                elif i == n_w - 1:
+                    s = (walk[i][0] - walk[i - 1][0],
+                         walk[i][1] - walk[i - 1][1])
+                    sl = math.hypot(*s) or 1e-6
+                    verts_perp.append((-s[1] / sl, s[0] / sl))
+                    verts_scale.append(1.0)
+                else:
+                    s1 = (walk[i][0] - walk[i - 1][0],
+                          walk[i][1] - walk[i - 1][1])
+                    s2 = (walk[i + 1][0] - walk[i][0],
+                          walk[i + 1][1] - walk[i][1])
+                    l1 = math.hypot(*s1) or 1e-6
+                    l2 = math.hypot(*s2) or 1e-6
+                    u1 = (s1[0] / l1, s1[1] / l1)
+                    u2 = (s2[0] / l2, s2[1] / l2)
+                    avg = ((u1[0] + u2[0]) / 2.0,
+                           (u1[1] + u2[1]) / 2.0)
+                    al = math.hypot(*avg)
+                    if al < 1e-6:
+                        verts_perp.append((-u1[1], u1[0]))
+                        verts_scale.append(1.0)
+                        continue
+                    tangent = (avg[0] / al, avg[1] / al)
+                    perp = (-tangent[1], tangent[0])
+                    dot = u1[0] * u2[0] + u1[1] * u2[1]
+                    cos_half = max(0.1, math.sqrt(
+                        max(0.0, (1.0 + dot) / 2.0)))
+                    verts_perp.append(perp)
+                    verts_scale.append(1.0 / cos_half)
+
+            def _vertex_offset(idx: int, off: float
+                               ) -> Tuple[float, float]:
+                px, py = walk[idx]
+                nx, ny = verts_perp[idx]
+                scaled = off * verts_scale[idx]
+                return (px + nx * scaled, py + ny * scaled)
+
+            for i in range(n_w - 1):
+                d_a = cum_dists[i]
+                d_b = cum_dists[i + 1]
+                seg_len = d_b - d_a
+                if seg_len < 0.5:
+                    continue
+                frac_a = d_a / total_walk if total_walk > 0 else 0.0
+                frac_b = d_b / total_walk if total_walk > 0 else 0.0
+                e_a = (1 - frac_a) * elev_low + frac_a * elev_high
+                e_b = (1 - frac_b) * elev_low + frac_b * elev_high
+                ra = _vertex_offset(i, +half_w)
+                rb = _vertex_offset(i + 1, +half_w)
+                rc = _vertex_offset(i + 1, -half_w)
+                rd = _vertex_offset(i, -half_w)
+                # Corners [0, 3] = HIGH end, [1, 2] = LOW end.
+                if e_b >= e_a:
+                    ramp_corners = [rb, ra, rd, rc]
+                    eh, el = e_b, e_a
+                else:
+                    ramp_corners = [ra, rb, rc, rd]
+                    eh, el = e_a, e_b
+                try:
+                    rp = Polygon(ramp_corners)
+                    if not rp.is_valid:
+                        rp = rp.buffer(0)
+                    if (rp.geom_type != "Polygon"
+                            or rp.is_empty
+                            or rp.area < 0.5):
+                        continue
+                except Exception:
+                    continue
+                if abs(eh - el) >= 0.1:
+                    layout.shapes.append(BuiltShape(
+                        polygon=rp,
+                        role=ROLE_TUNNEL_RAMP,
+                        ref="depressed_approach",
+                        altitude_high=round(eh, 1),
+                        altitude_low=round(el, 1)))
+                else:
+                    layout.shapes.append(BuiltShape(
+                        polygon=rp,
+                        role=ROLE_TUNNEL_RAMP,
+                        ref="depressed_approach",
+                        altitude=round(0.5 * (eh + el), 1)))
+                exclusion_zones.append(rp)
+
+    # ── Boundary coordination ─────────────────────────────────
+    if exclusion_zones:
+        try:
+            depressed_union = unary_union(exclusion_zones)
+        except Exception:
+            depressed_union = None
+        if (depressed_union is None
+                or depressed_union.is_empty):
+            return (n_emitted, depressed_set)
+        excl_union = depressed_union.buffer(boundary_clearance_m)
+        kept_shapes: List[BuiltShape] = []
+        for s in layout.shapes:
+            if s.role != ROLE_BOUNDARY:
+                kept_shapes.append(s)
+                continue
+            try:
+                _old_ring = list(s.polygon.exterior.coords)
+            except Exception:
+                _old_ring = []
+            if _old_ring and _old_ring[0] == _old_ring[-1]:
+                _old_ring = _old_ring[:-1]
+            _old_alts = (list(s.node_altitudes)
+                          if s.node_altitudes else None)
+            try:
+                new_poly = s.polygon.difference(excl_union)
+            except Exception:
+                kept_shapes.append(s)
+                continue
+            if new_poly.is_empty:
+                continue
+            if new_poly.geom_type == "Polygon":
+                s.polygon = new_poly
+                resampled = _resample_node_altitudes_nn(
+                    new_poly, _old_ring, _old_alts)
+                if resampled is not None:
+                    s.node_altitudes = resampled
+                kept_shapes.append(s)
+            elif new_poly.geom_type == "MultiPolygon":
+                for g in new_poly.geoms:
+                    if (g.geom_type != "Polygon"
+                            or g.is_empty
+                            or g.area < 5.0):
+                        continue
+                    resampled = _resample_node_altitudes_nn(
+                        g, _old_ring, _old_alts)
+                    kept_shapes.append(BuiltShape(
+                        polygon=g,
+                        role=s.role,
+                        ref=s.ref,
+                        altitude=(s.altitude
+                                  if resampled is None
+                                  else None),
+                        node_altitudes=resampled))
+        layout.shapes = kept_shapes
+    return (n_emitted, depressed_set)
 
 
 def _smooth_within_junction_adjacent_pair_grade(
@@ -7557,12 +9558,23 @@ def _enforce_shared_vertex_altitudes(
 
 
 def _snap_junction_altitudes_to_rect_corners(
-        layout: "PavementLayout") -> int:
+        layout: "PavementLayout",
+        interior_proximity_m: float = 1.0,
+        ) -> int:
     """For every junction polygon, snap any vertex whose bucket
     coincides with a runway / sloping-rect corner to that rect's
     corresponding altitude tag value (``altitude_high`` for HIGH
     corners 0,3; ``altitude_low`` for LOW corners 1,2; ``altitude``
     for flat shapes).
+
+    Per user 2026-04-29 (CYXY runway-32L ridge): also snap
+    junction vertices that lie INSIDE a sloping-rect footprint
+    (within ``interior_proximity_m`` of the rect's interior or
+    edge) to the rect's INTERPOLATED altitude at that point.
+    Without this, a runway-crossing junction polygon whose
+    vertices land inside a runway rect can override the rect's
+    smooth slope with mesh-interpolated values that are 4-5 m
+    off — visible as a ridge crossing the runway surface.
 
     Without this pass, the smoothing / subdivision / clamping
     passes can leave a junction's ``node_altitudes`` entry at a
@@ -7585,6 +9597,9 @@ def _snap_junction_altitudes_to_rect_corners(
         # renders a step where the apron meets the terminal pad.
         ROLE_TERMINAL,
     }
+    # Also collect the FULL sloping-rect shapes for interior-
+    # snap (point-in-polygon + interpolated altitude).
+    rect_shapes_for_interior: List[BuiltShape] = []
     for s in layout.shapes:
         if s.role not in sloping_rect_roles_for_snap:
             continue
@@ -7610,14 +9625,26 @@ def _snap_junction_altitudes_to_rect_corners(
                 # segments at a shared corner disagreeing about
                 # the canonical altitude.
                 rwy_corner_alt.setdefault(b, float(e))
+            rect_shapes_for_interior.append(s)
         elif s.altitude is not None:
             # Flat shapes (terminal pads, pre-elevation rects).
             # Any number of vertices; all share a single altitude.
             for (cx, cy) in coords:
                 b = _corner_elevation_bucket(cx, cy)
                 rwy_corner_alt.setdefault(b, float(s.altitude))
-    if not rwy_corner_alt:
+            rect_shapes_for_interior.append(s)
+    if not rwy_corner_alt and not rect_shapes_for_interior:
         return 0
+    # Spatial index for interior-snap probes.
+    try:
+        from shapely.strtree import STRtree as _STRtree
+        if rect_shapes_for_interior:
+            interior_tree = _STRtree(
+                [s.polygon for s in rect_shapes_for_interior])
+        else:
+            interior_tree = None
+    except Exception:
+        interior_tree = None
     n_changed = 0
     for s in layout.shapes:
         if s.role != ROLE_JUNCTION:
@@ -7638,20 +9665,183 @@ def _snap_junction_altitudes_to_rect_corners(
         for i, (cx, cy) in enumerate(coords_open):
             if i >= len(s.node_altitudes):
                 break
+            # Pass 1: corner-bucket snap (prevents shared-corner
+            # disagreement between junction and rect tags).
             b = _corner_elevation_bucket(cx, cy)
             target_e = rwy_corner_alt.get(b)
-            if target_e is None:
+            if target_e is not None:
+                if abs(s.node_altitudes[i] - target_e) >= 0.05:
+                    s.node_altitudes[i] = round(target_e, 1)
+                    n_changed += 1
                 continue
-            if abs(s.node_altitudes[i] - target_e) < 0.05:
+            # Pass 2: interior snap — when the junction vertex
+            # lies inside a sloping rect's polygon, snap to the
+            # rect's interpolated altitude at that location.
+            # Only adjust when the disagreement is > 0.5 m so we
+            # don't undo the Laplacian solver's small refinements
+            # at points that aren't truly inside a rect.
+            if interior_tree is None:
                 continue
-            s.node_altitudes[i] = round(target_e, 1)
-            n_changed += 1
+            try:
+                _Point = Point  # local alias
+                pt = _Point(cx, cy)
+                cands = interior_tree.query(pt)
+            except Exception:
+                cands = []
+            best_e: Optional[float] = None
+            best_d2 = float("inf")
+            for hit in cands:
+                ri = int(hit) if hasattr(hit, "__int__") else hit
+                if not isinstance(ri, int):
+                    continue
+                rs = rect_shapes_for_interior[ri]
+                try:
+                    if rs.polygon.distance(pt) > interior_proximity_m:
+                        continue
+                except Exception:
+                    continue
+                e = _sample_runway_segment_elev(rs, cx, cy)
+                if e is None:
+                    continue
+                # Pick the rect whose centroid is closest (deals
+                # with overlapping rect candidates — runway +
+                # parallel + stub at a complex junction).
+                try:
+                    rcx = rs.polygon.centroid.x
+                    rcy = rs.polygon.centroid.y
+                    d2 = (rcx - cx) ** 2 + (rcy - cy) ** 2
+                except Exception:
+                    d2 = 0.0
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_e = float(e)
+            if best_e is None:
+                continue
+            if abs(s.node_altitudes[i] - best_e) >= 0.5:
+                s.node_altitudes[i] = round(best_e, 1)
+                n_changed += 1
         # Maintain closed-ring invariant: last == first.
         if (s.node_altitudes
                 and len(s.node_altitudes) >= 2
                 and s.node_altitudes[0] != s.node_altitudes[-1]):
             s.node_altitudes[-1] = s.node_altitudes[0]
     return n_changed
+
+
+def _re_emit_apron_merged_runway_segments(
+        layout: "PavementLayout",
+        ) -> int:
+    """Re-emit each apron-merged-and-dropped runway segment back
+    into ``layout.shapes`` AFTER the elevation pipeline has
+    finished assigning altitudes to surrounding apron junctions.
+    Subtracts the re-emitted footprint from any overlapping
+    junction polygon so the two don't conflict, with NN-resample
+    of the junction's per-vertex altitudes after the clip.
+
+    Per user 2026-04-29 (CYXY runway 32L/16R ridge): the
+    builder drops runway segments that lie inside a much-larger
+    apron polygon to avoid emitting a visible rectangular
+    ribbon.  The surrounding apron junction then takes over the
+    surface in that area — but the junction's altitudes come
+    from the Laplacian solver pinning at non-runway corners, so
+    the surface at the dropped-segment's footprint can sit 4-5 m
+    above the runway's CIFP profile.  Reading along the runway,
+    the rendered surface dips into the runway segment, rises
+    over the apron-junction-covered void, then dips back into
+    the next segment — the user's "ridge across runway".
+
+    Re-emitting the dropped segment with its preserved
+    ``altitude``/``altitude_high``/``altitude_low`` puts a real
+    runway-altitude plate back into the output.  The
+    surrounding apron junction is clipped (subtracted) so it no
+    longer covers the runway footprint.  The runway surface is
+    now continuous at its profile altitude through the absorbed
+    area.
+
+    Returns the number of segments re-emitted.
+    """
+    drops = list(getattr(
+        layout, "_apron_merged_runway_drops", []) or [])
+    if not drops:
+        return 0
+    try:
+        from shapely.strtree import STRtree as _STRtree
+        # Index the junction polygons so we know which to clip.
+        jct_idxs = [i for i, s in enumerate(layout.shapes)
+                     if s.role == ROLE_JUNCTION
+                     and s.polygon is not None
+                     and not s.polygon.is_empty]
+        if jct_idxs:
+            index = _STRtree([layout.shapes[i].polygon
+                               for i in jct_idxs])
+        else:
+            index = None
+    except Exception:
+        index = None
+        jct_idxs = []
+    n_emitted = 0
+    for seg in drops:
+        if seg.polygon is None or seg.polygon.is_empty:
+            continue
+        # Subtract the segment's footprint from every junction
+        # whose polygon overlaps it.  Use the raw segment polygon
+        # (no buffer) so the clip is exactly the runway shape.
+        if index is not None:
+            try:
+                cands = index.query(seg.polygon)
+            except Exception:
+                cands = []
+            for hit in cands:
+                ji = int(hit) if hasattr(hit, "__int__") else hit
+                if not isinstance(ji, int):
+                    continue
+                shape_i = jct_idxs[ji]
+                target = layout.shapes[shape_i]
+                if (target.polygon is None
+                        or target.polygon.is_empty):
+                    continue
+                try:
+                    inter_area = target.polygon.intersection(
+                        seg.polygon).area
+                except Exception:
+                    continue
+                if inter_area < 1.0:
+                    continue
+                # Capture old ring + altitudes BEFORE clip.
+                try:
+                    _old_ring = list(
+                        target.polygon.exterior.coords)
+                except Exception:
+                    _old_ring = []
+                if _old_ring and _old_ring[0] == _old_ring[-1]:
+                    _old_ring = _old_ring[:-1]
+                _old_alts = (list(target.node_altitudes)
+                              if target.node_altitudes else None)
+                try:
+                    new_poly = target.polygon.difference(
+                        seg.polygon)
+                except Exception:
+                    continue
+                if (new_poly.is_empty
+                        or new_poly.geom_type
+                        not in ("Polygon", "MultiPolygon")):
+                    continue
+                if new_poly.geom_type == "MultiPolygon":
+                    new_poly = max(
+                        (g for g in new_poly.geoms
+                          if g.geom_type == "Polygon"),
+                        key=lambda g: g.area, default=None)
+                    if new_poly is None or new_poly.is_empty:
+                        continue
+                target.polygon = new_poly
+                resampled = _resample_node_altitudes_nn(
+                    new_poly, _old_ring, _old_alts)
+                if resampled is not None:
+                    target.node_altitudes = resampled
+        # Re-add the runway segment.
+        layout.shapes.append(seg)
+        n_emitted += 1
+    return n_emitted
 
 
 def _latlon_to_m_local(lat: float, lon: float,
@@ -11054,6 +13244,7 @@ def _terminal_groundside_zone(
     edge_classify_radius_m: float = 30.0,
     groundside_extent_m: float = 100.0,
     apt_pavement_seeds: Optional[List[Polygon]] = None,
+    apt_pavement_polys: Optional[List[Polygon]] = None,
 ) -> Optional[Polygon]:
     """Identify pavement strips on the GROUNDSIDE of terminal
     buildings — the road/curbside frontage where access roads,
@@ -11146,23 +13337,117 @@ def _terminal_groundside_zone(
             groundside_geoms.append(g)
     # Approach 1: build the airside-reachable subset of apt.dat
     # pavement.  Two polygons are "connected" if their boundaries
-    # touch (intersect within a small buffer).  Seeds are polygons
-    # that contain or touch a runway centerline (passed in as
-    # ``apt_pavement_seeds`` — the caller's runway / aeroway
-    # marker geometries).  BFS from seeds; reachable = airside.
+    # are within ``TOUCH_TOL_M`` of each other.  Seeds are
+    # polygons that contain or touch a runway centerline (passed
+    # in as ``apt_pavement_seeds``).  BFS from seeds through
+    # transitive touches; the reached set is the AIRSIDE-REACHABLE
+    # portion of apt.dat pavement.
+    #
+    # Per user 2026-04-30 (CYXY -10123 NW phantom groundside):
+    # When ``apt_pavement_polys`` is provided (full row-110 list),
+    # we BFS through it.  Without that list, fall back to using
+    # the seeds alone (legacy behaviour).  At CYXY, the apron
+    # extends NW past the terminal as part of one giant
+    # "Apron 1 and E" polygon that touches all three runways —
+    # the BFS reaches that whole polygon, so the NW-edge probe
+    # sees airside-reachable pavement and classifies AIRSIDE.
     airside_apt_polys: List[Polygon] = []
     if apt_pavement_seeds:
-        # Find apt.dat polys that touch a seed.
         TOUCH_TOL_M = 1.0
-        airside_set: set = set()
-        # Caller passes seeds as a flat list; use them as-is.
-        seed_geoms = apt_pavement_seeds
-        # Mark each seed-touching polygon as airside.
-        # (Caller is responsible for passing the apt.dat polygon
-        # list as the same object so identity comparison works;
-        # to be robust, just check touch directly inside the
-        # per-edge loop below.)
-        airside_apt_polys = list(seed_geoms)
+        if apt_pavement_polys:
+            # BFS over apt.dat pavement, seeded by polys that
+            # touch any runway / aeroway seed within TOUCH_TOL_M.
+            try:
+                from shapely.strtree import STRtree as _STRtree
+                pav_tree = _STRtree(apt_pavement_polys)
+            except Exception:
+                pav_tree = None
+            seed_buf_polys = [
+                s.buffer(TOUCH_TOL_M)
+                for s in apt_pavement_seeds
+                if s is not None and not s.is_empty]
+            airside_idxs: set = set()
+            queue: List[int] = []
+            # Initial seeds: any apt.dat poly intersecting any
+            # buffered seed geometry (i.e. within TOUCH_TOL_M).
+            for sb in seed_buf_polys:
+                if pav_tree is not None:
+                    cands = pav_tree.query(sb)
+                else:
+                    cands = range(len(apt_pavement_polys))
+                for hit in cands:
+                    pi = (int(hit) if hasattr(hit, "__int__")
+                          else hit)
+                    if not isinstance(pi, int):
+                        continue
+                    if pi in airside_idxs:
+                        continue
+                    cand = apt_pavement_polys[pi]
+                    if cand is None or cand.is_empty:
+                        continue
+                    try:
+                        if cand.intersects(sb):
+                            airside_idxs.add(pi)
+                            queue.append(pi)
+                    except Exception:
+                        continue
+            # BFS: a poly is airside-reachable if its boundary is
+            # within TOUCH_TOL_M of an already-airside poly's
+            # boundary.
+            while queue:
+                pi = queue.pop()
+                src = apt_pavement_polys[pi]
+                src_buf = src.buffer(TOUCH_TOL_M)
+                if pav_tree is not None:
+                    cands = pav_tree.query(src_buf)
+                else:
+                    cands = range(len(apt_pavement_polys))
+                for hit in cands:
+                    qi = (int(hit) if hasattr(hit, "__int__")
+                          else hit)
+                    if not isinstance(qi, int):
+                        continue
+                    if qi in airside_idxs:
+                        continue
+                    cand = apt_pavement_polys[qi]
+                    if cand is None or cand.is_empty:
+                        continue
+                    try:
+                        if cand.intersects(src_buf):
+                            airside_idxs.add(qi)
+                            queue.append(qi)
+                    except Exception:
+                        continue
+            # Use EXTERIOR rings only (drop interior holes).  Per
+            # user 2026-04-30 (CYXY -10123): apt.dat row-110
+            # apron polygons commonly have interior rings around
+            # terminals / non-pavement zones.  An airside-side
+            # building edge whose probe lands INSIDE such a hole
+            # would otherwise miss the airside polygon entirely
+            # and fall back to UNKNOWN/groundside.  Treating the
+            # hole as part of the airside-reachable region (since
+            # by definition it is SURROUNDED by airside pavement)
+            # restores correct classification.
+            for pi in airside_idxs:
+                src = apt_pavement_polys[pi]
+                if src is None or src.is_empty:
+                    continue
+                try:
+                    ext_only = Polygon(list(src.exterior.coords))
+                    if not ext_only.is_valid:
+                        ext_only = ext_only.buffer(0)
+                    if (ext_only.geom_type == "Polygon"
+                            and not ext_only.is_empty):
+                        airside_apt_polys.append(ext_only)
+                except Exception:
+                    airside_apt_polys.append(src)
+            # Always include the seeds themselves so the probe
+            # also fires when the building edge faces directly
+            # onto a runway.
+            airside_apt_polys.extend(apt_pavement_seeds)
+        else:
+            # Legacy fallback: use seeds directly (no BFS).
+            airside_apt_polys = list(apt_pavement_seeds)
     if (not airside_geoms
             and not groundside_geoms
             and not airside_apt_polys):
@@ -11192,6 +13477,8 @@ def _terminal_groundside_zone(
         n = len(coords)
         if n < 3:
             continue
+        # (No building-level airside skip; per-edge probe
+        # below handles classification.)
         # Per-building two-pass classification.  An edge becomes
         # GROUNDSIDE only when the OSM data gives us an EXPLICIT
         # indicator on that edge — either ``highway=*`` (road
@@ -11253,11 +13540,34 @@ def _terminal_groundside_zone(
                         airside = True
                         break
             if not airside and apt_air_tree is not None:
-                for hit in apt_air_tree.query(probe):
-                    g = airside_apt_polys[int(hit)]
-                    if g.intersects(probe):
-                        airside = True
-                        break
+                # Per user 2026-04-30 (CYXY -10123): use a
+                # LONGER probe for the apt.dat-pavement-
+                # connectivity check (vs the 30 m default for
+                # OSM aeroway tags).  At CYXY the terminal sits
+                # in a building-shaped concavity in the apron's
+                # exterior ring; the 30 m probe falls inside
+                # the concavity and never hits airside pavement.
+                # A 100 m probe reaches past the concavity into
+                # the apron's main body.  Groundside detection
+                # via OSM highway tags still uses the 30 m probe
+                # so this doesn't make the classifier more eager
+                # to fire airside on roads close to the building.
+                _far_radius_m = 100.0
+                far_probe = Polygon([
+                    (ax, ay), (bx, by),
+                    (bx + n_x * _far_radius_m,
+                     by + n_y * _far_radius_m),
+                    (ax + n_x * _far_radius_m,
+                     ay + n_y * _far_radius_m),
+                ])
+                if not far_probe.is_valid:
+                    far_probe = far_probe.buffer(0)
+                if not far_probe.is_empty:
+                    for hit in apt_air_tree.query(far_probe):
+                        g = airside_apt_polys[int(hit)]
+                        if g.intersects(far_probe):
+                            airside = True
+                            break
             if airside:
                 edge_class[i] = EDGE_AIRSIDE
                 continue
