@@ -1,15 +1,88 @@
 # Auto-Patch Refactor — Status
 
-## NEXT-SESSION PRIORITY (2026-04-25)
+## NEXT-SESSION PRIORITY (2026-04-30)
 
-**SPJC is still crashing X-Plane** despite the metrics being
-clean (0 plane-gradient, 0 cross-shape, 0 mid-edge step).  All
-known-bad-polygon classes (spike vertices, duplicate nids,
-self-intersection at .11f precision) have defensive guards in
-place, but something else is still upsetting the X-Plane mesh
-builder.  Debug SPJC first — re-check the staged
-`Patches/-20-080/-13-078/SPJC_auto.patch.osm` for any
-remaining structural issues we haven't accounted for.
+The auto-patch / airport-pavement-builder system is **mid-flight
+through a structural refactor** per the plan at
+`/Users/noah/.claude/plans/nested-hopping-toast.md`.  The plan
+carves the two monolithic files
+(`O4_Airport_Pavement_Builder.py` 17K lines,
+`O4_Auto_Patch.py` 7.6K lines) into small focused modules so any
+single module can be loaded fully into context — addressing the
+root cause of every recent regression.
+
+**Slices done (7 commits):**
+
+| Hash | Slice | What |
+|---|---|---|
+| `aeca81c` | (pre) | Test infra: `O4_TEST_TILE`/`O4_TEST_AIRPORTS`/`O4_SHIP_MODE` env vars + new `tests/test_junction_invariants.py` (4 tests) + tightened `test_no_self_overlap` (zero tolerance) |
+| `87885bc` | (pre) | Pavement-builder baseline: `EMIT_BRIDGES_AND_TUNNELS=False` gate, corridor-ref preservation reverted, accumulated session work locked in |
+| `a06d819` | 0 | Delete dead code from `O4_Auto_Patch.py` (-5,594 lines; `generate_airport_surface_patches`, `_emit_pavement_*`, etc.) |
+| `bca6891` | 1 | Extract `O4_Cifp_Reader.py`, `O4_Runway_Geometry.py`, `O4_Osm_Aeroway.py` from `O4_Auto_Patch` |
+| `2ba720c` | 2 | Extract `O4_Pavement_Layout.py` (BuiltShape, PavementLayout, role + projection) and `O4_Pavement_Config.py` (numeric tunables + emit gates) |
+| `579e075` | 3a | Extract `O4_Pavement_Absorption.py` (the recurring-regression hot spot — rule reproduced verbatim in module docstring) |
+| `2b6299f` | 3b | Extract `O4_Pavement_Vertices.py` (5 helpers + `SPIKE_VERTEX_TOL_M`); shared constants moved to Config |
+
+**Slices pending:**
+
+* **3c–3i**: `O4_Pavement_Runways`, `O4_Pavement_Runway_Segments`,
+  `O4_Pavement_Centerlines`, `O4_Pavement_Terminals`,
+  `O4_Pavement_Rects`, `O4_Pavement_Stubs`, `O4_Pavement_Junctions`.
+  The Junctions slice should also land the per-arc-capped
+  densification fix that closes
+  `test_junction_vertex_count_bounded`.
+* **4**: `O4_Pavement_Elevation` + NEW `O4_Pavement_Rect_Split`
+  (grade-aware rect splitting).
+* **5**: features (Boundary, Groundside, Bridges).
+* **6**: emit + thin pipeline + retire monolith.
+
+**Live test baseline (must remain unchanged across remaining
+slices):**
+
+```
+O4_TEST_AIRPORTS=CYXY pytest tests/test_pavement_geometry.py tests/test_junction_invariants.py
+→ 5 failed, 3 passed
+```
+
+The 5 failing tests track pre-existing pavement-geometry
+regressions later slices are designed to fix
+(`test_junction_vertex_count_bounded`,
+`test_junction_boundary_near_centerline`,
+`test_junction_neighbour_corners_shared`,
+`test_taxi_rects_not_alongside_apron`, `test_no_self_overlap`).
+A NEW failure or a passing test that starts failing means the
+extraction left an orphan constant — see
+`memory/feedback_extraction_pattern.md` for the audit recipe.
+
+**File sizes after slice 3b:**
+
+| File | Lines |
+|---|---|
+| `src/O4_Airport_Pavement_Builder.py` | 15,486 (was 17,108) |
+| `src/O4_Auto_Patch.py` | 1,264 (was 7,627) |
+| `src/O4_Pavement_Vertices.py` | 726 |
+| `src/O4_Pavement_Absorption.py` | 614 |
+| `src/O4_Pavement_Layout.py` | 503 |
+| `src/O4_Osm_Aeroway.py` | 344 |
+| `src/O4_Cifp_Reader.py` | 279 |
+| `src/O4_Runway_Geometry.py` | 240 |
+| `src/O4_Pavement_Config.py` | 75 |
+
+**Bridge/tunnel emission** is gated off via
+`EMIT_BRIDGES_AND_TUNNELS = False` (in `O4_Pavement_Config`).
+Re-enable is a separate post-refactor feature pass; the four emit
+sites in `build_airport_pavement` are wrapped behind the flag.
+
+**Stray `+60-140/`** at the repo root is leftover .hgt elevation
+tiles from a misplaced run.  Ignore — already escaped one
+accidental `git add -A`.
+
+## Earlier-session priority (2026-04-25, deferred)
+
+The points below predate the refactor.  **Most are still
+relevant** but any code-change action on them should wait until
+the refactor is past slice 4 (when each module is small enough to
+edit without risk).
 
 **THEN:** use **HECA (+30+031)** as the next test airport.
 HECA is complex (273 shapes, 86 m elevation spread across
