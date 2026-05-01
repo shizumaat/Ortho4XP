@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from math import cos, pi, sqrt
 
+import O4_UI_Utils as UI
+
 from .runway_geometry import (
     DEFAULT_RUNWAY_WIDTH,
     extend_point,
@@ -559,8 +561,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 g = abs(e1 - e0) / seg_d
                 if g > MAX_RUNWAY_GRADE + 1e-6:
                     try:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [auto-patch] {icao} runway "
                             f"{desig_a}/{desig_b}: anchor pair grade "
                             f"{g * 100:.2f}% > "
@@ -568,7 +569,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                             f"fractions {f0:.3f} and {f1:.3f} "
                             f"({seg_d:.0f} m apart, ΔE={e1 - e0:+.2f} m) "
                             f"— profile will be infeasible at FAA "
-                            f"runway max grade.\n")
+                            f"runway max grade.")
                     except Exception:
                         pass
 

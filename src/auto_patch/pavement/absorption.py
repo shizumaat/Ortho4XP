@@ -57,6 +57,8 @@ import math
 import sys
 from typing import List, Optional, Tuple
 
+import O4_UI_Utils as UI
+
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
@@ -436,12 +438,11 @@ def _drop_primary_parallels_embedded_in_pavement(
 
     if abs_refs:
         try:
-            import sys as _sys
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] long-edge-adjacent absorption: "
                 f"{n_full} dropped, {n_split} split, "
                 f"{n_clipped} clipped (refs: "
-                f"{', '.join(abs_refs)}).\n")
+                f"{', '.join(abs_refs)}).")
         except Exception:
             pass
     return kept
@@ -589,14 +590,13 @@ def _split_primary_parallels_at_pavement_boundary(
             out.append((new_rect, new_axis, role, ref))
             n_clipped += 1
             try:
-                import sys as _sys
-                _sys.stderr.write(
+                UI.vprint(1,
                     f"  [pav-builder] clipped primary_parallel "
                     f"{ref!r}: {L:.0f}m → {(u_hi - u_lo):.0f}m "
                     f"(dropped "
                     + ("prefix " if clip_pfx else "")
                     + ("suffix " if clip_sfx else "")
-                    + "embedded in pavement).\n")
+                    + "embedded in pavement).")
             except Exception:
                 pass
         except Exception:

@@ -66,6 +66,8 @@ import os
 import sys
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import O4_UI_Utils as UI
+
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
 
@@ -227,19 +229,17 @@ def _load_airport_dem(lat0: float, lon0: float):
             # internally).  Same path Ortho4XP's main pipeline
             # uses for the elevation data step.
             try:
-                import sys as _sys
-                _sys.stderr.write(
+                UI.vprint(1,
                     f"  [pav-builder] {fname} missing; downloading "
-                    f"DEM tile via Ortho4XP elevation provider...\n")
+                    f"DEM tile via Ortho4XP elevation provider...")
             except Exception:
                 pass
             dem = _DEM.DEM(tile_lat, tile_lon)
     except Exception as exc:
         try:
-            import sys as _sys
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] WARN: DEM load/download failed for "
-                f"{fname}: {exc}\n")
+                f"{fname}: {exc}")
         except Exception:
             pass
         _DEM_CACHE[key] = None
@@ -505,11 +505,10 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     kept_polys.append(sh.polygon)
             if n_dropped:
                 try:
-                    import sys as _sys
-                    _sys.stderr.write(
+                    UI.vprint(1,
                         f"  [pav-builder] {icao}: dropped "
                         f"{n_dropped} runway segment(s) "
-                        f"apron-merged.\n")
+                        f"apron-merged.")
                 except Exception:
                     pass
                 layout.shapes = kept_shapes
@@ -537,11 +536,10 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         n_crossings = _resolve_runway_crossings(layout)
         if n_crossings:
             try:
-                import sys as _sys
-                _sys.stderr.write(
+                UI.vprint(1,
                     f"  [pav-builder] {icao}: resolved "
                     f"{n_crossings} runway crossing(s) into "
-                    f"junction polygon(s).\n")
+                    f"junction polygon(s).")
             except Exception:
                 pass
             new_runway_polys = [
@@ -816,12 +814,12 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             import sys as _sys
             dem_str = (f"{dem_median:.1f}" if dem_median is not None
                        else "n/a")
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] terminal({shape.ref or '?'}) "
                 f"altitude {new_alt} m (max grade-compliant from "
                 f"runway corners within "
                 f"{TERMINAL_NEIGHBOUR_RADIUS_M:.0f} m, "
-                f"DEM-median ceiling = {dem_str}).\n")
+                f"DEM-median ceiling = {dem_str}).")
         except Exception:
             pass
 
@@ -1432,13 +1430,12 @@ def _solve_pavement_elevations_unified(
 
     elapsed = _time.time() - t_start
     try:
-        import sys as _sys
-        _sys.stderr.write(
+        UI.vprint(1,
             f"  [pav-builder] {icao}: unified Laplacian solver "
             f"converged in {it + 1}/{max_iters} iters "
             f"({elapsed:.2f} s); applied to "
             f"{n_terms} terminal(s), {n_rects} rect(s), "
-            f"{n_junctions} junction(s).\n")
+            f"{n_junctions} junction(s).")
     except Exception:
         pass
 
@@ -1726,13 +1723,12 @@ def _rederive_terminal_altitude_from_apron_neighbours(
         old_alt = s.altitude
         if old_alt is None or abs(old_alt - new_alt) >= 0.05:
             try:
-                import sys as _sys
-                _sys.stderr.write(
+                UI.vprint(1,
                     f"  [pav-builder] terminal({s.ref or '?'}) "
                     f"altitude {old_alt} → {new_alt} m "
                     f"(median of {len(closest)} closest hard "
                     f"anchors within {sample_radius_m:.0f} m; "
-                    f"replaces DEM-median).\n")
+                    f"replaces DEM-median).")
             except Exception:
                 pass
             s.altitude = new_alt
@@ -3368,9 +3364,9 @@ def _triangulate_junctions(
         # tool run; not a hard failure.
         try:
             import sys
-            sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] WARN: {grade_violations} junction "
-                f"triangle(s) exceed {TAXI_MAX_GRADE * 100:.1f}% grade.\n")
+                f"triangle(s) exceed {TAXI_MAX_GRADE * 100:.1f}% grade.")
         except Exception:
             pass
     return triangle_count
@@ -4167,11 +4163,10 @@ def _merge_sliver_junctions_into_neighbours(
         s for k, s in enumerate(layout.shapes)
         if k not in sliver_set]
     try:
-        import sys as _sys
-        _sys.stderr.write(
+        UI.vprint(1,
             f"  [pav-builder] {icao}: merged "
             f"{len(merge_into)} sliver junction(s) into "
-            f"adjacent larger junctions.\n")
+            f"adjacent larger junctions.")
     except Exception:
         pass
     return len(merge_into)
@@ -4269,8 +4264,8 @@ def _report_within_shape_violations(
                 msg += (f"; worst {worst_pct:.1f}% on "
                         f"{role}{rstr} ({ea:.1f} → {eb:.1f}, "
                         f"d={d:.1f}m, de={de:.1f}m)")
-            msg += ".\n"
-            _sys.stderr.write(msg)
+            msg += "."
+            UI.vprint(1, msg)
         except Exception:
             pass
 
@@ -4541,10 +4536,9 @@ def _drop_overlap_against_fixed_shapes(
 
     if (n_clipped + n_dropped) > 0:
         try:
-            import sys as _sys
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] {icao}: overlap-clip pass — "
                 f"{n_clipped} clip operation(s), "
-                f"{n_dropped} shape(s) dropped.\n")
+                f"{n_dropped} shape(s) dropped.")
         except Exception:
             pass

@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import O4_UI_Utils as UI
+
 from shapely.geometry import LineString, Polygon
 
 from . import apt_dat_reader as APR
@@ -60,7 +62,7 @@ __all__ = [
 # ──────────────────────────────────────────────────────────────────
 # Geometry constants
 # ──────────────────────────────────────────────────────────────────
-R_EARTH = 6_378_137.0
+from O4_Geo_Utils import earth_radius as R_EARTH  # single source of truth
 SHARED_VERTEX_TOL_M = 0.5    # snap vertices closer than this together
 
 
@@ -331,12 +333,11 @@ class PavementLayout:
                     [(lon, lat) for lat, lon in latlon_ring])
                 if not check_poly.is_valid:
                     try:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [pav-builder] WARN: dropping "
                             f"invalid polygon (role={s.role}, "
                             f"nids={len(ext_nids) - 1}): "
-                            f"X-Plane mesh builder would crash.\n")
+                            f"X-Plane mesh builder would crash.")
                     except Exception:
                         pass
                     continue
@@ -370,13 +371,12 @@ class PavementLayout:
                         break
                 if worst_ang is not None:
                     try:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [pav-builder] WARN: dropping "
                             f"sliver-corner polygon (role={s.role}, "
                             f"nids={len(ext_nids) - 1}, "
                             f"min angle {worst_ang:.2f}°): "
-                            f"X-Plane mesh builder would crash.\n")
+                            f"X-Plane mesh builder would crash.")
                     except Exception:
                         pass
                     continue

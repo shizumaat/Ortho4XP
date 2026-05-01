@@ -31,6 +31,8 @@ import sys
 import tempfile
 from typing import List, Optional, Tuple
 
+import O4_UI_Utils as UI
+
 
 # Pavement-detector patterns: a POLYGON_DEF must START with one of
 # these prefixes to be admitted as pavement geometry.  These are
@@ -160,9 +162,9 @@ def read_dsf_pavements(
                 )
         except Exception as exc:
             try:
-                sys.stderr.write(
+                UI.vprint(1,
                     f"  [dsf-reader] WARN: DSFTool failed on "
-                    f"{os.path.basename(dsf_path)}: {exc}\n")
+                    f"{os.path.basename(dsf_path)}: {exc}")
             except Exception:
                 pass
             return []

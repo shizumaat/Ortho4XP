@@ -35,6 +35,9 @@ from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import (
     linemerge, nearest_points, transform as shp_transform, unary_union)
 
+import O4_File_Names as FNAMES
+import O4_UI_Utils as UI
+
 from . import apt_dat_reader as APR
 from .pavement import classifier as PC
 from .pavement import strips as PS
@@ -147,21 +150,9 @@ def _load_osm_tile(path: str) -> Tuple[Dict[str, Tuple[float, float]],
     return nodes, ways, relations
 
 
-def _osm_tile_path(lat_tile: int, lon_tile: int,
-                    cached_suffix: str = "airports") -> str:
-    """Ortho4XP's per-tile cached OSM filename layout."""
-    def _fmt(v, pad):
-        sign = "+" if v >= 0 else "-"
-        return f"{sign}{abs(v):0{pad}d}"
-    lat_group = (lat_tile // 10) * 10
-    lon_group = (lon_tile // 10) * 10
-    return os.path.join(
-        "OSM_data",
-        f"{_fmt(lat_group, 2)}{_fmt(lon_group, 3)}",
-        f"{_fmt(lat_tile, 2)}{_fmt(lon_tile, 3)}",
-        f"{_fmt(lat_tile, 2)}{_fmt(lon_tile, 3)}"
-        f"_{cached_suffix}.osm.bz2",
-    )
+# `_osm_tile_path` removed — was a hand-rolled reimplementation of
+# `O4_File_Names.osm_cached(lat, lon, suffix)`.  Call sites now use
+# `FNAMES.osm_cached` directly.
 
 
 def _load_osm_airports(xplane_root: str, icao: str,
@@ -175,7 +166,7 @@ def _load_osm_airports(xplane_root: str, icao: str,
     Returns nodes + ways filtered to a bbox around the airport.
     """
     def _tile_path(lat_tile: int, lon_tile: int) -> str:
-        return _osm_tile_path(lat_tile, lon_tile, "airports")
+        return FNAMES.osm_cached(lat_tile, lon_tile, "airports")
 
     # An airport near a tile boundary may be cached in an adjacent
     # tile — try the natural tile + all 8 neighbours and merge.
@@ -199,16 +190,14 @@ def _load_osm_airports(xplane_root: str, icao: str,
                 tags_of_interest=["all"],
                 cached_suffix="airports")
             if not ok:
-                import sys as _sys
-                _sys.stderr.write(
+                UI.vprint(1,
                     f"  [pav-builder] WARN: Overpass download failed "
                     f"for airports tile +{base_lat}{base_lon:+04d}; "
-                    f"junctions/rects will be empty.\n")
+                    f"junctions/rects will be empty.")
         except Exception as exc:
-            import sys as _sys
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] WARN: airport OSM download error: "
-                f"{exc}\n")
+                f"{exc}")
     # Per user 2026-04-29: OSM Overpass exports use locally-
     # generated NEGATIVE IDs that aren't globally unique.  At
     # HECA (and any airport with adjacent OSM tiles), tile A's
@@ -538,10 +527,10 @@ def _pick_best_apt_dat_against_osm(
             import sys as _sys
             label = "PICK" if (passed and cand == chosen) else (
                 "ok" if passed else "skip")
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] {icao}: apt.dat candidate "
                 f"[{label}] apron={ac:.0%} taxi={tc:.0%}  "
-                f"{cand}\n")
+                f"{cand}")
         except Exception:
             pass
     if chosen is not None:
@@ -551,13 +540,12 @@ def _pick_best_apt_dat_against_osm(
     if scores:
         scores.sort(key=lambda s: -(s[1] + s[2]))
         try:
-            import sys as _sys
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] {icao}: no apt.dat met "
                 f"thresholds (apron≥{apron_threshold:.0%}, "
                 f"taxi≥{taxi_threshold:.0%}); falling back to "
                 f"highest combined coverage: "
-                f"apron={scores[0][1]:.0%} taxi={scores[0][2]:.0%}.\n")
+                f"apron={scores[0][1]:.0%} taxi={scores[0][2]:.0%}.")
         except Exception:
             pass
         return scores[0][0]
@@ -588,7 +576,7 @@ def _load_osm_big_roads(apt_lat: float, apt_lon: float,
         for dlon in (0, -1, 1):
             tile_lat_n = base_lat + dlat
             tile_lon_n = base_lon + dlon
-            osm_path = _osm_tile_path(
+            osm_path = FNAMES.osm_cached(
                 tile_lat_n, tile_lon_n, "big_roads")
             if osm_path in seen_paths or not os.path.isfile(osm_path):
                 continue
@@ -1027,15 +1015,13 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 break
         absorbed_pav_indices.update(absorbed)
         try:
-            import sys as _sys
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] {icao}: widened runway "
                 f"{r.desig_a}/{r.desig_b}: {old_w:.1f}m → "
                 f"{r.width_m:.1f}m"
                 + (f" (centerline shifted {offset:+.1f}m)"
-                   if abs(offset) > 0.5 else "")
-                + f" — absorbed {len(absorbed)} shoulder polygon(s).\n"
-            )
+                if abs(offset) > 0.5 else "")
+                + f" — absorbed {len(absorbed)} shoulder polygon(s).")
         except Exception:
             pass
 
@@ -1334,16 +1320,15 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 if n_dsf_dropped_outside_osm_gap:
                     msg += (f", {n_dsf_dropped_outside_osm_gap} "
                             f"dropped: outside OSM-aeroway gap")
-                _sys.stderr.write(msg + ".\n")
+                UI.vprint(1, msg + ".")
             except Exception:
                 pass
     except StopIteration:
         # DSF read intentionally disabled.
         try:
-            import sys as _sys
-            _sys.stderr.write(
+            UI.vprint(1,
                 f"  [pav-builder] {icao}: DSF pavement read "
-                f"disabled (LOAD_DSF_PAVEMENT=False).\n")
+                f"disabled (LOAD_DSF_PAVEMENT=False).")
         except Exception:
             pass
     except Exception:
@@ -1582,12 +1567,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                 _new_apron_cand.append(_g)
                 apron_candidates[:] = _new_apron_cand
                 try:
-                    import sys as _sys
-                    _sys.stderr.write(
+                    UI.vprint(1,
                         f"  [pav-builder] {icao}: subtracted "
                         f"{_ground_zone.area:,.0f} m² of "
                         f"groundside pavement (terminal "
-                        f"curbside / drop-off / parking).\n")
+                        f"curbside / drop-off / parking).")
                 except Exception:
                     pass
             except Exception:
@@ -2317,11 +2301,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 changed = True
         if len(kept) < len(taxi_rects):
             try:
-                import sys as _sys
-                _sys.stderr.write(
+                UI.vprint(1,
                     f"  [pav-builder] {icao}: dropped "
                     f"{len(taxi_rects) - len(kept)} taxi rect(s) "
-                    f"that overlapped another rect.\n")
+                    f"that overlapped another rect.")
             except Exception:
                 pass
             taxi_rects = kept
@@ -2712,10 +2695,9 @@ def build_airport_pavement(icao: str, xplane_root: str,
             n_b = _emit_airport_boundary_shape(
                 layout, _dem, _tile_lat, _tile_lon)
             if n_b:
-                import sys as _sys
-                _sys.stderr.write(
+                UI.vprint(1,
                     f"  [pav-builder] emitted "
-                    f"{n_b} airport-boundary shape piece(s).\n")
+                    f"{n_b} airport-boundary shape piece(s).")
             # Per user 2026-04-29: re-emit groundside pavement
             # captured before the airside-apron subtraction, with
             # per-vertex DEM altitudes and a 0.1 m gap from the
@@ -2727,11 +2709,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 n_gs = _emit_groundside_pavement_dem(
                     layout, _dem, _tile_lat, _tile_lon)
                 if n_gs:
-                    import sys as _sys
-                    _sys.stderr.write(
+                    UI.vprint(1,
                         f"  [pav-builder] emitted "
                         f"{n_gs} groundside pavement "
-                        f"polygon(s) with DEM altitudes.\n")
+                        f"polygon(s) with DEM altitudes.")
             except Exception:
                 pass
             # Per user 2026-04-29 (CYXY -10111 / -10115): drop
@@ -2749,11 +2730,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
             try:
                 n_orph = _drop_groundside_orphan_junctions(layout)
                 if n_orph:
-                    import sys as _sys
-                    _sys.stderr.write(
+                    UI.vprint(1,
                         f"  [pav-builder] dropped {n_orph} "
                         f"junction(s) sharing vertices with "
-                        f"groundside pavement.\n")
+                        f"groundside pavement.")
             except Exception:
                 pass
             # Then emit DEM-bridge polygons inside the boundary
@@ -2763,11 +2743,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 n_br = _emit_boundary_dem_bridge(
                     layout, _dem, _tile_lat, _tile_lon)
                 if n_br:
-                    import sys as _sys
-                    _sys.stderr.write(
+                    UI.vprint(1,
                         f"  [pav-builder] emitted "
                         f"{n_br} boundary→DEM bridge "
-                        f"polygon(s).\n")
+                        f"polygon(s).")
             except Exception:
                 pass
             # TODO(bridges): re-enable bridge / tunnel emission
@@ -2791,11 +2770,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
                             layout, _dem, _tile_lat, _tile_lon,
                             xplane_root=xplane_root, icao=icao))
                     if n_dep:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [pav-builder] emitted "
                             f"{n_dep} through-airport depressed "
-                            f"road segment(s).\n")
+                            f"road segment(s).")
                 except Exception:
                     _depressed_way_ids = set()
                 # Per user 2026-04-29: re-enable tunnel-portal
@@ -2814,11 +2792,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         layout, _dem, _tile_lat, _tile_lon,
                         excluded_way_ids=_depressed_way_ids)
                     if n_tun:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [pav-builder] emitted "
                             f"{n_tun} tunnel-portal cluster(s) "
-                            f"(ramp + walls along approach).\n")
+                            f"(ramp + walls along approach).")
                 except Exception:
                     pass
                 # Per user 2026-04-29: emit retaining walls along
@@ -2842,16 +2819,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         layout, _dem, _tile_lat, _tile_lon,
                         scenery_has_bridge_objects=_scn_bridge)
                     if n_brg:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [pav-builder] emitted "
-                            f"{n_brg} taxi-bridge wall pair(s).\n")
+                            f"{n_brg} taxi-bridge wall pair(s).")
                     elif _scn_bridge:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [pav-builder] {icao}: scenery has "
                             f"3D bridge OBJ(s); skipping wall "
-                            f"emission.\n")
+                            f"emission.")
                 except Exception:
                     pass
                 try:
@@ -2859,12 +2834,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         layout, _dem, _tile_lat, _tile_lon,
                         scenery_has_bridge_objects=_scn_bridge)
                     if n_app:
-                        import sys as _sys
-                        _sys.stderr.write(
+                        UI.vprint(1,
                             f"  [pav-builder] emitted underpass-"
                             f"road approaches for {n_app} "
                             f"surface(s)"
-                            f"{' (cut through under bridge OBJ)' if _scn_bridge else ' (ramp up to bridge edge)'}.\n")
+                            f"{' (cut through under bridge OBJ)' if _scn_bridge else ' (ramp up to bridge edge)'}.")
                 except Exception:
                     pass
         except Exception:
