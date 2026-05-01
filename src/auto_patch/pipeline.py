@@ -23,12 +23,10 @@ modules) so existing call sites keep working.
 """
 from __future__ import annotations
 
-import bz2
 import math
 import os
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
@@ -102,51 +100,42 @@ def _load_osm_tile(path: str) -> Tuple[Dict[str, Tuple[float, float]],
                                        List[Tuple[str, List[str], Dict[str, str]]]]:
     """Parse an Ortho4XP-cached OSM tile (.osm.bz2 or .osm).
 
-    Returns (nodes, ways, relations) where:
-      * nodes: {id: (lat, lon)}
-      * ways:  [(id, [nd_ref, ...], {tag: val})]
-      * relations: [(id, [member_way_ref, ...], {tag: val})]
-        (only outer-role way members are included)
+    Delegates to ``O4_OSM_Utils.OSM_layer.update_dicosm`` for the
+    actual XML parsing (handles bz2 + plain, encoding edge cases,
+    self-closing tags, escaped quotes, etc.) then adapts the layer's
+    data structures into the auto_patch tuple shape:
+
+      * nodes: ``{id: (lat, lon)}``  — note auto_patch uses ``(lat, lon)``;
+        OSM_layer stores ``(lon, lat)``, so coords are flipped here.
+      * ways:  ``[(id, [nd_ref, ...], {tag: val})]``
+      * relations: ``[(id, [member_way_ref, ...], {tag: val})]``
+        — only outer-role way members are included.
+
+    All IDs are stringified at the boundary because every downstream
+    auto_patch caller treats node/way IDs as opaque strings (and
+    builds tile-prefixed keys like ``"t+30+031:-42"`` for the
+    cross-tile-merge step in ``_load_osm_airports``).
     """
-    if path.endswith(".bz2"):
-        with bz2.open(path, "rt") as f:
-            txt = f.read()
-    else:
-        txt = Path(path).read_text()
+    import O4_OSM_Utils as OSM
+    layer = OSM.OSM_layer()
+    if not layer.update_dicosm(path):
+        return {}, [], []
 
-    node_re = re.compile(
-        r"""<node\s+id=["'](-?\d+)["'][^>]*?lat=["']([^"']+)["']\s+lon=["']([^"']+)["']"""
-    )
-    way_re = re.compile(r"""<way[^>]*?id=["'](-?\d+)["'][^>]*>(.*?)</way>""", re.S)
-    rel_re = re.compile(
-        r"""<relation[^>]*?id=["'](-?\d+)["'][^>]*>(.*?)</relation>""", re.S)
-    nd_re = re.compile(r"""<nd\s+ref=["'](-?\d+)["']""")
-    tag_re = re.compile(r"""<tag\s+k=["']([^"']+)["']\s+v=["']([^"']+)["']""")
-    outer_member_re = re.compile(
-        r"""<member\s+type=["']way["']\s+ref=["'](-?\d+)["']\s+role=["']outer["']""")
-
-    nodes: Dict[str, Tuple[float, float]] = {}
-    for m in node_re.finditer(txt):
-        try:
-            nodes[m.group(1)] = (float(m.group(2)), float(m.group(3)))
-        except ValueError:
-            continue
-
-    ways = []
-    for m in way_re.finditer(txt):
-        wid = m.group(1)
-        body = m.group(2)
-        nds = nd_re.findall(body)
-        tags = dict(tag_re.findall(body))
-        ways.append((wid, nds, tags))
-
-    relations = []
-    for m in rel_re.finditer(txt):
-        rid = m.group(1)
-        body = m.group(2)
-        outer = outer_member_re.findall(body)
-        tags = dict(tag_re.findall(body))
-        relations.append((rid, outer, tags))
+    nodes: Dict[str, Tuple[float, float]] = {
+        str(nid): (lat, lon)
+        for nid, (lon, lat) in layer.dicosmn.items()
+    }
+    way_tags = layer.dicosmtags.get("w", {})
+    ways: List[Tuple[str, List[str], Dict[str, str]]] = [
+        (str(wid), [str(nid) for nid in nds], way_tags.get(wid, {}))
+        for wid, nds in layer.dicosmw.items()
+    ]
+    rel_tags = layer.dicosmtags.get("r", {})
+    relations: List[Tuple[str, List[str], Dict[str, str]]] = []
+    for rid, role_dict in layer.dicosmrorig.items():
+        outer = role_dict.get("outer", []) if isinstance(role_dict, dict) else []
+        relations.append(
+            (str(rid), [str(wid) for wid in outer], rel_tags.get(rid, {})))
     return nodes, ways, relations
 
 
