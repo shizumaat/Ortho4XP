@@ -15,7 +15,9 @@ passes by calling out into the focused ``O4_Pavement_*`` modules:
 
 Public API:
 
-    build_airport_pavement(icao, xplane_root, *, compute_elevations=True)
+    build_airport_pavement(icao, xplane_root, *, compute_elevations=True,
+                            taxiway_data=None, tile_dem=None,
+                            airport_boundary=None)
 
 Backward-compat shim ``O4_Airport_Pavement_Builder`` re-exports
 ``build_airport_pavement`` (and a few helpers used by other
@@ -121,7 +123,11 @@ from .pavement.absorption import (
 # ──────────────────────────────────────────────────────────────────
 
 def build_airport_pavement(icao: str, xplane_root: str,
-                            compute_elevations: bool = True
+                            *,
+                            compute_elevations: bool = True,
+                            taxiway_data=None,
+                            tile_dem=None,
+                            airport_boundary=None,
                             ) -> PavementLayout:
     """Build the complete role-classified layout for ``icao``.
 
@@ -139,6 +145,31 @@ def build_airport_pavement(icao: str, xplane_root: str,
       * Junctions, buildings, aprons are left un-elevated (X-Plane
         triangulator interpolates them from neighbouring shared
         vertices).
+
+    Optional integration parameters (all default to ``None`` so
+    standalone callers — ``tools/build_target_osm.py``, the test
+    harness — work unchanged):
+
+      * ``taxiway_data``: per-airport list from
+        ``osm_aeroway.extract_taxiway_info``.  Threaded through to
+        Pipeline's centerline-union helper so reclassification /
+        downstream consumers can see OSM taxiway centerlines that
+        didn't survive into rects.
+      * ``tile_dem``: pre-loaded ``O4_DEM_Utils.DEM`` for the
+        containing tile (typically Ortho4XP's smoothed DEM after
+        ``smooth_raster_over_airports``).  When supplied, the
+        Phase-2 elevation solver and boundary-shape emit consume
+        this DEM directly instead of calling
+        ``_load_airport_dem`` per-airport — avoids redundant DEM
+        loads in the tile-pipeline driver and keeps auto_patch's
+        elevation field aligned with Ortho4XP's smoothed terrain.
+      * ``airport_boundary``: optional pre-computed airport
+        boundary (``dico_airports[icao]['boundary']`` from
+        Ortho4XP's ``update_airport_boundaries``).  Currently
+        reserved — the parameter is plumbed through but the
+        boundary-shape emit still derives its outline from
+        apt.dat row-130 until the source-of-truth question is
+        decided.
     """
     apt_path = _pick_best_apt_dat_against_osm(xplane_root, icao)
     if apt_path is None:
@@ -1672,7 +1703,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
         finalize.run_phase2(
             layout, icao, xplane_root, apt,
             nodes=nodes, ways=ways, to_m=to_m,
-            apron_candidates=apron_candidates)
+            apron_candidates=apron_candidates,
+            tile_dem=tile_dem)
 
 
     return layout

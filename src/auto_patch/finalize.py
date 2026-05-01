@@ -62,12 +62,22 @@ __all__ = ["run_phase2"]
 
 
 def run_phase2(layout, icao, xplane_root, apt, *,
-               nodes, ways, to_m, apron_candidates):
-    """Phase-2 elevation solve + feature emit.  Mutates layout."""
+               nodes, ways, to_m, apron_candidates,
+               tile_dem=None):
+    """Phase-2 elevation solve + feature emit.  Mutates layout.
+
+    ``tile_dem`` (when supplied by the tile-pipeline driver) is the
+    pre-loaded ``O4_DEM_Utils.DEM`` from Ortho4XP's
+    ``smooth_raster_over_airports`` step.  Threaded through so the
+    Phase-2 elevation solver and the boundary-shape emit consume
+    the SAME smoothed DEM that drives Ortho4XP's flattening,
+    without each per-airport pass loading DEM tiles independently.
+    """
     _compute_elevations(
         layout, icao, xplane_root, apt,
         osm_nodes=nodes, osm_ways=ways, to_m=to_m,
-        apron_candidates_m=apron_candidates)
+        apron_candidates_m=apron_candidates,
+        tile_dem=tile_dem)
     # Elevation phase can subdivide junctions, decompose holed
     # polygons, and otherwise modify polygon geometry — re-run
     # the shared-vertex collapse + overlap-clip so the
@@ -136,7 +146,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
         _lat0, _lon0 = layout.anchor
         _tile_lat = int(math.floor(_lat0))
         _tile_lon = int(math.floor(_lon0))
-        _dem = _load_airport_dem(_lat0, _lon0)
+        _dem = _load_airport_dem(_lat0, _lon0, override_dem=tile_dem)
         n_b = _emit_airport_boundary_shape(
             layout, _dem, _tile_lat, _tile_lon)
         if n_b:

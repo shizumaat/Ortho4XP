@@ -260,7 +260,26 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
             continue
         try:
             from .pipeline import build_airport_pavement
-            layout = build_airport_pavement(icao, xp_root)
+            # Forward Ortho4XP-side per-airport data already
+            # computed during the tile pipeline:
+            #   * ``airport_taxiways`` from ``extract_taxiway_info``
+            #     (above) — OSM centerlines, used by Pipeline's
+            #     centerline-union helper.
+            #   * ``tile.dem`` — Ortho4XP's post-smoothing DEM,
+            #     reused by Phase-2 elevation + boundary emit so
+            #     auto_patch reads the SAME smoothed DEM that
+            #     drives flattening, instead of loading its own.
+            #   * ``dico_apt_entry['boundary']`` — currently
+            #     reserved (parameter slot only); auto_patch's
+            #     boundary emit still derives its outline from
+            #     apt.dat row-130 until source-of-truth chosen.
+            layout = build_airport_pavement(
+                icao, xp_root,
+                taxiway_data=airport_taxiways,
+                tile_dem=getattr(tile, "dem", None),
+                airport_boundary=dico_apt_entry.get("boundary")
+                                  if dico_apt_entry else None,
+            )
         except Exception as _e:
             UI.vprint(
                 1, "   Auto-patch: Pavement builder failed for",

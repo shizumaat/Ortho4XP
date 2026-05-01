@@ -206,11 +206,23 @@ NEIGHBOUR_CLAMP_RADIUS_M = 5.0
 DEM_SUFFIX = ".hgt"
 _DEM_CACHE: Dict[Tuple[int, int], object] = {}
 
-def _load_airport_dem(lat0: float, lon0: float):
+def _load_airport_dem(lat0: float, lon0: float, override_dem=None):
     """Return an ``O4_DEM_Utils.DEM`` covering the 1° tile that
     contains (lat0, lon0).  Auto-downloads via Ortho4XP's standard
     DEM provider chain when no local .hgt file exists.  Falls back
-    to None only when the download itself fails."""
+    to None only when the download itself fails.
+
+    When ``override_dem`` is provided (typically Ortho4XP's
+    pre-loaded ``tile.dem`` after ``smooth_raster_over_airports``),
+    return it directly — avoids a redundant per-airport DEM load
+    during the tile pipeline and ensures auto_patch reads the
+    SAME smoothed DEM that drives Ortho4XP's airport flattening.
+    The standalone path (``tools/build_target_osm.py`` and tests)
+    passes ``override_dem=None`` and gets the legacy fresh-load
+    behaviour.
+    """
+    if override_dem is not None:
+        return override_dem
     tile_lat = int(math.floor(lat0))
     tile_lon = int(math.floor(lon0))
     key = (tile_lat, tile_lon)
@@ -281,7 +293,8 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                         osm_nodes=None, osm_ways=None,
                         to_m=None,
                         apron_candidates_m: Optional[
-                            List[Polygon]] = None) -> None:
+                            List[Polygon]] = None,
+                        tile_dem=None) -> None:
     """Phase-2: add altitude tags to runways (segmented), taxi
     rects, and terminal pads.  Junctions / aprons / buildings are
     left un-elevated this iteration.
@@ -298,7 +311,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     lat0, lon0 = layout.anchor
     tile_lat = int(math.floor(lat0))
     tile_lon = int(math.floor(lon0))
-    dem = _load_airport_dem(lat0, lon0)
+    dem = _load_airport_dem(lat0, lon0, override_dem=tile_dem)
 
     # Meter-space projection (local — the layout's to_m is not
     # exposed, so reconstruct).
