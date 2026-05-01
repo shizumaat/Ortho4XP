@@ -74,6 +74,51 @@ MAX_JUNCTION_VERTICES = 30
 MAX_ORPHAN_NEIGHBOUR_VERTICES = 0
 
 
+# ── Per-airport regression baselines (calibrated 2026-05-01) ──
+#
+# Three tests in this file (vertex-count-bounded,
+# boundary-near-centerline, taxi-rects-not-alongside-apron) fire
+# heavily at SPJC because of pre-existing geometry-quality bugs:
+# our junction polygons are vastly more sprawling than the
+# ``SPJC_target.osm`` ground truth (target max=36 verts, we
+# produce up to 336; target boundaries fit close to centerlines,
+# ours stray as much as 566 m).  Once those bugs are fixed the
+# baselines should drop toward zero and eventually be deleted.
+#
+# Each baseline records the WORST observed value at HEAD as a
+# regression ceiling: tests fail only if a future change exceeds
+# the recorded ceiling.  Lower recorded numbers → tighter gate.
+# When you fix something, run the test and lower the baseline.
+#
+# Airports without an explicit baseline use the default tight
+# value (zero offenders / hard cap) — those airports are still
+# fully gated by the original invariant.
+JUNCTION_VERTEX_REGRESSION_BASELINE = {
+    # SPJC: 12 junctions exceed the 30-vertex cap; worst = 336
+    # vertices (single mega-junction sprawling over the SE apron).
+    # Ground-truth target max is 36 — see test_compare_target_spjc.
+    "SPJC": {"max_offenders": 12, "max_vertex_count": 336},
+}
+
+JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE = {
+    # SPJC: all 43 junctions have boundary points > 20 m from
+    # any centerline; worst is 566.8 m (at the same SE-apron
+    # mega-junction).  The 20 m threshold is tight for normal
+    # taxi-junction geometry but ours are apron-sized at SPJC.
+    "SPJC": {"max_offenders": 43, "max_distance_m": 567.0},
+}
+
+TAXI_RECT_ADJACENCY_REGRESSION_BASELINE = {
+    # SPJC: 42/42 surviving sloping rects flag at ≥ 10 % adjacent;
+    # all 42 actually flag at 100 % because the surrounding
+    # junction polygons cover most of the apron extent.  The
+    # legacy partial-absorption rule keeps corridor sections
+    # alongside apron-edge as legitimate rects — those fragments
+    # trip this whole-rect probe.
+    "SPJC": {"max_offenders": 42, "max_adjacent_frac": 1.00},
+}
+
+
 # A neighbour vertex within this distance of a junction's perimeter
 # line is considered "kissing" and required to be shared.
 ORPHAN_NEAR_PERIMETER_M = 1.0
@@ -161,19 +206,13 @@ def test_junction_boundary_near_centerline(icao):
     Area alone is NOT the test — a 6-way mega-intersection can be
     legitimately large.  The geometric invariant is what matters.
 
-    Known-contradictory at SPJC: ``tests/fixtures/SPJC_target.osm``
-    has 43 legitimate junctions, of which 11 fail this 20 m
-    threshold.  The "should be reclassified as apron" hypothesis
-    is wrong — these are real junctions per ground truth.
-    Driving fixes from this test (Phase B.1, 2026-05-01) destroyed
-    structural fidelity at SPJC.  See ``test_compare_target_spjc``
-    which is the authoritative gate.  This test is preserved as
-    advisory but xfail'd at SPJC.
+    Per-airport regression baseline:
+    Airports listed in
+    ``JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE`` have a
+    known-bad ceiling (count + worst distance); the test fails
+    only if either exceeds the recorded value.  Other airports
+    are gated tightly (zero offenders).
     """
-    if icao == "SPJC":
-        pytest.xfail(
-            "premise contradicts SPJC ground truth — "
-            "see test_compare_target_spjc")
     layout = _build_layout(icao)
     centers = _aeroway_centerlines_m(layout)
     if centers is None or centers.is_empty:
@@ -206,10 +245,24 @@ def test_junction_boundary_near_centerline(icao):
         f"{lbl} max_d={d:.1f}m at ({mp[0]:.0f},{mp[1]:.0f}) "
         f"area={a:,.0f} m²"
         for d, lbl, a, mp in offenders[:5])
-    assert not offenders, (
-        f"{icao}: {len(offenders)} junction polygon(s) have "
-        f"boundary points > {cap:.0f} m from nearest taxi/runway "
-        f"centerline.  Top: {summary}.")
+
+    baseline = JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE.get(icao)
+    if baseline:
+        worst_d = offenders[0][0] if offenders else 0.0
+        n = len(offenders)
+        assert n <= baseline["max_offenders"], (
+            f"{icao}: {n} junctions exceed {cap:.0f} m centerline "
+            f"distance — exceeds known-bad baseline of "
+            f"{baseline['max_offenders']}.  Top: {summary}.")
+        assert worst_d <= baseline["max_distance_m"] + 1.0, (
+            f"{icao}: worst boundary distance {worst_d:.1f} m "
+            f"exceeds known-bad baseline of "
+            f"{baseline['max_distance_m']:.1f} m.  Top: {summary}.")
+    else:
+        assert not offenders, (
+            f"{icao}: {len(offenders)} junction polygon(s) have "
+            f"boundary points > {cap:.0f} m from nearest "
+            f"taxi/runway centerline.  Top: {summary}.")
 
 
 @pytest.mark.parametrize("icao", airports_under_test() or [
@@ -223,16 +276,12 @@ def test_junction_vertex_count_bounded(icao):
     long-edge densification midpoints, the rest from apt.dat
     boundary trace.
 
-    Known-contradictory at SPJC: at least one legitimate target
-    junction has 36 vertices, exceeding the cap of 30.  The cap
-    needs per-airport calibration once we have ground-truth
-    targets at more airports.  See ``test_compare_target_spjc``
-    for the authoritative SPJC gate.
+    Per-airport regression baseline:
+    Airports listed in ``JUNCTION_VERTEX_REGRESSION_BASELINE``
+    have a known-bad ceiling (count + worst vertex count); the
+    test fails only if either exceeds the recorded value.  Other
+    airports are gated tightly (zero offenders).
     """
-    if icao == "SPJC":
-        pytest.xfail(
-            "SPJC target has a legitimate 36-vertex junction; "
-            "cap needs recalibration — see test_compare_target_spjc")
     layout = _build_layout(icao)
     cap = MAX_JUNCTION_VERTICES
     offenders = []
@@ -247,9 +296,23 @@ def test_junction_vertex_count_bounded(icao):
             offenders.append((n, _shape_label(layout, idx, s)))
     offenders.sort(reverse=True)
     summary = "; ".join(f"{lbl} verts={n}" for n, lbl in offenders[:5])
-    assert not offenders, (
-        f"{icao}: {len(offenders)} junction polygon(s) exceed "
-        f"vertex cap {cap}.  Top: {summary}.")
+
+    baseline = JUNCTION_VERTEX_REGRESSION_BASELINE.get(icao)
+    if baseline:
+        n_off = len(offenders)
+        worst_n = offenders[0][0] if offenders else 0
+        assert n_off <= baseline["max_offenders"], (
+            f"{icao}: {n_off} junction polygon(s) exceed vertex cap "
+            f"{cap} — exceeds known-bad baseline of "
+            f"{baseline['max_offenders']}.  Top: {summary}.")
+        assert worst_n <= baseline["max_vertex_count"], (
+            f"{icao}: worst junction has {worst_n} vertices, "
+            f"exceeds known-bad baseline of "
+            f"{baseline['max_vertex_count']}.  Top: {summary}.")
+    else:
+        assert not offenders, (
+            f"{icao}: {len(offenders)} junction polygon(s) exceed "
+            f"vertex cap {cap}.  Top: {summary}.")
 
 
 @pytest.mark.parametrize("icao", airports_under_test() or [
@@ -349,23 +412,16 @@ def test_taxi_rects_not_alongside_apron(icao):
     (corridor-ref exception, EITHER → BOTH switch, etc.) or the
     apron / junction polygon was created after absorption ran.
 
-    Known-contradictory at SPJC: the legacy partial-absorption
-    behaviour produces some surviving rects whose corridor section
-    runs alongside an apron-edge — legitimate per the rule's
-    "split into kept-corridor + absorbed-alongside" semantics, but
-    the kept fragment still triggers this test's whole-rect probe.
-    Phase C (2026-05-01) tried to satisfy this test with a
-    whole-rect role-flip post-emit; the resulting cascade
-    destroyed structural fidelity at SPJC.  See
-    ``test_compare_target_spjc`` which is the authoritative gate.
-    The fix when revisited will be a partial-split post-emit
-    pass (matching the rule's existing semantics), not a
-    whole-rect flip.
+    Per-airport regression baseline:
+    Airports listed in
+    ``TAXI_RECT_ADJACENCY_REGRESSION_BASELINE`` have a known-bad
+    ceiling (count + worst adjacency fraction); the test fails
+    only if either exceeds the recorded value.  Other airports
+    are gated tightly (zero offenders).  Note this test surfaces
+    the same root issue as the junction-vertex / boundary-distance
+    tests at SPJC: surrounding junction polygons are too sprawling,
+    so every surviving rect probes "alongside" them.
     """
-    if icao == "SPJC":
-        pytest.xfail(
-            "partial-absorption survivors trip this whole-rect "
-            "probe — see test_compare_target_spjc")
     layout = _build_layout(icao)
     other_pav = [
         s.polygon for s in layout.shapes
@@ -443,8 +499,23 @@ def test_taxi_rects_not_alongside_apron(icao):
         f"{lbl} {f * 100:.0f}% adjacent "
         f"({rm:.0f}m of {ll:.0f}m axis)"
         for f, lbl, rm, ll in offenders[:5])
-    assert not offenders, (
-        f"{icao}: {len(offenders)} surviving taxi rect(s) have "
-        f"≥ {ADJACENCY_FRAC * 100:.0f}% of long-edge probes "
-        f"inside apron/junction pavement — the absorption rule "
-        f"should have clipped them.  Top: {summary}.")
+    baseline = TAXI_RECT_ADJACENCY_REGRESSION_BASELINE.get(icao)
+    if baseline:
+        n_off = len(offenders)
+        worst_frac = offenders[0][0] if offenders else 0.0
+        assert n_off <= baseline["max_offenders"], (
+            f"{icao}: {n_off} taxi rect(s) ≥ "
+            f"{ADJACENCY_FRAC * 100:.0f}% adjacent — exceeds "
+            f"known-bad baseline of {baseline['max_offenders']}.  "
+            f"Top: {summary}.")
+        assert worst_frac <= baseline["max_adjacent_frac"] + 0.01, (
+            f"{icao}: worst rect {worst_frac * 100:.0f}% adjacent, "
+            f"exceeds known-bad baseline of "
+            f"{baseline['max_adjacent_frac'] * 100:.0f}%.  "
+            f"Top: {summary}.")
+    else:
+        assert not offenders, (
+            f"{icao}: {len(offenders)} surviving taxi rect(s) have "
+            f"≥ {ADJACENCY_FRAC * 100:.0f}% of long-edge probes "
+            f"inside apron/junction pavement — the absorption rule "
+            f"should have clipped them.  Top: {summary}.")
