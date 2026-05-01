@@ -2525,7 +2525,17 @@ def _drop_overlap_against_fixed_shapes(
     """
     from shapely.strtree import STRtree
     MIN_KEEP_AREA_M2 = 0.5
-    NOISE_OVERLAP_M2 = 1.0   # ignore sub-1 m² overlaps as float noise
+    # ``test_no_self_overlap`` enforces SELF_OVERLAP_CAP_M2 = 0.0 —
+    # zero tolerance.  Threshold 0 means we clip on ANY non-empty
+    # intersection, including sub-meter overlaps (KPHX terminal/
+    # terminal 0.226 m²) AND pure float-noise sliver overlaps
+    # (KPHX apron/apron ≈ 4e-14 m², SPLP terminal/apron ≈ 4e-14
+    # m²) that arise when adjacent shapes share an edge whose
+    # coords differ by floating-point epsilon.  Clipping these
+    # near-zero overlaps shifts a boundary by ε with no
+    # measurable area change, but removes the residual sliver
+    # so shapely.intersection returns truly empty afterwards.
+    NOISE_OVERLAP_M2 = 0.0
 
     def _valid_poly(p: Optional[Polygon]) -> Optional[Polygon]:
         if p is None or p.is_empty:
@@ -2656,7 +2666,8 @@ def _drop_overlap_against_fixed_shapes(
         {ROLE_TERMINAL},
         {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
          ROLE_STUB, ROLE_CROSS_CONNECTOR},
-        {ROLE_JUNCTION},
+        {ROLE_JUNCTION, ROLE_APRON},
+        {ROLE_BOUNDARY},
     ]
     for outer in range(4):
         any_change = False
@@ -2714,8 +2725,11 @@ def _drop_overlap_against_fixed_shapes(
                         except Exception:
                             continue
                 if (new_p is not None
-                        and tier_roles == {ROLE_JUNCTION}):
-                    # Also clip against LARGER same-tier junctions.
+                        and ROLE_JUNCTION in tier_roles):
+                    # Also clip against LARGER same-tier junctions
+                    # / aprons.  (Phase B.1 added ROLE_APRON to
+                    # this tier; reclassified-from-junction shapes
+                    # need the same self-overlap handling.)
                     for k2 in range(k):
                         i2 = target_idx[k2]
                         tp2 = layout.shapes[i2].polygon
