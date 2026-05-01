@@ -78,7 +78,7 @@ COVERAGE_OVERAGE_CAP_FRAC = {
 
 
 def _build_layout(icao: str):
-    from O4_Airport_Pavement_Builder import build_airport_pavement
+    from auto_patch.pipeline import build_airport_pavement
     return build_airport_pavement(icao, _xplane_root(),
                                    compute_elevations=True)
 
@@ -89,7 +89,7 @@ def _source_pavement_union(icao: str):
     """
     import math
     from shapely.ops import transform as shp_transform
-    import O4_Apt_Dat_Reader as APR
+    from auto_patch import apt_dat_reader as APR
 
     apt_dats = APR.find_all_airport_apt_dats(_xplane_root(), icao)
     apt = None
@@ -122,7 +122,7 @@ def _source_pavement_union(icao: str):
             polys.extend(g for g in getattr(pm, "geoms", [])
                           if g.geom_type == "Polygon")
     # Add runway corners.
-    from O4_Airport_Pavement_Builder import _runway_rect_m
+    from auto_patch.pavement.runways import _runway_rect_m
     for r in apt.runways:
         rp = _runway_rect_m(r, to_m)
         if rp is not None and not rp.is_empty:

@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
 
-from O4_Pavement_Layout import (
+from .layout import (
     AEROWAY_FOR_ROLE,
     BuiltShape,
     PavementLayout,
@@ -59,9 +59,9 @@ from O4_Pavement_Layout import (
     ROLE_TUNNEL_RAMP,
     SHARED_VERTEX_TOL_M,
 )
-from O4_Pavement_Vertices import _snap_polygon_vertices_to_rect_corners
-from O4_Pavement_Runways import _sample_runway_segment_elev
-from O4_Pavement_Elevation import _sample_dem
+from .pavement.vertices import _snap_polygon_vertices_to_rect_corners
+from .pavement.runways import _sample_runway_segment_elev
+from .elevation import _sample_dem
 
 
 __all__ = [
@@ -140,7 +140,7 @@ def _emit_tunnel_portals(
     Returns the number of tunnel PORTALS emitted (each contributing
     1 cap + 2 arm walls + a ramp chain).
     """
-    from O4_Airport_Pavement_Builder import _load_osm_airports, _load_osm_big_roads  # lazy: avoids circular import
+    from .pipeline import _load_osm_airports, _load_osm_big_roads
     # Load big-roads OSM cache for this tile.
     nodes_r, ways_r = _load_osm_big_roads(
         layout.anchor[0], layout.anchor[1])
@@ -805,7 +805,7 @@ def _scenery_has_bridge_objects(
     if not bridge_rects:
         return False
     try:
-        import O4_DSF_Reader as _DSFR
+        from . import dsf_reader as _DSFR
     except Exception:
         return False
     dsf_path = _DSFR.find_associated_dsf(
@@ -923,7 +923,7 @@ def _emit_taxi_bridges(
     Returns the number of bridge rects whose walls were emitted
     (0 when the scenery already has bridge OBJs).
     """
-    from O4_Airport_Pavement_Builder import _load_osm_airports, _load_osm_big_roads  # lazy: avoids circular import
+    from .pipeline import _load_osm_airports, _load_osm_big_roads
     bridge_shapes = [s for s in layout.shapes
                      if getattr(s, "is_bridge", False)
                      and s.polygon is not None
@@ -1117,7 +1117,7 @@ def _emit_underpass_road_approaches(
 
     Returns the number of UNDERPASS surfaces processed.
     """
-    from O4_Airport_Pavement_Builder import _load_osm_airports, _load_osm_big_roads  # lazy: avoids circular import
+    from .pipeline import _load_osm_airports, _load_osm_big_roads
     # Collect underpass surfaces.
     bridge_shapes = [s for s in layout.shapes
                      if getattr(s, "is_bridge", False)
@@ -1415,7 +1415,7 @@ def _emit_through_airport_depressed_roads(
     by this pass, so the explicit-tunnel emitter doesn't
     double-process the same building_passage segments.
     """
-    from O4_Airport_Pavement_Builder import _load_osm_airports, _load_osm_big_roads  # lazy: avoids circular import
+    from .pipeline import _load_osm_airports, _load_osm_big_roads
     if (layout.airport_boundary is None
             or layout.airport_boundary.is_empty):
         return (0, set())

@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Tuple
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
-from O4_Pavement_Layout import (
+from ..layout import (
     BuiltShape,
     PavementLayout,
     ROLE_CROSS_CONNECTOR,
@@ -41,7 +41,7 @@ from O4_Pavement_Layout import (
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
 )
-from O4_Pavement_Vertices import _snap_polygon_vertices_to_rect_corners
+from .vertices import _snap_polygon_vertices_to_rect_corners
 
 
 __all__ = [

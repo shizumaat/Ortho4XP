@@ -35,15 +35,15 @@ from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import (
     linemerge, nearest_points, transform as shp_transform, unary_union)
 
-import O4_Apt_Dat_Reader as APR
-import O4_Pavement_Classifier as PC
-import O4_Pavement_Strips as PS
+from . import apt_dat_reader as APR
+from .pavement import classifier as PC
+from .pavement import strips as PS
 
 
 # ──────────────────────────────────────────────────────────────────
 # Constants (re-exported from O4_Pavement_Config + O4_Pavement_Layout)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Config import (
+from .config import (
     JUNCTION_CLUSTER_DIST_M,
     MIN_SEGMENT_LEN_M,
     SLIVER_ANGLE_THRESHOLD_DEG,
@@ -54,7 +54,7 @@ from O4_Pavement_Config import (
     RUNWAY_APRON_AREA_RATIO,
     RUNWAY_INSIDE_APRON_FRAC,
 )
-from O4_Pavement_Layout import (
+from .layout import (
     AEROWAY_FOR_ROLE,
     BuiltShape,
     PavementLayout,
@@ -75,7 +75,7 @@ from O4_Pavement_Layout import (
     _airport_anchor,
     _projection,
 )
-from O4_Pavement_Vertices import (
+from .pavement.vertices import (
     _drop_spike_vertices,
     _enforce_shared_vertices,
     _push_junction_vertices_off_taxi_rect_edges,
@@ -640,7 +640,7 @@ def _load_osm_big_roads(apt_lat: float, apt_lon: float,
 # Runway rects, crossings, shoulders (re-exported from
 # O4_Pavement_Runways)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Runways import (
+from .pavement.runways import (
     _detect_runway_shoulders,
     _insert_runway_chain_bridges,
     _resolve_runway_crossings,
@@ -756,7 +756,7 @@ def _clip_residue_at_stub_long_edges(
     return residue
 
 
-from O4_Pavement_Absorption import (
+from .pavement.absorption import (
     _drop_primary_parallels_embedded_in_pavement,
     _split_primary_parallels_at_pavement_boundary,
 )
@@ -1203,7 +1203,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
     try:
         if not LOAD_DSF_PAVEMENT:
             raise StopIteration  # skip the DSF block entirely
-        import O4_DSF_Reader as _DSFR
+        from . import dsf_reader as _DSFR
         seen_dsf: set = set()
         all_apt_dats = APR.find_all_airport_apt_dats(xplane_root, icao)
         n_dsf_kept = 0
@@ -2882,7 +2882,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
 # DEM + CIFP + main elevation pipeline
 # (re-exported from O4_Pavement_Junctions)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Junctions import (
+from .pavement.junctions import (
     _decompose_polygon_with_holes,
     _densify_long_boundary_edges,
     _drop_colinear_boundary_vertices,
@@ -2899,7 +2899,7 @@ from O4_Pavement_Junctions import (
 # DEM + CIFP + main elevation pipeline
 # (re-exported from O4_Pavement_Elevation)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Elevation import (
+from .elevation import (
     APRON_MAX_GRADE,
     DEM_SUFFIX,
     ELEVATION_GRID_STEP_M,
@@ -2922,7 +2922,7 @@ from O4_Pavement_Elevation import (
 # ──────────────────────────────────────────────────────────────────
 # Airport boundary shape (re-exported from O4_Pavement_Boundary)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Boundary import _emit_airport_boundary_shape
+from .boundary import _emit_airport_boundary_shape
 
 
 
@@ -2930,7 +2930,7 @@ from O4_Pavement_Boundary import _emit_airport_boundary_shape
 # Groundside (curbside / drop-off) pavement
 # (re-exported from O4_Pavement_Groundside)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Groundside import (
+from .groundside import (
     _drop_groundside_orphan_junctions,
     _emit_groundside_pavement_dem,
 )
@@ -2940,7 +2940,7 @@ from O4_Pavement_Groundside import (
 # ──────────────────────────────────────────────────────────────────
 # Boundary→DEM bridge polygons (re-exported from O4_Pavement_Boundary)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Boundary import _emit_boundary_dem_bridge
+from .boundary import _emit_boundary_dem_bridge
 
 
 
@@ -2948,7 +2948,7 @@ from O4_Pavement_Boundary import _emit_boundary_dem_bridge
 # Taxi/road bridges + tunnel portals + depressed-road segments
 # (re-exported from O4_Pavement_Bridges; gated by EMIT_BRIDGES_AND_TUNNELS)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Bridges import (
+from .bridges import (
     _emit_taxi_bridges,
     _emit_through_airport_depressed_roads,
     _emit_tunnel_portals,
@@ -2964,7 +2964,7 @@ from O4_Pavement_Bridges import (
 # Per-shape elevation field + altitude reconciliation
 # (re-exported from O4_Pavement_Elevation)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Elevation import (
+from .elevation import (
     SHARED_AGREE_TOL_M,
     USE_PER_POLYGON_ELEVATION_FIELD,
     _enforce_shared_vertex_altitudes,
@@ -2986,7 +2986,7 @@ from O4_Pavement_Elevation import (
 # Elevation finalization (corner buckets, clamp, sliver, overlap)
 # (re-exported from O4_Pavement_Elevation)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Elevation import (
+from .elevation import (
     SUBDIVIDE_MAX_PAIR_DIST_M,
     SUBDIVIDE_SNAP_RADIUS_M,
     _build_clamp_geom_state,
@@ -3009,7 +3009,7 @@ from O4_Pavement_Elevation import (
 # ──────────────────────────────────────────────────────────────────
 # OSM terminal pad extraction (re-exported from O4_Pavement_Terminals)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Terminals import (
+from .terminals import (
     _build_osm_aeroway_footprint,
     _extract_osm_terminals,
     _terminal_groundside_zone,
@@ -3022,7 +3022,7 @@ from O4_Pavement_Terminals import (
 # Junction-polygon construction
 # (re-exported from O4_Pavement_Junctions)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Junctions import (
+from .pavement.junctions import (
     _build_junction_constructive,
     _build_junction_polys_from_corners,
     _build_junctions_from_rect_endpoints,
@@ -3048,7 +3048,7 @@ STUB_MAX_LEN_M = 250.0        # dead — kept until next cleanup pass
 # Same-ref polyline bridging
 # (re-exported from O4_Pavement_Centerlines)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Centerlines import _bridge_same_ref_polylines
+from .pavement.centerlines import _bridge_same_ref_polylines
 
 
 
@@ -3056,7 +3056,7 @@ from O4_Pavement_Centerlines import _bridge_same_ref_polylines
 # Runway-end primary-parallel stub emission
 # (re-exported from O4_Pavement_Stubs)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Stubs import _emit_primary_parallel_runway_stubs
+from .pavement.stubs import _emit_primary_parallel_runway_stubs
 
 
 
@@ -3066,7 +3066,7 @@ from O4_Pavement_Stubs import _emit_primary_parallel_runway_stubs
 # OSM aeroway centerline extraction + splitting
 # (re-exported from O4_Pavement_Centerlines)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Centerlines import (
+from .pavement.centerlines import (
     _extract_osm_taxi_centerlines,
     _insert_points_on_boundary,
     _insert_points_on_ring,
@@ -3081,7 +3081,7 @@ from O4_Pavement_Centerlines import (
 # ──────────────────────────────────────────────────────────────────
 # Taxi rect construction (re-exported from O4_Pavement_Rects)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Rects import (
+from .pavement.rects import (
     EDGE_SNAP_RADIUS_M,
     VERTEX_SNAP_RADIUS_M,
     _axis_to_nearest_rwy_db,

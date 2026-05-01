@@ -12,8 +12,8 @@ import O4_Vector_Utils as VECT
 import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Airport_Utils as APT
-import O4_Auto_Patch as AUTOPATCH
-import O4_Osm_Aeroway as OSMAERO
+from auto_patch import driver as AUTOPATCH
+from auto_patch import osm_aeroway as OSMAERO
 import O4_Config_Utils as CFG
 
 good_imagery_list = ()

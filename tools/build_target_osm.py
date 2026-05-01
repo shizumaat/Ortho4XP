@@ -1,4 +1,4 @@
-"""Run ``O4_Airport_Pavement_Builder`` on an ICAO and dump to OSM.
+"""Run the auto-patch pavement builder on an ICAO and dump to OSM.
 
 Usage:
     python3 tools/build_target_osm.py <ICAO> [--xplane PATH] [--out PATH]
@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import O4_Airport_Pavement_Builder as APB
+from auto_patch.pipeline import build_airport_pavement
 
 
 def main(argv=None):
@@ -25,7 +25,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     out = args.out or f"/tmp/{args.icao}_auto.osm"
-    layout = APB.build_airport_pavement(args.icao, args.xplane)
+    layout = build_airport_pavement(args.icao, args.xplane)
     layout.to_osm(out)
 
     # Quick summary

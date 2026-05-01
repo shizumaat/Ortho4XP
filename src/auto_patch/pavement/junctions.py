@@ -44,12 +44,12 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
 
-from O4_Pavement_Config import (
+from ..config import (
     JUNCTION_CLUSTER_DIST_M,
     MAX_BOUNDARY_EDGE_M,
     SLIVER_ANGLE_THRESHOLD_DEG,
 )
-from O4_Pavement_Layout import (
+from ..layout import (
     BuiltShape,
     PavementLayout,
     ROLE_APRON,
@@ -441,7 +441,7 @@ def _densify_long_boundary_edges(
     interp matches) and the "junction-on-segmented-runway-edge"
     case (use the runway segment's interp).
     """
-    from O4_Airport_Pavement_Builder import _corner_elevation_bucket  # lazy: avoids circular import
+    from ..elevation import _corner_elevation_bucket
     n = len(ring)
     if n < 3 or len(vert_elev) != n:
         return ring, vert_elev
@@ -646,7 +646,7 @@ def _drop_colinear_boundary_vertices(
     Eliminates the "ear-clip can only emit a sliver here" geometry
     that produces visible step artefacts on long thin apron strips.
     """
-    from O4_Airport_Pavement_Builder import _corner_elevation_bucket  # lazy: avoids circular import
+    from ..elevation import _corner_elevation_bucket
     if len(ring) < 4:
         return ring
     # Iterate to fixed point: dropping one vertex may make a

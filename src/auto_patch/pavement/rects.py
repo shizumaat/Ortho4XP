@@ -32,8 +32,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import nearest_points, unary_union
 
-from O4_Pavement_Config import MIN_SEGMENT_LEN_M
-from O4_Pavement_Layout import (
+from ..config import MIN_SEGMENT_LEN_M
+from ..layout import (
     ROLE_CROSS_CONNECTOR,
     ROLE_PRIMARY_PARALLEL,
     ROLE_SECONDARY_PARALLEL,

@@ -44,10 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points, transform as shp_transform, unary_union
 
-import O4_Apt_Dat_Reader as APR
+from auto_patch import apt_dat_reader as APR
 
 try:
-    import O4_DSF_Reader as _DSFR
+    from auto_patch import dsf_reader as _DSFR
 except Exception:
     _DSFR = None
 

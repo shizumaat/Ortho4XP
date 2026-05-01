@@ -39,7 +39,7 @@ from shapely.geometry import LineString, Polygon
 from shapely.ops import substring, unary_union
 from shapely.validation import make_valid
 
-import O4_Taxiway_Skeleton as TS
+from . import taxiway_skeleton as TS
 
 
 # ──────────────────────────────────────────────────────────────────

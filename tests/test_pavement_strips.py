@@ -12,7 +12,7 @@ from shapely.affinity import rotate
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
-import O4_Pavement_Strips as PS
+from auto_patch.pavement import strips as PS
 
 
 # ──────────────────────────────────────────────────────────────────

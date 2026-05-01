@@ -18,14 +18,14 @@ from shapely import ops as shp_ops
 
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
-from O4_Cifp_Reader import (
+from .cifp_reader import (
     airport_in_tile,
     discover_cifp_airports,
     find_aptdat,
     parse_cifp_file,
     xplane_root_from_cifp_path,
 )
-from O4_Runway_Geometry import (
+from .pavement.runway_geometry import (
     DEFAULT_RUNWAY_WIDTH,
     extend_point,
     pair_runways,
@@ -75,7 +75,7 @@ DEBUG_REPLACE_LEGACY_PAVEMENT = DEBUG_NEW_MODEL or DEBUG_STRIP_MODEL
 # Runway-segment patch emission (re-exported from
 # O4_Pavement_Runway_Segments)
 # ──────────────────────────────────────────────────────────────────────────────
-from O4_Pavement_Runway_Segments import (
+from .pavement.runway_segments import (
     DEFAULT_CELL_SIZE,
     DEFAULT_PROFILE,
     DEG_TO_M,
@@ -259,7 +259,7 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                 "(cannot resolve X-Plane root from CIFP path).")
             continue
         try:
-            from O4_Airport_Pavement_Builder import build_airport_pavement
+            from .pipeline import build_airport_pavement
             layout = build_airport_pavement(icao, xp_root)
         except Exception as _e:
             UI.vprint(

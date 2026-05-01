@@ -27,7 +27,7 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
-from O4_Pavement_Layout import (
+from ..layout import (
     BuiltShape,
     PavementLayout,
     ROLE_BOUNDARY,
@@ -41,7 +41,7 @@ from O4_Pavement_Layout import (
     ROLE_TERMINAL,
     SHARED_VERTEX_TOL_M,
 )
-from O4_Pavement_Config import (
+from ..config import (
     JUNCTION_CLUSTER_DIST_M,
     SLIVER_ANGLE_THRESHOLD_DEG,
 )

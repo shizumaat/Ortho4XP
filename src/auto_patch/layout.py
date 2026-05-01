@@ -29,10 +29,10 @@ from typing import Dict, List, Optional, Tuple
 
 from shapely.geometry import LineString, Polygon
 
-import O4_Apt_Dat_Reader as APR
-import O4_Pavement_Strips as PS
+from . import apt_dat_reader as APR
+from .pavement import strips as PS
 
-from O4_Pavement_Config import SLIVER_ANGLE_THRESHOLD_DEG
+from .config import SLIVER_ANGLE_THRESHOLD_DEG
 
 __all__ = [
     "BuiltShape",

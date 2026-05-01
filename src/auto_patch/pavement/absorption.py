@@ -60,7 +60,7 @@ from typing import List, Optional, Tuple
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
-from O4_Pavement_Layout import (
+from ..layout import (
     ROLE_CROSS_CONNECTOR,
     ROLE_PRIMARY_PARALLEL,
     ROLE_SECONDARY_PARALLEL,

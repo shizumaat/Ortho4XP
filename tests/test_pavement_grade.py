@@ -57,7 +57,7 @@ MID_EDGE_CAP = {"SPJC": 10, "SPLP": 10}
 
 @pytest.mark.parametrize("icao", ["SPJC", "SPLP"])
 def test_pavement_grade(tmp_path, icao):
-    from O4_Airport_Pavement_Builder import build_airport_pavement
+    from auto_patch.pipeline import build_airport_pavement
     import check_grade
 
     layout = build_airport_pavement(

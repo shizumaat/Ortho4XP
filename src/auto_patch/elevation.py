@@ -69,14 +69,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
 
-import O4_Apt_Dat_Reader as APR
+from . import apt_dat_reader as APR
 
-from O4_Pavement_Config import (
+from .config import (
     EMIT_BRIDGES_AND_TUNNELS,
     RUNWAY_APRON_AREA_RATIO,
     RUNWAY_INSIDE_APRON_FRAC,
 )
-from O4_Pavement_Layout import (
+from .layout import (
     AEROWAY_FOR_ROLE,
     BuiltShape,
     PavementLayout,
@@ -94,14 +94,14 @@ from O4_Pavement_Layout import (
     ROLE_RETAINING_WALL,
     SHARED_VERTEX_TOL_M,
 )
-from O4_Pavement_Vertices import (
+from .pavement.vertices import (
     _drop_spike_vertices,
     _enforce_shared_vertices,
     _push_junction_vertices_off_taxi_rect_edges,
     _snap_polygon_vertices_to_rect_corners,
     _validate_shared_vertex_invariant,
 )
-from O4_Pavement_Runways import (
+from .pavement.runways import (
     _insert_runway_chain_bridges,
     _resolve_runway_crossings,
     _sample_runway_segment_elev,
@@ -308,9 +308,9 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     runway_segment_chain = []
     if cifp_path is not None and dem is not None:
         try:
-            import O4_Auto_Patch as _AP
-            import O4_Cifp_Reader as _CIFP
-            import O4_Runway_Geometry as _RWY
+            from . import driver as _AP
+            from . import cifp_reader as _CIFP
+            from .pavement import runway_geometry as _RWY
             cifp_runways = _CIFP.parse_cifp_file(cifp_path)
             if cifp_runways:
                 pairs = _RWY.pair_runways(cifp_runways)
@@ -2179,7 +2179,7 @@ def _orient_rect_for_altitude(shape: "BuiltShape",
 # Junction-polygon decomposition + densification
 # (re-exported from O4_Pavement_Junctions)
 # ──────────────────────────────────────────────────────────────────
-from O4_Pavement_Junctions import (
+from .pavement.junctions import (
     _decompose_polygon_with_holes,
     _densify_long_boundary_edges,
     _drop_colinear_boundary_vertices,

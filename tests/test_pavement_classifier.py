@@ -1,7 +1,7 @@
 """Unit tests for O4_Pavement_Classifier."""
 from shapely.geometry import Polygon
 
-import O4_Pavement_Classifier as PC
+from auto_patch.pavement import classifier as PC
 
 
 # ──────────────────────────────────────────────────────────────────────

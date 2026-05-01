@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
 
-from O4_Pavement_Layout import (
+from .layout import (
     AEROWAY_FOR_ROLE,
     BuiltShape,
     PavementLayout,
@@ -43,9 +43,9 @@ from O4_Pavement_Layout import (
     ROLE_RETAINING_WALL,
     SHARED_VERTEX_TOL_M,
 )
-from O4_Pavement_Vertices import _snap_polygon_vertices_to_rect_corners
-from O4_Pavement_Junctions import _decompose_polygon_with_holes
-from O4_Pavement_Elevation import _resample_node_altitudes_nn, _sample_dem
+from .pavement.vertices import _snap_polygon_vertices_to_rect_corners
+from .pavement.junctions import _decompose_polygon_with_holes
+from .elevation import _resample_node_altitudes_nn, _sample_dem
 
 
 __all__ = [
@@ -93,7 +93,7 @@ def _emit_airport_boundary_shape(
 
     Returns the number of boundary shape pieces emitted.
     """
-    from O4_Airport_Pavement_Builder import _load_osm_airports, _load_osm_big_roads  # lazy: avoids circular import
+    from .pipeline import _load_osm_airports, _load_osm_big_roads
     if layout.airport_boundary is None or layout.airport_boundary.is_empty:
         return 0
     from shapely.geometry import LineString as _LS, Polygon as _Polygon
@@ -341,7 +341,7 @@ def _emit_boundary_dem_bridge(
          edge = DEM, with shape vertices on the boundary side
          tagged ``clamped`` and inner-edge vertices tagged DEM.
     """
-    from O4_Airport_Pavement_Builder import _load_osm_airports, _load_osm_big_roads  # lazy: avoids circular import
+    from .pipeline import _load_osm_airports, _load_osm_big_roads
     if (layout.airport_boundary is None
             or layout.airport_boundary.is_empty):
         return 0

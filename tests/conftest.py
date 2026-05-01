@@ -92,7 +92,7 @@ def _discover_airports_in_tile(lat: int, lon: int) -> List[str]:
     cifp_path = os.path.join(xplane_root(), "Custom Data", "CIFP")
     if not os.path.isdir(cifp_path):
         return []
-    from O4_Cifp_Reader import (
+    from auto_patch.cifp_reader import (
         discover_cifp_airports, parse_cifp_file, airport_in_tile)
     found: List[str] = []
     for icao, filepath in discover_cifp_airports(cifp_path).items():

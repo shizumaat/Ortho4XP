@@ -3,7 +3,7 @@
 Standalone path-resolution tests; require no X-Plane install or
 fixture data.
 """
-import O4_Cifp_Reader as AP
+from auto_patch import cifp_reader as AP
 
 
 # ──────────────────────────────────────────────────────────────────────

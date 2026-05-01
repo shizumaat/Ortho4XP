@@ -18,8 +18,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
-from O4_Pavement_Layout import ROLE_STUB
-from O4_Pavement_Rects import (
+from ..layout import ROLE_STUB
+from .rects import (
     _extend_rect_corners_perpendicular,
     _natural_half_width,
     _rect_from_axis_extended,

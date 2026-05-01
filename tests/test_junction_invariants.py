@@ -89,7 +89,7 @@ _LAYOUT_CACHE: dict = {}
 def _build_layout(icao: str):
     if icao in _LAYOUT_CACHE:
         return _LAYOUT_CACHE[icao]
-    from O4_Airport_Pavement_Builder import build_airport_pavement
+    from auto_patch.pipeline import build_airport_pavement
     layout = build_airport_pavement(
         icao, _xplane_root(), compute_elevations=True)
     _LAYOUT_CACHE[icao] = layout

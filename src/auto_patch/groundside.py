@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
 
-from O4_Pavement_Layout import (
+from .layout import (
     AEROWAY_FOR_ROLE,
     BuiltShape,
     PavementLayout,
@@ -39,8 +39,8 @@ from O4_Pavement_Layout import (
     ROLE_RETAINING_WALL,
     SHARED_VERTEX_TOL_M,
 )
-from O4_Pavement_Vertices import _snap_polygon_vertices_to_rect_corners
-from O4_Pavement_Elevation import _sample_dem, _resample_node_altitudes_nn
+from .pavement.vertices import _snap_polygon_vertices_to_rect_corners
+from .elevation import _sample_dem, _resample_node_altitudes_nn
 
 
 __all__ = [
@@ -86,7 +86,7 @@ def _emit_groundside_pavement_dem(
 
     Returns the number of polygons emitted.
     """
-    from O4_Airport_Pavement_Builder import _load_osm_big_roads  # lazy: avoids circular import
+    from .pipeline import _load_osm_big_roads
     polys = list(getattr(layout, "_groundside_polys", []) or [])
     if not polys:
         return 0

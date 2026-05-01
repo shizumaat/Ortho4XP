@@ -18,7 +18,7 @@ import os
 import pytest
 from shapely.geometry import Polygon
 
-import O4_Apt_Dat_Reader as APR
+from auto_patch import apt_dat_reader as APR
 
 
 _FIXTURE = os.path.join(

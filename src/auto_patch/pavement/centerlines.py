@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Tuple
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import linemerge
 
-from O4_Pavement_Config import MIN_SEGMENT_LEN_M
+from ..config import MIN_SEGMENT_LEN_M
 
 
 # RDP simplification tolerance applied after per-ref linemerge.
@@ -141,7 +141,7 @@ def _extract_osm_taxi_centerlines(
     at SPJC) retain bend vertices and emit multiple rects that
     share corner vertices at the bend.
     """
-    from O4_Airport_Pavement_Builder import _natural_half_width  # lazy: avoids circular import
+    from .rects import _natural_half_width
     by_ref: Dict[str, List[LineString]] = {}
     for wid, nds, tags in ways:
         if tags.get("aeroway") != "taxiway":
@@ -756,7 +756,7 @@ def _split_centerlines_at_points(
     primary and on the runway sit farther down the taxi's own axis
     — without the larger margin the rect overlaps both junctions.
     """
-    from O4_Airport_Pavement_Builder import _natural_half_width  # lazy: avoids circular import
+    from .rects import _natural_half_width
     if not centerlines:
         return centerlines
     from shapely.ops import substring

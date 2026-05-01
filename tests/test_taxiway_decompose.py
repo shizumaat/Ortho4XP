@@ -5,7 +5,7 @@ from shapely.affinity import rotate, translate
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
-import O4_Taxiway_Decompose as TD
+from auto_patch.pavement import taxiway_decompose as TD
 
 
 def _strip(width, length, cx=0.0, cy=0.0):

@@ -4,7 +4,7 @@ import math
 from shapely.affinity import rotate
 from shapely.geometry import Polygon
 
-import O4_Taxiway_Rects as TR
+from auto_patch.pavement import taxiway_rects as TR
 
 
 # ──────────────────────────────────────────────────────────────────────
