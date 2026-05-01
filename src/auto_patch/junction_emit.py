@@ -61,17 +61,8 @@ from .pavement.vertices import (
 )
 
 
-from .layout import (
-    ROLE_CROSS_CONNECTOR,
-    ROLE_PRIMARY_PARALLEL,
-    ROLE_SECONDARY_PARALLEL,
-    ROLE_STUB,
-)
-
-
 __all__ = [
     "_aeroway_centerlines_m",
-    "_reclassify_alongside_apron_rects",
     "_reclassify_stranded_junctions",
     "emit_junctions_and_finalize",
 ]
@@ -210,133 +201,6 @@ def _reclassify_stranded_junctions(layout, taxiway_data=None, to_m=None):
             s.role = ROLE_APRON
             n_reclassified += 1
     return n_reclassified
-
-
-def _reclassify_alongside_apron_rects(layout):
-    """Reclassify sloping rects that are alongside apron-class
-    pavement post-emit.
-
-    Per the user 2026-04-30 absorption rule: a sloping rect
-    (primary_parallel / secondary_parallel / stub /
-    cross_connector) cannot share a long edge with an apron /
-    junction polygon, because the rect's straight-line slope
-    along the long edge has to match the surrounding pavement's
-    natural DEM slope along the seam — which it generally
-    won't, producing visible elevation glitches.
-
-    Probe semantics (5 m axial steps, 5 m outside-long-edge
-    probe distance, EITHER long edge, ≥ 10 % adjacent run)
-    match ``_drop_primary_parallels_embedded_in_pavement``
-    exactly — the rule's authoritative semantics, frozen per
-    ``feedback_shape_rules.md``.
-
-    The difference vs the legacy Stage-1 absorption: the input
-    set is the ACTUAL post-emit ``apron + junction`` shape pool
-    rather than the pre-emit ``apt_pav_union − full_runway −
-    all_input_taxis`` snapshot.  This eliminates both
-    over-absorption (Stage-1 drops based on a too-shrunken
-    junction_pav, removing rects that should have survived)
-    and under-absorption (Stage-1 misses adjacency the test
-    flags because the real apron pool is larger
-    post-elevation, post-Phase-B.1 reclass).
-
-    Reclassifies to ROLE_APRON: aligns with the rule's wording
-    ("absorbed into the surrounding apron") and keeps the
-    polygon's geometry intact (no merge).  Iterated to a fixed
-    point: each rect reclassified expands the apron pool, which
-    may flag adjacent rects.
-
-    Returns the number of rects reclassified.
-    """
-    sloping_rect_roles = {
-        ROLE_PRIMARY_PARALLEL,
-        ROLE_SECONDARY_PARALLEL,
-        ROLE_STUB,
-        ROLE_CROSS_CONNECTOR,
-    }
-    SAMPLE_STEP_M = 5.0
-    OUTER_PROBE_M = 5.0
-    ADJACENCY_FRAC = 0.10
-    MIN_AXIS_M = 30.0
-    MAX_ITERATIONS = 8
-
-    total_reclassified = 0
-    for _it in range(MAX_ITERATIONS):
-        # Build apron-class union from the CURRENT shape pool
-        # (each iteration sees previous reclassifications).
-        other_polys = [s.polygon for s in layout.shapes
-                        if s.role in {ROLE_APRON, ROLE_JUNCTION}
-                        and s.polygon is not None
-                        and not s.polygon.is_empty]
-        if not other_polys:
-            return total_reclassified
-        try:
-            other_union = unary_union(other_polys)
-        except Exception:
-            return total_reclassified
-
-        n_this_iter = 0
-        for s in layout.shapes:
-            if s.role not in sloping_rect_roles:
-                continue
-            if s.polygon is None or s.polygon.is_empty:
-                continue
-            try:
-                rc = list(s.polygon.exterior.coords)
-            except Exception:
-                continue
-            if rc and rc[0] == rc[-1]:
-                rc = rc[:-1]
-            if len(rc) != 4:
-                continue
-            a_mid = (0.5 * (rc[0][0] + rc[3][0]),
-                     0.5 * (rc[0][1] + rc[3][1]))
-            b_mid = (0.5 * (rc[1][0] + rc[2][0]),
-                     0.5 * (rc[1][1] + rc[2][1]))
-            ax = b_mid[0] - a_mid[0]
-            ay = b_mid[1] - a_mid[1]
-            L = math.hypot(ax, ay)
-            if L < MIN_AXIS_M:
-                continue
-            ux, uy = ax / L, ay / L
-            nx, ny = -uy, ux
-            half_w = math.hypot(rc[0][0] - a_mid[0],
-                                rc[0][1] - a_mid[1])
-            if half_w < 1.0:
-                continue
-            outer = half_w + OUTER_PROBE_M
-            # Subtract this rect from the test pool defensively
-            # (apron polygons should never include a rect's
-            # footprint, but float-noise overlaps could exist).
-            try:
-                test_pav = other_union.difference(s.polygon)
-            except Exception:
-                test_pav = other_union
-            n_steps = max(2, int(L / SAMPLE_STEP_M) + 1)
-            adj = 0
-            for i in range(n_steps):
-                u = min(L, i * SAMPLE_STEP_M)
-                cx = a_mid[0] + u * ux
-                cy = a_mid[1] + u * uy
-                try:
-                    lp = Point(cx + nx * outer,
-                                cy + ny * outer)
-                    rp = Point(cx - nx * outer,
-                                cy - ny * outer)
-                    if (test_pav.contains(lp)
-                            or test_pav.contains(rp)):
-                        adj += 1
-                except Exception:
-                    continue
-            if adj / max(1, n_steps) >= ADJACENCY_FRAC:
-                s.role = ROLE_APRON
-                n_this_iter += 1
-
-        total_reclassified += n_this_iter
-        if n_this_iter == 0:
-            break
-
-    return total_reclassified
 
 
 def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,

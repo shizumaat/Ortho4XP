@@ -1618,30 +1618,13 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # parallels that legitimately cross unpaved area are unaffected
     # (their long edges aren't inside pavement).
     #
-    # Phase C (Ortho4XP-shred86 2026-05-01): Stage 1 absorption is
-    # DISABLED.  The rule probed against ``pav_union − full_runway
-    # − all_input_taxis`` — the apt.dat snapshot before Stage 2's
-    # CIFP runway segmentation, runway-crossing resolution, and
-    # taxi_clip rect fragmentation, AND before Phase B.1's stranded
-    # junction → apron reclassification.  Decisions made against
-    # that early snapshot were wrong in both directions at the
-    # target airports: rects dropped that should have survived
-    # (CYXY: regions now covered by a junction polygon that should
-    # be a rect corridor) and rects kept that should have been
-    # absorbed (alongside post-emit apron polygons the early
-    # snapshot didn't see).
-    #
-    # The decision is made post-emit instead, in
-    # ``_reclassify_alongside_apron_rects`` (junction_emit.py),
-    # called from ``finalize.run_phase2`` after the post-elevation
-    # ``_reclassify_stranded_junctions`` pass.  By that point the
-    # shape pool is final: rect ∪ junction ∪ apron geometry
-    # matches exactly what ``test_taxi_rects_not_alongside_apron``
-    # checks against.
-    #
-    # The function ``_drop_primary_parallels_embedded_in_pavement``
-    # is preserved (still imported, exported) for potential future
-    # use but is no longer called from the build pipeline.
+    # Note: ``pav_union`` is now apt.dat ∪ DSF only (no OSM-synth);
+    # that's the right denominator for the absorption check.
+    # Including DSF is essential — at SPJC's SE apron, F's long
+    # edges are 0 % / 24 % inside row-110 alone but ≈100 % inside
+    # apt.dat ∪ DSF.
+    taxi_rects = _drop_primary_parallels_embedded_in_pavement(
+        taxi_rects, pav_union, runway_polys=runway_polys)
 
     # ── Detect bridge taxi rects from OSM (user 2026-04-29) ───────
     # Per OSM convention, bridge taxiways carry ``bridge=yes`` (or

@@ -656,67 +656,17 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                               and p.area >= 50.0]
                     if not pieces:
                         continue
-                    # Keep the shape metadata on the largest piece.
-                    # For JUNCTION/APRON shapes, additional pieces
-                    # are legitimate disjoint regions (e.g. a
-                    # residue junction split by the segmented
-                    # runway into two sides) and emit as new
-                    # junction shapes.
-                    #
-                    # For sloping rects (primary_parallel /
-                    # secondary_parallel / stub / cross_connector),
-                    # a rect by definition is a single 4-corner
-                    # polygon with one axis.  Two failure modes
-                    # to handle:
-                    #   * Clip produces a non-4-corner largest
-                    #     piece (irregular polygon from runway
-                    #     overlap).  Demote the whole shape to
-                    #     ROLE_JUNCTION — sloping-rect invariant
-                    #     test rejects 5+ corner rects.
-                    #   * Clip produces multiple disjoint pieces.
-                    #     Demote pieces[1:] to ROLE_JUNCTION so the
-                    #     residue-aware downstream passes treat
-                    #     them multi-directionally.  Coverage is
-                    #     preserved; the rect-shaped invariant on
-                    #     sloping roles is restored.
+                    # Keep the shape metadata on the largest piece,
+                    # emit any other pieces as new shapes with the
+                    # same role/tags.  For junctions this splits
+                    # the residue polygon; for rects this almost
+                    # never splits (their snap keeps them whole).
                     pieces.sort(key=lambda g: -g.area)
-                    is_junction_class = shape.role in (
-                        ROLE_JUNCTION, ROLE_APRON)
-
-                    def _ring_corner_count(p):
-                        try:
-                            cs = list(p.exterior.coords)
-                            if cs and cs[0] == cs[-1]:
-                                cs = cs[:-1]
-                            return len(cs)
-                        except Exception:
-                            return 0
-
-                    largest = pieces[0]
-                    if (not is_junction_class
-                            and _ring_corner_count(largest) != 4):
-                        # Largest piece is no longer a clean rect
-                        # — the clip turned it into an irregular
-                        # polygon.  Demote the whole shape.
-                        new_shapes.append(_dc_replace(
-                            shape, polygon=largest,
-                            role=ROLE_JUNCTION,
-                            source_axis=None,
-                            ref=None))
-                    else:
-                        shape.polygon = largest
-                        new_shapes.append(shape)
+                    shape.polygon = pieces[0]
+                    new_shapes.append(shape)
                     for extra in pieces[1:]:
-                        if is_junction_class:
-                            new_shapes.append(_dc_replace(
-                                shape, polygon=extra,
-                                source_axis=None))
-                        else:
-                            new_shapes.append(_dc_replace(
-                                shape, polygon=extra,
-                                role=ROLE_JUNCTION,
-                                source_axis=None,
-                                ref=None))
+                        new_shapes.append(_dc_replace(
+                            shape, polygon=extra, source_axis=None))
                 layout.shapes = new_shapes
 
                 # Per user 2026-04-28: junction polygon vertices
