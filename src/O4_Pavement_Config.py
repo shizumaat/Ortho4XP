@@ -18,9 +18,19 @@ __all__ = [
     "EMIT_APRONS",
     "EMIT_BRIDGES_AND_TUNNELS",
     "JUNCTION_CLUSTER_DIST_M",
+    "MAX_BOUNDARY_EDGE_M",
     "MIN_SEGMENT_LEN_M",
     "SLIVER_ANGLE_THRESHOLD_DEG",
 ]
+
+
+# Max length of any junction-polygon ring segment.  Long edges get
+# subdivided to anchor Triangle4XP's interior triangulation; without
+# this the elevation solver leaves the interior un-anchored on long
+# straight runs and produces visible cliffs.  Shared between the
+# junction-decomposition pass (densification) and the elevation
+# layer (vertex-aware grade clamp).
+MAX_BOUNDARY_EDGE_M = 30.0
 
 
 # Drop emitted line/segment fragments shorter than this length.
