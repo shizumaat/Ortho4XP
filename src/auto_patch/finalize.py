@@ -52,7 +52,10 @@ from .groundside import (
     _drop_groundside_orphan_junctions,
     _emit_groundside_pavement_dem,
 )
-from .junction_emit import _reclassify_stranded_junctions
+from .junction_emit import (
+    _reclassify_alongside_apron_rects,
+    _reclassify_stranded_junctions,
+)
 from .pavement.vertices import (
     _enforce_shared_vertices,
     _push_junction_vertices_off_taxi_rect_edges,
@@ -157,6 +160,25 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                 f"  [pav-builder] {icao}: post-elevation "
                 f"reclassified {n_reclass2} stranded "
                 f"junction(s) as apron.")
+        except Exception:
+            pass
+    # Phase C (post-elevation rect absorption): replaces the
+    # legacy Stage-1 ``_drop_primary_parallels_embedded_in_pavement``
+    # call (now disabled in pipeline.py) with a probe against the
+    # FINAL post-emit ``apron + junction`` shape pool.  Catches
+    # rects whose long edges are actually alongside apron-class
+    # pavement post-CIFP-segmentation, post-Phase-B.1 reclass —
+    # which the Stage-1 pass couldn't see.  Uses identical
+    # semantics (5 m probe, 10 % threshold, EITHER long edge);
+    # only the input set is corrected.  Iterates to a fixed point
+    # since each reclass expands the apron pool.
+    n_rect_reclass = _reclassify_alongside_apron_rects(layout)
+    if n_rect_reclass:
+        try:
+            UI.vprint(1,
+                f"  [pav-builder] {icao}: post-elevation "
+                f"reclassified {n_rect_reclass} rect(s) as "
+                f"apron (alongside post-emit apron pavement).")
         except Exception:
             pass
     # Final WARN summary — emitted after every elevation pass
