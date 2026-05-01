@@ -40,8 +40,8 @@ from .elevation import (
     _match_elev,
     _planar_fit,
     _sample_dem,
-    _smooth_polygon_grid,
 )
+from .elevation_smoothing import _smooth_polygon_grid
 from .layout import (
     BuiltShape,
     PavementLayout,
