@@ -39,6 +39,7 @@ from .elevation import (
     _corner_elevation_bucket,
 )
 from .layout import (
+    BuiltShape,
     PavementLayout,
     ROLE_CROSS_CONNECTOR,
     ROLE_JUNCTION,
