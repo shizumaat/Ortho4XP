@@ -17,7 +17,25 @@ __all__ = [
     "EMIT_JUNCTIONS",
     "EMIT_APRONS",
     "EMIT_BRIDGES_AND_TUNNELS",
+    "JUNCTION_CLUSTER_DIST_M",
+    "SLIVER_ANGLE_THRESHOLD_DEG",
 ]
+
+
+# Cluster of junction-corner candidates: any two within this
+# distance get merged when computing the residue's seam points.
+JUNCTION_CLUSTER_DIST_M = 40.0
+
+# Interior angles below this threshold count as "needle-tip"
+# slivers.  Residue construction can leave thin wedges where
+# rect / terminal edges meet the apt.dat boundary at near-collinear
+# angles.  The polygon is shapely-valid but a sub-2 deg corner
+# forces Triangle4XP to emit a near-degenerate triangle there --
+# crashes X-Plane's mesh builder.  Caught at junction-emission
+# time by _drop_sliver_corners (drops just the tip vertex), and
+# again by a to_osm safety net (drops the whole shape if any
+# slipped through).
+SLIVER_ANGLE_THRESHOLD_DEG = 2.0
 
 
 # Apron-merged runway detection: when at least this fraction of a

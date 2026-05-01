@@ -32,6 +32,8 @@ from shapely.geometry import LineString, Polygon
 import O4_Apt_Dat_Reader as APR
 import O4_Pavement_Strips as PS
 
+from O4_Pavement_Config import SLIVER_ANGLE_THRESHOLD_DEG
+
 __all__ = [
     "BuiltShape",
     "PavementLayout",
