@@ -11,6 +11,7 @@ variable in O4_Cfg_Vars.py instead.
 """
 
 __all__ = [
+    "BOUNDARY_SAMPLE_STEP_M",
     "RUNWAY_INSIDE_APRON_FRAC",
     "RUNWAY_APRON_AREA_RATIO",
     "LOAD_DSF_PAVEMENT",
@@ -19,6 +20,7 @@ __all__ = [
     "EMIT_BRIDGES_AND_TUNNELS",
     "JUNCTION_CLUSTER_DIST_M",
     "MAX_BOUNDARY_EDGE_M",
+    "MAX_BOUNDARY_TO_CENTERLINE_M",
     "MIN_SEGMENT_LEN_M",
     "SLIVER_ANGLE_THRESHOLD_DEG",
 ]
@@ -90,3 +92,16 @@ LOAD_DSF_PAVEMENT = True
 # baseline; iteration aids that remain useful).
 EMIT_JUNCTIONS = True
 EMIT_APRONS = False
+
+# Stranded-junction reclassification (Phase B.1).  Per user
+# 2026-04-30: a valid junction's pavement edge is always
+# "relatively close" to a converging taxi/runway centerline.  A
+# junction whose boundary strays farther than this threshold from
+# any centerline contains apron-territory pavement (no centerline
+# running through it) and is reclassified as ``role=apron``.
+# Threshold matches the test invariant in
+# ``tests/test_junction_invariants.py``.
+MAX_BOUNDARY_TO_CENTERLINE_M = 20.0
+# Step size when sampling a junction's boundary for the
+# centerline-distance check.
+BOUNDARY_SAMPLE_STEP_M = 5.0
