@@ -13,6 +13,7 @@ import O4_File_Names as FNAMES
 import O4_Geo_Utils as GEO
 import O4_Airport_Utils as APT
 import O4_Auto_Patch as AUTOPATCH
+import O4_Osm_Aeroway as OSMAERO
 import O4_Config_Utils as CFG
 
 good_imagery_list = ()
@@ -234,7 +235,7 @@ def include_airports(vector_map, tile):
                 cifp_path = candidate
         if cifp_path:
             # Extract taxiway centerlines from OSM data for patch generation
-            taxiway_data = AUTOPATCH.extract_taxiway_info(
+            taxiway_data = OSMAERO.extract_taxiway_info(
                 airport_layer, dico_airports, tile
             )
             # Building data: rely solely on aeroway=hangar and
@@ -251,7 +252,7 @@ def include_airports(vector_map, tile):
             # hangars dominate the apron-paint cut-outs.  Skipping
             # the extra query trades minor coverage for speed,
             # robustness, and zero rate-limit risk.
-            building_data = AUTOPATCH.extract_building_info(
+            building_data = OSMAERO.extract_building_info(
                 airport_layer, dico_airports, tile,
                 building_layer=None,
             )
@@ -267,7 +268,7 @@ def include_airports(vector_map, tile):
                     {"n": [], "w": [("highway", ""), ("tunnel", ""),
                                     ("bridge", "")], "r": []},
                 )
-                road_data = AUTOPATCH.extract_road_info(
+                road_data = OSMAERO.extract_road_info(
                     dico_airports, tile, road_layer=road_osm_layer)
             AUTOPATCH.generate_auto_patches(
                 tile, cifp_path,

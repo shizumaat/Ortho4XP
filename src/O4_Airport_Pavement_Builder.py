@@ -4722,9 +4722,11 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     if cifp_path is not None and dem is not None:
         try:
             import O4_Auto_Patch as _AP
-            cifp_runways = _AP.parse_cifp_file(cifp_path)
+            import O4_Cifp_Reader as _CIFP
+            import O4_Runway_Geometry as _RWY
+            cifp_runways = _CIFP.parse_cifp_file(cifp_path)
             if cifp_runways:
-                pairs = _AP.pair_runways(cifp_runways)
+                pairs = _RWY.pair_runways(cifp_runways)
 
                 # apt.dat runway geometry (sole source of truth for
                 # footprint lat/lon + width) — per legacy contract.

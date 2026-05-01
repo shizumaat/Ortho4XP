@@ -1,9 +1,9 @@
-"""Tests for ``O4_Auto_Patch.xplane_root_from_cifp_path``.
+"""Tests for ``O4_Cifp_Reader.xplane_root_from_cifp_path``.
 
 Standalone path-resolution tests; require no X-Plane install or
 fixture data.
 """
-import O4_Auto_Patch as AP
+import O4_Cifp_Reader as AP
 
 
 # ──────────────────────────────────────────────────────────────────────
