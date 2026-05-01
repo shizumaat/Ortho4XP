@@ -18,8 +18,15 @@ __all__ = [
     "EMIT_APRONS",
     "EMIT_BRIDGES_AND_TUNNELS",
     "JUNCTION_CLUSTER_DIST_M",
+    "MIN_SEGMENT_LEN_M",
     "SLIVER_ANGLE_THRESHOLD_DEG",
 ]
+
+
+# Drop emitted line/segment fragments shorter than this length.
+# Shared across centerline extraction, taxi-rect splitting, and the
+# Phase-A apt.dat-rect chain construction.
+MIN_SEGMENT_LEN_M = 15.0
 
 
 # Cluster of junction-corner candidates: any two within this
