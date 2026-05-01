@@ -19,6 +19,7 @@ Used by:
     * O4_Airport_Pavement_Builder (runway construction)
     * O4_Pavement_Runway_Segments (in slice 3)
 """
+import os
 import re
 from math import cos, sin, pi, sqrt, atan2, acos
 
