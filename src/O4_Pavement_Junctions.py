@@ -523,6 +523,16 @@ def _densify_long_boundary_edges(
         if d <= MAX_BOUNDARY_EDGE_M:
             continue
         n_subs = int(math.ceil(d / MAX_BOUNDARY_EDGE_M))
+        # Per-arc cap of 4 — at most 3 inserted midpoints per ring
+        # edge.  Without this, the long apt.dat boundary edges that
+        # bound a residue junction (CYXY's -10070 had 200+ m edges)
+        # add 6-8 midpoints each and total junction-vertex count
+        # explodes past Triangle4XP's safe ceiling.  4 anchors per
+        # arc is enough for the elevation solver to fit a smooth
+        # plane; more just adds free vertices that the solver pushes
+        # around until they create cliffs.
+        if n_subs > 4:
+            n_subs = 4
         for k in range(1, n_subs):
             t = k / n_subs
             mx = a[0] + t * (b[0] - a[0])
