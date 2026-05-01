@@ -52,7 +52,6 @@ from .groundside import (
     _drop_groundside_orphan_junctions,
     _emit_groundside_pavement_dem,
 )
-from .junction_emit import _reclassify_stranded_junctions
 from .pavement.vertices import (
     _enforce_shared_vertices,
     _push_junction_vertices_off_taxi_rect_edges,
@@ -64,7 +63,7 @@ __all__ = ["run_phase2"]
 
 def run_phase2(layout, icao, xplane_root, apt, *,
                nodes, ways, to_m, apron_candidates,
-               tile_dem=None, taxiway_data=None):
+               tile_dem=None):
     """Phase-2 elevation solve + feature emit.  Mutates layout.
 
     ``tile_dem`` (when supplied by the tile-pipeline driver) is the
@@ -73,13 +72,6 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     Phase-2 elevation solver and the boundary-shape emit consume
     the SAME smoothed DEM that drives Ortho4XP's flattening,
     without each per-airport pass loading DEM tiles independently.
-
-    ``taxiway_data`` is forwarded to the second-pass
-    ``_reclassify_stranded_junctions`` call so junctions that
-    only emerged during ``_compute_elevations`` (most notably
-    runway-runway crossings via ``_resolve_runway_crossings``)
-    are reclassified consistently with the residue junctions
-    flagged before elevation.
     """
     _compute_elevations(
         layout, icao, xplane_root, apt,
@@ -138,27 +130,6 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     # adjacent to -10243 = 30 k m²).  Merge them back so
     # JOSM doesn't show two near-duplicate polygons.
     _merge_sliver_junctions_into_neighbours(layout, icao=icao)
-    # Phase B.1 (post-elevation pass): runway-runway crossings
-    # become junction polygons inside ``_compute_elevations``
-    # via ``_resolve_runway_crossings`` — AFTER the pre-elevation
-    # reclass in ``junction_emit``.  Re-run reclassification so
-    # those crossing junctions, which can sprawl far past any
-    # single runway centerline at multi-runway intersections
-    # (CYXY 02/20 × 14R/32L × 14L/32R), get the same
-    # apron-territory treatment as residue junctions whose
-    # boundary strays past
-    # ``MAX_BOUNDARY_TO_CENTERLINE_M``.  Idempotent on shapes
-    # already reclassified.
-    n_reclass2 = _reclassify_stranded_junctions(
-        layout, taxiway_data=taxiway_data, to_m=to_m)
-    if n_reclass2:
-        try:
-            UI.vprint(1,
-                f"  [pav-builder] {icao}: post-elevation "
-                f"reclassified {n_reclass2} stranded "
-                f"junction(s) as apron.")
-        except Exception:
-            pass
     # Final WARN summary — emitted after every elevation pass
     # has run so the count reflects what the OSM emitter will
     # actually write to disk.  Earlier reports (mid-pipeline)

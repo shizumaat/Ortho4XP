@@ -1704,8 +1704,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
             layout, icao, xplane_root, apt,
             nodes=nodes, ways=ways, to_m=to_m,
             apron_candidates=apron_candidates,
-            tile_dem=tile_dem,
-            taxiway_data=taxiway_data)
+            tile_dem=tile_dem)
 
 
     return layout

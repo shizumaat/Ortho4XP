@@ -12,39 +12,21 @@ Public API:
     emit_junctions_and_finalize(
         layout, *, pav_union, emitted_taxi_rects, terminal_union,
         taxi_rects, icao)
-
-Helpers also exported (used by ``finalize.run_phase2`` for the
-post-elevation reclassification pass):
-
-    _aeroway_centerlines_m(layout, taxiway_data=None, to_m=None)
-    _reclassify_stranded_junctions(layout, taxiway_data=None, to_m=None)
 """
 from __future__ import annotations
 
 import math
 from typing import List, Optional, Tuple
 
-import O4_UI_Utils as UI
-
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points, unary_union
 
-from .config import (
-    BOUNDARY_SAMPLE_STEP_M,
-    EMIT_JUNCTIONS,
-    MAX_BOUNDARY_TO_CENTERLINE_M,
-)
+from .config import EMIT_JUNCTIONS
 from .elevation import (
     SHARED_VERTEX_CLUSTER_TOL_M,
     _drop_overlap_against_fixed_shapes,
 )
-from .layout import (
-    BuiltShape,
-    ROLE_APRON,
-    ROLE_JUNCTION,
-    ROLE_RUNWAY,
-    ROLE_TERMINAL,
-)
+from .layout import BuiltShape, ROLE_JUNCTION, ROLE_RUNWAY, ROLE_TERMINAL
 from .pavement.centerlines import _insert_points_on_boundary
 from .pavement.junctions import (
     _decompose_polygon_with_holes,
@@ -61,146 +43,7 @@ from .pavement.vertices import (
 )
 
 
-__all__ = [
-    "_aeroway_centerlines_m",
-    "_reclassify_stranded_junctions",
-    "emit_junctions_and_finalize",
-]
-
-
-def _aeroway_centerlines_m(layout, taxiway_data=None, to_m=None):
-    """Union of taxi + runway centerlines in layout-local meter
-    space.  Used as the "valid junction-boundary anchor" set per
-    user 2026-04-30.
-
-    Sources:
-      * Taxi rects keep ``source_axis`` (the OSM centerline span
-        the rect was built from).
-      * Runway shapes' long-axes are derived from the polygon's
-        4-corner exterior.
-      * Junctions / terminals / aprons / bridges contribute
-        nothing — they're regions, not corridors.
-      * When ``taxiway_data`` is supplied (Ortho4XP's per-airport
-        OSM taxiway centerlines from ``extract_taxiway_info``,
-        absolute lat/lon) and ``to_m`` projection is supplied,
-        OSM centerlines that did NOT end up as a rect's
-        ``source_axis`` are added too.  Catches sub-30 m taxiway
-        stubs auto_patch dropped during rect construction; without
-        this, a junction whose only nearby centerline came from
-        such a stub would look "stranded" at reclassification time.
-
-    Mirrors ``tests/test_junction_invariants.py::_aeroway_centerlines_m``
-    so the production reclassifier and the test build the same
-    union.
-    """
-    lines = []
-    for s in layout.shapes:
-        if s.source_axis is not None and not s.source_axis.is_empty:
-            lines.append(s.source_axis)
-            continue
-        if (s.role == ROLE_RUNWAY
-                and s.polygon is not None
-                and not s.polygon.is_empty):
-            coords = list(s.polygon.exterior.coords)
-            if coords and coords[0] == coords[-1]:
-                coords = coords[:-1]
-            if len(coords) == 4:
-                a_mid = (0.5 * (coords[0][0] + coords[3][0]),
-                         0.5 * (coords[0][1] + coords[3][1]))
-                b_mid = (0.5 * (coords[1][0] + coords[2][0]),
-                         0.5 * (coords[1][1] + coords[2][1]))
-                lines.append(LineString([a_mid, b_mid]))
-
-    # Optional: include OSM taxiway centerlines that didn't survive
-    # into a rect.  Each ``taxiway_data`` entry is
-    #   {"centerline": [(lon, lat), ...], "wayid": int, "name": str}
-    # in absolute coordinates; project to meter space and skip
-    # any whose length is largely covered by the existing
-    # rect-axis union (avoid double-counting).
-    if taxiway_data and to_m is not None:
-        existing_union = unary_union(lines) if lines else None
-        for entry in taxiway_data:
-            cl_coords = entry.get("centerline", [])
-            if len(cl_coords) < 2:
-                continue
-            try:
-                m_pts = [to_m(lon, lat) for (lon, lat) in cl_coords]
-            except Exception:
-                continue
-            if len(m_pts) < 2:
-                continue
-            try:
-                ls = LineString(m_pts)
-            except Exception:
-                continue
-            if ls.is_empty or ls.length < 1.0:
-                continue
-            if existing_union is not None:
-                try:
-                    cover = ls.intersection(
-                        existing_union.buffer(2.0)).length
-                    if cover > 0.8 * ls.length:
-                        continue
-                except Exception:
-                    pass
-            lines.append(ls)
-
-    if not lines:
-        return None
-    try:
-        return unary_union(lines)
-    except Exception:
-        return None
-
-
-def _reclassify_stranded_junctions(layout, taxiway_data=None, to_m=None):
-    """Walk every ``ROLE_JUNCTION`` shape; reclassify as
-    ``ROLE_APRON`` when its boundary strays farther than
-    ``MAX_BOUNDARY_TO_CENTERLINE_M`` from any taxi/runway
-    centerline.  Per user 2026-04-30: a valid junction's pavement
-    edge is always close to a converging centerline, no matter
-    how many taxiways meet there; a junction whose boundary
-    strays contains apron-territory pavement that should
-    triangulate as apron, not as a multi-directional junction.
-
-    Pure metadata change — geometry untouched.  Runs BEFORE the
-    overlap-clip pass so role-based priority decisions in
-    ``_drop_overlap_against_fixed_shapes`` see the final
-    classification.
-
-    Returns the number of shapes reclassified.
-    """
-    centers = _aeroway_centerlines_m(layout, taxiway_data, to_m)
-    if centers is None or centers.is_empty:
-        return 0
-    n_reclassified = 0
-    for s in layout.shapes:
-        if s.role != ROLE_JUNCTION:
-            continue
-        if s.polygon is None or s.polygon.is_empty:
-            continue
-        try:
-            bnd = s.polygon.boundary
-            L = bnd.length
-        except Exception:
-            continue
-        if L <= 0:
-            continue
-        n_steps = max(2, int(L / BOUNDARY_SAMPLE_STEP_M) + 1)
-        max_d = 0.0
-        for i in range(n_steps):
-            u = min(L, i * BOUNDARY_SAMPLE_STEP_M)
-            try:
-                p = bnd.interpolate(u)
-                d = centers.distance(p)
-            except Exception:
-                continue
-            if d > max_d:
-                max_d = d
-        if max_d > MAX_BOUNDARY_TO_CENTERLINE_M:
-            s.role = ROLE_APRON
-            n_reclassified += 1
-    return n_reclassified
+__all__ = ["emit_junctions_and_finalize"]
 
 
 def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
