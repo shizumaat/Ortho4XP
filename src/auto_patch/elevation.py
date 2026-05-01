@@ -2666,7 +2666,7 @@ def _drop_overlap_against_fixed_shapes(
         {ROLE_TERMINAL},
         {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
          ROLE_STUB, ROLE_CROSS_CONNECTOR},
-        {ROLE_JUNCTION, ROLE_APRON},
+        {ROLE_JUNCTION},
         {ROLE_BOUNDARY},
     ]
     for outer in range(4):
@@ -2725,11 +2725,8 @@ def _drop_overlap_against_fixed_shapes(
                         except Exception:
                             continue
                 if (new_p is not None
-                        and ROLE_JUNCTION in tier_roles):
-                    # Also clip against LARGER same-tier junctions
-                    # / aprons.  (Phase B.1 added ROLE_APRON to
-                    # this tier; reclassified-from-junction shapes
-                    # need the same self-overlap handling.)
+                        and tier_roles == {ROLE_JUNCTION}):
+                    # Also clip against LARGER same-tier junctions.
                     for k2 in range(k):
                         i2 = target_idx[k2]
                         tp2 = layout.shapes[i2].polygon

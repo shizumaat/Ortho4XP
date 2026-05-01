@@ -160,7 +160,20 @@ def test_junction_boundary_near_centerline(icao):
 
     Area alone is NOT the test — a 6-way mega-intersection can be
     legitimately large.  The geometric invariant is what matters.
+
+    Known-contradictory at SPJC: ``tests/fixtures/SPJC_target.osm``
+    has 43 legitimate junctions, of which 11 fail this 20 m
+    threshold.  The "should be reclassified as apron" hypothesis
+    is wrong — these are real junctions per ground truth.
+    Driving fixes from this test (Phase B.1, 2026-05-01) destroyed
+    structural fidelity at SPJC.  See ``test_compare_target_spjc``
+    which is the authoritative gate.  This test is preserved as
+    advisory but xfail'd at SPJC.
     """
+    if icao == "SPJC":
+        pytest.xfail(
+            "premise contradicts SPJC ground truth — "
+            "see test_compare_target_spjc")
     layout = _build_layout(icao)
     centers = _aeroway_centerlines_m(layout)
     if centers is None or centers.is_empty:
@@ -208,7 +221,18 @@ def test_junction_vertex_count_bounded(icao):
     densification ran amok or boundary-trace exceeded the per-arc
     cap.  At CYXY the -10070 regression had 80 vertices — ~45 from
     long-edge densification midpoints, the rest from apt.dat
-    boundary trace."""
+    boundary trace.
+
+    Known-contradictory at SPJC: at least one legitimate target
+    junction has 36 vertices, exceeding the cap of 30.  The cap
+    needs per-airport calibration once we have ground-truth
+    targets at more airports.  See ``test_compare_target_spjc``
+    for the authoritative SPJC gate.
+    """
+    if icao == "SPJC":
+        pytest.xfail(
+            "SPJC target has a legitimate 36-vertex junction; "
+            "cap needs recalibration — see test_compare_target_spjc")
     layout = _build_layout(icao)
     cap = MAX_JUNCTION_VERTICES
     offenders = []
@@ -324,7 +348,24 @@ def test_taxi_rects_not_alongside_apron(icao):
     its steps adjacent; otherwise the absorption rule was bypassed
     (corridor-ref exception, EITHER → BOTH switch, etc.) or the
     apron / junction polygon was created after absorption ran.
+
+    Known-contradictory at SPJC: the legacy partial-absorption
+    behaviour produces some surviving rects whose corridor section
+    runs alongside an apron-edge — legitimate per the rule's
+    "split into kept-corridor + absorbed-alongside" semantics, but
+    the kept fragment still triggers this test's whole-rect probe.
+    Phase C (2026-05-01) tried to satisfy this test with a
+    whole-rect role-flip post-emit; the resulting cascade
+    destroyed structural fidelity at SPJC.  See
+    ``test_compare_target_spjc`` which is the authoritative gate.
+    The fix when revisited will be a partial-split post-emit
+    pass (matching the rule's existing semantics), not a
+    whole-rect flip.
     """
+    if icao == "SPJC":
+        pytest.xfail(
+            "partial-absorption survivors trip this whole-rect "
+            "probe — see test_compare_target_spjc")
     layout = _build_layout(icao)
     other_pav = [
         s.polygon for s in layout.shapes
