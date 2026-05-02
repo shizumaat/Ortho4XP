@@ -43,12 +43,10 @@ pytestmark = pytest.mark.skipif(
 
 RULE1_REGRESSION_BASELINE: Dict[str, int] = {
     # SPJC: 2 vertices remain near the runway boundary that aren't
-    # at runway corners.  Both come from Rule 5's push pass moving
-    # interior junction vertices toward pavement boundary; in cases
-    # where pavement boundary IS the runway boundary, the pushed
-    # vertex lands within Rule 1's tolerance band.  Pending Rule 1
-    # v2 (widen runway-facing edges to outboard runway nodes) which
-    # should eliminate these.
+    # at runway corners — Rule 5's push pass moves interior junction
+    # vertices toward pavement boundary; in cases where pavement
+    # boundary IS the runway boundary, the pushed vertex lands within
+    # Rule 1's tolerance band.  Pending Rule 1 widening redesign.
     "SPJC": 2,
 }
 RULE2_REGRESSION_BASELINE: Dict[str, int] = {
@@ -60,12 +58,12 @@ RULE2_REGRESSION_BASELINE: Dict[str, int] = {
     "CYXY": 1,
 }
 RULE3_REGRESSION_BASELINE: Dict[str, int] = {
-    # SPJC: 14 non-axis-aligned junction edges remain at HEAD.  The
-    # Rule 3 emission pass switched ``_decompose_polygon_with_holes``
-    # to runway-aligned cuts, but other code paths (residue
-    # subtraction artifacts, post-elevation snap, sliver merge)
-    # still produce non-axis-aligned edges.  Lower this baseline as
-    # those paths get tightened.
+    # SPJC: 14 non-axis-aligned junction edges remain.  The Rule 3
+    # emission pass switched ``_decompose_polygon_with_holes`` to
+    # runway-aligned cuts, but other code paths (residue subtraction
+    # artifacts, post-elevation snap, sliver merge) still produce
+    # non-axis-aligned edges.  Lower this baseline as those paths
+    # get tightened.
     "SPJC": 14,
     # CYXY: 88 — same root cause as SPJC.  CYXY's apt.dat-fragmented
     # pavement leaves more residue boundaries that don't get caught

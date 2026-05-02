@@ -23,6 +23,7 @@ __all__ = [
     "NECK_ABSOLUTE_M",
     "NECK_ABSORB_FRAC",
     "NECK_RELATIVE",
+    "RUNWAY_ADJACENCY_TOL_M",
     "RUNWAY_BOUNDARY_TOL_M",
     "RUNWAY_INSIDE_APRON_FRAC",
     "RUNWAY_APRON_AREA_RATIO",
@@ -57,6 +58,14 @@ NECK_ABSORB_FRAC = 0.70
 # runway-adjacent vertex run that gets replaced with the runway's
 # exact node sequence.
 RUNWAY_BOUNDARY_TOL_M = 1.5
+
+# Rule 1 v2 (user 2026-05-02): the WIDER tolerance for detecting
+# vertices in a junction's runway-facing region.  Vertices in this
+# band but outside RUNWAY_BOUNDARY_TOL_M still count as part of the
+# junction's joining edge that needs to widen out to the next
+# runway node.  Captures densification midpoints at ~2 m and
+# boundary-trace vertices that float a few metres off the runway.
+RUNWAY_ADJACENCY_TOL_M = 5.0
 
 # Rule 3 test tolerance: a non-pavement, non-anchor junction edge
 # must run parallel or perpendicular to the longest runway axis

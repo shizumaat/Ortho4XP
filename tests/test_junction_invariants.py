@@ -125,8 +125,8 @@ TAXI_RECT_ADJACENCY_REGRESSION_BASELINE = {
 
 ORPHAN_NEIGHBOUR_VERTEX_REGRESSION_BASELINE = {
     # SPJC: 1 rect corner shifted off its co-located junction vertex
-    # by Rule 5 (push-outside-pavement).  Pending Rule 1 v2 +
-    # tighter Rule 5 anchor exemption to recover.
+    # by Rule 5 (push-outside-pavement).  Pending tighter Rule 5
+    # anchor exemption.
     "SPJC": 1,
 }
 

@@ -32,6 +32,7 @@ from .config import (
     NECK_ABSOLUTE_M,
     NECK_ABSORB_FRAC,
     NECK_RELATIVE,
+    RUNWAY_ADJACENCY_TOL_M,
     RUNWAY_BOUNDARY_TOL_M,
 )
 from .layout import (
@@ -337,26 +338,21 @@ def _snap_to_long_edge_corners(layout: PavementLayout) -> None:
 
 
 def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
-    """Rule 1 (user 2026-05-01): when a junction polygon shares an
-    edge with a runway, its runway-side vertex sequence must match
-    the runway's vertex sequence on that span exactly — no extras,
-    no near-misses.
+    """Rule 1 v2 (user 2026-05-02): junctions meeting a runway must
+    WIDEN to share runway nodes — never narrow.  For each contiguous
+    run of junction vertices within ``RUNWAY_ADJACENCY_TOL_M`` of
+    the runway boundary, snap each run vertex to its closest runway
+    segment's endpoint chosen to be OUTBOARD (away from the run's
+    centroid).  This grows the junction's runway-facing edge to
+    span the next runway nodes on each side.
 
-    Algorithm:
-      1. For each (junction, runway) pair where the junction touches
-         the runway boundary at one or more contiguous spans:
-      2. For each span: drop junction vertices that lie within
-         ``RUNWAY_BOUNDARY_TOL_M`` of the runway boundary but DON'T
-         coincide with any runway vertex (within ``SHARED_VERTEX_TOL_M``).
-      3. Snap the surviving runway-near junction vertices to the
-         exact runway vertex they're closest to.
+    For a 2-vertex run: the two flanking vertices snap to OPPOSITE
+    endpoints of their respective segments, widening the junction
+    to span the runway joining region.
 
-    The "widen out to next runway node" behaviour described by the
-    user is achieved as a side-effect: when the junction's run of
-    runway-near vertices is replaced by exact runway vertex matches,
-    the OUTBOARD endpoints of the run get snapped to the nearest
-    runway vertex, which is by definition outboard of where the
-    junction's edge used to land.
+    For a 3+-vertex run with an interior already-shared runway
+    vertex: the interior vertex stays (it's already at a runway
+    corner); the flanking vertices snap outboard.
 
     Per-vertex altitudes are preserved by index (a snapped vertex
     keeps its existing altitude entry; dropped vertices' altitudes
@@ -372,9 +368,9 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
     if not runway_shapes:
         return
 
-    # Build runway boundary segments PAIRED with their two endpoints
-    # (which are runway vertices).  Snap targets are the segment's
-    # endpoints — never a runway vertex on a different segment.
+    # Build runway segment edges, each paired with its 2 endpoints
+    # (= runway corners).  Snap targets are always one of these
+    # endpoints — never a runway vertex from a different segment.
     rwy_segs: List[Tuple[float, float, float, float,
                          Tuple[float, float], Tuple[float, float]]] = []
     for s in runway_shapes:
@@ -392,8 +388,28 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
     if not rwy_segs:
         return
 
-    boundary_tol = RUNWAY_BOUNDARY_TOL_M
+    # Rule 1 v3 (user 2026-05-02 clarified):
+    #   * Each junction-runway interface has 2, 3, or 4 shared
+    #     nodes — never 1, never 5+.  The 4-node case occurs when
+    #     two diagonal stubs converge at the runway.
+    #   * Each runway-near junction vertex snaps to the nearer
+    #     endpoint of its NEAREST RUNWAY EDGE.
+    #   * If that snap would SHRINK the junction (collide with an
+    #     existing junction vertex), snap to the OTHER endpoint of
+    #     the same edge instead — widening, never narrowing.
+    #   * Never insert a new node onto the runway segment.
+    adjacency_tol = RUNWAY_ADJACENCY_TOL_M
     vertex_tol = SHARED_VERTEX_TOL_M
+    # A snap "would shrink" when the candidate target is within
+    # this distance of any OTHER existing junction vertex
+    # (collision = unintended dedupe).
+    shrink_collision_tol = SHARED_VERTEX_TOL_M * 2.0
+    # Cap on how far a single snap can move a vertex.  Beyond this
+    # the snap risks overlapping adjacent junctions; it's safer to
+    # leave the vertex alone and accept that the junction won't
+    # share that node.  Tuned conservatively for SPJC's 48 m runway
+    # segments.
+    MAX_SNAP_MOVE_M = 30.0
 
     for shape in layout.shapes:
         if shape.role != ROLE_JUNCTION:
@@ -412,63 +428,108 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
             coords = coords[:-1]
             if node_alts is not None:
                 node_alts = list(node_alts[:-1])
+        n = len(coords)
+        if n < 3:
+            continue
 
-        new_pts: List[Tuple[float, float]] = []
-        new_alts: Optional[List[float]] = (
-            [] if node_alts is not None else None)
-        changed = False
+        # Pass 1: classify each vertex (runway-adjacent? closest segment?).
+        nearest_seg: List[
+            Optional[Tuple[Tuple[float, float], Tuple[float, float]]]
+        ] = [None] * n
         for i, (vx, vy) in enumerate(coords):
-            # Find the runway segment closest to this vertex.
-            best_seg = None
-            best_seg_d = float("inf")
+            best_d = adjacency_tol
+            best_endpoints = None
             for ax, ay, bx, by, c1, c2 in rwy_segs:
                 d, _, _ = _point_segment_distance(vx, vy, ax, ay, bx, by)
-                if d < best_seg_d:
-                    best_seg_d = d
-                    best_seg = (c1, c2)
-                    if best_seg_d <= 1e-6:
+                if d < best_d:
+                    best_d = d
+                    best_endpoints = (c1, c2)
+                    if best_d <= 1e-6:
                         break
-            if best_seg_d > boundary_tol or best_seg is None:
-                # Not on a runway boundary; keep as-is.
-                new_pts.append((vx, vy))
-                if new_alts is not None:
-                    new_alts.append(node_alts[i])
-                continue
+            if best_endpoints is not None:
+                nearest_seg[i] = best_endpoints
 
-            # Snap to the nearer endpoint of the closest segment.
-            c1, c2 = best_seg
-            d1 = math.hypot(vx - c1[0], vy - c1[1])
-            d2 = math.hypot(vx - c2[0], vy - c2[1])
-            target = c1 if d1 <= d2 else c2
-            target_d = min(d1, d2)
-            if target_d <= vertex_tol:
-                # Already at this corner.
-                new_pts.append(target)
-                if new_alts is not None:
-                    new_alts.append(node_alts[i])
-                if target != (vx, vy):
-                    changed = True
-            else:
-                new_pts.append(target)
-                if new_alts is not None:
-                    new_alts.append(node_alts[i])
+        if not any(s is not None for s in nearest_seg):
+            continue
+
+        # Pass 2: find contiguous runs of runway-adjacent vertices
+        # in circular order.
+        runs = _find_circular_runs(
+            [s is not None for s in nearest_seg], n)
+        if not runs:
+            continue
+
+        # Pass 3 (v3): snap each runway-near vertex to the NEAREST
+        # endpoint of its closest runway segment.  If that snap
+        # would collide with an existing junction vertex (shrinking
+        # the polygon), pick the OTHER endpoint of the same edge.
+        new_pts: List[Tuple[float, float]] = list(coords)
+        new_alts: Optional[List[Optional[float]]] = (
+            list(node_alts) if node_alts is not None else None)
+        changed = False
+        for run_indices in runs:
+            for idx in run_indices:
+                seg_endpoints = nearest_seg[idx]
+                if seg_endpoints is None:
+                    continue
+                c1, c2 = seg_endpoints
+                vx, vy = coords[idx]
+                d1c = math.hypot(vx - c1[0], vy - c1[1])
+                d2c = math.hypot(vx - c2[0], vy - c2[1])
+                # Tentative snap: nearer endpoint.
+                if d1c <= d2c:
+                    primary, alt = c1, c2
+                else:
+                    primary, alt = c2, c1
+                # Check whether the primary target collides with
+                # ANY existing junction vertex (other than vertex
+                # ``idx`` itself).
+                def _collides(target):
+                    for k, (px, py) in enumerate(new_pts):
+                        if k == idx:
+                            continue
+                        if math.hypot(target[0] - px,
+                                      target[1] - py) <= shrink_collision_tol:
+                            return True
+                    return False
+                if _collides(primary):
+                    # Would shrink — try the other endpoint.
+                    if not _collides(alt):
+                        target = alt
+                    else:
+                        # Both endpoints collide; leave vertex alone
+                        # (junction is already at one of these or
+                        # squeezed between two adjacent junctions).
+                        continue
+                else:
+                    target = primary
+                if target == (vx, vy):
+                    continue
+                # Cap snap displacement to avoid overlapping
+                # adjacent junctions.
+                if math.hypot(target[0] - vx,
+                              target[1] - vy) > MAX_SNAP_MOVE_M:
+                    continue
+                new_pts[idx] = target
                 changed = True
 
         if not changed:
             continue
+
         # Dedupe consecutive identical vertices (snap may collapse
-        # adjacent vertices onto the same runway node).
+        # adjacent vertices onto the same runway corner).
         deduped_pts: List[Tuple[float, float]] = []
         deduped_alts: Optional[List[float]] = (
             [] if new_alts is not None else None)
-        for j, (cx, cy) in enumerate(new_pts):
+        for j, (px, py) in enumerate(new_pts):
             if deduped_pts:
-                px, py = deduped_pts[-1]
-                if math.hypot(cx - px, cy - py) <= vertex_tol:
+                qx, qy = deduped_pts[-1]
+                if math.hypot(px - qx, py - qy) <= vertex_tol:
                     continue
-            deduped_pts.append((cx, cy))
+            deduped_pts.append((px, py))
             if deduped_alts is not None:
-                deduped_alts.append(new_alts[j])
+                a = new_alts[j]
+                deduped_alts.append(a if a is not None else 0.0)
         if len(deduped_pts) < 3:
             continue
         try:
@@ -484,6 +545,37 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
         shape.polygon = new_poly
         if deduped_alts is not None:
             shape.node_altitudes = deduped_alts + [deduped_alts[0]]
+
+
+def _find_circular_runs(flags: Sequence[bool], n: int) -> List[List[int]]:
+    """Find contiguous runs of True values in a circular list of
+    length n.  Returns each run as a list of indices in walk order.
+    Handles wrap-around (a run that crosses the seam between
+    index n-1 and index 0)."""
+    if n == 0 or not any(flags):
+        return []
+    if all(flags):
+        return [list(range(n))]
+    # Find a transition point (False before True).
+    start = 0
+    for i in range(n):
+        if (not flags[i]) and flags[(i + 1) % n]:
+            start = (i + 1) % n
+            break
+    # Walk from start, collecting runs.
+    runs: List[List[int]] = []
+    cur: List[int] = []
+    for offset in range(n):
+        idx = (start + offset) % n
+        if flags[idx]:
+            cur.append(idx)
+        else:
+            if cur:
+                runs.append(cur)
+                cur = []
+    if cur:
+        runs.append(cur)
+    return runs
 
 
 # ── Rule 4: split narrow necks ───────────────────────────────────
