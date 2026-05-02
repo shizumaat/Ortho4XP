@@ -184,10 +184,11 @@ def _triangulate_junctions(
             neighbour_edges.append((ax, ay, bx, by, ea, eb))
 
     # Sloping-rect long edges (Rule 2: densification midpoints must
-    # not land within LONG_EDGE_SNAP_M of these).  Pick the 2
-    # longest edges per rect by computed length — index-based
-    # convention does NOT hold after overlap-clip / shared-vertex
-    # collapse renormalises vertex order (user 2026-05-02 issue #4).
+    # not land within LONG_EDGE_SNAP_M of these).  Per user
+    # 2026-05-02 clarification: what matters is the SLOPING
+    # direction (parallel to source_axis), not edge length.  Use
+    # the BuiltShape's source_axis for proper detection;
+    # fall back to longest-2 if missing.
     sloping_long_edges: List[Tuple[float, float, float, float]] = []
     sloping_roles = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
                      ROLE_STUB, ROLE_CROSS_CONNECTOR}
@@ -203,6 +204,32 @@ def _triangulate_junctions(
         if len(rc) != 4:
             continue
         edges = [(rc[i], rc[(i + 1) % 4]) for i in range(4)]
+        # If source_axis available, pick edges most parallel to it.
+        if s.source_axis is not None and not s.source_axis.is_empty:
+            ax_pts = list(s.source_axis.coords)
+            if len(ax_pts) >= 2:
+                axdx = ax_pts[-1][0] - ax_pts[0][0]
+                axdy = ax_pts[-1][1] - ax_pts[0][1]
+                axlen = math.hypot(axdx, axdy)
+                if axlen >= 1e-6:
+                    aux, auy = axdx / axlen, axdy / axlen
+                    dots = []
+                    for a, b in edges:
+                        ex, ey = b[0] - a[0], b[1] - a[1]
+                        elen = math.hypot(ex, ey)
+                        if elen < 1e-6:
+                            dots.append(0.0)
+                            continue
+                        dots.append(abs(ex * aux + ey * auy) / elen)
+                    sloping_idx = sorted(
+                        range(4), key=lambda i: -dots[i])[:2]
+                    for i in sloping_idx:
+                        a, b = edges[i]
+                        sloping_long_edges.append(
+                            (float(a[0]), float(a[1]),
+                             float(b[0]), float(b[1])))
+                    continue
+        # Fallback: longest 2.
         lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
                    for a, b in edges]
         long_idx = sorted(range(4), key=lambda i: -lengths[i])[:2]

@@ -142,24 +142,31 @@ def longest_runway_axis_deg(layout: PavementLayout) -> Optional[float]:
 # ── Rule 2: long-edge corner snap ────────────────────────────────
 
 
-def _rect_long_edges(
+def _rect_sloping_edges(
     rect: Polygon,
+    source_axis: Optional[LineString] = None,
 ) -> List[Tuple[Tuple[float, float], Tuple[float, float],
                 Tuple[float, float], Tuple[float, float]]]:
-    """Return the rect's two long edges as
-    ``[(p1, p2, corner_a, corner_b), ...]`` where (p1, p2) is the
-    long edge endpoints and (corner_a, corner_b) are the same two
-    points (corners that bound this long edge).
+    """Return the rect's two SLOPING edges — the edges parallel to
+    its source_axis (where altitude varies linearly).  These are
+    the edges junctions must NOT have nodes along (other than at
+    the corners), because that breaks the rect's straight-line
+    slope rendering.  Per user 2026-05-02 clarification:
+    "long" vs "short" was misleading — what matters is sloping vs
+    flat.  A rect can be wider than long and still have its slope
+    along the short axis.
 
-    Per user 2026-05-02 (issue #4): the index-based convention
-    ``coords[0]↔coords[1]`` & ``coords[2]↔coords[3]`` does NOT
-    hold for all rects — overlap-clip / shared-vertex collapse can
-    rotate the polygon's vertex order, e.g. SPJC primary_parallel
-    -10013 has SHORT edges at those indices and LONG edges at
-    ``coords[1]↔coords[2]`` & ``coords[3]↔coords[0]``.
+    Detection:
+      * If ``source_axis`` provided: compute the absolute dot
+        product between each edge direction and the axis direction;
+        the 2 edges with the highest dot are the most parallel =
+        sloping edges.
+      * Fallback (no axis): use the 2 longest edges by length —
+        works for typical sloping rects where the long dimension
+        is the slope direction.
 
-    Solution: pick the 2 longest of the 4 edges by computed length.
-    Robust regardless of how the polygon was assembled.
+    Return format: ``[(p1, p2, corner_a, corner_b), ...]`` (same
+    as the legacy ``_rect_long_edges`` API).
     """
     coords = list(rect.exterior.coords)
     if not coords:
@@ -169,11 +176,39 @@ def _rect_long_edges(
     if len(coords) != 4:
         return []
     edges = [(coords[i], coords[(i + 1) % 4]) for i in range(4)]
+    if source_axis is not None and not source_axis.is_empty:
+        ax_pts = list(source_axis.coords)
+        if len(ax_pts) >= 2:
+            axdx = ax_pts[-1][0] - ax_pts[0][0]
+            axdy = ax_pts[-1][1] - ax_pts[0][1]
+            axlen = math.hypot(axdx, axdy)
+            if axlen >= 1e-6:
+                aux, auy = axdx / axlen, axdy / axlen
+                dots = []
+                for a, b in edges:
+                    ex, ey = b[0] - a[0], b[1] - a[1]
+                    elen = math.hypot(ex, ey)
+                    if elen < 1e-6:
+                        dots.append(0.0)
+                        continue
+                    dots.append(abs(ex * aux + ey * auy) / elen)
+                # The 2 edges with HIGHEST absolute dot are most
+                # parallel to the axis = sloping.
+                sloping_idx = sorted(
+                    range(4), key=lambda i: -dots[i])[:2]
+                return [(edges[i][0], edges[i][1],
+                         edges[i][0], edges[i][1])
+                        for i in sloping_idx]
+    # Fallback: pick the 2 longest edges (typical heuristic).
     lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
                for a, b in edges]
     long_idx = sorted(range(4), key=lambda i: -lengths[i])[:2]
     return [(edges[i][0], edges[i][1], edges[i][0], edges[i][1])
             for i in long_idx]
+
+
+# Backward-compat alias.
+_rect_long_edges = _rect_sloping_edges
 
 
 def _point_segment_distance(
@@ -251,7 +286,7 @@ def _snap_to_long_edge_corners(layout: PavementLayout) -> None:
             continue
         for ax, ay, bx, by in (
             (e[0][0], e[0][1], e[1][0], e[1][1])
-            for e in _rect_long_edges(rect)
+            for e in _rect_sloping_edges(rect, shape.source_axis)
         ):
             long_edges.append((ax, ay, bx, by, (ax, ay), (bx, by)))
     if not long_edges:
@@ -535,10 +570,12 @@ def _do_widen(
         if not shared_in_poly:
             continue
 
-        # User 2026-05-02 spec: 2, 3, or 4 runway-shared nodes per
-        # junction.  Cap at 4 — if v5 already widened to 2+, only
-        # add up to (4 - current) more.
-        max_total_shared = 4
+        # User 2026-05-02 spec: 2-4 runway-shared nodes per junction
+        # in the typical case.  Bumped to 5 per user 2026-05-02
+        # follow-up for cases where 5 connections are needed (e.g.
+        # diagonal stubs converging plus an internal runway-seam
+        # corner falling within the joining region).
+        max_total_shared = 5
         current_shared_count = len(shared_in_poly)
         max_inserts = max(0, max_total_shared - current_shared_count)
         if max_inserts == 0:
@@ -1268,22 +1305,36 @@ def _push_junction_vertices_outside_pavement(
                 runway_edges.append((float(ax), float(ay),
                                      float(bx), float(by)))
         elif s.role in SLOPING_RECT_ROLES:
-            # Per the rect-build convention: long edges connect
-            # coords[0]↔coords[1] and coords[2]↔coords[3].
+            # Sloping vs flat: use source_axis-based detection
+            # (per user 2026-05-02 clarification — what matters
+            # is direction of slope, not edge length).
             if m == 4:
-                rect_long_edges.append(
-                    (float(c[0][0]), float(c[0][1]),
-                     float(c[1][0]), float(c[1][1])))
-                rect_long_edges.append(
-                    (float(c[2][0]), float(c[2][1]),
-                     float(c[3][0]), float(c[3][1])))
-                # Short edges into other_anchor_edges for tight tol.
-                other_anchor_edges.append(
-                    (float(c[1][0]), float(c[1][1]),
-                     float(c[2][0]), float(c[2][1])))
-                other_anchor_edges.append(
-                    (float(c[3][0]), float(c[3][1]),
-                     float(c[0][0]), float(c[0][1])))
+                sloping = _rect_sloping_edges(s.polygon, s.source_axis)
+                sloping_keys = set()
+                for sa, sb, _, _ in sloping:
+                    rect_long_edges.append(
+                        (float(sa[0]), float(sa[1]),
+                         float(sb[0]), float(sb[1])))
+                    sloping_keys.add((round(sa[0] * 2.0),
+                                      round(sa[1] * 2.0),
+                                      round(sb[0] * 2.0),
+                                      round(sb[1] * 2.0)))
+                # Flat edges = the other 2 (short ends in typical
+                # case): tight-tol anchor exemption.
+                for i in range(4):
+                    sa = c[i]
+                    sb = c[(i + 1) % 4]
+                    key = (round(sa[0] * 2.0), round(sa[1] * 2.0),
+                           round(sb[0] * 2.0), round(sb[1] * 2.0))
+                    rkey = (round(sb[0] * 2.0), round(sb[1] * 2.0),
+                            round(sa[0] * 2.0), round(sa[1] * 2.0))
+                    if key in sloping_keys or rkey in sloping_keys:
+                        continue
+                    other_anchor_edges.append(
+                        (float(sa[0]), float(sa[1]),
+                         float(sb[0]), float(sb[1])))
+                # Skip the legacy index-based block below.
+                continue
         elif s.role == "terminal":
             for i in range(m):
                 ax, ay = c[i]
