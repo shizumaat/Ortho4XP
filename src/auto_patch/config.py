@@ -11,17 +11,57 @@ variable in O4_Cfg_Vars.py instead.
 """
 
 __all__ = [
-    "RUNWAY_INSIDE_APRON_FRAC",
-    "RUNWAY_APRON_AREA_RATIO",
+    "AXIS_ALIGN_TOL_DEG",
     "LOAD_DSF_PAVEMENT",
+    "LONG_EDGE_SNAP_M",
     "EMIT_JUNCTIONS",
     "EMIT_APRONS",
     "EMIT_BRIDGES_AND_TUNNELS",
     "JUNCTION_CLUSTER_DIST_M",
     "MAX_BOUNDARY_EDGE_M",
     "MIN_SEGMENT_LEN_M",
+    "NECK_ABSOLUTE_M",
+    "NECK_ABSORB_FRAC",
+    "NECK_RELATIVE",
+    "RUNWAY_BOUNDARY_TOL_M",
+    "RUNWAY_INSIDE_APRON_FRAC",
+    "RUNWAY_APRON_AREA_RATIO",
     "SLIVER_ANGLE_THRESHOLD_DEG",
 ]
+
+
+# ── Junction-refinement rule constants (user 2026-05-01) ─────────
+# Plan: ``/Users/noah/.claude/plans/kind-meandering-sifakis.md``.
+
+# Rule 2: junction vertex within this distance of a sloping rect's
+# long edge gets snapped to the rect's nearest short-end CORNER.
+# Per user 2026-05-01: 10 m chosen because there should never be any
+# junction node along a sloping rect's long side; 10 m is a safety
+# band that catches densification midpoints + boundary-trace vertices
+# that float off-rect due to apt.dat row-110 curvature noise.
+LONG_EDGE_SNAP_M = 10.0
+
+# Rule 4: a junction polygon is split at its narrowest cross-section
+# when that thickness is below NECK_ABSOLUTE_M (in metres) OR is
+# below NECK_RELATIVE × the polygon's MRR long-side length
+# (whichever fires first per user 2026-05-01).
+NECK_ABSOLUTE_M = 5.0
+NECK_RELATIVE = 0.10
+# A piece resulting from a neck split is absorbed into a neighbouring
+# rect / junction / apron when the neighbour shares more than this
+# fraction of the piece's perimeter.
+NECK_ABSORB_FRAC = 0.70
+
+# Rule 1: a junction vertex is "on the runway boundary" when within
+# this distance of the runway polygon edge.  Used to identify the
+# runway-adjacent vertex run that gets replaced with the runway's
+# exact node sequence.
+RUNWAY_BOUNDARY_TOL_M = 1.5
+
+# Rule 3 test tolerance: a non-pavement, non-anchor junction edge
+# must run parallel or perpendicular to the longest runway axis
+# within this many degrees.
+AXIS_ALIGN_TOL_DEG = 2.0
 
 
 # Max length of any junction-polygon ring segment.  Long edges get

@@ -200,8 +200,13 @@ def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
                 # multiple simple polygons that join AROUND the
                 # rect instead.  Cleaner human-editable output and
                 # avoids hole-splicing artefacts in triangulation.
+                # Per Rule 3 (user 2026-05-01): cut lines run
+                # parallel/perpendicular to the longest runway axis.
+                from .junction_rules import longest_runway_axis_deg
+                _runway_axis_deg = longest_runway_axis_deg(layout)
                 pieces = _decompose_polygon_with_holes(
-                    simp, min_area_m2=MIN_JUNCTION_AREA_M2)
+                    simp, min_area_m2=MIN_JUNCTION_AREA_M2,
+                    runway_axis_deg=_runway_axis_deg)
                 for piece in pieces:
                     # Re-inject seam points: cut lines added by
                     # the decomposition split may have introduced
@@ -270,6 +275,16 @@ def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
     # within the cluster tol of an existing vertex on the
     # higher-priority shape's edge.
     _drop_overlap_against_fixed_shapes(layout, icao=icao)
+    _enforce_shared_vertices(layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
+
+    # Junction-refinement rules (user 2026-05-01).  See
+    # ``auto_patch/junction_rules.py``.  Run after overlap-clip +
+    # shared-vertex collapse so the rules see the final polygon
+    # geometry; re-run shared-vertex enforcement afterwards because
+    # rule passes (Rule 2 corner snaps, Rule 4 splits) introduce new
+    # vertex positions.
+    from .junction_rules import apply_junction_rules
+    apply_junction_rules(layout)
     _enforce_shared_vertices(layout, tol=SHARED_VERTEX_CLUSTER_TOL_M)
 
     # Validate the invariant: every vertex of every shape must either

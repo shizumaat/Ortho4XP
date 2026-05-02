@@ -1706,6 +1706,21 @@ def build_airport_pavement(icao: str, xplane_root: str,
             apron_candidates=apron_candidates,
             tile_dem=tile_dem)
 
+        # Final Rule 2 enforcement (user 2026-05-01).  Triangulation
+        # densification and Laplacian-solver vertex insertions can
+        # leave a few junction vertices within LONG_EDGE_SNAP_M of a
+        # sloping rect's long edge despite the in-densify guard.  A
+        # final post-elevation snap clears these residual cases.
+        # Aligned per-vertex altitudes are preserved by index, so the
+        # snap is altitude-safe (a 10 m planar move at typical
+        # taxi-grade ≤ 1.5 % shifts elevation by ≤ 15 cm — well
+        # within the within-shape grade tolerance).
+        from .junction_rules import (
+            _enforce_runway_1to1_sharing,
+            _snap_to_long_edge_corners,
+        )
+        _snap_to_long_edge_corners(layout)
+        _enforce_runway_1to1_sharing(layout)
 
     return layout
 

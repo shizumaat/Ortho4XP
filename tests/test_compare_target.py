@@ -52,7 +52,17 @@ pytestmark = pytest.mark.skipif(
 # To intentionally raise a baseline (output improved), update
 # both the count and the date stamp here.
 SPJC_BASELINE: Dict[str, int] = {
-    "junction":           32,   # of 43 target
+    # 2026-05-02: junction floor lowered 32 → 30 across two phases.
+    # Phase 1 (32 → 31) — Rule 1 (junction-runway 1:1 sharing) snaps
+    # runway-near junction vertices to the nearest runway segment
+    # endpoint; one junction deformed enough to drop below IoU
+    # threshold.
+    # Phase 2 (31 → 30) — Rule 3 (axis-aligned cut lines) routes
+    # decomposition cuts along the runway axis instead of hole-MRR;
+    # one further junction's cut topology shifted off-target.
+    # Both intentional per user 2026-05-01 — invariants supersede
+    # individual ground-truth matches.
+    "junction":           30,   # of 43 target
     "primary_parallel":   20,   # of 29 target
     "stub":               15,   # of 15 target (full match)
     "terminal":            2,   # of  2 target (full match)
@@ -63,7 +73,7 @@ SPJC_BASELINE: Dict[str, int] = {
     #                              CIFP-driven segmentation is correct
     #                              behaviour, the target keeps single rects.
 }
-SPJC_BASELINE_TOTAL = 71  # of 104 target shapes (sum of above + ...)
+SPJC_BASELINE_TOTAL = 69  # of 104 target shapes (sum of above + ...)
 
 
 def _build_layout(icao: str):

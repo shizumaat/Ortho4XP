@@ -94,10 +94,15 @@ MAX_ORPHAN_NEIGHBOUR_VERTICES = 0
 # value (zero offenders / hard cap) — those airports are still
 # fully gated by the original invariant.
 JUNCTION_VERTEX_REGRESSION_BASELINE = {
-    # SPJC: 12 junctions exceed the 30-vertex cap; worst = 336
+    # SPJC: 12 junctions exceed the 30-vertex cap; worst = 340
     # vertices (single mega-junction sprawling over the SE apron).
     # Ground-truth target max is 36 — see test_compare_target_spjc.
-    "SPJC": {"max_offenders": 12, "max_vertex_count": 336},
+    # 2026-05-02: bumped 336 → 340 after Rule 1+2+3+4 enforcement
+    # adds a few snapped runway vertices to the central hub.  These
+    # are intentional per user 2026-05-01 (junction-runway 1:1
+    # sharing); the +4 vertex bump is the cost of exact node
+    # coincidence with the runway segments.
+    "SPJC": {"max_offenders": 12, "max_vertex_count": 340},
 }
 
 JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE = {

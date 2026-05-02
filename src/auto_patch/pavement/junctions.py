@@ -97,36 +97,26 @@ __all__ = [
 
 def _decompose_polygon_with_holes(polygon: Polygon,
                                   min_area_m2: float = 50.0,
-                                  max_depth: int = 8
+                                  max_depth: int = 8,
+                                  runway_axis_deg: Optional[float] = None,
                                   ) -> List[Polygon]:
     """Return a list of simple (no-hole) polygons that tile the
     same area as ``polygon``.  Cuts through each hole's centroid
-    along a direction chosen to follow the hole's natural axes (or
-    the centroid-spread of multiple holes), then recurses on each
-    side.
+    along a direction chosen to satisfy Rule 3 (axis-aligned non-
+    pavement borders) when ``runway_axis_deg`` is supplied; falls
+    back to the legacy hole-MRR / centroid-spread heuristic
+    otherwise.
 
-    Per user 2026-04-28: previous implementation always cut
-    horizontally, which produced thin (~2–12 m) strips between
-    parallel taxi-rect holes whose y-centroids happened to be
-    close.  Those strips were arbitrary geometric artifacts —
-    their cut edges didn't follow any real pavement feature —
-    and required a downstream merge band-aid to suppress.  The
-    new policy:
+    Per Rule 3 (user 2026-05-01): every junction edge that isn't on
+    the apt.dat pavement boundary or a shared anchor edge must run
+    parallel or perpendicular to the longest runway.  When the
+    runway axis is supplied, cut lines align to it; when omitted,
+    we use the legacy heuristic so non-Phase-2 callers keep working.
 
+    Legacy heuristic (kept as fallback per user 2026-04-28):
       * Multiple holes ⇒ cut PERPENDICULAR to the centroid-spread
-        direction.  When holes are spread along x (typical
-        parallel-taxiway apron), the cut runs vertically BETWEEN
-        the holes rather than horizontally between two close
-        cut lines.
-      * Single hole ⇒ cut along the hole's MRR long axis.  The
-        cut is collinear with the rect's natural orientation and
-        produces two pieces straddling the rect rather than
-        slicing it across.
-
-    Both rules align cut lines with real geometric features
-    (rect axes, hole-cluster alignment) instead of an arbitrary
-    horizontal direction.  The thin-piece merge fallback is kept
-    at a small threshold purely for floating-point sliver clean-up.
+        direction.
+      * Single hole ⇒ cut along its MRR long-axis direction.
     """
     from shapely.ops import split as _shp_split
     from shapely.geometry import LineString as _LS
@@ -153,7 +143,42 @@ def _decompose_polygon_with_holes(polygon: Polygon,
     # centroid; ``angle_rad`` is the angle of the cut LINE (not
     # the perpendicular), measured from +x.  Default = horizontal.
     angle_rad = 0.0
-    if len(interiors) >= 2:
+    if runway_axis_deg is not None:
+        # Per Rule 3: cut parallel to the runway axis (or
+        # perpendicular).  Bearing convention: 0° = +Y (north),
+        # 90° = +X (east); convert to "atan2 from +x" by
+        # angle_x = π/2 − bearing_rad.  Choose the one of
+        # {parallel, perpendicular} that produces the more balanced
+        # split — measured by area ratio of the resulting pieces;
+        # we proxy this by picking the direction that runs along
+        # the polygon's longer side.
+        bearing_rad = math.radians(runway_axis_deg)
+        runway_x_angle = math.pi / 2.0 - bearing_rad
+        # Two candidate cut directions: along runway, perpendicular.
+        cand_a = runway_x_angle % math.pi
+        cand_b = (runway_x_angle + math.pi / 2.0) % math.pi
+        # Pick whichever produces a longer cut chord through the
+        # polygon (proxy for "more balanced split").
+        def _chord_len(theta):
+            ux, uy = math.cos(theta), math.sin(theta)
+            span = max(maxx - minx, maxy - miny) + 2.0
+            line = _LS([(cx - span * ux, cy - span * uy),
+                        (cx + span * ux, cy + span * uy)])
+            try:
+                inter = line.intersection(polygon)
+            except Exception:
+                return 0.0
+            if inter.is_empty:
+                return 0.0
+            if inter.geom_type == "LineString":
+                return inter.length
+            if inter.geom_type == "MultiLineString":
+                return sum(g.length for g in inter.geoms)
+            return 0.0
+        len_a = _chord_len(cand_a)
+        len_b = _chord_len(cand_b)
+        angle_rad = cand_a if len_a >= len_b else cand_b
+    elif len(interiors) >= 2:
         # Multi-hole: cut perpendicular to the centroid-spread
         # axis so the cut SEPARATES the holes rather than slicing
         # parallel to their alignment.  E.g. holes spread along
@@ -210,7 +235,8 @@ def _decompose_polygon_with_holes(polygon: Polygon,
         if g.area < min_area_m2:
             continue
         pieces.extend(_decompose_polygon_with_holes(
-            g, min_area_m2=min_area_m2, max_depth=max_depth - 1))
+            g, min_area_m2=min_area_m2, max_depth=max_depth - 1,
+            runway_axis_deg=runway_axis_deg))
     # Sliver clean-up: smart-cut alignment eliminates the most
     # egregious wide-band strips (5 m × 67 m, 10 m × 119 m) that
     # appeared with horizontal-only cuts, but recursive splits can
@@ -424,6 +450,8 @@ def _densify_long_boundary_edges(
     vert_elev: List[float],
     neighbour_edges: List[Tuple[float, float, float, float,
                                  float, float]],
+    rect_long_edges: Optional[List[Tuple[float, float, float, float]]] = None,
+    runway_edges: Optional[List[Tuple[float, float, float, float]]] = None,
 ) -> Tuple[List[Tuple[float, float]], List[float]]:
     """Insert interpolated midpoints along long ring segments.
 
@@ -436,11 +464,21 @@ def _densify_long_boundary_edges(
     Otherwise use linear interpolation between the segment's
     endpoint elevations.
 
+    Per Rule 2 (user 2026-05-01): if ``rect_long_edges`` is supplied,
+    skip any midpoint within ``LONG_EDGE_SNAP_M`` of a sloping rect's
+    long edge — junctions must not have any vertices in that band.
+
+    Per Rule 1 (user 2026-05-01): if ``runway_edges`` is supplied,
+    skip any midpoint within ``RUNWAY_BOUNDARY_TOL_M`` of a runway
+    boundary edge — junction vertices on the runway must coincide
+    with runway vertices, not float between them.
+
     This guarantees no shared-boundary step is introduced and
     handles both the simple "junction-on-rect-edge" case (linear
     interp matches) and the "junction-on-segmented-runway-edge"
     case (use the runway segment's interp).
     """
+    from ..config import LONG_EDGE_SNAP_M, RUNWAY_BOUNDARY_TOL_M
     from ..elevation import _corner_elevation_bucket
     n = len(ring)
     if n < 3 or len(vert_elev) != n:
@@ -469,6 +507,32 @@ def _densify_long_boundary_edges(
                 best_d2 = d2
                 best_e = ea + t * (eb - ea)
         return best_e if best_e is not None else fallback
+
+    def _point_within_of_edge(mx: float, my: float,
+                              edges: List[Tuple[float, float, float, float]],
+                              tol_m: float) -> bool:
+        """True if (mx, my) lies within ``tol_m`` PERPENDICULAR to
+        any edge in the supplied list, AND its projection falls
+        strictly within the edge segment.  Per user 2026-05-01:
+        vertices reaching toward a rect's short-end corner (whose
+        projection lies past the long edge's endpoint) are allowed,
+        so we exempt projections at or beyond either endpoint."""
+        tol2 = tol_m * tol_m
+        for ax, ay, bx, by in edges:
+            dx = bx - ax
+            dy = by - ay
+            seg2 = dx * dx + dy * dy
+            if seg2 < 0.04:
+                continue
+            t = ((mx - ax) * dx + (my - ay) * dy) / seg2
+            if t <= 0.0 or t >= 1.0:
+                continue
+            cx = ax + t * dx
+            cy = ay + t * dy
+            d2 = (mx - cx) * (mx - cx) + (my - cy) * (my - cy)
+            if d2 <= tol2:
+                return True
+        return False
 
     def _point_on_neighbour(mx: float, my: float) -> bool:
         """True if point (mx, my) lies within SHARED_VERTEX_TOL_M of
@@ -545,6 +609,16 @@ def _densify_long_boundary_edges(
             # neighbour, creating a T-junction that breaks the
             # neighbour rect's 4-corner slope rendering.
             if _point_on_neighbour(mx, my):
+                continue
+            # Per Rule 2 (user 2026-05-01): no junction vertex within
+            # ``LONG_EDGE_SNAP_M`` of a sloping rect's long edge.
+            if rect_long_edges and _point_within_of_edge(
+                    mx, my, rect_long_edges, LONG_EDGE_SNAP_M):
+                continue
+            # Per Rule 1 (user 2026-05-01): no junction vertex within
+            # ``RUNWAY_BOUNDARY_TOL_M`` of a runway boundary edge.
+            if runway_edges and _point_within_of_edge(
+                    mx, my, runway_edges, RUNWAY_BOUNDARY_TOL_M):
                 continue
             linear_me = ea + t * (eb - ea)
             me = _interp_at(mx, my, linear_me)

@@ -183,6 +183,51 @@ def _triangulate_junctions(
             eb = float(elevs[(i + 1) % m])
             neighbour_edges.append((ax, ay, bx, by, ea, eb))
 
+    # Sloping-rect long edges (Rule 2: densification midpoints must
+    # not land within LONG_EDGE_SNAP_M of these).  Per the
+    # ``_rect_from_axis_extended`` corner convention: long edges are
+    # ``(coords[0], coords[1])`` and ``(coords[2], coords[3])``.
+    sloping_long_edges: List[Tuple[float, float, float, float]] = []
+    sloping_roles = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+                     ROLE_STUB, ROLE_CROSS_CONNECTOR}
+    for s in layout.shapes:
+        if s.role not in sloping_roles:
+            continue
+        try:
+            rc = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        sloping_long_edges.append(
+            (rc[0][0], rc[0][1], rc[1][0], rc[1][1]))
+        sloping_long_edges.append(
+            (rc[2][0], rc[2][1], rc[3][0], rc[3][1]))
+
+    # Runway boundary edges (Rule 1: densification midpoints must
+    # not land within RUNWAY_BOUNDARY_TOL_M of a runway boundary
+    # unless they coincide with a runway vertex).  Treated the same
+    # way as sloping rect long edges via the per-edge wider-tolerance
+    # exclusion.
+    runway_edges: List[Tuple[float, float, float, float]] = []
+    for s in layout.shapes:
+        if s.role != ROLE_RUNWAY:
+            continue
+        try:
+            rc = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        m = len(rc)
+        for i in range(m):
+            ax, ay = rc[i]
+            bx, by = rc[(i + 1) % m]
+            runway_edges.append((float(ax), float(ay),
+                                 float(bx), float(by)))
+
     def _edge_interp_elev(x: float, y: float,
                           max_dist: float = NEAR_EDGE_M
                           ) -> Optional[float]:
@@ -577,7 +622,9 @@ def _triangulate_junctions(
         # gradients within the polygon (especially helpful for
         # long cut edges from hole-decomposition).
         densified_ring, densified_elev = _densify_long_boundary_edges(
-            ring, vert_elev, neighbour_edges)
+            ring, vert_elev, neighbour_edges,
+            rect_long_edges=sloping_long_edges,
+            runway_edges=runway_edges)
         # Validate: a densification midpoint can occasionally land
         # on a non-adjacent ring edge (concave polygons with
         # near-touches), turning a valid polygon into a self-
