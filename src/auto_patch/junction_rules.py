@@ -402,15 +402,49 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
     # (collision = unintended dedupe).
     shrink_collision_tol = SHARED_VERTEX_TOL_M * 2.0
 
-    for shape in layout.shapes:
-        if shape.role != ROLE_JUNCTION:
-            continue
+    # Global "claimed runway corners" set (Rule 1 v5, user 2026-05-02):
+    # accumulates runway corner positions that previously-processed
+    # junctions have snapped to.  Used by the cross-junction shrink
+    # check — if a corner is claimed, the next junction's snap to
+    # that same corner is allowed (sharing) but if that snap would
+    # collide with a NON-runway vertex of either junction, fall back
+    # to the other endpoint of the same edge.  Also: PROCESSING
+    # ORDER matters; we sort junctions by their nearest runway
+    # boundary distance ASCENDING so junctions touching the runway
+    # most directly snap first.
+    claimed_corners: List[Tuple[float, float]] = []
+
+    # Order junctions by min distance to runway boundary (closest
+    # first) so confident snaps commit before borderline cases.
+    def _min_d_to_runway(s):
+        if s.role != ROLE_JUNCTION or s.polygon is None:
+            return float("inf")
+        c = list(s.polygon.exterior.coords)
+        if c and c[0] == c[-1]:
+            c = c[:-1]
+        if not c:
+            return float("inf")
+        m = float("inf")
+        for vx, vy in c:
+            for ax, ay, bx, by, _, _ in rwy_segs:
+                d, _, _ = _point_segment_distance(vx, vy, ax, ay, bx, by)
+                if d < m:
+                    m = d
+                    if m <= 1e-6:
+                        return m
+        return m
+
+    junction_indices_ordered = sorted(
+        (i for i, s in enumerate(layout.shapes)
+         if s.role == ROLE_JUNCTION and s.polygon is not None
+         and not s.polygon.is_empty
+         and s.polygon.geom_type == "Polygon"),
+        key=lambda i: _min_d_to_runway(layout.shapes[i]))
+
+    for shape_idx in junction_indices_ordered:
+        shape = layout.shapes[shape_idx]
         poly = shape.polygon
-        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
-            continue
         coords = list(poly.exterior.coords)
-        if not coords:
-            continue
         node_alts = shape.node_altitudes
         if node_alts is not None and len(node_alts) != len(coords):
             node_alts = None
@@ -451,10 +485,14 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
             continue
 
         # Pass 3: for each run, surgically replace it with the
-        # ordered runway-corner sequence (Option B).
+        # ordered runway-corner sequence (Option B).  Pass the
+        # GLOBAL claimed-corners list so we don't drop a target
+        # already used by an earlier-processed junction (sharing
+        # is allowed; the polygons just touch at that vertex).
         new_polygon = _rewrite_runway_runs(
             coords, node_alts, runs, nearest_seg,
-            shrink_collision_tol)
+            shrink_collision_tol,
+            claimed_corners=claimed_corners)
         if new_polygon is None:
             continue
         new_pts, new_alts_out = new_polygon
@@ -479,6 +517,19 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
         shape.polygon = new_poly
         if new_alts_out is not None:
             shape.node_altitudes = new_alts_out + [new_alts_out[0]]
+        # Commit this junction's runway corners to the global
+        # claimed set (other junctions can share these but won't
+        # snap-collide with them).
+        for v in new_pts:
+            on_rwy = False
+            for ax, ay, bx, by, _, _ in rwy_segs:
+                d, _, _ = _point_segment_distance(
+                    v[0], v[1], ax, ay, bx, by)
+                if d <= vertex_tol:
+                    on_rwy = True
+                    break
+            if on_rwy:
+                claimed_corners.append(v)
 
 
 def _rewrite_runway_runs(
@@ -488,6 +539,7 @@ def _rewrite_runway_runs(
     nearest_seg: List[
         Optional[Tuple[Tuple[float, float], Tuple[float, float]]]],
     shrink_collision_tol: float,
+    claimed_corners: Optional[List[Tuple[float, float]]] = None,
 ) -> Optional[Tuple[List[Tuple[float, float]], Optional[List[float]]]]:
     """Surgically replace each runway-near vertex run with the
     ordered sequence of runway corners.  Returns the new (open)
@@ -566,14 +618,12 @@ def _rewrite_runway_runs(
         def _proj(t):
             return ((t[0] - bvx) * dirx + (t[1] - bvy) * diry) / dirlen
         unique.sort(key=_proj)
-        # 5) Drop targets that fall OUTSIDE the BEFORE→AFTER span
-        # (would force polygon to backtrack — degenerate spike).
-        # Keep targets with 0 < projection < dirlen.
-        kept: List[Tuple[float, float]] = []
-        for t in unique:
-            p = _proj(t)
-            if -1.0 <= p <= dirlen + 1.0:
-                kept.append(t)
+        # 5) Keep all unique targets in walk-projection order.  The
+        # validity guard at the caller will reject any rewrite that
+        # produces an invalid polygon, so we no longer drop
+        # backtracking targets here — sharing claimed corners with
+        # adjacent junctions is per user 2026-05-02 explicitly OK.
+        kept: List[Tuple[float, float]] = list(unique)
         if not kept:
             continue
         # 6) Compose replacement sequence; per-vertex altitudes are
