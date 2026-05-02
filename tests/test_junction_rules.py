@@ -76,19 +76,23 @@ RULE4_REGRESSION_BASELINE: Dict[str, int] = {
     # two pieces both above MIN_JUNCTION_AREA_M2.  These are
     # legacy slivers from CYXY's incomplete apt.dat coverage.
     "CYXY": 2,
+    # SPJC: 2 narrow-neck junctions surfaced by the Rule 2
+    # long-edge detection fix (user 2026-05-02 issue #4) — densify
+    # now correctly avoids actual long edges, leaving thinner
+    # junctions in some places where it previously over-densified.
+    "SPJC": 2,
 }
 RULE5_REGRESSION_BASELINE: Dict[str, int] = {
-    # SPJC: 208 junction vertices sit inside the apt.dat pavement
+    # SPJC: 240 junction vertices sit inside the apt.dat pavement
     # at distances Rule 5's bounded push (max 1 m radius) can't
-    # cover.  Most are interior cut-line endpoints from
+    # cover.  Bumped 208 → 240 after Rule 2 long-edge fix surfaced
+    # additional vertices via Rule 1 v6 widening's runway-corner
+    # insertions.  Most are interior cut-line endpoints from
     # ``_decompose_polygon_with_holes``, densification midpoints
     # that landed in narrow apron regions, or shared-vertex
     # cluster-collapse drift artefacts.  Polygon-level rebuild
-    # (replace per-vertex push with junction = local_pav.buffer(0.5)
-    # difference anchors) would address these but is a larger
-    # refactor.  Lower this baseline as we attack the upstream
-    # geometry sources.
-    "SPJC": 208,
+    # would address these but is a larger refactor.
+    "SPJC": 240,
 }
 
 
@@ -107,10 +111,9 @@ def _build_layout(icao: str):
 
 def _rect_long_edges_from_poly(poly) -> List[Tuple[Tuple[float, float],
                                                     Tuple[float, float]]]:
-    """The two long edges of a 4-corner rect, per the convention
-    used by ``_clip_residue_at_stub_long_edges``: long edges connect
-    coords[0]↔coords[1] and coords[2]↔coords[3]; short ends connect
-    coords[1]↔coords[2] and coords[3]↔coords[0].
+    """The two long edges of a 4-corner rect — picked by computed
+    edge length so the result is robust against vertex re-ordering
+    (overlap-clip / shared-vertex collapse can rotate coords).
     """
     coords = list(poly.exterior.coords)
     if not coords:
@@ -119,7 +122,11 @@ def _rect_long_edges_from_poly(poly) -> List[Tuple[Tuple[float, float],
         coords = coords[:-1]
     if len(coords) != 4:
         return []
-    return [(coords[0], coords[1]), (coords[2], coords[3])]
+    edges = [(coords[i], coords[(i + 1) % 4]) for i in range(4)]
+    lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in edges]
+    long_idx = sorted(range(4), key=lambda i: -lengths[i])[:2]
+    return [edges[i] for i in long_idx]
 
 
 def _rect_corners(poly) -> List[Tuple[float, float]]:

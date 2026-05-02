@@ -151,12 +151,15 @@ def _rect_long_edges(
     long edge endpoints and (corner_a, corner_b) are the same two
     points (corners that bound this long edge).
 
-    Per the rect-build convention used in
-    ``_clip_residue_at_stub_long_edges`` (`pavement/stubs.py:495`),
-    a 4-corner rect's exterior coords are ordered so that
-    ``[(coords[0], coords[1]), (coords[2], coords[3])]`` are the
-    long edges (parallel to the axis) and the two short ends are
-    ``[(coords[1], coords[2]), (coords[3], coords[0])]``.
+    Per user 2026-05-02 (issue #4): the index-based convention
+    ``coords[0]↔coords[1]`` & ``coords[2]↔coords[3]`` does NOT
+    hold for all rects — overlap-clip / shared-vertex collapse can
+    rotate the polygon's vertex order, e.g. SPJC primary_parallel
+    -10013 has SHORT edges at those indices and LONG edges at
+    ``coords[1]↔coords[2]`` & ``coords[3]↔coords[0]``.
+
+    Solution: pick the 2 longest of the 4 edges by computed length.
+    Robust regardless of how the polygon was assembled.
     """
     coords = list(rect.exterior.coords)
     if not coords:
@@ -165,10 +168,12 @@ def _rect_long_edges(
         coords = coords[:-1]
     if len(coords) != 4:
         return []
-    return [
-        (coords[0], coords[1], coords[0], coords[1]),
-        (coords[2], coords[3], coords[2], coords[3]),
-    ]
+    edges = [(coords[i], coords[(i + 1) % 4]) for i in range(4)]
+    lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in edges]
+    long_idx = sorted(range(4), key=lambda i: -lengths[i])[:2]
+    return [(edges[i][0], edges[i][1], edges[i][0], edges[i][1])
+            for i in long_idx]
 
 
 def _point_segment_distance(
