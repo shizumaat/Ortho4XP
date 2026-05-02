@@ -50,13 +50,7 @@ RULE1_REGRESSION_BASELINE: Dict[str, int] = {
     "SPJC": 2,
 }
 RULE2_REGRESSION_BASELINE: Dict[str, int] = {
-    # SPJC: 6 vertices remain at 1 m perpendicular to actual
-    # sloping edges (newly visible after the source_axis-based
-    # detection fix, user 2026-05-02).  These are residue-trace
-    # vertices from upstream emit; my Rule 2 snap should catch
-    # them but doesn't yet — pending investigation.  The
-    # densify-skip widens to skip them in future passes.
-    "SPJC": 6,
+    "SPJC": 0,
     # CYXY: 1 corner-adjacent vertex (2.14 m perp from edge, 2.15 m
     # from corner) where the snap's segment-projection check
     # marginally exempts it.  Edge case — junction's own boundary
@@ -115,12 +109,54 @@ def _build_layout(icao: str):
     return layout
 
 
-def _rect_long_edges_from_poly(poly) -> List[Tuple[Tuple[float, float],
-                                                    Tuple[float, float]]]:
-    """The two long edges of a 4-corner rect — picked by computed
-    edge length so the result is robust against vertex re-ordering
-    (overlap-clip / shared-vertex collapse can rotate coords).
+def _rect_sloping_edges_from_shape(shape) -> List[
+        Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """The two SLOPING edges of a 4-corner rect — edges parallel
+    to ``source_axis`` (where altitude varies linearly).  Per user
+    2026-05-02 clarification: 'long' vs 'short' was misleading;
+    what matters is direction of slope.  Falls back to longest-2
+    if source_axis is missing.
     """
+    poly = shape.polygon
+    coords = list(poly.exterior.coords)
+    if not coords:
+        return []
+    if coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) != 4:
+        return []
+    edges = [(coords[i], coords[(i + 1) % 4]) for i in range(4)]
+    sa = getattr(shape, "source_axis", None)
+    if sa is not None and not sa.is_empty:
+        ax_pts = list(sa.coords)
+        if len(ax_pts) >= 2:
+            axdx = ax_pts[-1][0] - ax_pts[0][0]
+            axdy = ax_pts[-1][1] - ax_pts[0][1]
+            axlen = math.hypot(axdx, axdy)
+            if axlen >= 1e-6:
+                aux, auy = axdx / axlen, axdy / axlen
+                dots = []
+                for a, b in edges:
+                    ex, ey = b[0] - a[0], b[1] - a[1]
+                    elen = math.hypot(ex, ey)
+                    if elen < 1e-6:
+                        dots.append(0.0)
+                        continue
+                    dots.append(abs(ex * aux + ey * auy) / elen)
+                sloping_idx = sorted(
+                    range(4), key=lambda i: -dots[i])[:2]
+                return [edges[i] for i in sloping_idx]
+    lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in edges]
+    long_idx = sorted(range(4), key=lambda i: -lengths[i])[:2]
+    return [edges[i] for i in long_idx]
+
+
+# Backward-compat alias.
+def _rect_long_edges_from_poly(poly):
+    """Legacy length-based; new code should use
+    ``_rect_sloping_edges_from_shape(shape)`` to get the correct
+    sloping edges via source_axis."""
     coords = list(poly.exterior.coords)
     if not coords:
         return []
@@ -210,7 +246,7 @@ def test_junction_no_long_edge_proximity(icao):
             continue
         if s.polygon is None or s.polygon.is_empty:
             continue
-        for (a, b) in _rect_long_edges_from_poly(s.polygon):
+        for (a, b) in _rect_sloping_edges_from_shape(s):
             long_edges.append((a[0], a[1], b[0], b[1]))
         rect_corners.extend(_rect_corners(s.polygon))
 
