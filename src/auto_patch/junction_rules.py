@@ -25,6 +25,7 @@ import math
 from typing import List, Optional, Sequence, Tuple
 
 from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import unary_union
 
 from .config import (
     AXIS_ALIGN_TOL_DEG,
@@ -337,6 +338,248 @@ def _snap_to_long_edge_corners(layout: PavementLayout) -> None:
 # ── Rule 1: junction-runway 1:1 vertex sharing ───────────────────
 
 
+def _build_runway_union_chain(
+    runway_shapes: Sequence[BuiltShape],
+) -> Tuple[List[Tuple[float, float]],
+           dict]:
+    """Walk the runway-union boundary (one continuous loop per
+    contiguous runway component) and return:
+      * ``chain`` — list of corner positions in walk order.  For
+        a multi-component layout (e.g. parallel runways) all
+        components are concatenated; segment-internal seams are
+        skipped because the union eliminates them.
+      * ``corner_index`` — dict mapping bucketed (round to ~0.5 m)
+        corner key → its position in ``chain``.
+    """
+    if not runway_shapes:
+        return [], {}
+    polys = [s.polygon for s in runway_shapes
+             if s.polygon is not None and not s.polygon.is_empty]
+    if not polys:
+        return [], {}
+    try:
+        union = unary_union(polys)
+    except Exception:
+        return [], {}
+    components: List[Polygon] = []
+    if union.geom_type == "Polygon":
+        components.append(union)
+    else:
+        for g in getattr(union, "geoms", []):
+            if g.geom_type == "Polygon" and not g.is_empty:
+                components.append(g)
+    chain: List[Tuple[float, float]] = []
+    corner_index: dict = {}
+    for poly in components:
+        coords = list(poly.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for c in coords:
+            key = (round(c[0] * 2.0), round(c[1] * 2.0))
+            corner_index[key] = len(chain)
+            chain.append((float(c[0]), float(c[1])))
+    return chain, corner_index
+
+
+def _build_runway_corner_altitudes(
+    runway_shapes: Sequence[BuiltShape],
+) -> dict:
+    """Map bucketed runway-corner key → altitude.  Per the convention
+    in ``triangulation.py:165-170``: ``coords[0]`` and ``coords[3]``
+    are at the ``altitude_high`` end; ``coords[1]`` and ``coords[2]``
+    are at the ``altitude_low`` end.  Seam corners assigned twice
+    (once from each adjacent segment) — the values should match
+    because adjacent segments slope continuously through the seam.
+    """
+    out: dict = {}
+    for s in runway_shapes:
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        coords = list(s.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        if (s.altitude_high is not None
+                and s.altitude_low is not None):
+            corner_alts = (
+                (coords[0], float(s.altitude_high)),
+                (coords[1], float(s.altitude_low)),
+                (coords[2], float(s.altitude_low)),
+                (coords[3], float(s.altitude_high)),
+            )
+        elif s.altitude is not None:
+            a = float(s.altitude)
+            corner_alts = tuple((c, a) for c in coords)
+        else:
+            continue
+        for c, alt in corner_alts:
+            key = (round(c[0] * 2.0), round(c[1] * 2.0))
+            # Take the FIRST encounter; matching with the second
+            # encounter is asserted via the elevation pipeline's
+            # continuity check.
+            if key not in out:
+                out[key] = alt
+    return out
+
+
+def _widen_runway_shared_corners(
+    layout: PavementLayout,
+    chain: Sequence[Tuple[float, float]],
+    corner_index: dict,
+    corner_alt: dict,
+) -> None:
+    """Rule 1 v6 widening (user 2026-05-02): for each junction with
+    at least one runway-shared vertex, insert the immediately-
+    adjacent runway corners (one on each side, walking the runway
+    union boundary) as new junction vertices.  The polygon may
+    grow a thin arm extending along the runway — this is acceptable
+    per the user direction.
+
+    New vertices' altitudes are taken from the runway corner's
+    altitude, providing smooth elevation continuity.
+    """
+    if not chain or len(chain) < 2:
+        return
+    n_chain = len(chain)
+    vertex_tol = SHARED_VERTEX_TOL_M
+
+    def _key(p):
+        return (round(p[0] * 2.0), round(p[1] * 2.0))
+
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            continue
+        poly = shape.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        coords = list(poly.exterior.coords)
+        if not coords:
+            continue
+        node_alts = shape.node_altitudes
+        if node_alts is not None and len(node_alts) != len(coords):
+            node_alts = None
+        had_close = (coords[0] == coords[-1])
+        if had_close:
+            coords = coords[:-1]
+            if node_alts is not None:
+                node_alts = list(node_alts[:-1])
+        n = len(coords)
+        if n < 3:
+            continue
+
+        # Identify runway-shared vertices in the polygon.
+        # shared_in_poly: list of (poly_idx, chain_corner_position)
+        existing_keys = set(_key(v) for v in coords)
+        shared_in_poly: List[Tuple[int, Tuple[float, float]]] = []
+        for i, v in enumerate(coords):
+            k = _key(v)
+            if k in corner_index:
+                shared_in_poly.append((i, chain[corner_index[k]]))
+
+        if not shared_in_poly:
+            continue
+
+        # User 2026-05-02 spec: 2, 3, or 4 runway-shared nodes per
+        # junction.  Cap at 4 — if v5 already widened to 2+, only
+        # add up to (4 - current) more.
+        max_total_shared = 4
+        current_shared_count = len(shared_in_poly)
+        max_inserts = max(0, max_total_shared - current_shared_count)
+        if max_inserts == 0:
+            continue
+
+        # Build insertions: list of (insert_at_position, new_vertex,
+        # new_altitude).  insert_at_position uses the ORIGINAL coords
+        # indices; we'll apply them in reverse order.
+        insertions: List[
+            Tuple[int, Tuple[float, float], Optional[float]]] = []
+
+        for poly_idx, corner in shared_in_poly:
+            if len(insertions) >= max_inserts:
+                break
+            ci = corner_index[_key(corner)]
+            chain_neighbors = (
+                chain[(ci - 1) % n_chain],
+                chain[(ci + 1) % n_chain],
+            )
+            prev_v = coords[(poly_idx - 1) % n]
+            next_v = coords[(poly_idx + 1) % n]
+
+            for neighbor in chain_neighbors:
+                if len(insertions) >= max_inserts:
+                    break
+                # Skip if already a junction vertex.
+                if _key(neighbor) in existing_keys:
+                    continue
+                # Decide insertion side: BEFORE poly_idx or AFTER.
+                # Compare angles from corner to neighbor vs to
+                # prev_v / next_v in polygon walk; pick the side
+                # whose angle is closer to the neighbor's.
+                ax_n, ay_n = (neighbor[0] - corner[0],
+                              neighbor[1] - corner[1])
+                ax_p, ay_p = (prev_v[0] - corner[0],
+                              prev_v[1] - corner[1])
+                ax_x, ay_x = (next_v[0] - corner[0],
+                              next_v[1] - corner[1])
+                a_n = math.atan2(ay_n, ax_n)
+                a_p = math.atan2(ay_p, ax_p)
+                a_x = math.atan2(ay_x, ax_x)
+
+                def _ang_diff(a, b):
+                    d = abs(a - b) % (2 * math.pi)
+                    return min(d, 2 * math.pi - d)
+
+                d_to_prev = _ang_diff(a_n, a_p)
+                d_to_next = _ang_diff(a_n, a_x)
+                if d_to_prev <= d_to_next:
+                    insert_at = poly_idx       # before
+                else:
+                    insert_at = poly_idx + 1   # after
+                alt = corner_alt.get(_key(neighbor))
+                insertions.append((insert_at, neighbor, alt))
+                # Track this neighbor as "now-in-polygon" so we
+                # don't insert duplicates from other shared corners.
+                existing_keys.add(_key(neighbor))
+
+        if not insertions:
+            continue
+
+        # Apply insertions in REVERSE position order so earlier
+        # indices remain valid.
+        insertions.sort(key=lambda x: -x[0])
+        new_coords = list(coords)
+        new_alts: Optional[List[float]] = (
+            list(node_alts) if node_alts is not None else None)
+        for pos, vert, alt in insertions:
+            new_coords.insert(pos, vert)
+            if new_alts is not None:
+                new_alts.insert(pos, alt if alt is not None else 0.0)
+
+        # Validate polygon.
+        if len(new_coords) < 3:
+            continue
+        try:
+            new_poly = Polygon(new_coords).buffer(0)
+        except Exception:
+            continue
+        if new_poly.is_empty:
+            continue
+        if new_poly.geom_type == "MultiPolygon":
+            new_poly = max(new_poly.geoms, key=lambda g: g.area)
+        if new_poly.geom_type != "Polygon":
+            continue
+        if not new_poly.is_valid or not new_poly.is_simple:
+            continue
+        # Allow polygon to GROW (Rule 1 v6 widening) but not shrink
+        # significantly — a > 50 % shrink suggests degenerate snap.
+        if new_poly.area < 0.5 * poly.area:
+            continue
+        shape.polygon = new_poly
+        if new_alts is not None:
+            shape.node_altitudes = new_alts + [new_alts[0]]
+
+
 def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
     """Rule 1 v4 — surgical runway-edge rewrite (user 2026-05-02).
 
@@ -508,8 +751,6 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
             new_poly = max(new_poly.geoms, key=lambda g: g.area)
         if new_poly.geom_type != "Polygon":
             continue
-        # Validity guard: if the rewrite shrinks area dramatically
-        # or creates an invalid polygon, skip the rewrite.
         if not new_poly.is_valid or not new_poly.is_simple:
             continue
         if new_poly.area < 0.5 * poly.area:
@@ -517,9 +758,6 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
         shape.polygon = new_poly
         if new_alts_out is not None:
             shape.node_altitudes = new_alts_out + [new_alts_out[0]]
-        # Commit this junction's runway corners to the global
-        # claimed set (other junctions can share these but won't
-        # snap-collide with them).
         for v in new_pts:
             on_rwy = False
             for ax, ay, bx, by, _, _ in rwy_segs:
@@ -530,6 +768,13 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
                     break
             if on_rwy:
                 claimed_corners.append(v)
+
+    # Phase 2 (v6 widening, DISABLED): widening via insertion at
+    # outboard runway corners over-grows because the segmented
+    # runway has dense corners and insertions cascade across multiple
+    # passes.  Needs cleaner per-junction integration with Rule 4
+    # split + post-elevation re-segmentation before re-enabling.
+    # See user 2026-05-02 thread.
 
 
 def _rewrite_runway_runs(
