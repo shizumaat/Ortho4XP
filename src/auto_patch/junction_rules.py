@@ -338,25 +338,32 @@ def _snap_to_long_edge_corners(layout: PavementLayout) -> None:
 
 
 def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
-    """Rule 1 v2 (user 2026-05-02): junctions meeting a runway must
-    WIDEN to share runway nodes — never narrow.  For each contiguous
-    run of junction vertices within ``RUNWAY_ADJACENCY_TOL_M`` of
-    the runway boundary, snap each run vertex to its closest runway
-    segment's endpoint chosen to be OUTBOARD (away from the run's
-    centroid).  This grows the junction's runway-facing edge to
-    span the next runway nodes on each side.
+    """Rule 1 v4 — surgical runway-edge rewrite (user 2026-05-02).
 
-    For a 2-vertex run: the two flanking vertices snap to OPPOSITE
-    endpoints of their respective segments, widening the junction
-    to span the runway joining region.
+    For each junction polygon, find each contiguous run of vertices
+    within ``RUNWAY_ADJACENCY_TOL_M`` of the runway boundary and
+    REPLACE the run with a clean sequence of runway corners ordered
+    to match the polygon's walk direction.
 
-    For a 3+-vertex run with an interior already-shared runway
-    vertex: the interior vertex stays (it's already at a runway
-    corner); the flanking vertices snap outboard.
+    Per-vertex snap rule (user 2026-05-02):
+      * Each runway-near vertex's target = nearer endpoint of its
+        nearest runway edge.
+      * If that target collides with an existing junction vertex
+        (snap would shrink), use the other endpoint of the same
+        edge instead.
 
-    Per-vertex altitudes are preserved by index (a snapped vertex
-    keeps its existing altitude entry; dropped vertices' altitudes
-    are removed in lockstep).
+    Order rule:
+      * Sort the unique snap targets by their progression from the
+        polygon's vertex BEFORE the run to the polygon's vertex
+        AFTER the run.
+      * Drop targets that would force the polygon to backtrack
+        (would create a degenerate spike) — the resulting
+        junction-runway interface is then bounded by the polygon
+        body's natural extent.
+
+    Per-vertex altitudes drop alongside replaced vertices; new
+    runway-corner vertices have no per-vertex altitude (the
+    elevation pipeline interpolates from neighbours).
     """
     runway_shapes = [
         s for s in layout.shapes
@@ -388,28 +395,12 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
     if not rwy_segs:
         return
 
-    # Rule 1 v3 (user 2026-05-02 clarified):
-    #   * Each junction-runway interface has 2, 3, or 4 shared
-    #     nodes — never 1, never 5+.  The 4-node case occurs when
-    #     two diagonal stubs converge at the runway.
-    #   * Each runway-near junction vertex snaps to the nearer
-    #     endpoint of its NEAREST RUNWAY EDGE.
-    #   * If that snap would SHRINK the junction (collide with an
-    #     existing junction vertex), snap to the OTHER endpoint of
-    #     the same edge instead — widening, never narrowing.
-    #   * Never insert a new node onto the runway segment.
     adjacency_tol = RUNWAY_ADJACENCY_TOL_M
     vertex_tol = SHARED_VERTEX_TOL_M
     # A snap "would shrink" when the candidate target is within
     # this distance of any OTHER existing junction vertex
     # (collision = unintended dedupe).
     shrink_collision_tol = SHARED_VERTEX_TOL_M * 2.0
-    # Cap on how far a single snap can move a vertex.  Beyond this
-    # the snap risks overlapping adjacent junctions; it's safer to
-    # leave the vertex alone and accept that the junction won't
-    # share that node.  Tuned conservatively for SPJC's 48 m runway
-    # segments.
-    MAX_SNAP_MOVE_M = 30.0
 
     for shape in layout.shapes:
         if shape.role != ROLE_JUNCTION:
@@ -459,81 +450,18 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
         if not runs:
             continue
 
-        # Pass 3 (v3): snap each runway-near vertex to the NEAREST
-        # endpoint of its closest runway segment.  If that snap
-        # would collide with an existing junction vertex (shrinking
-        # the polygon), pick the OTHER endpoint of the same edge.
-        new_pts: List[Tuple[float, float]] = list(coords)
-        new_alts: Optional[List[Optional[float]]] = (
-            list(node_alts) if node_alts is not None else None)
-        changed = False
-        for run_indices in runs:
-            for idx in run_indices:
-                seg_endpoints = nearest_seg[idx]
-                if seg_endpoints is None:
-                    continue
-                c1, c2 = seg_endpoints
-                vx, vy = coords[idx]
-                d1c = math.hypot(vx - c1[0], vy - c1[1])
-                d2c = math.hypot(vx - c2[0], vy - c2[1])
-                # Tentative snap: nearer endpoint.
-                if d1c <= d2c:
-                    primary, alt = c1, c2
-                else:
-                    primary, alt = c2, c1
-                # Check whether the primary target collides with
-                # ANY existing junction vertex (other than vertex
-                # ``idx`` itself).
-                def _collides(target):
-                    for k, (px, py) in enumerate(new_pts):
-                        if k == idx:
-                            continue
-                        if math.hypot(target[0] - px,
-                                      target[1] - py) <= shrink_collision_tol:
-                            return True
-                    return False
-                if _collides(primary):
-                    # Would shrink — try the other endpoint.
-                    if not _collides(alt):
-                        target = alt
-                    else:
-                        # Both endpoints collide; leave vertex alone
-                        # (junction is already at one of these or
-                        # squeezed between two adjacent junctions).
-                        continue
-                else:
-                    target = primary
-                if target == (vx, vy):
-                    continue
-                # Cap snap displacement to avoid overlapping
-                # adjacent junctions.
-                if math.hypot(target[0] - vx,
-                              target[1] - vy) > MAX_SNAP_MOVE_M:
-                    continue
-                new_pts[idx] = target
-                changed = True
-
-        if not changed:
+        # Pass 3: for each run, surgically replace it with the
+        # ordered runway-corner sequence (Option B).
+        new_polygon = _rewrite_runway_runs(
+            coords, node_alts, runs, nearest_seg,
+            shrink_collision_tol)
+        if new_polygon is None:
             continue
-
-        # Dedupe consecutive identical vertices (snap may collapse
-        # adjacent vertices onto the same runway corner).
-        deduped_pts: List[Tuple[float, float]] = []
-        deduped_alts: Optional[List[float]] = (
-            [] if new_alts is not None else None)
-        for j, (px, py) in enumerate(new_pts):
-            if deduped_pts:
-                qx, qy = deduped_pts[-1]
-                if math.hypot(px - qx, py - qy) <= vertex_tol:
-                    continue
-            deduped_pts.append((px, py))
-            if deduped_alts is not None:
-                a = new_alts[j]
-                deduped_alts.append(a if a is not None else 0.0)
-        if len(deduped_pts) < 3:
+        new_pts, new_alts_out = new_polygon
+        if len(new_pts) < 3:
             continue
         try:
-            new_poly = Polygon(deduped_pts).buffer(0)
+            new_poly = Polygon(new_pts).buffer(0)
         except Exception:
             continue
         if new_poly.is_empty:
@@ -542,9 +470,157 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
             new_poly = max(new_poly.geoms, key=lambda g: g.area)
         if new_poly.geom_type != "Polygon":
             continue
+        # Validity guard: if the rewrite shrinks area dramatically
+        # or creates an invalid polygon, skip the rewrite.
+        if not new_poly.is_valid or not new_poly.is_simple:
+            continue
+        if new_poly.area < 0.5 * poly.area:
+            continue
         shape.polygon = new_poly
-        if deduped_alts is not None:
-            shape.node_altitudes = deduped_alts + [deduped_alts[0]]
+        if new_alts_out is not None:
+            shape.node_altitudes = new_alts_out + [new_alts_out[0]]
+
+
+def _rewrite_runway_runs(
+    coords: List[Tuple[float, float]],
+    node_alts: Optional[List[float]],
+    runs: List[List[int]],
+    nearest_seg: List[
+        Optional[Tuple[Tuple[float, float], Tuple[float, float]]]],
+    shrink_collision_tol: float,
+) -> Optional[Tuple[List[Tuple[float, float]], Optional[List[float]]]]:
+    """Surgically replace each runway-near vertex run with the
+    ordered sequence of runway corners.  Returns the new (open)
+    coord list and (optional) per-vertex altitude list, or None if
+    no rewrite is possible.
+
+    Per Option B: the run vertices are DROPPED entirely; runway
+    corners are INSERTED in walk order (BEFORE_RUN → AFTER_RUN)
+    such that the polygon's body vertices outside the run are
+    preserved exactly.
+    """
+    n = len(coords)
+    if not runs:
+        return None
+
+    # Build per-run replacement.  Returns list of (run_set,
+    # replacement_corners, replacement_alts).
+    replacements: List[
+        Tuple[set, List[Tuple[float, float]],
+              Optional[List[float]]]
+    ] = []
+    for run_indices in runs:
+        # 1) Compute snap target per vertex (shrink-fallback).
+        seen_targets: List[Tuple[float, float]] = []
+        for idx in run_indices:
+            seg_endpoints = nearest_seg[idx]
+            if seg_endpoints is None:
+                continue
+            c1, c2 = seg_endpoints
+            vx, vy = coords[idx]
+            d1c = math.hypot(vx - c1[0], vy - c1[1])
+            d2c = math.hypot(vx - c2[0], vy - c2[1])
+            primary, alt = (c1, c2) if d1c <= d2c else (c2, c1)
+            # Check collision with junction vertices NOT in this run.
+            def _collides(target, excluded_set=set(run_indices)):
+                for k in range(n):
+                    if k in excluded_set:
+                        continue
+                    px, py = coords[k]
+                    if math.hypot(target[0] - px,
+                                  target[1] - py) <= shrink_collision_tol:
+                        return True
+                return False
+            if _collides(primary):
+                if not _collides(alt):
+                    target = alt
+                else:
+                    continue
+            else:
+                target = primary
+            seen_targets.append(target)
+        # 2) Dedupe targets (preserve order of first appearance).
+        unique: List[Tuple[float, float]] = []
+        seen_keys: set = set()
+        for t in seen_targets:
+            key = (round(t[0] * 2.0), round(t[1] * 2.0))  # ~0.5 m bucket
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique.append(t)
+        if not unique:
+            continue
+        # 3) Determine walk direction: vector from BEFORE_RUN vertex
+        # to AFTER_RUN vertex.
+        before_idx = (run_indices[0] - 1) % n
+        after_idx = (run_indices[-1] + 1) % n
+        bvx, bvy = coords[before_idx]
+        avx, avy = coords[after_idx]
+        dirx = avx - bvx
+        diry = avy - bvy
+        dirlen = math.hypot(dirx, diry)
+        if dirlen < 1e-6:
+            continue
+        # 4) Order targets by progression along walk direction
+        # (project onto dir vector starting at BEFORE_RUN vertex).
+        def _proj(t):
+            return ((t[0] - bvx) * dirx + (t[1] - bvy) * diry) / dirlen
+        unique.sort(key=_proj)
+        # 5) Drop targets that fall OUTSIDE the BEFORE→AFTER span
+        # (would force polygon to backtrack — degenerate spike).
+        # Keep targets with 0 < projection < dirlen.
+        kept: List[Tuple[float, float]] = []
+        for t in unique:
+            p = _proj(t)
+            if -1.0 <= p <= dirlen + 1.0:
+                kept.append(t)
+        if not kept:
+            continue
+        # 6) Compose replacement sequence; per-vertex altitudes are
+        # inherited from the run's first/last existing entries when
+        # available (just to avoid Nones — elevation pipeline will
+        # re-interpolate).
+        rep_alts: Optional[List[float]] = None
+        if node_alts is not None:
+            run_alt_avg = (sum(node_alts[i] for i in run_indices)
+                           / max(1, len(run_indices)))
+            rep_alts = [run_alt_avg] * len(kept)
+        replacements.append((set(run_indices), kept, rep_alts))
+
+    if not replacements:
+        return None
+
+    # Build new coord list: walk original polygon, dropping in-run
+    # vertices and inserting replacement at the END of each run.
+    out_pts: List[Tuple[float, float]] = []
+    out_alts: Optional[List[float]] = (
+        [] if node_alts is not None else None)
+    # Index runs by their first index for quick lookup.
+    run_by_first: dict = {r[0][0]: r for r in
+                          [(run_indices, rep, alts)
+                           for run_indices_set, rep, alts in replacements
+                           for run_indices in [sorted(run_indices_set)]]}
+    # Easier: build a flat per-index drop set + per-first-index insert.
+    drop = set()
+    insert_at = {}
+    for run_set, rep, alts in replacements:
+        drop.update(run_set)
+        run_sorted = sorted(run_set)
+        insert_at[run_sorted[0]] = (rep, alts)
+    for i in range(n):
+        if i in drop:
+            if i in insert_at:
+                rep, alts = insert_at[i]
+                for k, t in enumerate(rep):
+                    out_pts.append(t)
+                    if out_alts is not None:
+                        out_alts.append(alts[k] if alts else 0.0)
+            # Skip this vertex (in-run, dropped).
+            continue
+        out_pts.append(coords[i])
+        if out_alts is not None:
+            out_alts.append(node_alts[i])
+    return out_pts, out_alts
 
 
 def _find_circular_runs(flags: Sequence[bool], n: int) -> List[List[int]]:
