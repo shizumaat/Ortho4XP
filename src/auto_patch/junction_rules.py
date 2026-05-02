@@ -48,6 +48,7 @@ from .layout import (
 __all__ = [
     "apply_junction_rules",
     "longest_runway_axis_deg",
+    "widen_junctions_to_runway_corners",
 ]
 
 
@@ -423,11 +424,60 @@ def _build_runway_corner_altitudes(
     return out
 
 
+def widen_junctions_to_runway_corners(
+    layout: PavementLayout,
+) -> None:
+    """Public entrypoint: widen each junction's runway-shared
+    vertices by inserting the immediately-adjacent corners along
+    the runway-union boundary.  Called POST-ELEVATION (after the
+    runway is segmented and altitudes are committed) so:
+      * the chain has all the segment seam corners
+      * we can pull each new junction vertex's altitude from the
+        runway shape's ``altitude_high`` / ``altitude_low``
+
+    Per-junction cap of 4 runway-shared nodes (user 2026-05-02
+    spec: 2, 3, or 4 nodes).
+    """
+    runway_shapes = [s for s in layout.shapes
+                     if s.role == ROLE_RUNWAY
+                     and s.polygon is not None
+                     and not s.polygon.is_empty
+                     and s.polygon.geom_type == "Polygon"]
+    if not runway_shapes:
+        return
+    chain, corner_index = _build_runway_union_chain(runway_shapes)
+    corner_alt = _build_runway_corner_altitudes(runway_shapes)
+    _widen_runway_shared_corners(layout, chain, corner_index, corner_alt)
+
+
 def _widen_runway_shared_corners(
     layout: PavementLayout,
     chain: Sequence[Tuple[float, float]],
     corner_index: dict,
     corner_alt: dict,
+) -> None:
+    # Pre-compute runway union for overlap rejection (per user
+    # 2026-05-02: junctions and runways must never overlap; if a
+    # widening insertion would extend the polygon body across the
+    # runway boundary, revert the insertion).
+    runway_polys = [s.polygon for s in layout.shapes
+                    if s.role == ROLE_RUNWAY
+                    and s.polygon is not None
+                    and not s.polygon.is_empty]
+    try:
+        runway_union = unary_union(runway_polys) if runway_polys else None
+    except Exception:
+        runway_union = None
+    return _do_widen(
+        layout, chain, corner_index, corner_alt, runway_union)
+
+
+def _do_widen(
+    layout: PavementLayout,
+    chain: Sequence[Tuple[float, float]],
+    corner_index: dict,
+    corner_alt: dict,
+    runway_union,
 ) -> None:
     """Rule 1 v6 widening (user 2026-05-02): for each junction with
     at least one runway-shared vertex, insert the immediately-
@@ -574,6 +624,32 @@ def _widen_runway_shared_corners(
         # Allow polygon to GROW (Rule 1 v6 widening) but not shrink
         # significantly — a > 50 % shrink suggests degenerate snap.
         if new_poly.area < 0.5 * poly.area:
+            continue
+        # Overlap rejection: if the widened polygon overlaps the
+        # runway OR any other junction polygon by > a tiny noise
+        # tolerance, the insertion wrapped the polygon body across
+        # a neighbour boundary — revert.
+        if runway_union is not None and not runway_union.is_empty:
+            try:
+                ovl = new_poly.intersection(runway_union).area
+            except Exception:
+                ovl = 0.0
+            if ovl > 1.0:
+                continue
+        # Check overlap against OTHER junctions (excluding self).
+        bad = False
+        for other in layout.shapes:
+            if other is shape or other.role != ROLE_JUNCTION:
+                continue
+            if other.polygon is None or other.polygon.is_empty:
+                continue
+            try:
+                if new_poly.intersection(other.polygon).area > 1.0:
+                    bad = True
+                    break
+            except Exception:
+                pass
+        if bad:
             continue
         shape.polygon = new_poly
         if new_alts is not None:

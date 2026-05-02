@@ -1719,9 +1719,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _enforce_runway_1to1_sharing,
             _push_junction_vertices_outside_pavement,
             _snap_to_long_edge_corners,
+            widen_junctions_to_runway_corners,
         )
         _snap_to_long_edge_corners(layout)
         _enforce_runway_1to1_sharing(layout)
+        # Rule 1 v6 widening (user 2026-05-02): runs ONLY here,
+        # post-elevation, after the runway is segmented.  Inserts
+        # outboard runway corners as new junction vertices with
+        # matching altitudes.  Pre-elevation widening was disabled
+        # because the cascade with Rule 4 + segmentation re-run
+        # over-grew junctions past the 4-node cap.
+        widen_junctions_to_runway_corners(layout)
         _push_junction_vertices_outside_pavement(layout)
 
     return layout
