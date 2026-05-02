@@ -589,8 +589,42 @@ def _do_widen(
                 d_to_next = _ang_diff(a_n, a_x)
                 if d_to_prev <= d_to_next:
                     insert_at = poly_idx       # before
+                    flank_v = prev_v           # vertex before corner
                 else:
                     insert_at = poly_idx + 1   # after
+                    flank_v = next_v           # vertex after corner
+
+                # Per user 2026-05-02 issue #1/#2: reject the
+                # insertion if it creates a JAG (sharp backtrack)
+                # in the polygon walk.  At the inserted vertex N,
+                # the turn angle = angle between (flank→N) and
+                # (N→corner) for "before" insertion, or
+                # (corner→N) and (N→flank) for "after".  A turn >
+                # JAG_THRESHOLD_DEG means the polygon doubles back
+                # — the corner is too far outboard for the
+                # polygon body to reach naturally.
+                if d_to_prev <= d_to_next:
+                    # Walk: flank_v → N → corner
+                    e1 = (neighbor[0] - flank_v[0],
+                          neighbor[1] - flank_v[1])
+                    e2 = (corner[0] - neighbor[0],
+                          corner[1] - neighbor[1])
+                else:
+                    # Walk: corner → N → flank_v
+                    e1 = (neighbor[0] - corner[0],
+                          neighbor[1] - corner[1])
+                    e2 = (flank_v[0] - neighbor[0],
+                          flank_v[1] - neighbor[1])
+                m1 = math.hypot(*e1)
+                m2 = math.hypot(*e2)
+                if m1 > 1e-6 and m2 > 1e-6:
+                    cos_turn = (e1[0] * e2[0]
+                                + e1[1] * e2[1]) / (m1 * m2)
+                    # cos_turn near +1 = straight; near -1 = U-turn.
+                    # Reject when turn > 135° (cos < -0.7).
+                    if cos_turn < -0.7:
+                        continue
+
                 alt = corner_alt.get(_key(neighbor))
                 insertions.append((insert_at, neighbor, alt))
                 # Track this neighbor as "now-in-polygon" so we
