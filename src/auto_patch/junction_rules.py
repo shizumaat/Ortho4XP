@@ -77,6 +77,12 @@ def apply_junction_rules(layout: PavementLayout) -> None:
     # Phase 3 (landed): Rule 4 — split narrow necks.
     _split_narrow_necks(layout, runway_axis_deg)
 
+    # Phase 5 (landed): Rule 5 — push junction vertices outside
+    # apt.dat pavement boundary.  Runs LAST so the rule sees the
+    # final polygon shapes (after Rule 1/2/4 reshapes); any vertex
+    # that ended up inside the pavement gets pushed back out.
+    _push_junction_vertices_outside_pavement(layout)
+
     # Phase 4 (TODO): Rule 3 — axis-align cut lines.
     # _axis_align_non_pavement_borders(layout, runway_axis_deg)
 
@@ -599,3 +605,247 @@ def _split_narrow_necks(
             new_shapes.append(BuiltShape(polygon=p, role=ROLE_JUNCTION))
     if new_shapes:
         layout.shapes.extend(new_shapes)
+
+
+# ── Rule 5: push junction vertices outside pavement boundary ────
+
+
+# Per user 2026-05-02: every junction vertex that ISN'T shared with
+# an anchor (rect / runway / terminal) must sit OUTSIDE the apt.dat
+# pavement boundary, within ``PAVEMENT_OUTWARD_OFFSET_MAX_M``.  This
+# guarantees the elevation-smoothing junction polygon FULLY ENCLOSES
+# the apt.dat pavement (any apt.dat pavement is INSIDE one of our
+# emitted shapes), so no rendered pavement renders outside its
+# elevation-smoothed shape.
+PAVEMENT_OUTWARD_OFFSET_M = 0.5
+PAVEMENT_OUTWARD_OFFSET_MAX_M = 1.0
+PAVEMENT_INSIDE_TOL_M = 0.1  # treat vertices within this of boundary as on-it
+
+# Rule 5 is a NEAR-BOUNDARY pass: vertices farther than this distance
+# from the pavement boundary aren't push candidates.  Vertices inside
+# pavement at greater depths are typically:
+#   * Interior cut-line endpoints from ``_decompose_polygon_with_holes``
+#   * Densification midpoints near runway/rect long edges (handled by
+#     Rule 1 v2 / Rule 2 instead)
+#   * Shared-vertex centroid drift artefacts
+# Moving them by ≤ 1 m wouldn't get them outside, and a larger move
+# would catastrophically deform the polygon.  Tracked separately
+# (per-airport baselines) until the upstream geometry is fixed.
+PAVEMENT_PUSH_SEARCH_RADIUS_M = 1.0
+
+
+def _push_junction_vertices_outside_pavement(
+    layout: PavementLayout,
+) -> None:
+    """Rule 5 (user 2026-05-02): for each junction vertex NOT on a
+    rect / runway / terminal anchor edge, ensure it lies OUTSIDE the
+    apt.dat pavement boundary by at least ``PAVEMENT_OUTWARD_OFFSET_M``
+    (capped at ``PAVEMENT_OUTWARD_OFFSET_MAX_M``).  Anchor-edge
+    vertices stay put — they're shared exactly with an anchor that
+    already covers that pavement region.
+
+    Algorithm per vertex:
+      1. If within ``SHARED_VERTEX_TOL_M`` of any anchor edge → skip.
+      2. Compute the closest point ``foot`` on ``pav_union.boundary``.
+      3. If the vertex is OUTSIDE pavement and at least
+         ``PAVEMENT_OUTWARD_OFFSET_M`` past the foot → already
+         compliant; skip.
+      4. Otherwise push the vertex along the ``vertex → foot``
+         direction (or its inverse if the vertex is inside) until it
+         sits ``PAVEMENT_OUTWARD_OFFSET_M`` outside.
+    """
+    pav_union = getattr(layout, "_apt_pav_union", None)
+    if pav_union is None or pav_union.is_empty:
+        return
+
+    pav_boundary = pav_union.boundary
+    if pav_boundary.is_empty:
+        return
+
+    # Collect anchor edges grouped by exemption tolerance.  Rule 5
+    # MUST NOT push vertices that Rule 1 / Rule 2 specifically
+    # placed near anchor boundaries:
+    #   * Runway edges → exempt within ``RUNWAY_BOUNDARY_TOL_M`` (Rule 1
+    #     legitimately leaves vertices there).
+    #   * Sloping rect long edges → exempt within
+    #     ``LONG_EDGE_SNAP_M`` PERPENDICULAR (Rule 2 keeps short-end
+    #     reach-corners there).
+    #   * Terminal & rect short edges → exempt within
+    #     ``SHARED_VERTEX_TOL_M`` (legitimate anchor sharing only).
+    from .config import LONG_EDGE_SNAP_M
+    runway_edges: List[Tuple[float, float, float, float]] = []
+    rect_long_edges: List[Tuple[float, float, float, float]] = []
+    other_anchor_edges: List[Tuple[float, float, float, float]] = []
+    for s in layout.shapes:
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        c = list(s.polygon.exterior.coords)
+        if c and c[0] == c[-1]:
+            c = c[:-1]
+        m = len(c)
+        if s.role == ROLE_RUNWAY:
+            for i in range(m):
+                ax, ay = c[i]
+                bx, by = c[(i + 1) % m]
+                runway_edges.append((float(ax), float(ay),
+                                     float(bx), float(by)))
+        elif s.role in SLOPING_RECT_ROLES:
+            # Per the rect-build convention: long edges connect
+            # coords[0]↔coords[1] and coords[2]↔coords[3].
+            if m == 4:
+                rect_long_edges.append(
+                    (float(c[0][0]), float(c[0][1]),
+                     float(c[1][0]), float(c[1][1])))
+                rect_long_edges.append(
+                    (float(c[2][0]), float(c[2][1]),
+                     float(c[3][0]), float(c[3][1])))
+                # Short edges into other_anchor_edges for tight tol.
+                other_anchor_edges.append(
+                    (float(c[1][0]), float(c[1][1]),
+                     float(c[2][0]), float(c[2][1])))
+                other_anchor_edges.append(
+                    (float(c[3][0]), float(c[3][1]),
+                     float(c[0][0]), float(c[0][1])))
+        elif s.role == "terminal":
+            for i in range(m):
+                ax, ay = c[i]
+                bx, by = c[(i + 1) % m]
+                other_anchor_edges.append(
+                    (float(ax), float(ay), float(bx), float(by)))
+
+    from shapely.ops import nearest_points
+
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            continue
+        poly = shape.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        coords = list(poly.exterior.coords)
+        if not coords:
+            continue
+        node_alts = shape.node_altitudes
+        if node_alts is not None and len(node_alts) != len(coords):
+            node_alts = None
+        had_close = (coords[0] == coords[-1])
+        if had_close:
+            coords = coords[:-1]
+            if node_alts is not None:
+                node_alts = list(node_alts[:-1])
+
+        new_coords: List[Tuple[float, float]] = []
+        changed = False
+        for i, (vx, vy) in enumerate(coords):
+            # Per-anchor-class exemptions (don't undo Rule 1 / Rule 2).
+            if _vertex_on_any_anchor_edge(
+                    vx, vy, runway_edges, RUNWAY_BOUNDARY_TOL_M):
+                new_coords.append((vx, vy))
+                continue
+            if _vertex_on_any_anchor_edge(
+                    vx, vy, rect_long_edges, LONG_EDGE_SNAP_M):
+                new_coords.append((vx, vy))
+                continue
+            if _vertex_on_any_anchor_edge(
+                    vx, vy, other_anchor_edges, SHARED_VERTEX_TOL_M):
+                new_coords.append((vx, vy))
+                continue
+            # Find closest point on apt.dat pavement boundary.
+            try:
+                p = Point(vx, vy)
+                foot_pt, _ = nearest_points(pav_boundary, p)
+            except Exception:
+                new_coords.append((vx, vy))
+                continue
+            fx, fy = foot_pt.x, foot_pt.y
+            # Distance to boundary, signed: positive if outside, neg if inside.
+            d = math.hypot(vx - fx, vy - fy)
+            try:
+                inside = pav_union.contains(p)
+            except Exception:
+                inside = False
+            if not inside and d >= PAVEMENT_OUTWARD_OFFSET_M:
+                # Already at least the desired offset outside.
+                new_coords.append((vx, vy))
+                continue
+            if d > PAVEMENT_PUSH_SEARCH_RADIUS_M:
+                # Too deep to fix via a sub-1 m push; leave alone and
+                # let the test surface it.
+                new_coords.append((vx, vy))
+                continue
+            # Need to move.  Direction from foot to vertex (when
+            # outside) or its inverse (when inside).
+            if d < 1e-6:
+                # Vertex sits exactly on the boundary; we need a
+                # direction.  Use the boundary's local normal —
+                # approximate via a tiny step in the outward
+                # direction (away from pavement centroid).
+                cx_p, cy_p = pav_union.centroid.x, pav_union.centroid.y
+                ddx = vx - cx_p
+                ddy = vy - cy_p
+                ln = math.hypot(ddx, ddy)
+                if ln < 1e-6:
+                    new_coords.append((vx, vy))
+                    continue
+                ux, uy = ddx / ln, ddy / ln
+            else:
+                if inside:
+                    # Move from inside to outside: vector vertex→foot
+                    # then a bit beyond.
+                    ux = (fx - vx) / d
+                    uy = (fy - vy) / d
+                else:
+                    # Outside but too close: vector foot→vertex.
+                    ux = (vx - fx) / d
+                    uy = (vy - fy) / d
+            # Place the new vertex PAVEMENT_OUTWARD_OFFSET_M outside.
+            target_x = fx + PAVEMENT_OUTWARD_OFFSET_M * ux
+            target_y = fy + PAVEMENT_OUTWARD_OFFSET_M * uy
+            # Clamp the move so we never displace by more than
+            # PAVEMENT_OUTWARD_OFFSET_MAX_M from the original.
+            mv_d = math.hypot(target_x - vx, target_y - vy)
+            if mv_d > PAVEMENT_OUTWARD_OFFSET_MAX_M:
+                # Scale the move down.
+                scale = PAVEMENT_OUTWARD_OFFSET_MAX_M / mv_d
+                target_x = vx + (target_x - vx) * scale
+                target_y = vy + (target_y - vy) * scale
+            new_coords.append((target_x, target_y))
+            changed = True
+
+        if not changed:
+            continue
+        try:
+            new_poly = Polygon(new_coords).buffer(0)
+        except Exception:
+            continue
+        if new_poly.is_empty:
+            continue
+        if new_poly.geom_type == "MultiPolygon":
+            new_poly = max(new_poly.geoms, key=lambda g: g.area)
+        if new_poly.geom_type != "Polygon":
+            continue
+        shape.polygon = new_poly
+
+
+def _vertex_on_any_anchor_edge(
+    vx: float, vy: float,
+    anchor_edges: Sequence[Tuple[float, float, float, float]],
+    tol: float,
+) -> bool:
+    tol2 = tol * tol
+    for ax, ay, bx, by in anchor_edges:
+        dx = bx - ax
+        dy = by - ay
+        seg2 = dx * dx + dy * dy
+        if seg2 < 1e-9:
+            continue
+        t = ((vx - ax) * dx + (vy - ay) * dy) / seg2
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        cx = ax + t * dx
+        cy = ay + t * dy
+        d2 = (vx - cx) * (vx - cx) + (vy - cy) * (vy - cy)
+        if d2 <= tol2:
+            return True
+    return False

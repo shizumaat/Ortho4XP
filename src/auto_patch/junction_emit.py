@@ -52,6 +52,11 @@ def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
 
     Mutates layout in place.
     """
+    # Stash apt.dat pavement union on the layout so post-emit rule
+    # passes (Rule 5) can check whether junction vertices sit inside
+    # the pavement.  Recomputing pav_union later would require the
+    # apt.dat reader; cheaper to keep a reference.
+    layout._apt_pav_union = pav_union
     # ── Junction emission (user 2026-04-23): junctions and
     # aprons are treated identically going forward — both will
     # triangulate and slope multi-directionally (unlike rects,

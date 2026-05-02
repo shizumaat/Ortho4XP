@@ -1717,10 +1717,12 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # within the within-shape grade tolerance).
         from .junction_rules import (
             _enforce_runway_1to1_sharing,
+            _push_junction_vertices_outside_pavement,
             _snap_to_long_edge_corners,
         )
         _snap_to_long_edge_corners(layout)
         _enforce_runway_1to1_sharing(layout)
+        _push_junction_vertices_outside_pavement(layout)
 
     return layout
 
