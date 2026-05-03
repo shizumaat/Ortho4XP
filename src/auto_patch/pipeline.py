@@ -79,6 +79,7 @@ from .layout import (
 # ──────────────────────────────────────────────────────────────────
 from .osm_load import (
     _load_osm_airports,
+    _load_osm_big_roads,
     _pick_best_apt_dat_against_osm,
 )
 from . import finalize, junction_emit

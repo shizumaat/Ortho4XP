@@ -197,14 +197,16 @@ SHARED_AGREE_TOL_M = 0.10
 # grade compliance.
 USE_PER_POLYGON_ELEVATION_FIELD = False
 
-# Per-surface elevation solver (user 2026-05-02 redesign).
+# Per-surface elevation solver (user 2026-05-02 / 2026-05-03 redesign).
 # When True, replaces ``_solve_pavement_elevations_unified`` with the
-# phased per-surface solver in ``elevation_per_surface``.  See
-# ``docs/elevation_per_surface_redesign.md``.  Default OFF until
-# validated against SPJC + CYXY + HECA; enable per-airport via env
-# var ``O4_PER_SURFACE_SOLVER=1`` for A/B testing.
+# unified Jacobi solver in ``elevation_per_surface`` that enforces the
+# per-axis grade rule (rect axial only; junction multi-directional;
+# rect cross-section flatness).  See
+# ``docs/elevation_per_surface_redesign.md``.  Default ON now that
+# SPJC is the validated baseline; set ``O4_PER_SURFACE_SOLVER=0``
+# in the environment to fall back to the legacy unified solver.
 USE_PER_SURFACE_SOLVER = (
-    os.environ.get("O4_PER_SURFACE_SOLVER", "0") == "1")
+    os.environ.get("O4_PER_SURFACE_SOLVER", "1") == "1")
 
 # Used by both _build_clamp_geom_state (in this module) and the
 # _triangulate_junctions code path (in auto_patch.triangulation).

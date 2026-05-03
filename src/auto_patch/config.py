@@ -127,7 +127,7 @@ RUNWAY_APRON_AREA_RATIO = 3.0
 # _emit_underpass_road_approaches.  Each must carve its footprint
 # out of overlapping airside / groundside pavement before emitting,
 # or test_no_self_overlap will fail again.
-EMIT_BRIDGES_AND_TUNNELS = False
+EMIT_BRIDGES_AND_TUNNELS = True
 
 # Combine apt.dat with DSF pavement polygons: when True the
 # smart-apt.dat selector still runs to choose the best custom-pack
