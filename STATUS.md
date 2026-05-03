@@ -1,27 +1,31 @@
-# Auto-Patch Status — handoff 2026-05-02 (late evening)
+# Auto-Patch Status — handoff 2026-05-03
 
 ## TL;DR
 
-Two major outcomes this session: (1) fixed the slope-alignment
-regression introduced earlier today (commit `35db401` — runway
-slopes restored at SPJC); (2) confirmed a deeper architectural
-issue with elevation grading at CYXY and produced a redesign
-plan: see [docs/elevation_per_surface_redesign.md](docs/elevation_per_surface_redesign.md).
+**SPJC is the new validated baseline.**  Per-surface elevation
+solver landed and is the default; bridges/tunnels re-enabled;
+boundary emit restored.  Tagged at
+[`per-surface-solver-baseline`](https://github.com/) (commit
+`e4d7e3c`) and refined through `079f43f`.
 
-The redesign work is **in progress** at HEAD; no new code yet
-beyond the slope-alignment fix.
+User-validated visually in JOSM; X-Plane testing pending.
 
 The next agent's focus:
 
-1. **Implement the per-surface elevation solver** per
-   [docs/elevation_per_surface_redesign.md](docs/elevation_per_surface_redesign.md).
-   New package `src/auto_patch/elevation_per_surface/` lives behind
-   a feature flag while we validate against CYXY + SPJC. CYXY taxi
-   E at the south edge of the SW apron must reach ≥ 714 m
-   (currently 707.9).
-2. **Diagnose Rule 1 v6** (runway widening) — 2 of 15 SPJC
-   runway-touching junctions still share only 1 node. Deferred
-   behind the elevation redesign.
+1. **Two SPJC follow-ups now baselined as known issues** (not
+   blocking):
+   * Boundary polygon doesn't carve around tunnel_ramp /
+     retaining_wall footprints — 1614 m² overlap.  Pending fix
+     to `_emit_airport_boundary_shape` to subtract bridge/tunnel
+     polygons before emit.
+   * Boundary polygon vertices don't snap to nearby junction
+     corners — 4 orphan vertices.  Pending vertex-snap pass at
+     boundary emit time.
+2. **CYXY taxi E reaches 717 m at SW apron** ✓ (test passes).
+   But CYXY has other issues the user wants addressed AFTER SPJC
+   stabilises.
+3. **Diagnose Rule 1 v6** (runway widening) — 2 of 15 SPJC
+   runway-touching junctions still share only 1 node.  Deferred.
 
 ---
 
