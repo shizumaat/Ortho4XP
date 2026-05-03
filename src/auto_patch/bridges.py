@@ -115,8 +115,15 @@ def _emit_tunnel_portals(
         arm_max_length_m: float = 500.0,
         carriageway_width_m: float = 22.0,
         retaining_wall_width_m: float = 1.0,
-        wall_gap_m: float = 0.5,
-        portal_cluster_dist_m: float = 40.0,
+        # ``wall_gap_m`` must exceed the OSM emit's vertex bucket
+        # size (SHARED_VERTEX_TOL_M = 0.5 m) so the ramp's road-edge
+        # corners and the wall's inner corners don't hash to the
+        # same node id.  At the portal end the ramp altitude is
+        # apt_elev − tunnel_depth; the wall altitude is apt_elev.
+        # Sharing the vertex would emit one node with two altitudes,
+        # rendering as a vertical glitch (user 2026-05-03).
+        wall_gap_m: float = 0.6,
+        portal_cluster_dist_m: float = 15.0,
         boundary_clearance_m: float = 0.5,
         excluded_way_ids: Optional[set] = None,
         ) -> int:
@@ -379,6 +386,25 @@ def _emit_tunnel_portals(
             walk = merged
             if len(walk) < 2:
                 continue
+            # Densify long segments so the visible ramp tracks the
+            # road with multiple sloped pieces — user 2026-05-03
+            # ("SW tunnel only has one ramp segment, should be
+            # multiple following the road up to DEM elevation").
+            # Sparse OSM ways often have ~150-200 m gaps between
+            # nodes; without densification a 200 m approach renders
+            # as a single straight ramp.  Target ~50 m segments.
+            target_seg_m = 50.0
+            densified: List[Tuple[float, float]] = [walk[0]]
+            for k in range(1, len(walk)):
+                px, py = densified[-1]
+                qx, qy = walk[k]
+                d = math.hypot(qx - px, qy - py)
+                n_sub = max(1, int(round(d / target_seg_m)))
+                for s in range(1, n_sub + 1):
+                    t = s / n_sub
+                    densified.append(
+                        (px + t * (qx - px), py + t * (qy - py)))
+            walk = densified
             portal_xy = walk[0]
             apt_elev = _airport_elevation_at(*portal_xy)
             if apt_elev is None:
@@ -493,7 +519,13 @@ def _emit_tunnel_portals(
             continue
         # Cluster spread for combined width: project each cluster
         # member's portal node onto the perpendicular at the head
-        # portal.
+        # portal.  The cap (and only the cap) is centred on the
+        # cluster centroid, not on the head portal — user 2026-05-03
+        # ("trunk highway tunnels not centered on OSM ways, offset
+        # with one edge on one of the ways").  The arms still follow
+        # the head walk because we don't yet emit per-carriageway
+        # arms; centring at least the cap puts it symmetric across
+        # both carriageways of a divided highway.
         first_seg = (walk_pts[1][0] - walk_pts[0][0],
                      walk_pts[1][1] - walk_pts[0][1])
         first_len = math.hypot(*first_seg)
@@ -512,6 +544,8 @@ def _emit_tunnel_portals(
                 (p[0] - walk_pts[0][0]) * first_perp[0]
                 + (p[1] - walk_pts[0][1]) * first_perp[1])
         cluster_span = max(spans) - min(spans) if spans else 0.0
+        cluster_perp_offset = (
+            (max(spans) + min(spans)) / 2.0 if spans else 0.0)
         combined_half = half_carriage + 0.5 * cluster_span
 
         def _build_wall_segment(p_a: Tuple[float, float],
@@ -548,21 +582,22 @@ def _emit_tunnel_portals(
             except Exception:
                 return None
             return None
-        # 1) Cap wall AT the portal node, perpendicular to the
-        #    first segment.  The cap's centre line passes through
-        #    the portal; its width spans the carriageway + 2 ×
-        #    wall_gap; its thickness is retaining_wall_width_m.
+        # 1) Cap wall AT the portal cluster's centroid, perpendicular
+        #    to the first segment.  The cap's centre line passes
+        #    through the cluster centroid (so divided-highway
+        #    tunnels are centered between the carriageways, user
+        #    2026-05-03), its width spans the combined carriageways
+        #    + 2 × wall_gap, its thickness is
+        #    retaining_wall_width_m.
         cap_half_len = combined_half + wall_gap_m
         portal_xy = walk_pts[0]
-        # Cap polygon: centred at portal, perpendicular to first
-        # segment direction, thickness facing INTO the tunnel
-        # (opposite first_dir).  We put the cap's outer face
-        # right at the portal node so the back of the wall is at
-        # OSM's tunnel-portal point.
-        c0 = (portal_xy[0] + first_perp[0] * cap_half_len,
-              portal_xy[1] + first_perp[1] * cap_half_len)
-        c1 = (portal_xy[0] - first_perp[0] * cap_half_len,
-              portal_xy[1] - first_perp[1] * cap_half_len)
+        cap_centre = (
+            portal_xy[0] + first_perp[0] * cluster_perp_offset,
+            portal_xy[1] + first_perp[1] * cluster_perp_offset)
+        c0 = (cap_centre[0] + first_perp[0] * cap_half_len,
+              cap_centre[1] + first_perp[1] * cap_half_len)
+        c1 = (cap_centre[0] - first_perp[0] * cap_half_len,
+              cap_centre[1] - first_perp[1] * cap_half_len)
         # Move cap thickness INTO the tunnel direction (negative
         # first_dir) — cap occupies the strip from portal back
         # by retaining_wall_width_m.
