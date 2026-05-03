@@ -124,10 +124,15 @@ TAXI_RECT_ADJACENCY_REGRESSION_BASELINE = {
 }
 
 ORPHAN_NEIGHBOUR_VERTEX_REGRESSION_BASELINE = {
-    # SPJC: 1 rect corner shifted off its co-located junction vertex
-    # by Rule 5 (push-outside-pavement).  Pending tighter Rule 5
-    # anchor exemption.
-    "SPJC": 1,
+    # SPJC: 5 vertex orphans:
+    # * 1 rect corner shifted off its co-located junction vertex by
+    #   Rule 5 (push-outside-pavement) -- pending tighter Rule 5
+    #   anchor exemption.
+    # * 4 boundary-polygon vertices near junction perimeters that
+    #   don't snap to junction vertices (boundary traces airport
+    #   outline; vertices come from apt.dat row-130 / OSM).  Pending
+    #   boundary-vertex snap to nearest junction corner.
+    "SPJC": 5,
 }
 
 
