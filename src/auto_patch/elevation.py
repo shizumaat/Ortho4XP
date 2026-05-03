@@ -713,7 +713,12 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                         shape.polygon = snapped
 
     # ── Terminal pad elevations ─────────────────────────────────
-    # Per user 2026-04-28: CIFP runway thresholds are the ONLY
+    # Per user 2026-05-03: only runway corners are HARD; terminals
+    # may adjust to comply with grade rules.  When the per-surface
+    # solver is enabled it handles terminal altitudes itself (soft
+    # nodes with a flatness constraint), so skip the legacy
+    # pre-pinning here.  Legacy block (preserved while flag is
+    # off): per user 2026-04-28: CIFP runway thresholds are the ONLY
     # truly authoritative elevations.  Everything else, including
     # the terminal altitude, should be derived to satisfy FAA
     # grade rules with the propagated runway / taxi / apron
@@ -736,7 +741,15 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     #     ground).
     #   * Fall back to DEM-median if no anchors are available.
     runway_corner_pts: List[Tuple[float, float, float]] = []
+    if USE_PER_SURFACE_SOLVER:
+        # Skip the entire legacy terminal pre-pin block.  The
+        # per-surface solver treats terminals as SOFT nodes and
+        # derives their altitudes from the constrained Laplacian.
+        runway_corner_pts = []  # remain empty to no-op the loop below
+
     for s in layout.shapes:
+        if USE_PER_SURFACE_SOLVER:
+            break  # legacy terminal pre-pin disabled
         if s.role not in (
                 ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
                 ROLE_SECONDARY_PARALLEL, ROLE_STUB,
@@ -767,6 +780,8 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     TERMINAL_NEIGHBOUR_RADIUS_M = 250.0
     INF = float("inf")
     for shape in layout.shapes:
+        if USE_PER_SURFACE_SOLVER:
+            break  # legacy terminal pre-pin disabled
         if shape.role != ROLE_TERMINAL:
             continue
         if shape.polygon is None or shape.polygon.is_empty:

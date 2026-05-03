@@ -1,4 +1,5 @@
-"""Regression tests for terrain-following elevation (user 2026-05-02).
+"""Regression tests for terrain-following elevation (user 2026-05-02
+and 2026-05-03).
 
 The current unified Laplacian solver propagates elevation from
 runway HARD anchors outward through the pavement graph at
@@ -13,13 +14,14 @@ See ``docs/elevation_per_surface_redesign.md`` for the redesign plan.
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
-from conftest import xplane_available, xplane_root
+from conftest import airports_under_test, xplane_available, xplane_root
 
 
 _HERE = Path(__file__).resolve().parent
@@ -127,3 +129,122 @@ def test_cyxy_taxi_e_south_apron_follows_terrain():
         f"Likely over-flattening — the per-surface elevation solver is "
         f"propagating runway altitudes across surfaces instead of letting "
         f"taxi/apron follow DEM along their own axes.")
+
+
+# ── Within-junction grade audit (user 2026-05-03) ─────────────────
+
+
+JUNCTION_MAX_GRADE = 0.015  # 1.5 %, matches FAA taxiway cap
+APRON_MAX_GRADE = 0.010     # 1.0 %, matches FAA apron cap
+
+# Absolute rounding allowance for the within-junction grade audit.
+# Elevations are stored to 0.1 m precision, so a vertex pair can
+# have up to 0.10 m of rounding error.  Plus the solver's own
+# convergence tolerance (tol_m=0.005) accumulated across iterations
+# can leave residual cap-violation under 0.10 m.  We use 0.20 m as
+# the absolute slack — captures genuine grade-rule failures
+# (typically 0.5 m+ excess on small junctions) while letting
+# rounding-noise pairs pass.
+ROUNDING_ALLOWANCE_M = 0.20
+
+
+def _within_polygon_violations(coords, alts, max_grade: float):
+    """All-pair Euclidean grade audit on a polygon.  Returns a list
+    of (i, j, dist_m, de_m, grade) for pairs whose
+    ``|de| > max_grade * d + ROUNDING_ALLOWANCE_M``.
+    """
+    out = []
+    n = len(coords)
+    for i in range(n):
+        x1, y1 = coords[i]
+        for j in range(i + 1, n):
+            x2, y2 = coords[j]
+            d = math.hypot(x2 - x1, y2 - y1)
+            if d < 1.0:
+                continue
+            de = abs(alts[i] - alts[j])
+            allowed = max_grade * d + ROUNDING_ALLOWANCE_M
+            if de > allowed:
+                out.append((i, j, d, de, de / d))
+    return out
+
+
+def _polygon_alts_and_coords(shape):
+    """Return ``(coords_open, alts_open)`` aligned to the polygon's
+    open exterior ring.  ``alts_open`` length matches ``coords_open``;
+    excludes the closing duplicate vertex.
+    """
+    if shape.polygon is None or shape.polygon.is_empty:
+        return None, None
+    coords = list(shape.polygon.exterior.coords)
+    ring_closed = coords and coords[0] == coords[-1]
+    coords_open = coords[:-1] if ring_closed else coords
+    if shape.node_altitudes:
+        alts = list(shape.node_altitudes)
+        if ring_closed and len(alts) == len(coords):
+            alts = alts[:-1]
+        if len(alts) != len(coords_open):
+            return None, None
+        return coords_open, alts
+    if shape.altitude is not None:
+        return coords_open, [float(shape.altitude)] * len(coords_open)
+    return None, None
+
+
+# Per-airport regression baselines.  Strict: zero within-junction or
+# within-apron grade violations.  When this test fails, the elevation
+# pipeline is producing a junction or apron whose internal Euclidean
+# gradient exceeds the FAA cap — a real geometric defect that JOSM
+# inspection of the patch will confirm visually.
+WITHIN_SHAPE_GRADE_BASELINE: Dict[str, int] = {
+    # Empty by design.  Add airport-specific entries here only as
+    # interim ceilings while a fix is staged.
+}
+
+
+@pytest.mark.parametrize("icao", airports_under_test() or [
+    pytest.param("(no airports)", marks=pytest.mark.skip(
+        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+def test_within_junction_grade_compliance(icao):
+    """Junctions must satisfy ≤ 1.5 % Euclidean grade between any
+    pair of their vertices; aprons ≤ 1.0 %.
+
+    Per user 2026-05-03: junctions are multi-directional but still
+    capped at 1.5 % from edge to edge in any direction.  An aircraft
+    can taxi across a junction surface in any direction, so the cap
+    applies to every vertex pair, not just ring-adjacent ones.
+
+    Failure indicates the elevation pipeline is producing a junction
+    whose internal slope exceeds the cap — typically because the
+    rect anchors on opposite sides of the junction are too far apart
+    in elevation for the junction's spatial extent to bridge.  The
+    fix lives in Phase 1 (rect-corner bound derivation from HARD
+    anchors via junction grade-reach).
+    """
+    layout = _build_layout(icao)
+    violations: List[str] = []
+    for s_idx, s in enumerate(layout.shapes):
+        if s.role == "junction":
+            cap = JUNCTION_MAX_GRADE
+        elif s.role == "apron":
+            cap = APRON_MAX_GRADE
+        else:
+            continue
+        coords, alts = _polygon_alts_and_coords(s)
+        if coords is None or alts is None:
+            continue
+        bad = _within_polygon_violations(coords, alts, cap)
+        for i, j, d, de, grade in bad:
+            violations.append(
+                f"{s.role}#{s_idx} verts {i}↔{j}: "
+                f"de={de:.2f} m / d={d:.1f} m = {grade*100:.1f}% "
+                f"(cap {cap*100:.1f}%, alts {alts[i]:.1f}→{alts[j]:.1f})")
+
+    baseline = WITHIN_SHAPE_GRADE_BASELINE.get(icao, 0)
+    if len(violations) > baseline:
+        msg = (f"{icao}: {len(violations)} within-junction/apron "
+               f"grade violations (baseline {baseline}).\n"
+               + "First 10:\n  " + "\n  ".join(violations[:10]))
+        if len(violations) > 10:
+            msg += f"\n  ... and {len(violations) - 10} more"
+        pytest.fail(msg)

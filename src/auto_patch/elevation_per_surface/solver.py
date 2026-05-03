@@ -1,62 +1,31 @@
-"""Per-surface elevation solver — top-level orchestrator.
+"""Per-surface elevation solver — top-level entry point.
 
-Replaces ``auto_patch.elevation._solve_pavement_elevations_unified``
-behind a feature flag.  See
-``docs/elevation_per_surface_redesign.md`` for the design.
+Delegates to ``unified_jacobi.solve``.  The DEM + tile coords are
+accepted for API parity with the legacy unified solver and for
+future use (per-vertex DEM seeding) but are currently unused: the
+solver warm-starts soft nodes from existing layout altitudes
+(rect altitude_high/low, junction node_altitudes, terminal altitude)
+which were already populated upstream from DEM.
+
+See ``unified_jacobi`` for the per-axis grade rule and the
+three-change derivation from the legacy unified solver.
 """
 from __future__ import annotations
 
-import math
-import time as _time
-
-from .axial_profile import apply_axial_profiles
-from .bfs_propagate import (
-    build_runway_anchor_lookup,
-    propagate_through_rects,
-)
-from .junction_field import apply_apron_field, apply_junction_field
-from .continuity import collect_anchor_map, reconcile_shared_vertices
+from .unified_jacobi import solve as _jacobi_solve
 
 
-def solve(layout, icao: str, dem, tile_lat: int, tile_lon: int) -> None:
-    """Per-surface phased elevation solve.
+def solve(layout, icao: str,
+          dem=None, tile_lat: int = 0, tile_lon: int = 0) -> None:
+    """Per-surface phased elevation solve.  Mutates ``layout`` in
+    place: writes ``altitude_high``/``altitude_low`` on rects,
+    ``node_altitudes`` on junctions, ``altitude`` on terminals and
+    aprons.  Runway segments (HARD anchors) are left untouched.
 
-    The runway shapes must already carry their CIFP profile in
-    ``altitude_high`` / ``altitude_low``.  Terminal flat altitudes
-    are set by the existing terminal-altitude rule before this
-    runs.  This solver fills in:
-
-      * taxi rect altitude_high / altitude_low (Phase 1 + 2)
-      * junction node_altitudes (Phase 3)
-      * apron node_altitudes (Phase 4)
-
-    and finally reconciles shared-vertex disagreements.
+    When ``dem`` is supplied, SOFT nodes are seeded from per-vertex
+    DEM samples — necessary so taxi rects/junctions reach the
+    DEM-driven elevations the user expects (e.g. CYXY taxi E sits
+    on terrain ~717 m, not pulled down to the 705 m runway).
     """
-    t_start = _time.time()
-    runway_anchor_lookup = build_runway_anchor_lookup(layout)
-
-    n_phase1 = apply_axial_profiles(
-        layout, dem, tile_lat, tile_lon, runway_anchor_lookup)
-    n_phase2 = propagate_through_rects(
-        layout, dem, tile_lat, tile_lon, runway_anchor_lookup)
-
-    # Phases 3 + 4: junctions and aprons key off rect / runway /
-    # terminal corners.  Snapshot the anchor map after rect solves.
-    anchor_map = collect_anchor_map(layout)
-    n_phase3 = apply_junction_field(
-        layout, dem, tile_lat, tile_lon, anchor_map)
-    n_phase4 = apply_apron_field(
-        layout, dem, tile_lat, tile_lon, anchor_map)
-
-    n_reconciled = reconcile_shared_vertices(layout)
-
-    elapsed = _time.time() - t_start
-    try:
-        import O4_UI_Utils as UI
-        UI.vprint(1,
-            f"  [pav-builder] {icao}: per-surface solver "
-            f"({elapsed:.2f} s); rects={n_phase1}+{n_phase2} "
-            f"junctions={n_phase3} aprons={n_phase4} "
-            f"reconciled_buckets={n_reconciled}.")
-    except Exception:
-        pass
+    _jacobi_solve(layout, icao, dem=dem,
+                   tile_lat=tile_lat, tile_lon=tile_lon)

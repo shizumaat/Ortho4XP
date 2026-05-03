@@ -1,24 +1,24 @@
-"""Per-surface elevation pipeline (user 2026-05-02).
+"""Per-surface elevation solver (user 2026-05-02 / 2026-05-03).
 
-Replacement for the unified Laplacian solver in
+Replacement for the legacy unified Laplacian solver in
 ``auto_patch.elevation._solve_pavement_elevations_unified``.
 
-The unified solver propagates runway elevations across all pavement
-through a single graph with per-edge grade caps, which over-flattens
-terrain-following surfaces (CYXY taxi E, HECA elevated taxiways).
-This package implements a per-surface phased solve that respects
-the FAA per-axis grade rule:
+The legacy solver treats all pavement as one connected graph with
+per-edge grade caps and propagates runway HARD anchors through
+every connected vertex.  This violates the per-axis FAA grade rule:
 
-* Phase 1 — taxi rects get an axial DEM-smoothed profile capped at
-  1.5 %/m.
-* Phase 2 — BFS from runway HARD anchors propagates through the
-  rect-junction chain along realistic taxi axes only.
-* Phase 3 — junctions take boundary vertices from adjacent
-  rects/runways; interior vertices follow DEM smoothed to 1.5 %.
-* Phase 4 — aprons same as junctions but capped at 1.0 %.
-* Phase 5 — terminals flat at DEM-median (existing rule).
+* Taxi rect grade applies along source_axis only — never
+  perpendicular to an unrelated surface like a parallel runway.
+* Junction / apron grade applies in any direction (multi-directional)
+  within the polygon's surface, but not across to a different shape.
+* Terminals are flat; aprons follow terrain at 1.0 % grade.
+* Only CIFP runway corners are immutable HARD anchors — terminals,
+  aprons, and taxi rects can all adjust.
 
-See ``docs/elevation_per_surface_redesign.md`` for the full plan.
+The implementation lives in ``unified_jacobi`` as a single damped
+Jacobi solver with role-aware edge generation (rects ring-only;
+junctions / aprons / terminals ring + all-pair Euclidean).  See
+``docs/elevation_per_surface_redesign.md`` for the full design.
 """
 from .solver import solve
 

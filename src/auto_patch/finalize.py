@@ -94,34 +94,48 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     # such vertex off — pure geometry, doesn't touch
     # elevations.
     _push_junction_vertices_off_taxi_rect_edges(layout)
-    # Per user 2026-04-28: junction polygon vertices that
-    # coincide with a runway / sloping-rect / terminal corner
-    # MUST emit that shape's altitude tag value.  Run this
-    # AFTER all the shared-vertex / overlap-clip passes since
-    # they can rearrange polygon coords and put node_altitudes
-    # out of sync with the rect's emitted altitude tags.
-    _snap_junction_altitudes_to_rect_corners(layout)
-    # Per user 2026-04-28: junctions sharing a boundary vertex
-    # MUST agree on its altitude.  Subdivide / clamp passes can
-    # leave sub-metre disagreement at shared buckets — average
-    # them so X-Plane doesn't render a tear at the seam.
-    _enforce_shared_vertex_altitudes(layout)
-    # Re-run the rect-corner snap after the shared-vertex
-    # average, since averaging can pull a shared-with-rect
-    # bucket away from the rect's tag value.
-    _snap_junction_altitudes_to_rect_corners(layout)
-    # Per user 2026-04-28: smooth adjacent-vertex pair grade
-    # WITHIN each junction.  Above passes enforce shared-
-    # vertex agreement (across polygons) and rect-corner
-    # alignment (junction ↔ sloping rect), but interior
-    # junction vertices can still violate 1.5 % grade against
-    # their immediate ring neighbours.  Iterate adjacent-pair
-    # smoothing with hard-vertex anchoring to converge those.
-    _smooth_within_junction_adjacent_pair_grade(layout)
-    # Re-run shared-vertex + rect-corner snaps so any seam
-    # vertex the smoother nudged off-target is restored.
-    _enforce_shared_vertex_altitudes(layout)
-    _snap_junction_altitudes_to_rect_corners(layout)
+    # Per user 2026-05-03: when the per-surface solver runs the
+    # legacy chain of post-elevation reconciliation passes
+    # (snap-to-rect-corner, shared-vertex agree, adjacent-pair
+    # smoother) re-introduces the within-junction grade violations
+    # the solver just fixed.  In particular,
+    # ``_snap_junction_altitudes_to_rect_corners`` propagates a
+    # rect's ``altitude_high``/``altitude_low`` scalars to junction
+    # vertices via the legacy [high, low, low, high] convention,
+    # which restores the cross-section delta the solver had
+    # equalised to flat.  Skip the chain when the flag is on; the
+    # solver's writeback already gives every shared bucket one
+    # value, so the snaps are redundant and harmful.
+    from .elevation import USE_PER_SURFACE_SOLVER
+    if not USE_PER_SURFACE_SOLVER:
+        # Per user 2026-04-28: junction polygon vertices that
+        # coincide with a runway / sloping-rect / terminal corner
+        # MUST emit that shape's altitude tag value.  Run this
+        # AFTER all the shared-vertex / overlap-clip passes since
+        # they can rearrange polygon coords and put node_altitudes
+        # out of sync with the rect's emitted altitude tags.
+        _snap_junction_altitudes_to_rect_corners(layout)
+        # Per user 2026-04-28: junctions sharing a boundary vertex
+        # MUST agree on its altitude.  Subdivide / clamp passes can
+        # leave sub-metre disagreement at shared buckets — average
+        # them so X-Plane doesn't render a tear at the seam.
+        _enforce_shared_vertex_altitudes(layout)
+        # Re-run the rect-corner snap after the shared-vertex
+        # average, since averaging can pull a shared-with-rect
+        # bucket away from the rect's tag value.
+        _snap_junction_altitudes_to_rect_corners(layout)
+        # Per user 2026-04-28: smooth adjacent-vertex pair grade
+        # WITHIN each junction.  Above passes enforce shared-
+        # vertex agreement (across polygons) and rect-corner
+        # alignment (junction ↔ sloping rect), but interior
+        # junction vertices can still violate 1.5 % grade against
+        # their immediate ring neighbours.  Iterate adjacent-pair
+        # smoothing with hard-vertex anchoring to converge those.
+        _smooth_within_junction_adjacent_pair_grade(layout)
+        # Re-run shared-vertex + rect-corner snaps so any seam
+        # vertex the smoother nudged off-target is restored.
+        _enforce_shared_vertex_altitudes(layout)
+        _snap_junction_altitudes_to_rect_corners(layout)
     # Per user 2026-04-29: merge small junction slivers into
     # adjacent larger junctions.  Polygon-with-holes
     # decomposition + post-elevation subdivisions can carve
@@ -130,6 +144,15 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     # adjacent to -10243 = 30 k m²).  Merge them back so
     # JOSM doesn't show two near-duplicate polygons.
     _merge_sliver_junctions_into_neighbours(layout, icao=icao)
+    # Per user 2026-05-03: when the per-surface solver is on,
+    # geometry passes above (overlap clip, push-off, sliver merge)
+    # may have moved or added vertices since the solver finished.
+    # Re-run the solver one more time so its constraints (per-axis
+    # rect grade, all-pair junction grade, cross-section flatness)
+    # apply to the final geometry the OSM emit will write.
+    # Per user 2026-05-03: skip the mid-pipeline per-surface solver
+    # call and run the final solver AT THE END (below) after every
+    # geometry pass has settled.
     # Final WARN summary — emitted after every elevation pass
     # has run so the count reflects what the OSM emitter will
     # actually write to disk.  Earlier reports (mid-pipeline)
@@ -298,3 +321,9 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                 pass
     except Exception:
         pass
+
+    # The per-surface solver final pass moved to pipeline.py — it
+    # must run AFTER pipeline.py's own post-finalize passes
+    # (widen_junctions_to_runway_corners, etc.) which can insert new
+    # vertices into junctions.  See pipeline.py at end of
+    # build_airport_pavement.

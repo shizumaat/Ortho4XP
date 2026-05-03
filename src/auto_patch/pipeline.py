@@ -1738,6 +1738,26 @@ def build_airport_pavement(icao: str, xplane_root: str,
         widen_junctions_to_runway_corners(layout)
         _push_junction_vertices_outside_pavement(layout)
 
+        # Per user 2026-05-03: per-surface solver runs AS THE LAST
+        # STEP of the pipeline, after every junction rule and
+        # runway-corner insertion.  ``widen_junctions_to_runway_
+        # corners`` inserts vertices with raw runway altitudes that
+        # may violate the surrounding junction's per-axis grade
+        # rule with respect to neighbouring (terrain-following)
+        # vertices; the solver pass cap-projects them into
+        # compliance.
+        from .elevation import USE_PER_SURFACE_SOLVER
+        if USE_PER_SURFACE_SOLVER and layout.anchor is not None:
+            from .elevation import _load_airport_dem
+            from .elevation_per_surface import solve as per_surface_solve
+            dem = tile_dem if tile_dem is not None else _load_airport_dem(
+                layout.anchor[0], layout.anchor[1])
+            tile_lat = math.floor(layout.anchor[0])
+            tile_lon = math.floor(layout.anchor[1])
+            per_surface_solve(layout, icao,
+                               dem=dem,
+                               tile_lat=tile_lat, tile_lon=tile_lon)
+
     return layout
 
 
