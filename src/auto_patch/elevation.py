@@ -1431,11 +1431,23 @@ def _solve_pavement_elevations_unified(
                          ROLE_SECONDARY_PARALLEL,
                          ROLE_STUB, ROLE_CROSS_CONNECTOR):
             if len(corner_elevs) == 4:
-                # Sloping rect: corners 0,3 → high; 1,2 → low.
-                hi = (corner_elevs[0] + corner_elevs[3]) / 2
-                lo = (corner_elevs[1] + corner_elevs[2]) / 2
-                if hi < lo:
-                    hi, lo = lo, hi
+                # Group the 4 corners into the two short-end pairs by
+                # projecting onto source_axis (the rect's centerline).
+                # Don't trust polygon vertex index — overlap-clip /
+                # shared-vertex collapse can rotate the order, in
+                # which case the legacy [0,3]/[1,2] grouping silently
+                # averages across the slope direction and produces
+                # hi ≈ lo (a sloping rect that looks flat).
+                start_pair, end_pair = _short_end_pairs_by_axis(
+                    coords_open, s.source_axis)
+                if start_pair is None:
+                    # Fall back to legacy index pairing.
+                    start_pair, end_pair = (0, 3), (1, 2)
+                a_avg = (corner_elevs[start_pair[0]]
+                         + corner_elevs[start_pair[1]]) / 2
+                b_avg = (corner_elevs[end_pair[0]]
+                         + corner_elevs[end_pair[1]]) / 2
+                hi, lo = (a_avg, b_avg) if a_avg >= b_avg else (b_avg, a_avg)
                 s.altitude_high = round(float(hi), 1)
                 s.altitude_low = round(float(lo), 1)
                 s.altitude = None
@@ -2303,6 +2315,47 @@ def _match_elev(rx: float, ry: float,
 # 2D polygon-grid smoothing (extracted to auto_patch.elevation_smoothing)
 # ──────────────────────────────────────────────────────────────────
 from .elevation_smoothing import _smooth_polygon_grid
+
+def _short_end_pairs_by_axis(
+        coords_open: Sequence[Tuple[float, float]],
+        source_axis,
+) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    """Group a 4-corner rect ring into its two short-end vertex pairs
+    by projecting each corner onto ``source_axis``.
+
+    The two corners with the smallest parametric position form one
+    short end; the two largest form the other.  Returns ``(start_pair,
+    end_pair)`` as 0-based index tuples into ``coords_open``, or
+    ``(None, None)`` if ``source_axis`` is unusable (missing or
+    zero-length).
+
+    Used by the Laplacian-solver writeback to set
+    ``altitude_high``/``altitude_low`` from the actual rect geometry,
+    independent of polygon vertex index order — which can be rotated
+    by overlap-clip / shared-vertex collapse.
+    """
+    if source_axis is None or source_axis.is_empty:
+        return None, None
+    if len(coords_open) != 4:
+        return None, None
+    ax_pts = list(source_axis.coords)
+    if len(ax_pts) < 2:
+        return None, None
+    ax_start = ax_pts[0]
+    ax_end = ax_pts[-1]
+    axdx = ax_end[0] - ax_start[0]
+    axdy = ax_end[1] - ax_start[1]
+    ax_len2 = axdx * axdx + axdy * axdy
+    if ax_len2 < 1e-9:
+        return None, None
+    ts = []
+    for x, y in coords_open:
+        t = ((x - ax_start[0]) * axdx
+             + (y - ax_start[1]) * axdy) / ax_len2
+        ts.append(t)
+    order = sorted(range(4), key=lambda i: ts[i])
+    return (order[0], order[1]), (order[2], order[3])
+
 
 def _corner_elevation_bucket(x: float, y: float,
                              tol: float = SHARED_VERTEX_TOL_M
