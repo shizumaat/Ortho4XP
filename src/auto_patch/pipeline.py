@@ -1716,11 +1716,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # taxi-grade ≤ 1.5 % shifts elevation by ≤ 15 cm — well
         # within the within-shape grade tolerance).
         from .junction_rules import (
+            _align_rect_slope_to_axis,
             _enforce_runway_1to1_sharing,
             _push_junction_vertices_outside_pavement,
             _snap_to_long_edge_corners,
             widen_junctions_to_runway_corners,
         )
+        # Slope alignment runs FIRST post-elevation: rects whose
+        # slope is purely perpendicular to source_axis become flat
+        # (single altitude) so subsequent rules treat them as
+        # multi-connection-allowed (per user 2026-05-02).
+        _align_rect_slope_to_axis(layout)
         _snap_to_long_edge_corners(layout)
         _enforce_runway_1to1_sharing(layout)
         # Rule 1 v6 widening (user 2026-05-02): runs ONLY here,

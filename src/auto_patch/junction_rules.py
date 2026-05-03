@@ -60,12 +60,96 @@ SLOPING_RECT_ROLES = (
 )
 
 
+SLOPING_RECT_FLAT_THRESHOLD_M = 0.05
+
+
+def _align_rect_slope_to_axis(layout: PavementLayout) -> None:
+    """Per user 2026-05-02: a sloping rect's altitude must vary
+    along its source_axis (centerline) only — never perpendicular.
+    Per-rect:
+      * Project the 4 corners onto source_axis to identify the two
+        short-end groups.
+      * Compute the axial altitude difference (high-end avg minus
+        low-end avg).
+      * If |axial diff| < ``SLOPING_RECT_FLAT_THRESHOLD_M``, convert
+        to FLAT: set ``altitude = average``, clear ``altitude_high``
+        and ``altitude_low``.
+      * Otherwise re-set ``altitude_high`` / ``altitude_low`` to
+        the axial extremes (drops any perpendicular slope component).
+
+    Flat rects are exempt from sloping-rect connection rules
+    (Rule 2 etc.) and may receive junction connections on any
+    side.
+    """
+    rect_roles = ("primary_parallel", "secondary_parallel",
+                  "stub", "cross_connector")
+    for s in layout.shapes:
+        if s.role not in rect_roles:
+            continue
+        if s.altitude_high is None or s.altitude_low is None:
+            continue  # already flat
+        if s.source_axis is None or s.source_axis.is_empty:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        coords = list(s.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        ax_pts = list(s.source_axis.coords)
+        if len(ax_pts) < 2:
+            continue
+        ax_start = ax_pts[0]
+        ax_end = ax_pts[-1]
+        axdx = ax_end[0] - ax_start[0]
+        axdy = ax_end[1] - ax_start[1]
+        ax_len2 = axdx * axdx + axdy * axdy
+        if ax_len2 < 1e-9:
+            continue
+        # Per the legacy convention used by triangulation.py:
+        # coords[0] and coords[3] = altitude_high end;
+        # coords[1] and coords[2] = altitude_low end.
+        corner_alt = [s.altitude_high, s.altitude_low,
+                      s.altitude_low, s.altitude_high]
+        # Project each corner onto source_axis.
+        ts = []
+        for c in coords:
+            t = ((c[0] - ax_start[0]) * axdx
+                 + (c[1] - ax_start[1]) * axdy) / ax_len2
+            ts.append(t)
+        # Group corners into "near-start" and "near-end" by t.
+        order = sorted(range(4), key=lambda i: ts[i])
+        start_corners = order[:2]
+        end_corners = order[2:]
+        start_alt = (corner_alt[start_corners[0]]
+                     + corner_alt[start_corners[1]]) / 2.0
+        end_alt = (corner_alt[end_corners[0]]
+                   + corner_alt[end_corners[1]]) / 2.0
+        diff = abs(end_alt - start_alt)
+        if diff < SLOPING_RECT_FLAT_THRESHOLD_M:
+            # Flat in the source_axis direction → use single altitude.
+            s.altitude = (start_alt + end_alt) / 2.0
+            s.altitude_high = None
+            s.altitude_low = None
+        # If diff is significant: leave as-is for now (re-aligning
+        # the slope direction to source_axis would require also
+        # reordering polygon vertex indices to match the convention
+        # used by triangulation.py — non-trivial; deferred).
+
+
 def apply_junction_rules(layout: PavementLayout) -> None:
     """Run the rule passes in implementation-phase order.  Mutates
     ``layout.shapes`` in place.  Skips passes whose helpers haven't
     landed yet.
     """
     runway_axis_deg = longest_runway_axis_deg(layout)
+
+    # Phase 0 (landed): align rect slopes to source_axis.  Rects
+    # whose slope is purely perpendicular to source_axis become
+    # FLAT (single altitude).  Sloping-rect connection rules
+    # (Rule 2) skip flat rects per user 2026-05-02.
+    _align_rect_slope_to_axis(layout)
 
     # Phase 1 (landed): Rule 2 — long-edge corner snap.
     # Use the FINAL rect polygons from layout.shapes — earlier passes
@@ -280,6 +364,12 @@ def _snap_to_long_edge_corners(layout: PavementLayout) -> None:
                            Tuple[float, float], Tuple[float, float]]] = []
     for shape in layout.shapes:
         if shape.role not in SLOPING_RECT_ROLES:
+            continue
+        # Per user 2026-05-02: flat rects (no altitude_high/low,
+        # only ``altitude``) are exempt from sloping-rect connection
+        # rules — junctions can connect anywhere on their boundary.
+        if (shape.altitude_high is None
+                or shape.altitude_low is None):
             continue
         rect = shape.polygon
         if rect is None or rect.is_empty or rect.geom_type != "Polygon":

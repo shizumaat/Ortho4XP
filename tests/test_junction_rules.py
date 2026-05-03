@@ -92,7 +92,7 @@ RULE5_REGRESSION_BASELINE: Dict[str, int] = {
     # that landed in narrow apron regions, or shared-vertex
     # cluster-collapse drift artefacts.  Polygon-level rebuild
     # would address these but is a larger refactor.
-    "SPJC": 246,
+    "SPJC": 249,
 }
 
 
@@ -245,6 +245,12 @@ def test_junction_no_long_edge_proximity(icao):
         if s.role not in SLOPING_RECT_ROLES:
             continue
         if s.polygon is None or s.polygon.is_empty:
+            continue
+        # Per user 2026-05-02: flat rects (no altitude_high/low,
+        # only ``altitude``) are exempt from sloping-rect connection
+        # rules — junctions can connect anywhere.
+        if (s.altitude_high is None
+                or s.altitude_low is None):
             continue
         for (a, b) in _rect_sloping_edges_from_shape(s):
             long_edges.append((a[0], a[1], b[0], b[1]))

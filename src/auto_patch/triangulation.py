@@ -195,6 +195,11 @@ def _triangulate_junctions(
     for s in layout.shapes:
         if s.role not in sloping_roles:
             continue
+        # Per user 2026-05-02: flat rects are exempt from sloping-
+        # rect connection rules; junctions can densify against
+        # their edges freely.
+        if s.altitude_high is None or s.altitude_low is None:
+            continue
         try:
             rc = list(s.polygon.exterior.coords)
         except Exception:
