@@ -1759,6 +1759,13 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                dem=dem,
                                tile_lat=tile_lat, tile_lon=tile_lon)
 
+        # Final within-shape grade WARN reflects the absolute
+        # final state — junction / apron / terminal Euclidean caps
+        # post-final-solver.  Per user 2026-05-03 the WARN was
+        # previously firing mid-pipeline with stale numbers.
+        from .elevation import _report_within_shape_violations
+        _report_within_shape_violations(layout, icao)
+
     return layout
 
 

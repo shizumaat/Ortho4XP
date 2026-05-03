@@ -2494,26 +2494,50 @@ from .junction_repair import (
 
 def _report_within_shape_violations(
         layout: "PavementLayout", icao: str) -> None:
-    """Layer 3: scan every emitted polygon for vertex-pair grade
-    violations and emit a stderr WARN summary.
+    """Audit + WARN summary for within-shape grade violations.
 
-    Pair set: only pairs within ``WITHIN_SHAPE_VIOLATION_RADIUS_M``
-    of each other (the same Triangle4XP-plausible-edge radius
-    check_grade.py uses).  Far-pair grades are noisy false
-    positives — Triangle4XP would interpose a Steiner point and
-    never connect them directly.
+    Per user 2026-05-03: the old audit used ``TAXI_MAX_GRADE``
+    (1.5 %) for every shape and a 60 m Euclidean radius cap.  Both
+    were wrong for the per-surface elevation pipeline:
+
+    * Junctions cap at 1.5 % (multi-directional) but APRONS /
+      TERMINALS cap at 1.0 %.
+    * The user's rule is "any direction", not "within 60 m" —
+      drop the radius cap for junction / apron / terminal.
+    * RECTS are flat across their width by construction (cross-
+      section flatness equality in the solver) and slope only
+      along source_axis; pairing arbitrary rect corners via the
+      legacy ``[high, low, low, high]`` convention is ambiguous
+      after the canonicalisation pass and produces misleading
+      WARN noise.  Skip rects entirely — their grade is enforced
+      structurally via altitude_high / altitude_low and the cross-
+      section equality constraint.
+
+    Apply a 0.10 m absolute rounding allowance (altitudes are
+    stored to 0.1 m precision; the per-pair noise envelope is
+    twice that worst-case).
     """
     if not layout.shapes:
         return
-    radius = WITHIN_SHAPE_VIOLATION_RADIUS_M
-    radius2 = radius * radius
+    rounding_allowance_m = 0.10
     cos0 = math.cos(math.radians(layout.anchor[0]))
     n_viol = 0
     worst_pct = 0.0
     worst_info: Optional[Tuple[str, str, float, float, float, float]] = None
+    # Audit ONLY multi-directional surfaces.  Per-axis surfaces
+    # (rects, runway segments, boundary ribbon, tunnel ramp,
+    # retaining wall) have grade enforced along their own axis, not
+    # across the polygon — pairing arbitrary corners via Euclidean
+    # produces meaningless WARN noise (a 1.5 %-along-axis rect's
+    # diagonal IS more than 1.5 % grade because the axial cap fits
+    # exactly along the long edge).
+    AUDITED_ROLES = {ROLE_JUNCTION, ROLE_APRON}
     for s in layout.shapes:
         if s.polygon is None or s.polygon.is_empty:
             continue
+        if s.role not in AUDITED_ROLES:
+            continue
+        cap_pct = TAXI_MAX_GRADE if s.role == ROLE_JUNCTION else APRON_MAX_GRADE
         try:
             coords = list(s.polygon.exterior.coords)
         except Exception:
@@ -2538,16 +2562,11 @@ def _report_within_shape_violations(
                      float(s.altitude_low), float(s.altitude_high)]
         else:
             continue
-        # Convert ring to local meter coords for grade check.
         coords_m = []
         for (lon, lat) in coords:
-            # Some shapes' polygons store (x, y) in meters already
-            # (the new pavement builder works in meters); others
-            # might store (lon, lat).  Detect by magnitude.
             if abs(lon) > 180.0 or abs(lat) > 180.0:
-                coords_m.append((lon, lat))  # already meters
+                coords_m.append((lon, lat))
             else:
-                # lat/lon → meters
                 x = math.radians(lon - layout.anchor[1]) * R_EARTH * cos0
                 y = math.radians(lat - layout.anchor[0]) * R_EARTH
                 coords_m.append((x, y))
@@ -2556,14 +2575,11 @@ def _report_within_shape_violations(
             ei = elevs[i]
             for j in range(i + 1, n):
                 xj, yj = coords_m[j]
-                dx = xi - xj
-                dy = yi - yj
-                d2 = dx * dx + dy * dy
-                if d2 > radius2 or d2 < 0.25:
+                d = math.hypot(xi - xj, yi - yj)
+                if d < 0.5:
                     continue
-                d = math.sqrt(d2)
                 de = abs(ei - elevs[j])
-                if de <= TAXI_MAX_GRADE * d + 0.10:
+                if de <= cap_pct * d + rounding_allowance_m:
                     continue
                 pct = (de / d) * 100.0
                 if pct > worst_pct:
@@ -2576,8 +2592,9 @@ def _report_within_shape_violations(
         try:
             import sys as _sys
             msg = (f"  [pav-builder] WARN: {icao}: {n_viol} within-shape "
-                   f"grade violations (> {TAXI_MAX_GRADE * 100:.1f}%, "
-                   f"checked pairs within {radius:.0f} m)")
+                   f"grade violations (junction ≤ 1.5 %, apron / "
+                   f"terminal ≤ 1.0 %, all-pair Euclidean within "
+                   f"polygon)")
             if worst_info is not None:
                 role, ref, ea, eb, d, de = worst_info
                 rstr = f"/{ref}" if ref else ""

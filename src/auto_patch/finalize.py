@@ -153,12 +153,11 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     # Per user 2026-05-03: skip the mid-pipeline per-surface solver
     # call and run the final solver AT THE END (below) after every
     # geometry pass has settled.
-    # Final WARN summary — emitted after every elevation pass
-    # has run so the count reflects what the OSM emitter will
-    # actually write to disk.  Earlier reports (mid-pipeline)
-    # over-counted because they ran before the smoother /
-    # shared-vertex agree / rect-corner snap chain converged.
-    _report_within_shape_violations(layout, icao)
+    # WARN summary moved to pipeline.py after the absolute final
+    # per-surface solver pass — the WARN that ran here would
+    # report a stale state because the post-finalize junction-rule
+    # passes (widen_junctions_to_runway_corners etc.) and the
+    # final solver run after this point.
     # Per user 2026-04-28: emit a 5 m-wide ribbon polygon
     # tracing the airport boundary (apt.dat row-130) with
     # per-vertex altitudes clamped to ≤ 3 % grade from the
