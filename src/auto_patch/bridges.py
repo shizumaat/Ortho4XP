@@ -73,6 +73,37 @@ __all__ = [
 ]
 
 
+# Per-OSM-highway-type carriageway width (user 2026-05-03).
+# Was a single 22 m default, which made every tunnel look like a
+# 6-lane motorway.  Real-world widths vary by classification; the
+# numbers below match typical FAA-relevant standards (single
+# carriageway including shoulders).
+HIGHWAY_CARRIAGEWAY_WIDTH_M = {
+    "motorway":         24.0,  # 6+ lanes per direction in some places
+    "motorway_link":     8.0,
+    "trunk":            22.0,
+    "trunk_link":        8.0,
+    "primary":          18.0,
+    "primary_link":      7.0,
+    "secondary":        11.0,  # ~half of trunk per user 2026-05-03
+    "secondary_link":    7.0,
+    "tertiary":          9.0,
+    "tertiary_link":     6.0,
+    "residential":       7.0,
+    "service":           6.0,
+}
+
+
+def _carriageway_width_for(highway_type: Optional[str],
+                            default_m: float) -> float:
+    """Return the carriageway width in metres for an OSM highway
+    type, falling back to ``default_m`` for unknown types.
+    """
+    if highway_type is None:
+        return default_m
+    return HIGHWAY_CARRIAGEWAY_WIDTH_M.get(highway_type, default_m)
+
+
 def _emit_tunnel_portals(
         layout: "PavementLayout",
         dem,
@@ -86,7 +117,7 @@ def _emit_tunnel_portals(
         retaining_wall_width_m: float = 1.0,
         wall_gap_m: float = 0.5,
         portal_cluster_dist_m: float = 40.0,
-        boundary_clearance_m: float = 1.0,
+        boundary_clearance_m: float = 0.5,
         excluded_way_ids: Optional[set] = None,
         ) -> int:
     """For each tunnel portal (each end of an OSM ``aeroway=*``
@@ -433,16 +464,21 @@ def _emit_tunnel_portals(
     # Per-cluster: build cap + arm walls + ramp chain.
     exclusion_zones: List[Polygon] = []
     n_emitted = 0
-    half_carriage = 0.5 * carriageway_width_m
     half_wall_w = retaining_wall_width_m / 2.0
     for cl in clusters:
         # All portals in cluster share approximately the same
         # location.  Use the first portal's walk as the canonical
         # arm path; combine widths for divided highways.
         head = portal_data[cl[0]]
-        portal_nid, _wid_unused, walk_pts, _hw, apt_elev, far_dem = head
+        portal_nid, _wid_unused, walk_pts, hw_type, apt_elev, far_dem = head
         if len(walk_pts) < 2:
             continue
+        # Per-OSM-highway-type carriageway width (user 2026-05-03):
+        # was a fixed 22 m default; now varies by classification
+        # so secondary tunnels are ~half the width of trunk tunnels.
+        carriage_w = _carriageway_width_for(
+            hw_type, carriageway_width_m)
+        half_carriage = 0.5 * carriage_w
         elev_low = apt_elev - tunnel_depth_m
         elev_high = far_dem
         # Compute the walk's cumulative distance for elevation
