@@ -1,18 +1,36 @@
-# Auto-Patch Status — handoff 2026-05-03
+# Auto-Patch Status — handoff 2026-05-03 (evening)
 
 ## TL;DR
 
-**SPJC is the new validated baseline.**  Per-surface elevation
-solver landed and is the default; bridges/tunnels re-enabled;
-boundary emit restored.  Tagged at
-[`per-surface-solver-baseline`](https://github.com/) (commit
-`e4d7e3c`) and refined through `079f43f`.
+**SPJC is the validated baseline; X-Plane visually confirmed.**
+Per-surface elevation solver is the default, bridges/tunnels
+re-enabled, boundary emit restored, tunnel emit improvements
+landed (highway-typed widths, divided-carriageway unification,
+both-ends emit on short tunnels, ramp/wall vertex separation,
+ramp densification, 0.5 m boundary clearance), WARN audit
+revised to match the per-surface model.
 
-User-validated visually in JOSM; X-Plane testing pending.
+* Tagged baseline: [`per-surface-solver-baseline`](https://github.com/)
+  at commit `e4d7e3c`.
+* Tagged "best elevation model so far":
+  [`best-elevation-model`](https://github.com/) at commit `187d2cd`.
+* Refined further through commit `3776929` (today).
 
 The next agent's focus:
 
-1. **Two SPJC follow-ups now baselined as known issues** (not
+1. **Center dual-carriageway tunnels across BOTH carriageways**
+   (user 2026-05-03 evening).  The single-carriageway secondary
+   tunnel south of Terminal 2 is now correct (both ends emit).
+   Trunk tunnels with two parallel carriageways still appear
+   centered on ONE carriageway in X-Plane, even though
+   ``cluster_perp_offset`` should shift the cap centre to the
+   midpoint.  Investigate whether the perpendicular spans are
+   being computed correctly for trunk clusters, or whether the
+   arms (still along the head walk) visually outweigh the centred
+   cap.  The likely fix is to also shift the arm walk to the
+   centroid path between the two carriageways.
+
+2. **Two SPJC follow-ups still baselined as known issues** (not
    blocking):
    * Boundary polygon doesn't carve around tunnel_ramp /
      retaining_wall footprints — 1614 m² overlap.  Pending fix
@@ -21,11 +39,92 @@ The next agent's focus:
    * Boundary polygon vertices don't snap to nearby junction
      corners — 4 orphan vertices.  Pending vertex-snap pass at
      boundary emit time.
-2. **CYXY taxi E reaches 717 m at SW apron** ✓ (test passes).
-   But CYXY has other issues the user wants addressed AFTER SPJC
-   stabilises.
+
 3. **Diagnose Rule 1 v6** (runway widening) — 2 of 15 SPJC
    runway-touching junctions still share only 1 node.  Deferred.
+
+4. **CYXY taxi E reaches 717 m at SW apron** ✓ (test passes).
+   But CYXY has other issues the user wants addressed AFTER SPJC
+   is fully stable.
+
+---
+
+## Session work (2026-05-03 evening)
+
+### Solver perf — 3 passes → 1
+
+`_apply_geometric_finalization`'s legacy clamp + subdivide chain
+and second solver pass are skipped when the per-surface flag is
+on.  The unified Jacobi converges in one pass; the final
+end-of-pipeline solver call (in `pipeline.py` after
+`widen_junctions_to_runway_corners` etc.) absorbs any geometry
+changes from junction-rule passes.  Build time ~half.  Commit
+`305d3be`.
+
+### Pipeline wiring fixes
+
+* `_load_osm_big_roads` re-exported from `pipeline.py` so
+  `_emit_airport_boundary_shape` no longer raises ImportError
+  silently.  Boundary polygon now actually emits.  Commit
+  `ca3d8c3`.
+* `EMIT_BRIDGES_AND_TUNNELS = True` (was False).  Commit
+  `ca3d8c3`.
+* `USE_PER_SURFACE_SOLVER` defaults ON.  Commit `ca3d8c3`.
+
+### Tunnel emit overhaul (commits `63ae6f6`, `094031f`, `9b3a3de`)
+
+Six issues flagged by user 2026-05-03 in JOSM review of SPJC:
+
+1. Per-OSM-highway-type carriageway widths (was uniform 22 m).
+   New `HIGHWAY_CARRIAGEWAY_WIDTH_M` table: motorway 24, trunk 22,
+   primary 18, secondary 11, tertiary 9, residential 7, service
+   6, link variants narrower.
+2. Cluster algorithm now skips pairs from the SAME tunnel way —
+   short tunnels (≤ 40 m) had both ends collapsing into one
+   cluster, emitting only one entrance.  Commit `9b3a3de`.
+3. `wall_gap_m` 0.5 m → 0.6 m.  At 0.5 m equals the OSM emit's
+   vertex bucket size, ramp road-edge corners and wall inner
+   corners hashed to the same node id and rendered with two
+   different altitudes (visible vertical glitch).
+4. Cap polygon centre is now `cluster_perp_offset` (midpoint of
+   perpendicular spans), not the head portal.  Centred for
+   single carriageways; for divided highways the cap centre
+   shifts to the midpoint between carriageway portals.
+   **Open issue:** still appears centred on one carriageway in
+   X-Plane — investigate.
+5. Walk densification: subdivide any segment > 50 m so short OSM
+   ways don't render as single straight ramps.  SPJC tunnel_ramp
+   count: 9 → 25 (one per ~50 m ramp piece across multiple
+   portals).
+6. `boundary_clearance_m` 1.0 m → 0.5 m default per user
+   "come up to 0.5 m from boundary, but not overlap".
+
+### WARN audit revised (commit `3776929`)
+
+The legacy `_report_within_shape_violations`:
+
+* ran mid-pipeline, BEFORE the absolute-final solver, so reported
+  stale numbers (10 violations on SPJC even though the regression
+  test saw zero).
+* used `TAXI_MAX_GRADE` (1.5 %) for every shape, ignoring
+  apron / terminal 1.0 % cap.
+* capped pair distance at 60 m Euclidean (Triangle4XP
+  rendering heuristic, not the user's "any direction" rule).
+* audited rect / boundary-ribbon / tunnel-ramp / retaining-wall
+  with the same Euclidean-any-direction rule, conflating axial
+  with cross-axial grade.
+
+Now:
+
+* runs in `pipeline.py` AFTER the final solver pass.
+* audits ONLY `ROLE_JUNCTION` and `ROLE_APRON` (multi-directional
+  surfaces).  Per-axis surfaces have grade enforced structurally.
+* per-role cap (1.5 % junction, 1.0 % apron).
+* all-pair Euclidean within polygon, no radius cap.
+* 0.10 m absolute rounding allowance (matches the slack used in
+  `test_within_junction_grade_compliance`).
+
+SPJC: zero WARN messages — consistent with the regression test.
 
 ---
 
