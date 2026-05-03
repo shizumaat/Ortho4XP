@@ -123,7 +123,13 @@ def _emit_tunnel_portals(
         # Sharing the vertex would emit one node with two altitudes,
         # rendering as a vertical glitch (user 2026-05-03).
         wall_gap_m: float = 0.6,
-        portal_cluster_dist_m: float = 15.0,
+        # Divided-highway carriageways with two parallel ways
+        # cluster into a single combined entrance.  User 2026-05-03:
+        # one entrance per end of the tunnel, not one per
+        # carriageway.  40 m is wide enough for typical separated
+        # carriageways; tighter values would split them into
+        # separate caps which is wrong.
+        portal_cluster_dist_m: float = 40.0,
         boundary_clearance_m: float = 0.5,
         excluded_way_ids: Optional[set] = None,
         ) -> int:
@@ -468,18 +474,33 @@ def _emit_tunnel_portals(
                  float(apt_elev), float(far_dem)))
     if not portal_data:
         return 0
-    # Cluster portals by node-coord proximity (divided highways).
+    # Cluster portals by node-coord proximity (divided highways
+    # with two parallel carriageways have a portal per carriageway
+    # at each tunnel end; cluster them so we emit one combined
+    # entrance per end).
+    #
+    # Per user 2026-05-03: do NOT cluster the two portals of the
+    # SAME tunnel way (a short tunnel ≤ ``portal_cluster_dist_m``
+    # long has both ends within cluster distance, but they're the
+    # OPPOSITE ends of the same tunnel — emitting only one cluster
+    # would skip one tunnel mouth, which is what was happening on
+    # the small 33 m secondary tunnel south of Terminal 2).
     clusters: List[List[int]] = []
     used: set = set()
     for i in range(len(portal_data)):
         if i in used:
             continue
+        wid_i = portal_data[i][1]
         nid_i = portal_data[i][0]
         cl = [i]
         used.add(i)
         pi = nodes_m[nid_i]
         for j in range(i + 1, len(portal_data)):
             if j in used:
+                continue
+            wid_j = portal_data[j][1]
+            if wid_j == wid_i:
+                # Same tunnel way — two ends, do not cluster.
                 continue
             pj = nodes_m[portal_data[j][0]]
             if (math.hypot(pi[0] - pj[0], pi[1] - pj[1])
