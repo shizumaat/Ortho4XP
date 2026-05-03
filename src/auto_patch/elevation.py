@@ -197,6 +197,15 @@ SHARED_AGREE_TOL_M = 0.10
 # grade compliance.
 USE_PER_POLYGON_ELEVATION_FIELD = False
 
+# Per-surface elevation solver (user 2026-05-02 redesign).
+# When True, replaces ``_solve_pavement_elevations_unified`` with the
+# phased per-surface solver in ``elevation_per_surface``.  See
+# ``docs/elevation_per_surface_redesign.md``.  Default OFF until
+# validated against SPJC + CYXY + HECA; enable per-airport via env
+# var ``O4_PER_SURFACE_SOLVER=1`` for A/B testing.
+USE_PER_SURFACE_SOLVER = (
+    os.environ.get("O4_PER_SURFACE_SOLVER", "0") == "1")
+
 # Used by both _build_clamp_geom_state (in this module) and the
 # _triangulate_junctions code path (in auto_patch.triangulation).
 # Defined here so triangulation can import it without forcing a
@@ -966,10 +975,11 @@ def _apply_geometric_finalization(
     _triangulate_junctions(
         layout, dem, tile_lat, tile_lon, m_to_ll)
 
-    # Phase 2: first unified-solver pass (real elevations on the
+    # Phase 2: first solver pass (real elevations on the
     # current geometry — clamp + subdivide need these to detect
     # grade violations, not DEM-noisy fallbacks).
-    _solve_pavement_elevations_unified(layout, icao)
+    _solve_pavement_elevations(
+        layout, icao, dem=dem, tile_lat=tile_lat, tile_lon=tile_lon)
 
     # Phase 3: clamp + subdivide based on the real elevations.
     clamp_geom = _build_clamp_geom_state(layout)
@@ -989,11 +999,28 @@ def _apply_geometric_finalization(
         if n == 0:
             break
 
-    # Phase 4: second unified-solver pass (final elevations on
+    # Phase 4: second solver pass (final elevations on
     # refined geometry).
+    _solve_pavement_elevations(
+        layout, icao, dem=dem, tile_lat=tile_lat, tile_lon=tile_lon)
+
+
+
+
+def _solve_pavement_elevations(
+        layout: "PavementLayout", icao: str,
+        dem=None, tile_lat: int = 0, tile_lon: int = 0) -> None:
+    """Dispatcher: route to the per-surface or unified solver based
+    on ``USE_PER_SURFACE_SOLVER``.  The per-surface solver requires
+    a DEM + tile coords (passed via callers in
+    ``_apply_geometric_finalization``).  When DEM args are missing,
+    falls back to the unified solver.
+    """
+    if USE_PER_SURFACE_SOLVER and dem is not None:
+        from .elevation_per_surface import solve as per_surface_solve
+        per_surface_solve(layout, icao, dem, tile_lat, tile_lon)
+        return
     _solve_pavement_elevations_unified(layout, icao)
-
-
 
 
 def _solve_pavement_elevations_unified(

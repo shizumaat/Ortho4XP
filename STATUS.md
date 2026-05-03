@@ -1,43 +1,27 @@
-# Auto-Patch Status — handoff 2026-05-02 (evening)
+# Auto-Patch Status — handoff 2026-05-02 (late evening)
 
 ## TL;DR
 
-Implemented 5 junction-refinement rules across this session, with
-multiple iterations on Rule 1 (junction-runway sharing) and a
-slope-alignment pass.  HEAD at `b37d65a`.
+Two major outcomes this session: (1) fixed the slope-alignment
+regression introduced earlier today (commit `35db401` — runway
+slopes restored at SPJC); (2) confirmed a deeper architectural
+issue with elevation grading at CYXY and produced a redesign
+plan: see [docs/elevation_per_surface_redesign.md](docs/elevation_per_surface_redesign.md).
 
-**🚨 CRITICAL ISSUE — likely regression introduced this session:**
-The slope-alignment pass (`f35b1b8`) converted ALL 42 SPJC sloping
-rects to flat (single altitude).  User reports SPJC is NOT flat:
-runway 32R threshold is 29 m, climbs to mid-30s in displaced
-threshold; opposite end 16L is 13 m.  My axial-slope check
-(threshold 0.05 m) thinks every rect is flat.  Almost certainly:
-the convention `[altitude_high, altitude_low, altitude_low,
-altitude_high]` for `coords[0..3]` doesn't always hold (per
-issue #4 from earlier feedback), so my `start_alt` and `end_alt`
-calculation in `_align_rect_slope_to_axis` (junction_rules.py:90)
-gets bogus per-corner altitudes and reports zero axial diff for
-rects that are actually sloping properly.
-
-**Other open issue:** user asked about elevation grading rules:
-"Do you understand how (and do or algorithms allow) a taxiway to
-be 20m higher or lower than an adjacent runway just 150m away
-perpendicularly?" — I haven't answered.  Need to investigate the
-elevation pipeline to confirm constraints handle SPJC's real
-elevation profile.
+The redesign work is **in progress** at HEAD; no new code yet
+beyond the slope-alignment fix.
 
 The next agent's focus:
 
-1. **Diagnose + fix the slope-alignment regression.**  The
-   per-corner altitude lookup needs to use the actual altitude at
-   each corner (not assume the index convention).  See
-   "Slope alignment regression" below for the specific fix.
-2. **Verify elevation/grade rules** for SPJC's real altitude
-   range (16 m delta along runway).  Confirm taxiway-runway
-   adjacency tolerates 20 m perpendicular delta.
-3. **Continue refining Rule 1 v6** (runway widening).  Currently
-   13 of 15 runway-touching junctions are at 2-4 shared nodes
-   (user's spec); 2 still at 1.
+1. **Implement the per-surface elevation solver** per
+   [docs/elevation_per_surface_redesign.md](docs/elevation_per_surface_redesign.md).
+   New package `src/auto_patch/elevation_per_surface/` lives behind
+   a feature flag while we validate against CYXY + SPJC. CYXY taxi
+   E at the south edge of the SW apron must reach ≥ 714 m
+   (currently 707.9).
+2. **Diagnose Rule 1 v6** (runway widening) — 2 of 15 SPJC
+   runway-touching junctions still share only 1 node. Deferred
+   behind the elevation redesign.
 
 ---
 
@@ -127,19 +111,24 @@ d215c93 Rule 1 v5: cross-junction global shrink check + ordered processing
 
 ---
 
-## 🚨 CRITICAL: Slope alignment regression
+## ✅ RESOLVED: Slope alignment regression (commit `35db401`)
 
-### Symptom (user 2026-05-02)
+After commit `f35b1b8`, all 42 SPJC sloping taxi rects became
+flat. Root cause: TWO places (the Laplacian solver writeback at
+elevation.py:1430 AND `_align_rect_slope_to_axis`) used the
+unstable polygon-vertex convention `[altitude_high,
+altitude_low, altitude_low, altitude_high]` for `coords[0..3]`.
+After overlap-clip / shared-vertex collapse rotates the vertex
+order, the convention silently averages across the slope
+direction → `hi ≈ lo` → rect classified flat.
 
-> "SPJC is definitely not flat.  The runway 32R threshold is at
-> 29m, and continues to climb in the displaced threshold into the
-> mid 30's, while the opposite end of that runway, 16L is only
-> 13m."
-
-After commit `f35b1b8`, all 42 SPJC sloping taxi rects (every
-primary_parallel, secondary_parallel, stub, cross_connector)
-became flat.  This is wrong — SPJC has 16 m of runway altitude
-delta, and adjacent taxiways should slope similarly.
+Fix (`35db401`): added `_short_end_pairs_by_axis` helper in
+elevation.py that groups corners by source_axis projection;
+the solver now uses this geometry-based pairing instead of
+indices. `_align_rect_slope_to_axis` simplified to a scalar
+threshold check. SPJC after fix: 41 of 42 rects sloping (was
+0/42); test_junction_no_long_edge_proximity un-skipped and
+passes.
 
 ### Root cause hypothesis
 
@@ -198,25 +187,32 @@ Tests that depend on slope:
 
 ---
 
-## Open question: elevation grading rules
+## Elevation grading rules — redesign needed
 
-User 2026-05-02:
+User 2026-05-02 confirmed: **FAA grade is per-axis along each
+surface only**, not Euclidean / not graph-distance. A taxiway
+parallel to a runway can be 15+ m higher at a perpendicular
+distance of 150 m without violating FAA grade, as long as each
+surface (and the connecting stubs) individually grade-comply
+along their own axes.
 
-> "I want to be sure you understand the nature of the
-> grade/elevation/slope rules.  Do you understand how (and do our
-> algorithms allow) a taxiway to be 20m higher or lower than an
-> adjacent runway just 150m away perpendicularly?"
+**Concrete CYXY example:** taxi E at the south edge of the SW
+apron should be ~14–15 m above the runway following natural
+terrain (~717 m DEM vs 703 m runway). Current algorithm collapses
+it to ~708 m by propagating the runway's HARD anchor up through
+the connecting graph chain at 1.5 % × short_path. This is wrong.
 
-I haven't investigated yet.  Worth checking:
-* `src/auto_patch/elevation.py` — Laplacian solver +
-  grade-compliance.
-* `tests/test_pavement_grade.py` — the grade test that's failing
-  for SPJC and SPLP.
-* `feedback_shape_rules.md` (memory) — should be updated with
-  the elevation-grading constraints once understood.
+**Redesign plan:** see
+[docs/elevation_per_surface_redesign.md](docs/elevation_per_surface_redesign.md).
+Per-surface phased solver — taxis first (axial DEM-smoothed),
+then BFS from runway anchors through rect-junction chains, then
+junction interiors (ring-edge cap only, no spatial pairs), then
+aprons (1 % cap), then terminals. New code goes in
+`src/auto_patch/elevation_per_surface/`.
 
-The user's question implies the answer should be "yes, the
-algorithm supports this."  We need to verify and document.
+**Memory updated:**
+[feedback_grade_rules.md](/Users/noah/.claude/projects/-Users-noah-Ortho4XP-shred86/memory/feedback_grade_rules.md)
+captures the per-axis rule and the redesign rationale.
 
 ---
 
