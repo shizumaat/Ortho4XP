@@ -994,32 +994,39 @@ def _apply_geometric_finalization(
 
     # Phase 2: first solver pass (real elevations on the
     # current geometry — clamp + subdivide need these to detect
-    # grade violations, not DEM-noisy fallbacks).
-    _solve_pavement_elevations(
-        layout, icao, dem=dem, tile_lat=tile_lat, tile_lon=tile_lon)
+    # grade violations, not DEM-noisy fallbacks).  Per user
+    # 2026-05-03: when the per-surface solver is on, the legacy
+    # clamp + subdivide chain is unnecessary (the unified Jacobi
+    # converges to a grade-compliant field directly), and the
+    # final solver pass at the END of build_airport_pavement
+    # absorbs any geometry changes from junction-rule passes.
+    # Skipping these here cuts build time roughly in half.
+    if not USE_PER_SURFACE_SOLVER:
+        _solve_pavement_elevations(
+            layout, icao, dem=dem, tile_lat=tile_lat, tile_lon=tile_lon)
 
-    # Phase 3: clamp + subdivide based on the real elevations.
-    clamp_geom = _build_clamp_geom_state(layout)
-    for _ in range(8):
-        n = _clamp_junction_free_vertices(layout, clamp_geom)
-        if n == 0:
-            break
-    for _ in range(4):
-        n = _subdivide_violating_junctions(layout)
-        if n == 0:
-            break
-    # Subdivision may introduce vertices on rect edge interiors.
-    _push_junction_vertices_off_taxi_rect_edges(layout)
-    clamp_geom = _build_clamp_geom_state(layout)
-    for _ in range(4):
-        n = _clamp_junction_free_vertices(layout, clamp_geom)
-        if n == 0:
-            break
+        # Phase 3: clamp + subdivide based on the real elevations.
+        clamp_geom = _build_clamp_geom_state(layout)
+        for _ in range(8):
+            n = _clamp_junction_free_vertices(layout, clamp_geom)
+            if n == 0:
+                break
+        for _ in range(4):
+            n = _subdivide_violating_junctions(layout)
+            if n == 0:
+                break
+        # Subdivision may introduce vertices on rect edge interiors.
+        _push_junction_vertices_off_taxi_rect_edges(layout)
+        clamp_geom = _build_clamp_geom_state(layout)
+        for _ in range(4):
+            n = _clamp_junction_free_vertices(layout, clamp_geom)
+            if n == 0:
+                break
 
-    # Phase 4: second solver pass (final elevations on
-    # refined geometry).
-    _solve_pavement_elevations(
-        layout, icao, dem=dem, tile_lat=tile_lat, tile_lon=tile_lon)
+        # Phase 4: second solver pass (final elevations on
+        # refined geometry).
+        _solve_pavement_elevations(
+            layout, icao, dem=dem, tile_lat=tile_lat, tile_lon=tile_lon)
 
 
 
