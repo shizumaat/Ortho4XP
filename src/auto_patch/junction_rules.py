@@ -618,181 +618,6 @@ def _build_runway_corner_altitudes(
     return out
 
 
-def _on_sloping_edge_interior(
-    pt: Tuple[float, float],
-    layout: PavementLayout,
-    edge_prox_m: float = SLOPING_EDGE_SNAP_M,
-    corner_guard_m: float = 0.5,
-) -> bool:
-    """Return True if ``pt`` sits within ``edge_prox_m`` of a
-    sloping-rect edge AND > ``corner_guard_m`` from both of that
-    edge's endpoints.
-
-    Mirrors two invariants the regression suite enforces on
-    junction polygon vertices:
-      * ``test_no_vertex_on_sloping_rect_edge`` (user 2026-04-28):
-        verts may share only CORNERS with sloping rects / runway
-        segments, never edge interiors.
-      * ``test_junction_no_long_edge_proximity`` (Rule 2): no
-        junction vertex within ``SLOPING_EDGE_SNAP_M`` (= 20 m) of
-        a sloping rect's sloping edge unless it coincides with a
-        corner.
-
-    Used by the runway-corner widening pass to filter out boundary
-    trace waypoints that would land on (or near) a runway-segment
-    edge interior — at the apt.dat-pavement / runway interface the
-    pav_union ring runs along the runway boundary, so the trace
-    can return ring vertices that violate the invariants if not
-    filtered.
-    """
-    px, py = pt
-    epm2 = edge_prox_m * edge_prox_m
-    cgm2 = corner_guard_m * corner_guard_m
-    for s in layout.shapes:
-        if s.role not in (ROLE_RUNWAY,) + SLOPING_RECT_ROLES:
-            continue
-        if s.polygon is None or s.polygon.is_empty:
-            continue
-        coords = list(s.polygon.exterior.coords)
-        if coords and coords[0] == coords[-1]:
-            coords = coords[:-1]
-        m = len(coords)
-        for i in range(m):
-            ax, ay = coords[i]
-            bx, by = coords[(i + 1) % m]
-            d_a2 = (px - ax) * (px - ax) + (py - ay) * (py - ay)
-            d_b2 = (px - bx) * (px - bx) + (py - by) * (py - by)
-            if d_a2 <= cgm2 or d_b2 <= cgm2:
-                continue
-            dx = bx - ax
-            dy = by - ay
-            L2 = dx * dx + dy * dy
-            if L2 <= 0:
-                continue
-            t = ((px - ax) * dx + (py - ay) * dy) / L2
-            if t <= 0.001 or t >= 0.999:
-                continue
-            proj_x = ax + t * dx
-            proj_y = ay + t * dy
-            d2 = ((px - proj_x) * (px - proj_x)
-                  + (py - proj_y) * (py - proj_y))
-            if d2 < epm2:
-                return True
-    return False
-
-
-def _trace_pav_boundary_waypoints(
-    pav_union,
-    start_pt: Tuple[float, float],
-    end_pt: Tuple[float, float],
-    max_perp_dist_m: float = 25.0,
-    max_end_proj_m: float = 25.0,
-    max_arc_from_end_m: float = 80.0,
-) -> Optional[List[Tuple[float, float]]]:
-    """Find apt.dat-pavement-boundary vertices to insert between
-    ``start_pt`` and ``end_pt`` so the polygon edge follows the
-    pavement boundary instead of cutting straight.
-
-    A candidate ring vertex must:
-      1. Lie on the ring closest to ``end_pt`` (within
-         ``max_end_proj_m``).  This keeps the trace local: ring
-         vertices from unrelated apron edges elsewhere on the
-         airfield don't sneak in.
-      2. Sit within ``max_arc_from_end_m`` along the ring from
-         ``end_pt``'s projection.  Caps how far the trace ranges
-         along the boundary so it can't pull in distant geometry.
-      3. Sit within ``max_perp_dist_m`` perpendicular to the chord
-         ``start_pt`` → ``end_pt``.
-      4. Project strictly between the chord endpoints
-         (parametric position 0 < t < chord_len) so the waypoints
-         actually lie ALONG the path being replaced.
-
-    Used by the runway-corner widening pass: when inserting a
-    single new chain corner would otherwise create a 180° spike
-    crossing a long off-pavement gap, the polygon edge from the
-    new corner to the flank vertex is replaced by a series of
-    pavement-boundary waypoints that hug the apt.dat boundary
-    along the gap.
-
-    Returns the waypoints in chord order (start → end), excluding
-    the endpoints themselves.  Returns ``None`` when no ring is
-    within ``max_end_proj_m`` of ``end_pt``; an empty list when no
-    ring vertex passes all constraints.
-    """
-    if pav_union is None or pav_union.is_empty:
-        return None
-    if pav_union.geom_type == "MultiPolygon":
-        polys = list(pav_union.geoms)
-    elif pav_union.geom_type == "Polygon":
-        polys = [pav_union]
-    else:
-        return None
-
-    chord = LineString([start_pt, end_pt])
-    chord_len = chord.length
-    if chord_len < 1.0:
-        return []
-
-    p_end = Point(end_pt)
-    best_ring = None
-    best_de = max_end_proj_m
-    for poly in polys:
-        for ring in [poly.exterior] + list(poly.interiors):
-            de = ring.distance(p_end)
-            if de < best_de:
-                best_de = de
-                best_ring = ring
-    if best_ring is None:
-        return None
-
-    L = best_ring.length
-    e_proj = best_ring.project(p_end)
-    ring_coords = list(best_ring.coords)
-    if ring_coords and ring_coords[0] == ring_coords[-1]:
-        ring_coords = ring_coords[:-1]
-
-    # Require the waypoint to sit at least ``end_skirt_m`` away
-    # from both chord endpoints (in chord-projection terms).  A
-    # ring vertex within a metre or two of an endpoint's chord
-    # projection is just a near-duplicate of an existing polygon
-    # vertex.
-    end_skirt_m = max(5.0, 0.10 * chord_len)
-    # Pick the SINGLE ring vertex with the largest perpendicular
-    # offset from the chord, subject to the other constraints.
-    # Multiple waypoints clustered along the chord direction tend
-    # to create 180° spikes between adjacent waypoints (sliver
-    # corners that the OSM emitter drops); a single, off-axis
-    # waypoint deflects the polygon arm enough to produce a
-    # well-formed corner.
-    #
-    # Require the waypoint to have at least ``min_perp_m`` of
-    # perpendicular offset.  A waypoint sitting nearly ON the
-    # chord doesn't deflect the polygon arm — the angle at the
-    # chain corner stays near 180° and the OSM emitter rejects
-    # the polygon as a sliver-corner.  Below this threshold the
-    # waypoint is worse than no waypoint (plain-insert produces
-    # equivalent near-collinear geometry with one fewer vertex).
-    min_perp_m = 3.0
-    best_wpt = None  # (perp, t, coord)
-    for c in ring_coords:
-        p = Point(c)
-        c_proj = best_ring.project(p)
-        arc_dist = min((c_proj - e_proj) % L, (e_proj - c_proj) % L)
-        if arc_dist > max_arc_from_end_m:
-            continue
-        d_perp = chord.distance(p)
-        if d_perp < min_perp_m or d_perp > max_perp_dist_m:
-            continue
-        t = chord.project(p)
-        if t <= end_skirt_m or t >= chord_len - end_skirt_m:
-            continue
-        if best_wpt is None or d_perp > best_wpt[0]:
-            best_wpt = (d_perp, t, (c[0], c[1]))
-    if best_wpt is None:
-        return []
-    return [best_wpt[2]]
-
-
 def widen_junctions_to_runway_corners(
     layout: PavementLayout,
 ) -> None:
@@ -925,32 +750,33 @@ def _do_widen(
             list(node_alts) if node_alts is not None else None)
         n_committed = 0
 
-        def _validate_trial(trial):
-            """Return the buffered polygon if the candidate sequence
-            ``trial`` produces a valid widening, else None."""
+        def _attempt_insert(insert_at, neighbor, alt):
+            nonlocal current_coords, current_alts, existing_keys
+            trial = list(current_coords)
+            trial.insert(insert_at, neighbor)
             if len(trial) < 3:
-                return None
+                return False
             try:
                 trial_poly = Polygon(trial).buffer(0)
             except Exception:
-                return None
+                return False
             if trial_poly.is_empty:
-                return None
+                return False
             if trial_poly.geom_type == "MultiPolygon":
                 trial_poly = max(trial_poly.geoms, key=lambda g: g.area)
             if trial_poly.geom_type != "Polygon":
-                return None
+                return False
             if not trial_poly.is_valid or not trial_poly.is_simple:
-                return None
+                return False
             if trial_poly.area < 0.5 * poly.area:
-                return None
+                return False
             if runway_union is not None and not runway_union.is_empty:
                 try:
                     ovl = trial_poly.intersection(runway_union).area
                 except Exception:
                     ovl = 0.0
                 if ovl > 1.0:
-                    return None
+                    return False
             for other in layout.shapes:
                 if other is shape or other.role != ROLE_JUNCTION:
                     continue
@@ -959,27 +785,27 @@ def _do_widen(
                 try:
                     if trial_poly.intersection(
                             other.polygon).area > 1.0:
-                        return None
+                        return False
                 except Exception:
                     pass
-            # Sliver-corner pre-emption: if the trial polygon's
-            # exterior has any vertex whose interior angle is below
-            # the OSM emitter's sliver threshold, the polygon would
-            # be dropped at emit time.  Reject the insert here so
-            # the caller can try a different option (plain instead
-            # of traced, or skip the chain step entirely).
+            # Sliver-corner pre-emption (per user 2026-05-05): the
+            # OSM emitter drops any polygon with an interior angle
+            # below ``SLIVER_ANGLE_THRESHOLD_DEG`` (≈ 2°) at emit
+            # time.  Reject the insert here so the caller has the
+            # option to skip the chain step entirely instead of
+            # silently losing the whole junction downstream.
             try:
                 ring_pts = list(trial_poly.exterior.coords)
                 if ring_pts and ring_pts[0] == ring_pts[-1]:
                     ring_pts = ring_pts[:-1]
-                m = len(ring_pts)
-                if m >= 3:
+                m_ring = len(ring_pts)
+                if m_ring >= 3:
                     sliver_cos = math.cos(
                         math.radians(SLIVER_ANGLE_THRESHOLD_DEG))
-                    for vi in range(m):
-                        ax, ay = ring_pts[(vi - 1) % m]
+                    for vi in range(m_ring):
+                        ax, ay = ring_pts[(vi - 1) % m_ring]
                         bx, by = ring_pts[vi]
-                        cx, cy = ring_pts[(vi + 1) % m]
+                        cx, cy = ring_pts[(vi + 1) % m_ring]
                         v1x, v1y = ax - bx, ay - by
                         v2x, v2y = cx - bx, cy - by
                         n1 = math.hypot(v1x, v1y)
@@ -988,52 +814,33 @@ def _do_widen(
                             continue
                         cos = (v1x * v2x + v1y * v2y) / (n1 * n2)
                         if cos > sliver_cos:
-                            return None
+                            return False
             except Exception:
                 pass
-            return trial_poly
-
-        def _attempt_insert_seq(insert_at, seq):
-            """Insert a list of (point, alt) at ``insert_at`` and
-            commit if the resulting polygon validates.  Returns the
-            number of points actually committed (0 on rejection)."""
-            nonlocal current_coords, current_alts, existing_keys
-            if not seq:
-                return 0
-            pts = [p for p, _ in seq]
-            trial = (current_coords[:insert_at]
-                     + pts
-                     + current_coords[insert_at:])
-            if _validate_trial(trial) is None:
-                return 0
+            # Commit
             current_coords = trial
             if current_alts is not None:
-                alts_seq = [(a if a is not None else 0.0) for _, a in seq]
-                current_alts = (current_alts[:insert_at]
-                                + alts_seq
-                                + current_alts[insert_at:])
-            for p, _ in seq:
-                existing_keys.add(_key(p))
-            return len(seq)
+                current_alts.insert(
+                    insert_at, alt if alt is not None else 0.0)
+            existing_keys.add(_key(neighbor))
+            return True
 
-        # Per user 2026-05-04 (followup): walk one chain step from
-        # each runway-shared corner — both originals and newly-
-        # inserted ones, capped at 2 rounds (1 step for originals
-        # + 1 step for new corners).  When a single-vertex insert
-        # hits the U-turn check (chain neighbor sits far enough
-        # beyond the polygon's flank that the polygon would do a
-        # 180° spike), fall back to a multi-vertex insert that
-        # traces the apt.dat pavement boundary between the new
-        # corner and the flank vertex.
+        # Per user 2026-05-05 (after apt.dat-aware segmenter
+        # landed): walk one chain step from each runway-shared
+        # corner, INCLUDING newly-inserted ones, capped at 2
+        # rounds.  With the segmenter now placing seam corners at
+        # apt.dat-pavement intersections, the chain is denser; a
+        # single-step walk from each ORIGINAL anchor reaches only
+        # the immediately-adjacent (often very close) seam corners,
+        # which doesn't extend the polygon to the runway corners
+        # the user actually wants shared.  Walking one step from
+        # each newly-inserted corner reaches one chain step
+        # further, which corresponds to the natural extent of the
+        # polygon's runway-shared edge.
         WIDEN_MAX_ROUNDS = 2
-        ROUND_PROCESSED_KEY = set()
-        # Build the queue: each item is (corner, round_idx).  Originals
-        # start at round 0; new corners they spawn enter round 1, and
-        # we stop before round 2.
+        round_processed_keys = set(_key(c) for _, c in shared_in_poly)
         widen_queue: List[Tuple[Tuple[float, float], int]] = [
             (c, 0) for _, c in shared_in_poly]
-        for _, c in shared_in_poly:
-            ROUND_PROCESSED_KEY.add(_key(c))
 
         while widen_queue and n_committed < max_inserts:
             corner, rnd = widen_queue.pop(0)
@@ -1044,6 +851,8 @@ def _do_widen(
                 chain[(ci - 1) % n_chain],
                 chain[(ci + 1) % n_chain],
             )
+            # Find current poly_idx of this corner (insertions before
+            # it shift its index forward by 1 each).
             try:
                 poly_idx = next(
                     i for i, v in enumerate(current_coords)
@@ -1085,7 +894,6 @@ def _do_widen(
                           neighbor[1] - flank_v[1])
                     e2 = (corner[0] - neighbor[0],
                           corner[1] - neighbor[1])
-                    side = "before"
                 else:
                     insert_at = poly_idx + 1
                     flank_v = next_v
@@ -1093,132 +901,34 @@ def _do_widen(
                           neighbor[1] - corner[1])
                     e2 = (flank_v[0] - neighbor[0],
                           flank_v[1] - neighbor[1])
-                    side = "after"
                 m1 = math.hypot(*e1)
                 m2 = math.hypot(*e2)
-                cos_turn = None
                 if m1 > 1e-6 and m2 > 1e-6:
                     cos_turn = (e1[0] * e2[0]
                                 + e1[1] * e2[1]) / (m1 * m2)
+                    # Per user 2026-05-04: only reject TRUE U-turns
+                    # (cos < -0.99, > 172°).  The -0.95 threshold
+                    # rejected legitimate widenings at SPJC's 34R
+                    # west-side junction (-10130) where the angle
+                    # was 162° (cos = -0.954) — a sharp but valid
+                    # widening arm.  The per-insertion validity +
+                    # overlap guards in ``_attempt_insert`` already
+                    # catch the geometrically degenerate cases.
+                    if cos_turn < -0.99:
+                        continue
 
-                neighbor_alt = corner_alt.get(_key(neighbor))
-                committed = 0
-
-                # When the plain single-vertex insert would create
-                # a near-180° spike at the chain corner (cos_turn <
-                # -0.95), try the boundary-trace fallback first.
-                # Otherwise just plain-insert.
-                want_trace = (cos_turn is not None and cos_turn < -0.95)
-                waypoints = (_trace_pav_boundary_waypoints(
-                                pav_union, neighbor, flank_v)
-                             if want_trace else None)
-                if waypoints:
-                    # Drop waypoints already in the polygon (would
-                    # create duplicate vertices).
-                    waypoints = [w for w in waypoints
-                                 if _key(w) not in existing_keys]
-                if waypoints:
-                    # Drop waypoints that land on a sloping-rect
-                    # edge INTERIOR (not at a corner).  Per user
-                    # 2026-04-28 invariant (test_no_vertex_on_
-                    # sloping_rect_edge), junction polygons may
-                    # share only CORNERS with sloping rects /
-                    # runway segments.  At the apt.dat-pavement-
-                    # runway interface the pav_union ring runs
-                    # along the runway boundary, so naively-picked
-                    # ring vertices can land on a runway-segment
-                    # edge interior.  Exclude those.
-                    waypoints = [w for w in waypoints
-                                 if not _on_sloping_edge_interior(
-                                     w, layout)]
-                if waypoints:
-                    flank_alt = None
-                    if current_alts is not None:
-                        try:
-                            flank_idx = next(
-                                i for i, v in enumerate(current_coords)
-                                if _key(v) == _key(flank_v))
-                            flank_alt = current_alts[flank_idx]
-                        except StopIteration:
-                            flank_alt = None
-                    # Build the inserted walk in polygon walk-order:
-                    #   "after":  neighbor → wp_near_n → ... → wp_near_f
-                    #             (sits between corner and flank_v in poly)
-                    #   "before": wp_near_f → ... → wp_near_n → neighbor
-                    #             (sits between flank_v and corner in poly)
-                    # ``waypoints`` come from the trace in chord
-                    # order (closest-to-neighbor first, closest-to-
-                    # flank last); reverse for the "before" side so
-                    # the walk hits wp_near_f first.
-                    if side == "after":
-                        walk_pts = [neighbor] + list(waypoints) + [flank_v]
-                        a0, a1 = neighbor_alt, flank_alt
-                    else:
-                        walk_pts = ([flank_v]
-                                    + list(reversed(waypoints))
-                                    + [neighbor])
-                        a0, a1 = flank_alt, neighbor_alt
-                    # Cumulative arc length along walk_pts, with
-                    # walk_pts[0] / walk_pts[-1] as alt anchors at
-                    # t=0 / t=1.
-                    cum = [0.0]
-                    for a, b in zip(walk_pts[:-1], walk_pts[1:]):
-                        cum.append(cum[-1]
-                                   + math.hypot(b[0]-a[0], b[1]-a[1]))
-                    total = cum[-1] if cum[-1] > 1e-9 else 1.0
-                    have_alts = (current_alts is not None
-                                 and neighbor_alt is not None
-                                 and flank_alt is not None)
-                    # Build ``ordered`` (the slice to be inserted —
-                    # excludes both anchors) with interpolated
-                    # altitudes.
-                    ordered = []
-                    for i in range(1, len(walk_pts) - 1):
-                        pt = walk_pts[i]
-                        if have_alts:
-                            t = cum[i] / total
-                            alt = a0 + (a1 - a0) * t
-                        else:
-                            alt = None
-                        ordered.append((pt, alt))
-                    if side == "after":
-                        ordered.insert(0, (neighbor, neighbor_alt))
-                    else:
-                        ordered.append((neighbor, neighbor_alt))
-                    committed = _attempt_insert_seq(insert_at, ordered)
-
-                if committed == 0:
-                    # No waypoints found, or traced insert failed
-                    # validation — try the plain single-vertex
-                    # insert.  Reject only TRUE U-turns (cos < -0.95,
-                    # > 162°): at that angle the plain insert would
-                    # produce a near-spike that the OSM emitter
-                    # drops as a sliver.  Cases between -0.99 and
-                    # -0.95 should have been handled by the
-                    # boundary-trace path above; if we got here,
-                    # there's no usable trace and the plain insert
-                    # is the only option, but we still skip when
-                    # the geometry is genuinely degenerate.
-                    if cos_turn is None or cos_turn >= -0.95:
-                        committed = _attempt_insert_seq(
-                            insert_at, [(neighbor, neighbor_alt)])
-
-                if committed > 0:
-                    # ``max_inserts`` caps RUNWAY-SHARED corners
-                    # (per the user's 2-5 spec).  A traced fallback
-                    # commits 1 chain corner + N pavement-boundary
-                    # waypoints; only the chain corner counts toward
-                    # the cap.
+                alt = corner_alt.get(_key(neighbor))
+                if _attempt_insert(insert_at, neighbor, alt):
                     n_committed += 1
-                    # Push the new chain corner onto the queue for
-                    # one more round of walking, unless we've already
-                    # hit the round cap.
+                    # Push the newly-inserted neighbor for one more
+                    # round of walking, unless we've already hit the
+                    # round cap.  ``round_processed_keys`` guards
+                    # against re-walking the same corner twice.
                     if (rnd + 1 < WIDEN_MAX_ROUNDS
-                            and _key(neighbor) not in ROUND_PROCESSED_KEY):
-                        ROUND_PROCESSED_KEY.add(_key(neighbor))
+                            and _key(neighbor) not in round_processed_keys):
+                        round_processed_keys.add(_key(neighbor))
                         widen_queue.append((neighbor, rnd + 1))
-                    # Re-find the original corner's poly_idx after
-                    # the mutation.
+                    # poly_idx may shift if we inserted before it.
                     n_cur = len(current_coords)
                     try:
                         poly_idx = next(
@@ -1231,74 +941,6 @@ def _do_widen(
 
         if n_committed == 0:
             continue
-
-        # Interior-vert pruning (per user 2026-05-04 followup): drop
-        # polygon vertices that aren't anchored — neither runway-
-        # shared corners nor newly-inserted chain corners /
-        # waypoints — and that sit far from any apt.dat-pavement /
-        # runway boundary.  These are leftover interior verts from
-        # the polygon's pre-widen shape that the new boundary-traced
-        # arms make redundant.  Without pruning, the result keeps
-        # the new arm AND the old interior detour that's now
-        # superseded.
-        INTERIOR_PRUNE_M = 5.0
-        on_pav_union = None
-        if pav_union is not None and not pav_union.is_empty:
-            try:
-                if runway_union is not None and not runway_union.is_empty:
-                    on_pav_union = unary_union([pav_union, runway_union])
-                else:
-                    on_pav_union = pav_union
-            except Exception:
-                on_pav_union = pav_union
-        # Anchor keys = runway-shared (corner_index) + everything
-        # added by widening (existing_keys was extended on each
-        # commit) minus the originals.  Easier: protect any vertex
-        # in corner_index OR in the post-commit existing_keys set
-        # that wasn't in the original ``coords`` set.
-        original_keys = set(_key(v) for v in coords)
-        if on_pav_union is not None and not on_pav_union.is_empty:
-            on_pav_boundary = on_pav_union.boundary
-            pruned: List[Tuple[float, float]] = []
-            pruned_alts: Optional[List[float]] = (
-                [] if current_alts is not None else None)
-            for i, v in enumerate(current_coords):
-                k = _key(v)
-                # Always preserve runway-shared (chain) corners.
-                if k in corner_index:
-                    pruned.append(v)
-                    if pruned_alts is not None:
-                        pruned_alts.append(current_alts[i])
-                    continue
-                # Always preserve verts widening just inserted
-                # (chain neighbors and pavement-boundary waypoints).
-                if k not in original_keys:
-                    pruned.append(v)
-                    if pruned_alts is not None:
-                        pruned_alts.append(current_alts[i])
-                    continue
-                # Original vert with no anchor → prune if interior.
-                d = on_pav_boundary.distance(Point(v))
-                if d > INTERIOR_PRUNE_M:
-                    continue
-                pruned.append(v)
-                if pruned_alts is not None:
-                    pruned_alts.append(current_alts[i])
-            if len(pruned) >= 3 and len(pruned) < len(current_coords):
-                # Validate the pruned polygon before committing.
-                try:
-                    test_poly = Polygon(pruned).buffer(0)
-                except Exception:
-                    test_poly = None
-                if (test_poly is not None
-                        and not test_poly.is_empty
-                        and test_poly.geom_type == "Polygon"
-                        and test_poly.is_valid
-                        and test_poly.is_simple
-                        and test_poly.area >= 0.5 * poly.area):
-                    current_coords = pruned
-                    if pruned_alts is not None:
-                        current_alts = pruned_alts
         # Final polygon from the running coords (already validated
         # piecewise; guaranteed to be a single valid Polygon).
         try:
