@@ -339,6 +339,83 @@ def build_airport_pavement(icao: str, xplane_root: str,
         layout.runway_union = (unary_union(runway_polys)
                                 if runway_polys else None)
 
+    # ── Pavement-runway intersection points (per user 2026-05-05) ──
+    # Walk each apt.dat row-110 pavement polygon's exterior; collect
+    # the vertices that sit within ``INTERSECTION_PROX_M`` of a
+    # runway's 4-corner rect boundary AND project to a centerline
+    # parameter strictly between 0 and 1 (not at the runway ends).
+    # These t-values become segment seam corners during Phase 2's
+    # runway segmentation, so chain corners (= the runway-union
+    # exterior) align exactly with apt.dat-pavement boundaries.
+    # Without this, the junction-widening pass has to bridge the
+    # gap with boundary-trace waypoints — the alignment makes that
+    # unnecessary.  Per user direction: dedup intersections within
+    # 2 m centerline distance (a junction can span a 2 m gap
+    # without needing a node there).
+    INTERSECTION_PROX_M = 0.5
+    INTERSECTION_DEDUP_M = 2.0
+    pav_runway_intersections: dict = {}
+    for ridx, r in enumerate(apt.runways):
+        if ridx >= len(runway_polys):
+            continue
+        rect = runway_polys[ridx]
+        if rect is None or rect.is_empty:
+            continue
+        rect_boundary = rect.exterior
+        cl_ax, cl_ay = to_m(r.lon_a, r.lat_a)
+        cl_bx, cl_by = to_m(r.lon_b, r.lat_b)
+        cl_dx = cl_bx - cl_ax
+        cl_dy = cl_by - cl_ay
+        cl_L2 = cl_dx * cl_dx + cl_dy * cl_dy
+        if cl_L2 < 1.0:
+            continue
+        phys_dist = math.sqrt(cl_L2)
+        # Avoid the runway end zones — the segmenter handles those
+        # via thresholds + physical-end anchors and we don't want
+        # spurious end-zone seams.
+        end_skirt_t = 5.0 / phys_dist
+        intersections: List[Tuple[float, float]] = []
+        for pav_poly in apt_only_pav_polys:
+            try:
+                ring = pav_poly.exterior
+            except Exception:
+                continue
+            coords = list(ring.coords)
+            if coords and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            for px, py in coords:
+                if rect_boundary.distance(Point(px, py)) > INTERSECTION_PROX_M:
+                    continue
+                t = ((px - cl_ax) * cl_dx
+                     + (py - cl_ay) * cl_dy) / cl_L2
+                if t <= end_skirt_t or t >= 1.0 - end_skirt_t:
+                    continue
+                intersections.append((t, px, py))
+        if not intersections:
+            continue
+        # Sort by centerline t and dedup within INTERSECTION_DEDUP_M.
+        intersections.sort(key=lambda x: x[0])
+        dedup_t_gap = INTERSECTION_DEDUP_M / phys_dist
+        deduped: List[Tuple[float, float, float]] = []
+        for t, px, py in intersections:
+            if deduped and (t - deduped[-1][0]) < dedup_t_gap:
+                continue
+            deduped.append((t, px, py))
+        # Convert intersection meter-coords back to lat/lon via the
+        # layout's m_to_ll (the segmenter consumes lat/lon).  Store
+        # under both designator orderings so the segmenter lookup
+        # finds them regardless of which key it tries.
+        ll_pts = [layout.m_to_ll(px, py) for _, px, py in deduped]
+        for key in (
+                (r.desig_a, r.desig_b),
+                (r.desig_b, r.desig_a),
+                ("RW" + r.desig_a.lstrip("RW"),
+                 "RW" + r.desig_b.lstrip("RW")),
+                ("RW" + r.desig_b.lstrip("RW"),
+                 "RW" + r.desig_a.lstrip("RW"))):
+            pav_runway_intersections[key] = list(ll_pts)
+    layout._pav_runway_intersections = pav_runway_intersections
+
     # Add draped pavement polygons from every available DSF for
     # this airport.  Some scenery packs (e.g. CYXY Whitehorse) ship
     # pavement geometry as DSF draped polygons referencing

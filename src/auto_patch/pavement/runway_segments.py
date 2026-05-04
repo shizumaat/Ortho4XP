@@ -68,7 +68,8 @@ __all__ = [
 
 
 def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
-                       apt_runways=None, extra_anchors=None):
+                       apt_runways=None, extra_anchors=None,
+                       pav_intersections=None):
     """Generate OSM XML content for segmented runway auto-patches.
 
     For each paired runway, samples the DEM along the centerline at
@@ -107,6 +108,18 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             e.g. "where this runway is crossed by a taxi anchored at
             another runway's threshold, this runway must be at the
             other threshold's elevation (within taxi-grade × distance)".
+        pav_intersections: Optional dict of
+            ``{(desig_a, desig_b): [(lat, lon), ...]}`` — apt.dat
+            pavement-polygon vertices that touch the runway boundary
+            (computed by ``pipeline.py`` at runway-rect build time).
+            Each point is projected onto the centerline and inserted
+            as a NON-ANCHORED segment break — the seam corner sits
+            there but the elevation comes from DEM/anchor-profile
+            interpolation, not a hard constraint.  Aligning seam
+            corners with apt.dat boundary intersections lets the
+            junction-widening pass reach runway corners via the
+            existing single-step chain walk, without needing
+            boundary-trace waypoints (per user 2026-05-05).
 
     Returns:
         str: Complete OSM XML content for the patch file.
@@ -384,6 +397,47 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                         if not any(abs(t - f) < 0.01 for f in fractions):
                             fractions.append(t)
                 fractions.sort()
+
+            # Per user 2026-05-05: inject pav_intersection breakpoints
+            # so segment seam corners align with apt.dat-pavement
+            # boundary points where the apron / taxiway meets the
+            # runway.  These are NOT elevation anchors — just
+            # geometric segment seams.  Dedup within 2 m of an
+            # existing fraction (a junction can span a 2 m gap).
+            if pav_intersections and phys_dist > 0:
+                pav_pts = []
+                for pkey in (
+                        (desig_a, desig_b),
+                        (desig_b, desig_a),
+                        ("RW" + desig_a.lstrip("RW"),
+                         "RW" + desig_b.lstrip("RW")),
+                        ("RW" + desig_b.lstrip("RW"),
+                         "RW" + desig_a.lstrip("RW"))):
+                    if pkey in pav_intersections:
+                        pav_pts = pav_intersections[pkey]
+                        break
+                rL2 = dx_phys * dx_phys + dy_phys * dy_phys
+                t_dedup = 2.0 / phys_dist
+                inserted_pav_t: List[float] = []
+                for pp_lat, pp_lon in pav_pts:
+                    px = (pp_lon - phys_end_a[1]) * cos_lat_v * DEG_TO_M
+                    py = (pp_lat - phys_end_a[0]) * DEG_TO_M
+                    if rL2 <= 0:
+                        break
+                    pt = (px * dx_phys + py * dy_phys) / rL2
+                    if pt <= 0.001 or pt >= 0.999:
+                        continue
+                    # Dedup against ALL existing fractions (uniform +
+                    # threshold + previously-inserted pav) and the
+                    # ones we've already added this loop.
+                    if any(abs(pt - f) < t_dedup for f in fractions):
+                        continue
+                    if any(abs(pt - f) < t_dedup for f in inserted_pav_t):
+                        continue
+                    inserted_pav_t.append(pt)
+                if inserted_pav_t:
+                    fractions.extend(inserted_pav_t)
+                    fractions.sort()
 
             # For each sample point, compute lat/lon and seed elevation
             sample_pts = []  # [(lat, lon, seeded_elev, is_anchored), ...]

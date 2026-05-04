@@ -371,9 +371,18 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 tile.lon = tile_lon
                 tile.dem = dem
 
+                # Per user 2026-05-05: thread the apt.dat-pavement-
+                # runway intersection points (collected in pipeline.py
+                # at runway-rect build time) into the segmenter so
+                # segment seam corners align with apt.dat boundary
+                # intersections.  The widening pass then doesn't need
+                # to bridge the gap with boundary-trace waypoints.
+                pav_intersections = getattr(
+                    layout, "_pav_runway_intersections", None)
                 _xml, runway_segment_chain = _AP.generate_patch_osm(
                     icao, pairs, runway_widths=runway_widths,
-                    tile=tile, apt_runways=apt_runway_geom)
+                    tile=tile, apt_runways=apt_runway_geom,
+                    pav_intersections=pav_intersections)
         except Exception:
             runway_segment_chain = []
 
