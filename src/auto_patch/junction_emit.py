@@ -34,7 +34,7 @@ from .pavement.junctions import (
 )
 from .pavement.stubs import (
     _add_stub_to_runway_bridges,
-    _clip_residue_at_stub_long_edges,
+    _clip_residue_at_stub_sloping_edges,
 )
 from .pavement.union_helpers import _merge_near_touching
 from .pavement.vertices import (
@@ -104,14 +104,14 @@ def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
 
         # Per user 2026-04-27 invariant: NO polygon along the long
         # edge of a sloping rect.  Even if apt.dat has pavement
-        # extending past a stub's long edge (because the boundary
+        # extending past a stub's sloping edge (because the boundary
         # bulges between the stub's two short edges), the residue
         # polygon there must NOT become a junction — it would wrap
-        # around the stub's long edge.  Subtract a thin strip just
-        # OUTSIDE each stub's long edges from the residue so the
+        # around the stub's sloping edge.  Subtract a thin strip just
+        # OUTSIDE each stub's sloping edges from the residue so the
         # resulting junctions stop at the stub's short-edge corners.
         try:
-            residue = _clip_residue_at_stub_long_edges(
+            residue = _clip_residue_at_stub_sloping_edges(
                 residue, taxi_rects)
         except Exception:
             pass

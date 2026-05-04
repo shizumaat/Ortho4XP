@@ -131,6 +131,11 @@ def _emit_tunnel_portals(
         # separate caps which is wrong.
         portal_cluster_dist_m: float = 40.0,
         boundary_clearance_m: float = 0.5,
+        # Per user 2026-05-04: skip portals more than this far from
+        # any airport boundary edge.  Tunnels far from the airport
+        # don't affect X-Plane's airport mesh and were generating
+        # spurious ramps along distant urban roads.
+        max_boundary_dist_m: float = 1000.0,
         excluded_way_ids: Optional[set] = None,
         ) -> int:
     """For each tunnel portal (each end of an OSM ``aeroway=*``
@@ -265,20 +270,74 @@ def _emit_tunnel_portals(
             return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
         except Exception:
             return None
-    # Helper: from a portal node, walk the connecting non-tunnel
-    # surface road OUTWARD for ``length_m`` metres.  Returns the
-    # walked path as a list of (x, y) points starting at the
-    # portal, or None if no valid surface way connects.
+    # Helper: orient ``o_nrefs`` so it starts at ``anchor_nid`` and
+    # walks AWAY from ``anchor_nid``.  When the anchor is mid-way,
+    # picks the longer side.  Returns None if anchor isn't on the way.
+    def _orient_away(o_nrefs: List[str],
+                      anchor_nid: str) -> Optional[List[str]]:
+        try:
+            idx = o_nrefs.index(anchor_nid)
+        except ValueError:
+            return None
+        forward = o_nrefs[idx:]
+        backward = list(reversed(o_nrefs[:idx + 1]))
+        if idx == 0:
+            return forward
+        if idx == len(o_nrefs) - 1:
+            return backward
+        # Mid-way: pick the longer leg.
+        def _leg_len(refs: List[str]) -> float:
+            return sum(
+                math.hypot(
+                    nodes_m[refs[i + 1]][0] - nodes_m[refs[i]][0],
+                    nodes_m[refs[i + 1]][1] - nodes_m[refs[i]][1])
+                for i in range(len(refs) - 1)
+                if (refs[i] in nodes_m
+                    and refs[i + 1] in nodes_m))
+        return forward if _leg_len(forward) >= _leg_len(backward) \
+            else backward
+
+    # Helper: from a portal node, walk a chain of connecting non-
+    # tunnel surface roads OUTWARD for ``length_m`` metres.  When
+    # the current OSM way ends, follow the connected highway way
+    # whose first segment best continues the current direction
+    # (smallest turn angle) — keeps us on the main road through
+    # OSM-imposed splits at intersections instead of bailing into
+    # a side street.  Returns the walked path as a list of (x, y)
+    # points starting at the portal, or None if no valid surface
+    # way connects.
     def _walk_surface(portal_nid: str,
                       tunnel_wid: str,
                       length_m: float
                       ) -> Optional[List[Tuple[float, float]]]:
         if portal_nid not in nodes_m:
             return None
-        # Look at every way that shares this node.  Prefer surface
-        # roads (highway tag, not tunnel-tagged); skip the tunnel
-        # way itself.  When multiple candidates exist (e.g., a
-        # roundabout), pick the first valid one.
+        # Pick the FIRST surface highway way leaving the portal.
+        # When several candidates connect, prefer the one whose
+        # first segment is most-aligned with the tunnel direction
+        # (so divided-highway crossings don't turn into a service
+        # road off the main carriageway).
+        if tunnel_wid in way_by_id:
+            tw_nrefs = way_by_id[tunnel_wid][0]
+            t_oriented = _orient_away(tw_nrefs, portal_nid)
+            if t_oriented and len(t_oriented) >= 2 \
+                    and t_oriented[1] in nodes_m:
+                tp = nodes_m[portal_nid]
+                tn = nodes_m[t_oriented[1]]
+                tdx, tdy = tn[0] - tp[0], tn[1] - tp[1]
+                tlen = math.hypot(tdx, tdy) or 1.0
+                # Tunnel direction points INTO the tunnel; the
+                # surface walk goes the OPPOSITE way.
+                tunnel_outward_dir: Optional[Tuple[float, float]] = (
+                    -tdx / tlen, -tdy / tlen)
+            else:
+                tunnel_outward_dir = None
+        else:
+            tunnel_outward_dir = None
+
+        first_way: Optional[str] = None
+        first_refs: Optional[List[str]] = None
+        best_align: float = -2.0
         for other_wid in node_to_ways.get(portal_nid, []):
             if other_wid == tunnel_wid:
                 continue
@@ -289,69 +348,142 @@ def _emit_tunnel_portals(
                 continue
             if o_tags.get("highway") not in HW_TUNNEL_TYPES:
                 continue
-            try:
-                idx = o_nrefs.index(portal_nid)
-            except ValueError:
+            refs = _orient_away(o_nrefs, portal_nid)
+            if refs is None or len(refs) < 2 \
+                    or refs[1] not in nodes_m:
                 continue
-            # Decide which direction to walk (away from tunnel).
-            forward = o_nrefs[idx:]
-            backward = list(reversed(o_nrefs[:idx + 1]))
-            # If portal is at one end, walk the other way.  If
-            # mid-way, walk the longer side.
-            walk_refs: List[str]
-            if idx == 0:
-                walk_refs = forward
-            elif idx == len(o_nrefs) - 1:
-                walk_refs = backward
-            else:
-                fl = sum(
-                    math.hypot(
-                        nodes_m[forward[i + 1]][0]
-                        - nodes_m[forward[i]][0],
-                        nodes_m[forward[i + 1]][1]
-                        - nodes_m[forward[i]][1])
-                    for i in range(len(forward) - 1)
-                    if (forward[i] in nodes_m
-                        and forward[i + 1] in nodes_m))
-                bl = sum(
-                    math.hypot(
-                        nodes_m[backward[i + 1]][0]
-                        - nodes_m[backward[i]][0],
-                        nodes_m[backward[i + 1]][1]
-                        - nodes_m[backward[i]][1])
-                    for i in range(len(backward) - 1)
-                    if (backward[i] in nodes_m
-                        and backward[i + 1] in nodes_m))
-                walk_refs = forward if fl >= bl else backward
-            # Collect walk points up to length_m.
-            pts: List[Tuple[float, float]] = []
-            cum = 0.0
-            for ni, n in enumerate(walk_refs):
-                if n not in nodes_m:
-                    break
-                p = nodes_m[n]
-                if pts:
-                    seg_len = math.hypot(
-                        p[0] - pts[-1][0], p[1] - pts[-1][1])
-                    if cum + seg_len >= length_m:
-                        # Truncate the last segment to hit length_m
-                        if seg_len > 0:
-                            t = (length_m - cum) / seg_len
-                            tx = pts[-1][0] + t * (p[0] - pts[-1][0])
-                            ty = pts[-1][1] + t * (p[1] - pts[-1][1])
-                            pts.append((tx, ty))
-                        cum = length_m
-                        break
-                    cum += seg_len
+            if tunnel_outward_dir is None:
+                first_way, first_refs = other_wid, refs
+                break
+            cp = nodes_m[portal_nid]
+            cn = nodes_m[refs[1]]
+            cdx, cdy = cn[0] - cp[0], cn[1] - cp[1]
+            clen = math.hypot(cdx, cdy) or 1.0
+            align = (cdx * tunnel_outward_dir[0]
+                     + cdy * tunnel_outward_dir[1]) / clen
+            if align > best_align:
+                best_align = align
+                first_way, first_refs = other_wid, refs
+        if first_refs is None or first_way is None:
+            return None
+
+        pts: List[Tuple[float, float]] = []
+        cum = 0.0
+        visited_ways = {tunnel_wid, first_way}
+        current_refs = first_refs
+        current_hw = way_by_id[first_way][1].get("highway")
+
+        def _append_node(p: Tuple[float, float]) -> bool:
+            """Append ``p`` to ``pts``; truncate at ``length_m``.
+            Returns True if walk should stop (length reached)."""
+            nonlocal cum
+            if not pts:
                 pts.append(p)
-            if len(pts) >= 2 and cum > 5.0:
-                return pts
-            # Surface way too short — could chain to next way at
-            # the far end, but for simplicity we accept short walks
-            # if we got at least 5 m.
-            if len(pts) >= 2:
-                return pts
+                return False
+            seg_len = math.hypot(
+                p[0] - pts[-1][0], p[1] - pts[-1][1])
+            if cum + seg_len >= length_m:
+                if seg_len > 0:
+                    t = (length_m - cum) / seg_len
+                    tx = pts[-1][0] + t * (p[0] - pts[-1][0])
+                    ty = pts[-1][1] + t * (p[1] - pts[-1][1])
+                    pts.append((tx, ty))
+                cum = length_m
+                return True
+            cum += seg_len
+            pts.append(p)
+            return False
+
+        while True:
+            stopped = False
+            for n in current_refs:
+                if n not in nodes_m:
+                    stopped = True
+                    break
+                if _append_node(nodes_m[n]):
+                    return pts
+            if stopped:
+                break
+            # Try to chain to a connected highway way at the end
+            # of ``current_refs``.  Skip tunnels and ways already
+            # visited; prefer same highway type, then most-straight
+            # continuation (smallest turn angle).
+            last_nid = current_refs[-1]
+            if len(pts) < 2:
+                break
+            end_dir_x = pts[-1][0] - pts[-2][0]
+            end_dir_y = pts[-1][1] - pts[-2][1]
+            ed_len = math.hypot(end_dir_x, end_dir_y) or 1.0
+            end_dir = (end_dir_x / ed_len, end_dir_y / ed_len)
+            best_score = -2.0
+            best_wid: Optional[str] = None
+            best_refs: Optional[List[str]] = None
+            for cand_wid in node_to_ways.get(last_nid, []):
+                if cand_wid in visited_ways:
+                    continue
+                if cand_wid not in way_by_id:
+                    continue
+                c_nrefs, c_tags = way_by_id[cand_wid]
+                if c_tags.get("tunnel") in TUNNEL_VALUES:
+                    continue
+                if c_tags.get("highway") not in HW_TUNNEL_TYPES:
+                    continue
+                refs = _orient_away(c_nrefs, last_nid)
+                if refs is None or len(refs) < 2 \
+                        or refs[1] not in nodes_m:
+                    continue
+                first_p = nodes_m[refs[1]]
+                last_p = nodes_m[last_nid]
+                fdx = first_p[0] - last_p[0]
+                fdy = first_p[1] - last_p[1]
+                fl = math.hypot(fdx, fdy) or 1.0
+                align = (fdx * end_dir[0] + fdy * end_dir[1]) / fl
+                same_hw = 1 if c_tags.get("highway") == current_hw else 0
+                # Tie-break: same highway type beats alignment by
+                # ~0.1 (~25° turn), so we follow trunk → trunk over
+                # trunk → service even when both are similar angle.
+                score = align + 0.1 * same_hw
+                if score > best_score:
+                    best_score = score
+                    best_wid = cand_wid
+                    best_refs = refs
+            if best_refs is None or best_wid is None:
+                break
+            visited_ways.add(best_wid)
+            current_hw = way_by_id[best_wid][1].get("highway")
+            # Skip refs[0]; it's the connecting node already in pts.
+            current_refs = best_refs[1:]
+
+        if len(pts) >= 2 and cum > 5.0:
+            return pts
+        if len(pts) >= 2:
+            return pts
         return None
+    # Build a boundary line (union of all ROLE_BOUNDARY shapes' rings)
+    # for the per-portal proximity filter.  Tunnels whose portal lies
+    # more than ``max_boundary_dist_m`` from any airport-boundary edge
+    # are skipped — they don't affect the airport mesh and the chained
+    # surface walk would otherwise emit ramps along urban roads far
+    # from the airport.
+    boundary_line = None
+    try:
+        from shapely.geometry import LineString as _LS, MultiLineString
+        from shapely.ops import unary_union as _uu
+        b_lines = []
+        for s in layout.shapes:
+            if s.role != ROLE_BOUNDARY:
+                continue
+            try:
+                rcoords = list(s.polygon.exterior.coords)
+            except Exception:
+                continue
+            if len(rcoords) >= 2:
+                b_lines.append(_LS(rcoords))
+        if b_lines:
+            boundary_line = _uu(b_lines)
+    except Exception:
+        boundary_line = None
+
     # Collect portal data: (portal_node_id, tunnel_wid, walk_pts,
     # hw_type, apt_elev_at_portal, dem_at_far_end).
     portal_data: List[Tuple[str, str, List[Tuple[float, float]],
@@ -374,6 +506,14 @@ def _emit_tunnel_portals(
             portal_nid = t_nrefs[portal_idx]
             if portal_nid not in nodes_m:
                 continue
+            if boundary_line is not None:
+                px, py = nodes_m[portal_nid]
+                try:
+                    if boundary_line.distance(
+                            Point(px, py)) > max_boundary_dist_m:
+                        continue
+                except Exception:
+                    pass
             walk = _walk_surface(portal_nid, tw_id, arm_walk_max_m)
             if walk is None or len(walk) < 2:
                 continue
@@ -399,13 +539,17 @@ def _emit_tunnel_portals(
             # Sparse OSM ways often have ~150-200 m gaps between
             # nodes; without densification a 200 m approach renders
             # as a single straight ramp.  Target ~50 m segments.
+            # Use ceil so segments never exceed ``target_seg_m``;
+            # ``round`` would leave a 72 m gap as a single segment
+            # (round(72/50) == 1) and the user noticed those single-
+            # segment ramps don't track the road's grade closely.
             target_seg_m = 50.0
             densified: List[Tuple[float, float]] = [walk[0]]
             for k in range(1, len(walk)):
                 px, py = densified[-1]
                 qx, qy = walk[k]
                 d = math.hypot(qx - px, qy - py)
-                n_sub = max(1, int(round(d / target_seg_m)))
+                n_sub = max(1, math.ceil(d / target_seg_m))
                 for s in range(1, n_sub + 1):
                     t = s / n_sub
                     densified.append(
@@ -540,13 +684,17 @@ def _emit_tunnel_portals(
             continue
         # Cluster spread for combined width: project each cluster
         # member's portal node onto the perpendicular at the head
-        # portal.  The cap (and only the cap) is centred on the
-        # cluster centroid, not on the head portal — user 2026-05-03
-        # ("trunk highway tunnels not centered on OSM ways, offset
-        # with one edge on one of the ways").  The arms still follow
-        # the head walk because we don't yet emit per-carriageway
-        # arms; centring at least the cap puts it symmetric across
-        # both carriageways of a divided highway.
+        # portal.  Cap, arms and ramps are all centred on the
+        # cluster centroid (midpoint between carriageway portals),
+        # not on the head portal — user 2026-05-03 ("trunk highway
+        # tunnels not centered on OSM ways, offset with one edge on
+        # one of the ways").  We apply a constant translation to
+        # ``walk_pts`` so every downstream geometry inherits the
+        # centring; this keeps the cap and ramps coplanar across
+        # both carriageways of a divided highway.  Constant shift
+        # is exact at the portal and stays close-to-correct for the
+        # length of the walk because parallel carriageways follow
+        # parallel curves.
         first_seg = (walk_pts[1][0] - walk_pts[0][0],
                      walk_pts[1][1] - walk_pts[0][1])
         first_len = math.hypot(*first_seg)
@@ -568,6 +716,11 @@ def _emit_tunnel_portals(
         cluster_perp_offset = (
             (max(spans) + min(spans)) / 2.0 if spans else 0.0)
         combined_half = half_carriage + 0.5 * cluster_span
+        if abs(cluster_perp_offset) > 1e-6:
+            shift_x = first_perp[0] * cluster_perp_offset
+            shift_y = first_perp[1] * cluster_perp_offset
+            walk_pts = [(p[0] + shift_x, p[1] + shift_y)
+                        for p in walk_pts]
 
         def _build_wall_segment(p_a: Tuple[float, float],
                                  p_b: Tuple[float, float],
@@ -611,10 +764,7 @@ def _emit_tunnel_portals(
         #    + 2 × wall_gap, its thickness is
         #    retaining_wall_width_m.
         cap_half_len = combined_half + wall_gap_m
-        portal_xy = walk_pts[0]
-        cap_centre = (
-            portal_xy[0] + first_perp[0] * cluster_perp_offset,
-            portal_xy[1] + first_perp[1] * cluster_perp_offset)
+        cap_centre = walk_pts[0]
         c0 = (cap_centre[0] + first_perp[0] * cap_half_len,
               cap_centre[1] + first_perp[1] * cap_half_len)
         c1 = (cap_centre[0] - first_perp[0] * cap_half_len,
@@ -640,6 +790,17 @@ def _emit_tunnel_portals(
                 exclusion_zones.append(cap_poly)
         except Exception:
             pass
+        # Per user 2026-05-04: the cap + arm walls form a continuous
+        # "U" — arms touch the cap on both sides (their inner-front
+        # corner sits exactly at the cap's outer-front corner, since
+        # ``cap_half_len`` and ``arm_off - half_wall_w`` both equal
+        # ``combined_half + wall_gap_m``).  Only the RAMP starts
+        # ``wall_gap_m`` further into the tunnel so its near edge
+        # (lowest elevation) leaves the same clearance from the cap
+        # as it already does from the side walls.  We achieve that
+        # by offsetting the FIRST ramp segment's near corners
+        # individually below; ``walk_pts`` itself stays at the portal.
+
         # 2) Arm walls + 3) Ramp polygons — one per walk segment.
         # Pre-compute per-vertex offset corners using the bisector
         # of adjacent segments at interior bends.  This makes
@@ -714,34 +875,98 @@ def _emit_tunnel_portals(
             # − half_wall_w); outer edge at +/- (arm_off +
             # half_wall_w).  Using the per-vertex bisector so
             # adjacent segments share their join.
-            for sign in (+1, -1):
-                inner = sign * (arm_off - half_wall_w)
-                outer = sign * (arm_off + half_wall_w)
-                ai = _vertex_offset(i, inner)
-                bi = _vertex_offset(i + 1, inner)
-                bo = _vertex_offset(i + 1, outer)
-                ao = _vertex_offset(i, outer)
-                try:
-                    wp = Polygon([ai, bi, bo, ao])
-                    if not wp.is_valid:
-                        wp = wp.buffer(0)
-                    if (wp.geom_type == "Polygon"
-                            and not wp.is_empty
-                            and wp.area > 0.5):
-                        layout.shapes.append(BuiltShape(
-                            polygon=wp,
-                            role=ROLE_RETAINING_WALL,
-                            ref="tunnel_wall",
-                            altitude=round(apt_elev, 1)))
-                        exclusion_zones.append(wp)
-                except Exception:
-                    continue
+            #
+            # Per user 2026-05-04: walls are at altitude ``apt_elev``;
+            # once the ramp climbs to that height the wall is just a
+            # spur sticking out of the terrain (a "trench").  Skip the
+            # wall when the segment runs entirely at or above the cap
+            # altitude; truncate it at the crossing point when only
+            # the upper end exceeds.
+            wall_top = apt_elev
+            wall_thresh = wall_top - 0.05  # 0.1 m altitude rounding
+            seg_e_lo = min(e_a, e_b)
+            seg_e_hi = max(e_a, e_b)
+            if seg_e_lo >= wall_thresh:
+                # Whole segment at/above wall height — no wall.
+                pass
+            else:
+                if seg_e_hi > wall_thresh and abs(e_b - e_a) > 1e-3:
+                    # Mixed: truncate at the crossing point on the
+                    # walk.  ``frac_cross`` runs 0→1 along the
+                    # segment; the wall covers walk[i] → cross only.
+                    frac_cross = (
+                        (wall_thresh - e_a) / (e_b - e_a))
+                    frac_cross = max(0.0, min(1.0, frac_cross))
+                else:
+                    frac_cross = 1.0
+                pa = walk_pts[i]
+                pb = walk_pts[i + 1]
+                cross = (
+                    pa[0] + frac_cross * (pb[0] - pa[0]),
+                    pa[1] + frac_cross * (pb[1] - pa[1]))
+                for sign in (+1, -1):
+                    inner = sign * (arm_off - half_wall_w)
+                    outer = sign * (arm_off + half_wall_w)
+                    ai = _vertex_offset(i, inner)
+                    ao = _vertex_offset(i, outer)
+                    if frac_cross >= 0.999:
+                        bi = _vertex_offset(i + 1, inner)
+                        bo = _vertex_offset(i + 1, outer)
+                    else:
+                        # Build the truncated end perpendicular at
+                        # ``cross`` using this segment's perp (no
+                        # bisector blend — the wall just stops here).
+                        sx, sy = (pb[0] - pa[0], pb[1] - pa[1])
+                        sl = math.hypot(sx, sy) or 1.0
+                        nx, ny = -sy / sl, sx / sl
+                        bi = (cross[0] + nx * inner,
+                              cross[1] + ny * inner)
+                        bo = (cross[0] + nx * outer,
+                              cross[1] + ny * outer)
+                    try:
+                        wp = Polygon([ai, bi, bo, ao])
+                        if not wp.is_valid:
+                            wp = wp.buffer(0)
+                        if (wp.geom_type == "Polygon"
+                                and not wp.is_empty
+                                and wp.area > 0.5):
+                            layout.shapes.append(BuiltShape(
+                                polygon=wp,
+                                role=ROLE_RETAINING_WALL,
+                                ref="tunnel_wall",
+                                altitude=round(apt_elev, 1)))
+                            exclusion_zones.append(wp)
+                    except Exception:
+                        continue
             # Ramp polygon (single segment, sloped).  Corners
             # share with adjacent segments via verts_perp.
-            ra = _vertex_offset(i, +combined_half)
+            #
+            # Per user 2026-05-04: the FIRST ramp segment's near
+            # edge sits ``wall_gap_m`` forward of the portal so the
+            # bottom of the ramp leaves the same clearance from the
+            # cap as it does from the side walls (the side walls
+            # themselves still touch the cap — continuous "U").
+            if i == 0 and first_len > wall_gap_m + 0.5:
+                near_xy = (walk_pts[0][0] + first_dir[0] * wall_gap_m,
+                           walk_pts[0][1] + first_dir[1] * wall_gap_m)
+                # Apply the perp offset at this shifted position
+                # using the first segment's perpendicular.
+                npx, npy = verts_perp[0]
+                ra = (near_xy[0] + npx * combined_half,
+                      near_xy[1] + npy * combined_half)
+                rd = (near_xy[0] - npx * combined_half,
+                      near_xy[1] - npy * combined_half)
+                # Pull the ramp's near-edge elevation forward by the
+                # same fraction so the slope rate stays correct.
+                if cum_dists[1] > 0:
+                    e_a = (
+                        e_a + (e_b - e_a)
+                        * (wall_gap_m / cum_dists[1]))
+            else:
+                ra = _vertex_offset(i, +combined_half)
+                rd = _vertex_offset(i, -combined_half)
             rb = _vertex_offset(i + 1, +combined_half)
             rc = _vertex_offset(i + 1, -combined_half)
-            rd = _vertex_offset(i, -combined_half)
             # Rect convention (see _sample_runway_segment_elev):
             # corners [0, 3] are the HIGH-elevation short edge
             # (across the road at the high end), corners [1, 2]

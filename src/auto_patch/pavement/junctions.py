@@ -450,8 +450,9 @@ def _densify_long_boundary_edges(
     vert_elev: List[float],
     neighbour_edges: List[Tuple[float, float, float, float,
                                  float, float]],
-    rect_long_edges: Optional[List[Tuple[float, float, float, float]]] = None,
+    sloping_rect_edges: Optional[List[Tuple[float, float, float, float]]] = None,
     runway_edges: Optional[List[Tuple[float, float, float, float]]] = None,
+    terminal_edges: Optional[List[Tuple[float, float, float, float]]] = None,
 ) -> Tuple[List[Tuple[float, float]], List[float]]:
     """Insert interpolated midpoints along long ring segments.
 
@@ -464,21 +465,37 @@ def _densify_long_boundary_edges(
     Otherwise use linear interpolation between the segment's
     endpoint elevations.
 
-    Per Rule 2 (user 2026-05-01): if ``rect_long_edges`` is supplied,
-    skip any midpoint within ``LONG_EDGE_SNAP_M`` of a sloping rect's
-    long edge — junctions must not have any vertices in that band.
+    Per Rule 2 (user 2026-05-01) + user 2026-05-04 follow-up: if
+    ``sloping_rect_edges`` is supplied, skip any midpoint within
+    ``SLOPING_EDGE_SNAP_M`` of ANY edge of a sloping rect (both the
+    sloping edges parallel to source_axis AND the cross edges
+    perpendicular to it).  Junctions must share a sloping rect's
+    boundary 1:1 — only the rect's 4 corners are legal shared
+    vertices.  Without this guard, the densification midpoints
+    appear as intermediate nodes on the cross edge between two
+    corner-coincident vertices, then get pushed ~1 m off the edge
+    by Rule 5's outward-push pass.
 
     Per Rule 1 (user 2026-05-01): if ``runway_edges`` is supplied,
     skip any midpoint within ``RUNWAY_BOUNDARY_TOL_M`` of a runway
     boundary edge — junction vertices on the runway must coincide
     with runway vertices, not float between them.
 
+    Per user 2026-05-04: if ``terminal_edges`` is supplied, skip any
+    midpoint within ``SHARED_VERTEX_TOL_M`` of a terminal edge.
+    Terminals don't yet have an elevation when triangulation runs,
+    so they're absent from ``neighbour_edges`` and the generic
+    ``_point_on_neighbour`` guard misses them — junctions adjacent
+    to a terminal pad would otherwise grow extra mid-edge vertices
+    that the terminal itself doesn't have, breaking the seamless
+    meld between the two surfaces.
+
     This guarantees no shared-boundary step is introduced and
     handles both the simple "junction-on-rect-edge" case (linear
     interp matches) and the "junction-on-segmented-runway-edge"
     case (use the runway segment's interp).
     """
-    from ..config import LONG_EDGE_SNAP_M, RUNWAY_BOUNDARY_TOL_M
+    from ..config import SLOPING_EDGE_SNAP_M, RUNWAY_BOUNDARY_TOL_M
     from ..elevation import _corner_elevation_bucket
     n = len(ring)
     if n < 3 or len(vert_elev) != n:
@@ -514,9 +531,10 @@ def _densify_long_boundary_edges(
         """True if (mx, my) lies within ``tol_m`` PERPENDICULAR to
         any edge in the supplied list, AND its projection falls
         strictly within the edge segment.  Per user 2026-05-01:
-        vertices reaching toward a rect's short-end corner (whose
-        projection lies past the long edge's endpoint) are allowed,
-        so we exempt projections at or beyond either endpoint."""
+        vertices reaching toward a rect's cross-edge corner (whose
+        projection lies past the sloping edge's endpoint) are
+        allowed, so we exempt projections at or beyond either
+        endpoint."""
         tol2 = tol_m * tol_m
         for ax, ay, bx, by in edges:
             dx = bx - ax
@@ -610,15 +628,24 @@ def _densify_long_boundary_edges(
             # neighbour rect's 4-corner slope rendering.
             if _point_on_neighbour(mx, my):
                 continue
-            # Per Rule 2 (user 2026-05-01): no junction vertex within
-            # ``LONG_EDGE_SNAP_M`` of a sloping rect's long edge.
-            if rect_long_edges and _point_within_of_edge(
-                    mx, my, rect_long_edges, LONG_EDGE_SNAP_M):
+            # Per Rule 2 (user 2026-05-01) + 1:1-corner-sharing rule
+            # (user 2026-05-04): no junction midpoint within
+            # ``SLOPING_EDGE_SNAP_M`` of any edge of a sloping rect
+            # (both sloping and cross edges) — junctions share
+            # corners only.
+            if sloping_rect_edges and _point_within_of_edge(
+                    mx, my, sloping_rect_edges, SLOPING_EDGE_SNAP_M):
                 continue
             # Per Rule 1 (user 2026-05-01): no junction vertex within
             # ``RUNWAY_BOUNDARY_TOL_M`` of a runway boundary edge.
             if runway_edges and _point_within_of_edge(
                     mx, my, runway_edges, RUNWAY_BOUNDARY_TOL_M):
+                continue
+            # Per user 2026-05-04: no junction vertex on a terminal
+            # edge interior — terminals lack altitude at triangulation
+            # time and thus don't appear in ``neighbour_edges``.
+            if terminal_edges and _point_within_of_edge(
+                    mx, my, terminal_edges, SHARED_VERTEX_TOL_M):
                 continue
             linear_me = ea + t * (eb - ea)
             me = _interp_at(mx, my, linear_me)

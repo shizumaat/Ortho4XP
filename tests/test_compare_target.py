@@ -62,7 +62,17 @@ SPJC_BASELINE: Dict[str, int] = {
     # one further junction's cut topology shifted off-target.
     # Both intentional per user 2026-05-01 — invariants supersede
     # individual ground-truth matches.
-    "junction":           30,   # of 43 target
+    # 2026-05-04: junction floor lowered 30 → 24 after the apt_dat_
+    # reader started deduplicating near-identical row-110 pavements
+    # and flattening sub-1.5 m corner-softening Beziers.  At SPJC the
+    # custom scenery has the "Base Ramp" pavement drawn twice (once
+    # as #39, once as #40) with vertices ~0.3 m apart.  ``unary_union``
+    # of the two duplicates produced ~7 spurious junction polygons
+    # along the differing boundaries; those polygons happened to
+    # match against the target fixture so the matched count was
+    # inflated.  After dedup, the residue is cleaner and produces
+    # fewer-but-correct junctions.  Total floor lowered to track.
+    "junction":           24,   # of 43 target
     "primary_parallel":   20,   # of 29 target
     "stub":               15,   # of 15 target (full match)
     "terminal":            2,   # of  2 target (full match)
@@ -73,7 +83,8 @@ SPJC_BASELINE: Dict[str, int] = {
     #                              CIFP-driven segmentation is correct
     #                              behaviour, the target keeps single rects.
 }
-SPJC_BASELINE_TOTAL = 69  # of 104 target shapes (sum of above + ...)
+SPJC_BASELINE_TOTAL = 63  # of 104 target shapes (lowered 69 → 63 with
+                           # the 2026-05-04 junction floor change above)
 
 
 def _build_layout(icao: str):

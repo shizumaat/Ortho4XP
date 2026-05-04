@@ -32,6 +32,7 @@ per-airport Custom Scenery pack over the global one.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -51,6 +52,20 @@ FT_TO_M = 0.3048
 # vertex count.  Tunable via the load_airport(..., bezier_segments=N)
 # parameter.
 DEFAULT_BEZIER_SEGMENTS = 4
+
+# Per user 2026-05-04: collapse Bezier to a straight line when the
+# curve's max chord deviation falls below this threshold (in degrees,
+# ≈ metres at airport latitudes).  Many apt.dat authors use Beziers
+# just to soften 90° corners by 1-2 m for visual smoothness — the
+# default 4-segment tessellation turns each into a 5-vertex arc that
+# downstream residue/junction passes treat as real boundary detail
+# and end up wrapping junction polygons around.  At SPJC stub C, two
+# such corner-softening Beziers (chord deviations 1.04 m and 0.39 m)
+# created the "wrong-side" junction vertex.  Real curves (taxiway
+# turns, swept apron edges) have deviations well above this.
+# Threshold expressed in DEGREES because the calculation runs in
+# lat/lon space; 0.000014 deg ≈ 1.5 m.
+BEZIER_FLATTEN_DEV_DEG = 1.5 / 111111.0
 
 # Row type codes (X-Plane apt.dat 1100 / 1200 spec).
 ROW_AIRPORT_HEADER = 1
@@ -312,6 +327,48 @@ def load_airport(
     # Final flush in case the block ends mid-pavement.
     flush_pavement()
     flush_boundary()
+
+    # Per user 2026-05-04: deduplicate near-identical pavement
+    # polygons.  Some custom-scenery apt.dat files carry the same
+    # logical pavement region drawn TWICE with slightly offset
+    # vertices (e.g. SPJC's "Base Ramp" appears as both row-110
+    # #39 and #40, with vertices ~0.3 m apart).  When ``unary_union``
+    # later merges these duplicates, the slight offset creates
+    # intersection-point artefacts on the boundary that downstream
+    # residue/junction passes mistake for real apt.dat detail and
+    # end up wrapping junction polygons around.  Two pavements with
+    # the SAME name and a symmetric_difference / union ratio below
+    # 1 % are treated as the same feature; the second one is dropped.
+    if len(airport.pavements) >= 2:
+        keep_idx = list(range(len(airport.pavements)))
+        dropped: set = set()
+        for i in range(len(airport.pavements)):
+            if i in dropped:
+                continue
+            pi = airport.pavements[i]
+            if pi.polygon is None or pi.polygon.is_empty:
+                continue
+            for j in range(i + 1, len(airport.pavements)):
+                if j in dropped:
+                    continue
+                pj = airport.pavements[j]
+                if pj.polygon is None or pj.polygon.is_empty:
+                    continue
+                if pi.name != pj.name:
+                    continue
+                try:
+                    u = pi.polygon.union(pj.polygon)
+                    if u.area <= 0:
+                        continue
+                    sd = pi.polygon.symmetric_difference(pj.polygon)
+                    if sd.area / u.area < 0.01:
+                        dropped.add(j)
+                except Exception:
+                    continue
+        if dropped:
+            airport.pavements = [
+                p for k, p in enumerate(airport.pavements)
+                if k not in dropped]
 
     return airport
 
@@ -781,15 +838,45 @@ def _interpolate_contour(contour: List[List[str]],
             # next iteration.
             continue
 
+        # Per user 2026-05-04: skip tessellation for Beziers whose
+        # max chord deviation is below ``BEZIER_FLATTEN_DEV_DEG``.
+        # These are "corner-softening" Beziers (~1 m visual rounding)
+        # that don't matter for X-Plane mesh purposes but cause
+        # downstream residue/junction artefacts when expanded into
+        # multi-vertex arcs.
         if a_ctrl is not None and b_ctrl is None:
-            curve = _quadratic_bezier(a_xy, a_ctrl, b_xy, bezier_segments)
+            ctrl_eff = a_ctrl
         elif a_ctrl is None and b_ctrl is not None:
-            mirrored = _mirror(b_ctrl, b_xy)
-            curve = _quadratic_bezier(a_xy, mirrored, b_xy, bezier_segments)
+            ctrl_eff = _mirror(b_ctrl, b_xy)
         else:
+            # Cubic — measure deviation as max(|ctrl1 - midpoint|,
+            # |ctrl2_mirrored - midpoint|) which bounds the curve.
             mirrored = _mirror(b_ctrl, b_xy)
+            mid = (0.5 * (a_xy[0] + b_xy[0]),
+                   0.5 * (a_xy[1] + b_xy[1]))
+            d1 = math.hypot(a_ctrl[0] - mid[0], a_ctrl[1] - mid[1])
+            d2 = math.hypot(mirrored[0] - mid[0],
+                            mirrored[1] - mid[1])
+            cubic_dev = 0.5 * max(d1, d2)
+            if cubic_dev < BEZIER_FLATTEN_DEV_DEG:
+                # Treat as straight line A→B.
+                continue
             curve = _cubic_bezier(a_xy, a_ctrl, mirrored, b_xy,
                                   bezier_segments)
+            for pt in curve[1:-1]:
+                if not out or out[-1] != pt:
+                    out.append(pt)
+            continue
+        # Quadratic Bezier path: max chord deviation is at t=0.5 and
+        # equals 0.5 * dist(ctrl, midpoint(a, b)).
+        mid = (0.5 * (a_xy[0] + b_xy[0]),
+               0.5 * (a_xy[1] + b_xy[1]))
+        quad_dev = 0.5 * math.hypot(ctrl_eff[0] - mid[0],
+                                      ctrl_eff[1] - mid[1])
+        if quad_dev < BEZIER_FLATTEN_DEV_DEG:
+            # Treat as straight line A→B.
+            continue
+        curve = _quadratic_bezier(a_xy, ctrl_eff, b_xy, bezier_segments)
         # Drop the first point (= a_xy, already in out) and the last
         # (= b_xy, will be appended next iteration).  Append only the
         # interior curve samples.

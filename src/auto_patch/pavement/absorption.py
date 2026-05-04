@@ -99,7 +99,7 @@ def _drop_primary_parallels_embedded_in_pavement(
 
     1. apt.dat pavement bulges past the long edge between the rect's
        short corners.  The residue then runs along the long edge to
-       reach the bulge.  ``_clip_residue_at_stub_long_edges`` already
+       reach the bulge.  ``_clip_residue_at_stub_sloping_edges`` already
        handles this for STUBs by carving the bulge away.
     2. The rect sits FULLY INSIDE a paved area (apron, ramp, big
        terminal area).  apt.dat covers the rect's footprint AND

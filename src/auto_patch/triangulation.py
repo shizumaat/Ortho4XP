@@ -51,6 +51,7 @@ from .layout import (
     ROLE_RUNWAY,
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
+    ROLE_TERMINAL,
     SHARED_VERTEX_TOL_M,
 )
 from .pavement.junctions import (
@@ -145,7 +146,7 @@ def _triangulate_junctions(
     # ``(ax, ay, bx, by, e_a, e_b)``.  Junction vertices that fall
     # close to such an edge are anchored to the linearly-interpolated
     # elevation along the edge — guaranteeing the junction triangle
-    # meets a sloped rect's long edge at the same height the rect is
+    # meets a sloped rect's sloping edge at the same height the rect is
     # rendering at, rather than at the centerline-graph value (which
     # is offset by the rect's half-width).
     neighbour_edges: List[Tuple[float, float, float, float,
@@ -183,22 +184,27 @@ def _triangulate_junctions(
             eb = float(elevs[(i + 1) % m])
             neighbour_edges.append((ax, ay, bx, by, ea, eb))
 
-    # Sloping-rect long edges (Rule 2: densification midpoints must
-    # not land within LONG_EDGE_SNAP_M of these).  Per user
-    # 2026-05-02 clarification: what matters is the SLOPING
-    # direction (parallel to source_axis), not edge length.  Use
-    # the BuiltShape's source_axis for proper detection;
-    # fall back to longest-2 if missing.
-    sloping_long_edges: List[Tuple[float, float, float, float]] = []
+    # Sloping-rect ALL edges (user 2026-05-04 clarification: junction
+    # joins with a sloping rect have to match 1:1 — no intermediate
+    # nodes on EITHER the sloping edges OR the cross edges.  The
+    # rect's 4 corners are the only legal shared vertices.  Pass
+    # every edge of every sloping-role rect to the densify-skip
+    # guard and the snap-to-corner pass.
+    #
+    # Per user 2026-05-04 (earlier today): we no longer skip rects
+    # with unassigned altitudes here.  Under the per-surface solver
+    # path, altitudes are assigned LATER — at densification time,
+    # every rect has ``altitude_high is None``, so the previous skip
+    # emptied this list and Rule 2 never triggered.  Treat every
+    # sloping-role rect as sloping at this stage; if the rect turns
+    # out flat after the elevation pass, the junction's corner-only
+    # sharing is still valid (the "flat rects allow free
+    # densification" rule allows extras but doesn't require them).
+    sloping_rect_edges: List[Tuple[float, float, float, float]] = []
     sloping_roles = {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
                      ROLE_STUB, ROLE_CROSS_CONNECTOR}
     for s in layout.shapes:
         if s.role not in sloping_roles:
-            continue
-        # Per user 2026-05-02: flat rects are exempt from sloping-
-        # rect connection rules; junctions can densify against
-        # their edges freely.
-        if s.altitude_high is None or s.altitude_low is None:
             continue
         try:
             rc = list(s.polygon.exterior.coords)
@@ -208,46 +214,16 @@ def _triangulate_junctions(
             rc = rc[:-1]
         if len(rc) != 4:
             continue
-        edges = [(rc[i], rc[(i + 1) % 4]) for i in range(4)]
-        # If source_axis available, pick edges most parallel to it.
-        if s.source_axis is not None and not s.source_axis.is_empty:
-            ax_pts = list(s.source_axis.coords)
-            if len(ax_pts) >= 2:
-                axdx = ax_pts[-1][0] - ax_pts[0][0]
-                axdy = ax_pts[-1][1] - ax_pts[0][1]
-                axlen = math.hypot(axdx, axdy)
-                if axlen >= 1e-6:
-                    aux, auy = axdx / axlen, axdy / axlen
-                    dots = []
-                    for a, b in edges:
-                        ex, ey = b[0] - a[0], b[1] - a[1]
-                        elen = math.hypot(ex, ey)
-                        if elen < 1e-6:
-                            dots.append(0.0)
-                            continue
-                        dots.append(abs(ex * aux + ey * auy) / elen)
-                    sloping_idx = sorted(
-                        range(4), key=lambda i: -dots[i])[:2]
-                    for i in sloping_idx:
-                        a, b = edges[i]
-                        sloping_long_edges.append(
-                            (float(a[0]), float(a[1]),
-                             float(b[0]), float(b[1])))
-                    continue
-        # Fallback: longest 2.
-        lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
-                   for a, b in edges]
-        long_idx = sorted(range(4), key=lambda i: -lengths[i])[:2]
-        for i in long_idx:
-            a, b = edges[i]
-            sloping_long_edges.append(
-                (float(a[0]), float(a[1]),
-                 float(b[0]), float(b[1])))
+        for i in range(4):
+            ax, ay = rc[i]
+            bx, by = rc[(i + 1) % 4]
+            sloping_rect_edges.append(
+                (float(ax), float(ay), float(bx), float(by)))
 
     # Runway boundary edges (Rule 1: densification midpoints must
     # not land within RUNWAY_BOUNDARY_TOL_M of a runway boundary
     # unless they coincide with a runway vertex).  Treated the same
-    # way as sloping rect long edges via the per-edge wider-tolerance
+    # way as sloping rect sloping edges via the per-edge wider-tolerance
     # exclusion.
     runway_edges: List[Tuple[float, float, float, float]] = []
     for s in layout.shapes:
@@ -266,6 +242,28 @@ def _triangulate_junctions(
             runway_edges.append((float(ax), float(ay),
                                  float(bx), float(by)))
 
+    # Terminal pad edges (user 2026-05-04: junctions adjacent to a
+    # terminal must share its boundary node-for-node, no extra mid-
+    # edge vertices).  Terminals lack altitude at triangulation time
+    # so they're absent from ``neighbour_edges``; we pass their
+    # geometry separately as a skip-only list.
+    terminal_edges: List[Tuple[float, float, float, float]] = []
+    for s in layout.shapes:
+        if s.role != ROLE_TERMINAL:
+            continue
+        try:
+            rc = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        m = len(rc)
+        for i in range(m):
+            ax, ay = rc[i]
+            bx, by = rc[(i + 1) % m]
+            terminal_edges.append((float(ax), float(ay),
+                                    float(bx), float(by)))
+
     def _edge_interp_elev(x: float, y: float,
                           max_dist: float = NEAR_EDGE_M
                           ) -> Optional[float]:
@@ -276,7 +274,7 @@ def _triangulate_junctions(
         Projects the query point onto each edge's segment, clamps
         to [0, 1], and linearly interpolates between the edge's
         two endpoint elevations.  This matches the elevation X-Plane
-        renders for a sloped rect at any point along its long edge
+        renders for a sloped rect at any point along its sloping edge
         — so junction triangles abutting a sloped rect at this
         point will meet it without a step.
         """
@@ -351,7 +349,7 @@ def _triangulate_junctions(
                 shared_junction_elev[bucket] = best_e
             return best_e, True
         # 4. Rect-edge interpolation — pulls junction vertices
-        # pushed 1m off a long edge (or any boundary-trace vertex
+        # pushed 1m off a sloping edge (or any boundary-trace vertex
         # within NEAR_EDGE_M of a rect/runway/terminal edge) onto
         # the rect's slope at the projected position.  HARD.
         e_edge = _edge_interp_elev(x, y)
@@ -661,8 +659,9 @@ def _triangulate_junctions(
         # long cut edges from hole-decomposition).
         densified_ring, densified_elev = _densify_long_boundary_edges(
             ring, vert_elev, neighbour_edges,
-            rect_long_edges=sloping_long_edges,
-            runway_edges=runway_edges)
+            sloping_rect_edges=sloping_rect_edges,
+            runway_edges=runway_edges,
+            terminal_edges=terminal_edges)
         # Validate: a densification midpoint can occasionally land
         # on a non-adjacent ring edge (concave polygons with
         # near-touches), turning a valid polygon into a self-

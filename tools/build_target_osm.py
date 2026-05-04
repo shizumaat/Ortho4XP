@@ -22,10 +22,19 @@ def main(argv=None):
     ap.add_argument("icao")
     ap.add_argument("--xplane", default="/Users/noah/X-Plane 12")
     ap.add_argument("--out", default=None)
+    ap.add_argument(
+        "--stage", default="final",
+        choices=["raw", "final"],
+        help=("'raw' = dump after junction_emit (residue construction) "
+              "but BEFORE Phase 2: densification, runway 1:1 snap, "
+              "rect-corner snap, widen, push-outside, per-surface "
+              "solver, terminal stitch.  'final' = full pipeline."))
     args = ap.parse_args(argv)
 
     out = args.out or f"/tmp/{args.icao}_auto.osm"
-    layout = build_airport_pavement(args.icao, args.xplane)
+    layout = build_airport_pavement(
+        args.icao, args.xplane,
+        compute_elevations=(args.stage == "final"))
     layout.to_osm(out)
 
     # Quick summary

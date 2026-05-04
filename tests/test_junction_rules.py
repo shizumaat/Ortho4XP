@@ -227,18 +227,22 @@ SLOPING_RECT_ROLES = ("primary_parallel", "secondary_parallel",
     pytest.param("(no airports)", marks=pytest.mark.skip(
         reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
 def test_junction_no_long_edge_proximity(icao):
-    """Rule 2: no junction vertex sits within ``LONG_EDGE_SNAP_M`` of
+    """Rule 2: no junction vertex sits within ``SLOPING_EDGE_SNAP_M`` of
     a sloping rect's long edge unless the vertex coincides with one
     of the rect's 4 corners.  Snap to the corner happens at emit
-    time in ``junction_rules._snap_to_long_edge_corners``; this test
+    time in ``junction_rules._snap_to_sloping_edge_corners``; this test
     catches regressions.
     """
-    from auto_patch.config import LONG_EDGE_SNAP_M
+    from auto_patch.config import SLOPING_EDGE_SNAP_M
     from auto_patch.layout import SHARED_VERTEX_TOL_M
 
     layout = _build_layout(icao)
 
     # Collect all sloping-rect long edges + their corner endpoints.
+    # Per user 2026-05-04: also accept runway corners as a valid
+    # placement — the runway-1:1-snap legitimately puts junction
+    # vertices at runway corners, which can incidentally lie within
+    # SLOPING_EDGE_SNAP_M of a nearby rect's sloping edge.
     long_edges: List[Tuple[float, float, float, float]] = []
     rect_corners: List[Tuple[float, float]] = []
     for s in layout.shapes:
@@ -255,11 +259,22 @@ def test_junction_no_long_edge_proximity(icao):
         for (a, b) in _rect_sloping_edges_from_shape(s):
             long_edges.append((a[0], a[1], b[0], b[1]))
         rect_corners.extend(_rect_corners(s.polygon))
+    # Add runway corners (Rule 1 1:1 snap targets).
+    from auto_patch.layout import ROLE_RUNWAY
+    for s in layout.shapes:
+        if s.role != ROLE_RUNWAY:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        rc = list(s.polygon.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        rect_corners.extend((float(c[0]), float(c[1])) for c in rc)
 
     if not long_edges:
         pytest.skip(f"{icao}: no sloping rects emitted")
 
-    snap_tol = LONG_EDGE_SNAP_M
+    snap_tol = SLOPING_EDGE_SNAP_M
     corner_tol = SHARED_VERTEX_TOL_M
 
     violations: List[str] = []

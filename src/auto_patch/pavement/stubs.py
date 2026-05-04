@@ -28,7 +28,7 @@ from .rects import (
 
 __all__ = [
     "_add_stub_to_runway_bridges",
-    "_clip_residue_at_stub_long_edges",
+    "_clip_residue_at_stub_sloping_edges",
     "_emit_primary_parallel_runway_stubs",
 ]
 
@@ -457,26 +457,28 @@ def _emit_primary_parallel_runway_stubs(
     return new_stubs
 
 
-def _clip_residue_at_stub_long_edges(
+def _clip_residue_at_stub_sloping_edges(
         residue: "Polygon",
         taxi_rects: "List[Tuple[Polygon, LineString, str, str]]",
         outer_buffer_m: float = 30.0,
         ) -> "Polygon":
-    """Subtract a thin strip just OUTSIDE each STUB rect's long
+    """Subtract a thin strip just OUTSIDE each STUB rect's sloping
     edges from the residue.  Per user 2026-04-27 invariant: a
-    junction polygon must never run along a sloping rect's long
-    edge — the rect's long edges are TAXI BOUNDARIES, not junction
-    boundaries.  When apt.dat pavement bulges past a stub's long
-    edge between its two short corners, the bulge becomes a
+    junction polygon must never run along a sloping rect's
+    sloping edge ("sloping" = parallel to source_axis = the slope
+    direction, regardless of geometric length) — the rect's
+    sloping edges are TAXI BOUNDARIES, not junction boundaries.
+    When apt.dat pavement bulges past a stub's sloping edge
+    between its two cross-edge corners, the bulge becomes a
     "wrap" on the adjacent junction.  Removing the bulge from the
-    residue forces the junction to stop at the stub's short-edge
+    residue forces the junction to stop at the stub's cross-edge
     corners.
 
-    The strip extends ``outer_buffer_m`` past each long edge —
+    The strip extends ``outer_buffer_m`` past each sloping edge —
     enough to swallow typical apt.dat curvature noise (the SPJC F
-    south-edge bulge is 21 m).  Stubs follow
+    sloping-edge bulge is 21 m).  Stubs follow
     ``_rect_from_axis_extended``'s corner convention: corners
-    [0,1] form long-edge "side1", [2,3] form long-edge "side2".
+    [0,1] form one sloping edge "side1", [2,3] form the other.
     """
     if residue is None or residue.is_empty:
         return residue
@@ -491,9 +493,9 @@ def _clip_residue_at_stub_long_edges(
             rc = rc[:-1]
         if len(rc) != 4:
             continue
-        # Long edges per ``_rect_from_axis_extended`` convention.
-        long_edges = [(rc[0], rc[1]), (rc[2], rc[3])]
-        for (e0, e1) in long_edges:
+        # Sloping edges per ``_rect_from_axis_extended`` convention.
+        sloping_edges = [(rc[0], rc[1]), (rc[2], rc[3])]
+        for (e0, e1) in sloping_edges:
             ex = e1[0] - e0[0]
             ey = e1[1] - e0[1]
             mag = math.hypot(ex, ey)
@@ -507,7 +509,7 @@ def _clip_residue_at_stub_long_edges(
             mid_y = 0.5 * (e0[1] + e1[1])
             if (cx_r - mid_x) * nx + (cy_r - mid_y) * ny > 0:
                 nx, ny = -nx, -ny
-            # Build a thin rectangle outside the long edge.
+            # Build a thin rectangle outside the sloping edge.
             o0 = (e0[0] + nx * outer_buffer_m,
                   e0[1] + ny * outer_buffer_m)
             o1 = (e1[0] + nx * outer_buffer_m,

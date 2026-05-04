@@ -13,7 +13,7 @@ variable in O4_Cfg_Vars.py instead.
 __all__ = [
     "AXIS_ALIGN_TOL_DEG",
     "LOAD_DSF_PAVEMENT",
-    "LONG_EDGE_SNAP_M",
+    "SLOPING_EDGE_SNAP_M",
     "EMIT_JUNCTIONS",
     "EMIT_APRONS",
     "EMIT_BRIDGES_AND_TUNNELS",
@@ -34,13 +34,15 @@ __all__ = [
 # ── Junction-refinement rule constants (user 2026-05-01) ─────────
 # Plan: ``/Users/noah/.claude/plans/kind-meandering-sifakis.md``.
 
-# Rule 2: junction vertex within this distance of a sloping rect's
-# long edge gets snapped to the rect's nearest short-end CORNER.
-# Per user 2026-05-01: 10 m chosen because there should never be any
-# junction node along a sloping rect's long side; 10 m is a safety
-# band that catches densification midpoints + boundary-trace vertices
-# that float off-rect due to apt.dat row-110 curvature noise.
-LONG_EDGE_SNAP_M = 10.0
+# Rule 2: junction vertex within this distance of a sloping-rect
+# edge (any edge — sloping or cross — of a rect with a sloping role)
+# gets snapped to the nearest rect corner.
+# Per user 2026-05-04: bumped 10 m → 20 m to match the runway snap
+# (RUNWAY_ADJACENCY_TOL_M).  10 m left vertices like SPJC junction
+# -10153's v5 (17.88 m perpendicular to V3's edge) outside the snap
+# radius, which forced the junction polygon to cut across V3 and
+# produce a 1012 m² overlap.
+SLOPING_EDGE_SNAP_M = 20.0
 
 # Rule 4: a junction polygon is split at its narrowest cross-section
 # when that thickness is below NECK_ABSOLUTE_M (in metres) OR is
@@ -63,9 +65,15 @@ RUNWAY_BOUNDARY_TOL_M = 1.5
 # vertices in a junction's runway-facing region.  Vertices in this
 # band but outside RUNWAY_BOUNDARY_TOL_M still count as part of the
 # junction's joining edge that needs to widen out to the next
-# runway node.  Captures densification midpoints at ~2 m and
-# boundary-trace vertices that float a few metres off the runway.
-RUNWAY_ADJACENCY_TOL_M = 5.0
+# runway node.
+#
+# Bumped 5 m → 20 m per user 2026-05-04: any junction vertex within
+# 20 m of the runway boundary should snap 1:1 to a runway segment
+# corner — no extra nodes floating near the runway.  The 5 m band
+# left vertices that had been pushed off the runway boundary by Rule
+# 5 (1 m perp) plus densification (2 m boundary-trace noise) outside
+# the snap radius; 20 m comfortably captures both.
+RUNWAY_ADJACENCY_TOL_M = 20.0
 
 # Rule 3 test tolerance: a non-pavement, non-anchor junction edge
 # must run parallel or perpendicular to the longest runway axis

@@ -1609,15 +1609,15 @@ def build_airport_pavement(icao: str, xplane_root: str,
             taxi_rects = kept
 
     # Per user 2026-04-27 invariant: a junction polygon must NEVER run
-    # along a sloping rect's long edge.  When a primary_parallel rect
+    # along a sloping rect's sloping edge.  When a primary_parallel rect
     # sits FULLY INSIDE the airport's pavement union (apt.dat row-110
     # ⊕ DSF ⊕ OSM-synthetic — i.e. the same union that becomes the
     # residue), the surrounding apron junction unavoidably wraps the
-    # rect's long edges as it traces around the rect-shaped hole.
+    # rect's sloping edges as it traces around the rect-shaped hole.
     # The fix is not to emit the rect at all: let the apron absorb
     # the rect's footprint and slope multi-directionally.  Primary
     # parallels that legitimately cross unpaved area are unaffected
-    # (their long edges aren't inside pavement).
+    # (their sloping edges aren't inside pavement).
     #
     # Note: ``pav_union`` is now apt.dat ∪ DSF only (no OSM-synth);
     # that's the right denominator for the absorption check.
@@ -1709,8 +1709,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
 
         # Final Rule 2 enforcement (user 2026-05-01).  Triangulation
         # densification and Laplacian-solver vertex insertions can
-        # leave a few junction vertices within LONG_EDGE_SNAP_M of a
-        # sloping rect's long edge despite the in-densify guard.  A
+        # leave a few junction vertices within SLOPING_EDGE_SNAP_M of a
+        # sloping rect's sloping edge despite the in-densify guard.  A
         # final post-elevation snap clears these residual cases.
         # Aligned per-vertex altitudes are preserved by index, so the
         # snap is altitude-safe (a 10 m planar move at typical
@@ -1720,7 +1720,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _align_rect_slope_to_axis,
             _enforce_runway_1to1_sharing,
             _push_junction_vertices_outside_pavement,
-            _snap_to_long_edge_corners,
+            _snap_to_sloping_edge_corners,
             widen_junctions_to_runway_corners,
         )
         # Slope alignment runs FIRST post-elevation: rects whose
@@ -1728,7 +1728,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # (single altitude) so subsequent rules treat them as
         # multi-connection-allowed (per user 2026-05-02).
         _align_rect_slope_to_axis(layout)
-        _snap_to_long_edge_corners(layout)
+        _snap_to_sloping_edge_corners(layout)
         _enforce_runway_1to1_sharing(layout)
         # Rule 1 v6 widening (user 2026-05-02): runs ONLY here,
         # post-elevation, after the runway is segmented.  Inserts
@@ -1758,6 +1758,15 @@ def build_airport_pavement(icao: str, xplane_root: str,
             per_surface_solve(layout, icao,
                                dem=dem,
                                tile_lat=tile_lat, tile_lon=tile_lon)
+
+        # Stitch pavement to terminal pads (user 2026-05-04): make
+        # the two share an identical vertex sequence on every shared
+        # edge — pavement vertices near a terminal corner snap to it,
+        # vertices in the edge interior get inserted into the
+        # terminal polygon.  Eliminates the 4 sub-metre "step"
+        # artefacts that survived the densify-skip guard.
+        from .junction_rules import stitch_pavement_to_terminals
+        stitch_pavement_to_terminals(layout)
 
         # Final within-shape grade WARN reflects the absolute
         # final state — junction / apron / terminal Euclidean caps

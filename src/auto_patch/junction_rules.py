@@ -6,8 +6,8 @@ Four rules apply as post-emission passes inside
 ``junction_emit.emit_junctions_and_finalize``:
 
 * **Rule 1** — junction-runway 1:1 vertex sharing.
-* **Rule 2** — snap junction vertices within ``LONG_EDGE_SNAP_M`` of
-  a sloping rect's long edge to the rect's nearest short-end corner.
+* **Rule 2** — snap junction vertices within ``SLOPING_EDGE_SNAP_M`` of
+  a sloping rect's SLOPING edge to the rect's nearest cross-edge corner.
 * **Rule 3** — for every junction, every edge that isn't a
   pavement-boundary arc and isn't a shared anchor edge must run
   parallel or perpendicular to the longest runway axis.
@@ -29,7 +29,7 @@ from shapely.ops import unary_union
 
 from .config import (
     AXIS_ALIGN_TOL_DEG,
-    LONG_EDGE_SNAP_M,
+    SLOPING_EDGE_SNAP_M,
     NECK_ABSOLUTE_M,
     NECK_ABSORB_FRAC,
     NECK_RELATIVE,
@@ -39,8 +39,10 @@ from .config import (
 from .layout import (
     BuiltShape,
     PavementLayout,
+    ROLE_APRON,
     ROLE_JUNCTION,
     ROLE_RUNWAY,
+    ROLE_TERMINAL,
     SHARED_VERTEX_TOL_M,
 )
 
@@ -48,6 +50,7 @@ from .layout import (
 __all__ = [
     "apply_junction_rules",
     "longest_runway_axis_deg",
+    "stitch_pavement_to_terminals",
     "widen_junctions_to_runway_corners",
 ]
 
@@ -111,12 +114,12 @@ def apply_junction_rules(layout: PavementLayout) -> None:
     # (Rule 2) skip flat rects per user 2026-05-02.
     _align_rect_slope_to_axis(layout)
 
-    # Phase 1 (landed): Rule 2 — long-edge corner snap.
+    # Phase 1 (landed): Rule 2 — sloping-edge corner snap.
     # Use the FINAL rect polygons from layout.shapes — earlier passes
     # (overlap clip, shared-vertex centroid collapse) may have shifted
     # the original ``taxi_rects`` polygons; reading from layout
     # guarantees we snap against the geometry the test sees.
-    _snap_to_long_edge_corners(layout)
+    _snap_to_sloping_edge_corners(layout)
 
     # Phase 2 (landed): Rule 1 — junction-runway 1:1 sharing.
     _enforce_runway_1to1_sharing(layout)
@@ -183,7 +186,7 @@ def longest_runway_axis_deg(layout: PavementLayout) -> Optional[float]:
     return math.degrees(math.atan2(dx, dy)) % 180.0
 
 
-# ── Rule 2: long-edge corner snap ────────────────────────────────
+# ── Rule 2: sloping-edge corner snap ─────────────────────────────
 
 
 def _rect_sloping_edges(
@@ -209,8 +212,7 @@ def _rect_sloping_edges(
         works for typical sloping rects where the long dimension
         is the slope direction.
 
-    Return format: ``[(p1, p2, corner_a, corner_b), ...]`` (same
-    as the legacy ``_rect_long_edges`` API).
+    Return format: ``[(p1, p2, corner_a, corner_b), ...]``.
     """
     coords = list(rect.exterior.coords)
     if not coords:
@@ -251,10 +253,6 @@ def _rect_sloping_edges(
             for i in long_idx]
 
 
-# Backward-compat alias.
-_rect_long_edges = _rect_sloping_edges
-
-
 def _point_segment_distance(
     px: float, py: float,
     ax: float, ay: float, bx: float, by: float,
@@ -290,8 +288,8 @@ def _point_perp_dist_within_segment(
     Per user 2026-05-01 clarification: Rule 2's 10 m exclusion is
     perpendicular-to-axis only, and only along the rect's axial
     extent.  A junction vertex that reaches toward the short-end
-    corner sits beyond the long edge's endpoint and is NOT flagged
-    even though its straight-line distance to the long edge is
+    corner sits beyond the sloping edge's endpoint and is NOT flagged
+    even though its straight-line distance to the sloping edge is
     small — it's connecting at the short side, not running along
     the long side.
     """
@@ -308,42 +306,78 @@ def _point_perp_dist_within_segment(
     return math.hypot(px - fx, py - fy)
 
 
-def _snap_to_long_edge_corners(layout: PavementLayout) -> None:
-    """Rule 2: snap each junction vertex within ``LONG_EDGE_SNAP_M``
-    of any sloping-rect long edge to the nearest of that long edge's
-    two endpoints (which are rect corners).  After snapping, dedupe
-    consecutive identical vertices.  When ``node_altitudes`` is set
-    on a junction shape, drop the altitude entry alongside the
-    vertex it corresponds to so the per-vertex altitude list stays
-    aligned with the polygon's ring length.
+def _snap_to_sloping_edge_corners(layout: PavementLayout) -> None:
+    """Snap each junction vertex within ``SLOPING_EDGE_SNAP_M`` of
+    any sloping-rect EDGE to the nearest rect corner — corner-only
+    1:1 sharing along every edge of every sloping rect.
+
+    Per user 2026-05-04: the rule applies to BOTH sloping edges
+    (parallel to ``source_axis``) AND cross edges (perpendicular).
+    Junctions adjacent to a sloping rect must share only the rect's
+    4 corners; intermediate vertices on a cross edge from
+    densification get snapped to whichever corner is nearer, then
+    consecutive duplicates collapse.
+
+    When ``node_altitudes`` is set on a junction shape, drop the
+    altitude entry alongside the vertex it corresponds to so the
+    per-vertex altitude list stays aligned with the polygon's ring
+    length.
     """
-    # Pre-compute long edges + endpoint corners per rect.  Read from
-    # ``layout.shapes`` so we snap against the FINAL rect polygons
-    # (after overlap clip + shared-vertex collapse).
-    long_edges: List[Tuple[float, float, float, float,
-                           Tuple[float, float], Tuple[float, float]]] = []
+    # Pre-compute corners + edges per rect.  Each rect has 4 corners
+    # (indexed 0..3) and 4 edges (each connecting consecutive corners
+    # i and (i+1)%4).  We snap to corners and use the (rect_idx,
+    # corner_idx) pair to detect "adjacent rect corners" pairs in the
+    # snapped polygon.  Read from ``layout.shapes`` so we snap
+    # against the FINAL rect polygons (after overlap clip + shared-
+    # vertex collapse).
+    #
+    # Per user 2026-05-04: don't gate on altitude_high/low.  Under
+    # the per-surface solver path, altitudes get assigned AFTER this
+    # snap pass; the previous gate left every sloping-role rect un-
+    # snapped.  Treat all sloping-role rects as sloping at this
+    # stage; if the rect turns out flat after the elevation pass the
+    # corner-only sharing is still valid (flat rects allow free
+    # sharing but don't require it).
+    rect_corners_per_rect: List[List[Tuple[float, float]]] = []
+    rect_edges: List[Tuple[float, float, float, float, int, int, int]] = []
+    # rect_edges entries are
+    # (ax, ay, bx, by, rect_idx, corner_idx_a, corner_idx_b).
     for shape in layout.shapes:
         if shape.role not in SLOPING_RECT_ROLES:
-            continue
-        # Per user 2026-05-02: flat rects (no altitude_high/low,
-        # only ``altitude``) are exempt from sloping-rect connection
-        # rules — junctions can connect anywhere on their boundary.
-        if (shape.altitude_high is None
-                or shape.altitude_low is None):
             continue
         rect = shape.polygon
         if rect is None or rect.is_empty or rect.geom_type != "Polygon":
             continue
-        for ax, ay, bx, by in (
-            (e[0][0], e[0][1], e[1][0], e[1][1])
-            for e in _rect_sloping_edges(rect, shape.source_axis)
-        ):
-            long_edges.append((ax, ay, bx, by, (ax, ay), (bx, by)))
-    if not long_edges:
+        rc = list(rect.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        rect_idx = len(rect_corners_per_rect)
+        rect_corners_per_rect.append(
+            [(float(c[0]), float(c[1])) for c in rc])
+        for i in range(4):
+            ax, ay = rc[i]
+            bx, by = rc[(i + 1) % 4]
+            rect_edges.append(
+                (float(ax), float(ay), float(bx), float(by),
+                 rect_idx, i, (i + 1) % 4))
+    if not rect_edges:
         return
 
-    snap_tol = LONG_EDGE_SNAP_M
+    snap_tol = SLOPING_EDGE_SNAP_M
     corner_tol = SHARED_VERTEX_TOL_M
+
+    def _corner_id_for(vx: float, vy: float
+                        ) -> Optional[Tuple[int, int]]:
+        """If (vx, vy) coincides with a rect corner (within
+        ``corner_tol``), return ``(rect_idx, corner_idx)``; else None.
+        Used for adjacency detection on already-snapped vertices."""
+        for r_idx, corners in enumerate(rect_corners_per_rect):
+            for c_idx, (cx, cy) in enumerate(corners):
+                if math.hypot(vx - cx, vy - cy) <= corner_tol:
+                    return (r_idx, c_idx)
+        return None
 
     for shape in layout.shapes:
         if shape.role != ROLE_JUNCTION:
@@ -367,46 +401,115 @@ def _snap_to_long_edge_corners(layout: PavementLayout) -> None:
             coords = coords[:-1]
             if node_alts is not None:
                 node_alts = list(node_alts[:-1])
-        # snapped[i] = (new_xy, original_alt_or_None).
-        snapped: List[Tuple[Tuple[float, float], Optional[float]]] = []
+        # snapped[i] = (new_xy, original_alt_or_None, corner_id_or_None).
+        snapped: List[Tuple[Tuple[float, float], Optional[float],
+                              Optional[Tuple[int, int]]]] = []
         changed = False
         for i, (vx, vy) in enumerate(coords):
             best_corner: Optional[Tuple[float, float]] = None
+            best_corner_id: Optional[Tuple[int, int]] = None
             best_dist = snap_tol
-            for ax, ay, bx, by, c1, c2 in long_edges:
-                # Perpendicular distance, only within the long edge's
-                # axial extent — vertices reaching toward the short
-                # end (projection past either corner) are allowed.
+            for ax, ay, bx, by, r_idx, ci_a, ci_b in rect_edges:
+                # Perpendicular distance, only within the edge's
+                # axial extent — vertices reaching toward a corner
+                # past either endpoint are allowed (those reach to
+                # an adjacent rect's edge legitimately).
                 d = _point_perp_dist_within_segment(
                     vx, vy, ax, ay, bx, by)
                 if d is None or d >= best_dist:
                     continue
+                c1 = (ax, ay)
+                c2 = (bx, by)
                 d1 = math.hypot(vx - c1[0], vy - c1[1])
                 d2 = math.hypot(vx - c2[0], vy - c2[1])
                 if d1 <= corner_tol or d2 <= corner_tol:
                     continue
-                candidate = c1 if d1 <= d2 else c2
+                if d1 <= d2:
+                    candidate = c1
+                    candidate_id = (r_idx, ci_a)
+                else:
+                    candidate = c2
+                    candidate_id = (r_idx, ci_b)
                 best_dist = d
                 best_corner = candidate
+                best_corner_id = candidate_id
             alt = node_alts[i] if node_alts is not None else None
             if best_corner is not None:
-                snapped.append((best_corner, alt))
+                snapped.append((best_corner, alt, best_corner_id))
                 changed = True
             else:
-                snapped.append(((vx, vy), alt))
+                # Pre-existing corner coincidence (e.g. originally on
+                # a corner): tag with corner id so adjacency detection
+                # below sees it.
+                snapped.append(((vx, vy), alt,
+                                _corner_id_for(vx, vy)))
 
         if not changed:
-            continue
+            # Even if no NEW snap, we may still need to drop
+            # intervening vertices between pre-existing corner
+            # coincidences (pre-snap geometry already had two corners
+            # in the polygon).  Continue if no corner ids found.
+            if not any(e[2] is not None for e in snapped):
+                continue
         # Dedupe consecutive identical vertices, dropping the matching
         # altitude entry.
-        deduped: List[Tuple[Tuple[float, float], Optional[float]]] = []
+        deduped: List[Tuple[Tuple[float, float], Optional[float],
+                              Optional[Tuple[int, int]]]] = []
         for entry in snapped:
-            (cx, cy), _alt = entry
+            (cx, cy), _alt, _cid = entry
             if deduped:
-                (px, py), _ = deduped[-1]
+                (px, py), _, _ = deduped[-1]
                 if math.hypot(cx - px, cy - py) <= corner_tol:
                     continue
             deduped.append(entry)
+        # Per user 2026-05-04: when two NON-consecutive corner-snapped
+        # vertices land on adjacent corners of the same rect (i.e.
+        # the two endpoints of one rect edge), the polygon edge
+        # between them follows that rect edge — drop any intervening
+        # non-corner vertices so the junction polygon traces the rect
+        # boundary corner-to-corner with no extras.  Without this,
+        # vertices like SPJC junction -10153's v4 stay between V3
+        # corners -85 and -84, forcing the polygon's edge to cut
+        # across V3 and produce the 1012 m² overlap.
+        n_d = len(deduped)
+        if n_d >= 4:
+            keep = [True] * n_d
+            for i in range(n_d):
+                cid_a = deduped[i][2]
+                if cid_a is None:
+                    continue
+                # Look ahead (circular) for the next corner-snapped
+                # vertex; intervening must all be non-corner.
+                k = 1
+                while k < n_d:
+                    j = (i + k) % n_d
+                    if deduped[j][2] is not None:
+                        break
+                    k += 1
+                if k <= 1 or k >= n_d:
+                    continue
+                # Only fire on the SHORTER side around the polygon —
+                # the other side is the polygon's main body wrapping
+                # around the rect, which has its own legitimate
+                # vertices.  When the two halves are equal length,
+                # process forward only.
+                if k > n_d - k:
+                    continue
+                j = (i + k) % n_d
+                cid_b = deduped[j][2]
+                if cid_b is None:
+                    continue
+                if cid_a[0] != cid_b[0]:
+                    continue
+                # Adjacent rect corners?  |a − b| == 1 (mod 4).
+                diff = (cid_b[1] - cid_a[1]) % 4
+                if diff != 1 and diff != 3:
+                    continue
+                # Drop the intervening vertices.
+                for off in range(1, k):
+                    keep[(i + off) % n_d] = False
+            if not all(keep):
+                deduped = [e for e, k in zip(deduped, keep) if k]
         if len(deduped) < 3:
             continue
         new_pts = [e[0] for e in deduped]
@@ -558,8 +661,10 @@ def _widen_runway_shared_corners(
         runway_union = unary_union(runway_polys) if runway_polys else None
     except Exception:
         runway_union = None
+    pav_union = getattr(layout, "_apt_pav_union", None)
     return _do_widen(
-        layout, chain, corner_index, corner_alt, runway_union)
+        layout, chain, corner_index, corner_alt,
+        runway_union, pav_union)
 
 
 def _do_widen(
@@ -568,6 +673,7 @@ def _do_widen(
     corner_index: dict,
     corner_alt: dict,
     runway_union,
+    pav_union=None,
 ) -> None:
     """Rule 1 v6 widening (user 2026-05-02): for each junction with
     at least one runway-shared vertex, insert the immediately-
@@ -631,33 +737,96 @@ def _do_widen(
         if max_inserts == 0:
             continue
 
-        # Build insertions: list of (insert_at_position, new_vertex,
-        # new_altitude).  insert_at_position uses the ORIGINAL coords
-        # indices; we'll apply them in reverse order.
-        insertions: List[
-            Tuple[int, Tuple[float, float], Optional[float]]] = []
+        # Per user 2026-05-04: validate each insertion individually
+        # and commit one at a time.  The previous batch validation
+        # rejected ALL insertions whenever ANY one of them caused a
+        # geometric problem — at SPJC's 34R end the south-side chain
+        # neighbor wraps around the runway end (1600 m² overlap), so
+        # the legitimate north-side widening was getting thrown out
+        # alongside it.
+        current_coords = list(coords)
+        current_alts: Optional[List[float]] = (
+            list(node_alts) if node_alts is not None else None)
+        n_committed = 0
 
-        for poly_idx, corner in shared_in_poly:
-            if len(insertions) >= max_inserts:
+        def _attempt_insert(insert_at, neighbor, alt):
+            nonlocal current_coords, current_alts, existing_keys
+            trial = list(current_coords)
+            trial.insert(insert_at, neighbor)
+            if len(trial) < 3:
+                return False
+            try:
+                trial_poly = Polygon(trial).buffer(0)
+            except Exception:
+                return False
+            if trial_poly.is_empty:
+                return False
+            if trial_poly.geom_type == "MultiPolygon":
+                trial_poly = max(trial_poly.geoms, key=lambda g: g.area)
+            if trial_poly.geom_type != "Polygon":
+                return False
+            if not trial_poly.is_valid or not trial_poly.is_simple:
+                return False
+            if trial_poly.area < 0.5 * poly.area:
+                return False
+            if runway_union is not None and not runway_union.is_empty:
+                try:
+                    ovl = trial_poly.intersection(runway_union).area
+                except Exception:
+                    ovl = 0.0
+                if ovl > 1.0:
+                    return False
+            for other in layout.shapes:
+                if other is shape or other.role != ROLE_JUNCTION:
+                    continue
+                if other.polygon is None or other.polygon.is_empty:
+                    continue
+                try:
+                    if trial_poly.intersection(
+                            other.polygon).area > 1.0:
+                        return False
+                except Exception:
+                    pass
+            # Commit
+            current_coords = trial
+            if current_alts is not None:
+                current_alts.insert(
+                    insert_at, alt if alt is not None else 0.0)
+            existing_keys.add(_key(neighbor))
+            return True
+
+        # Rebuild shared_in_poly indices each iteration since the
+        # polygon mutates.  Walk a snapshot of the original shared
+        # corners and translate poly_idx through the running insert
+        # offset.
+        for orig_poly_idx, corner in shared_in_poly:
+            if n_committed >= max_inserts:
                 break
             ci = corner_index[_key(corner)]
             chain_neighbors = (
                 chain[(ci - 1) % n_chain],
                 chain[(ci + 1) % n_chain],
             )
-            prev_v = coords[(poly_idx - 1) % n]
-            next_v = coords[(poly_idx + 1) % n]
+            # Find current poly_idx of this corner (insertions before
+            # it shift its index forward by 1 each).
+            try:
+                poly_idx = next(
+                    i for i, v in enumerate(current_coords)
+                    if _key(v) == _key(corner))
+            except StopIteration:
+                continue
+            n_cur = len(current_coords)
+            prev_v = current_coords[(poly_idx - 1) % n_cur]
+            next_v = current_coords[(poly_idx + 1) % n_cur]
 
             for neighbor in chain_neighbors:
-                if len(insertions) >= max_inserts:
+                if n_committed >= max_inserts:
                     break
-                # Skip if already a junction vertex.
                 if _key(neighbor) in existing_keys:
                     continue
                 # Decide insertion side: BEFORE poly_idx or AFTER.
-                # Compare angles from corner to neighbor vs to
-                # prev_v / next_v in polygon walk; pick the side
-                # whose angle is closer to the neighbor's.
+                # Pick the side whose angle is closer to the
+                # neighbor's bearing from the corner.
                 ax_n, ay_n = (neighbor[0] - corner[0],
                               neighbor[1] - corner[1])
                 ax_p, ay_p = (prev_v[0] - corner[0],
@@ -675,24 +844,15 @@ def _do_widen(
                 d_to_prev = _ang_diff(a_n, a_p)
                 d_to_next = _ang_diff(a_n, a_x)
                 if d_to_prev <= d_to_next:
-                    insert_at = poly_idx       # before
-                    flank_v = prev_v           # vertex before corner
-                else:
-                    insert_at = poly_idx + 1   # after
-                    flank_v = next_v           # vertex after corner
-
-                # Per user 2026-05-02: only reject EXTREME backtracks
-                # (near-180° U-turns).  Soft jag rejection blocked
-                # too many legitimate widenings, leaving junctions
-                # with only 1 runway-shared node (user wants 2-4).
-                # Polygon validity + overlap-rejection guards below
-                # catch the truly degenerate cases.
-                if d_to_prev <= d_to_next:
+                    insert_at = poly_idx
+                    flank_v = prev_v
                     e1 = (neighbor[0] - flank_v[0],
                           neighbor[1] - flank_v[1])
                     e2 = (corner[0] - neighbor[0],
                           corner[1] - neighbor[1])
                 else:
+                    insert_at = poly_idx + 1
+                    flank_v = next_v
                     e1 = (neighbor[0] - corner[0],
                           neighbor[1] - corner[1])
                     e2 = (flank_v[0] - neighbor[0],
@@ -702,35 +862,37 @@ def _do_widen(
                 if m1 > 1e-6 and m2 > 1e-6:
                     cos_turn = (e1[0] * e2[0]
                                 + e1[1] * e2[1]) / (m1 * m2)
-                    # Only reject NEAR-180° U-turns (cos < -0.95).
-                    if cos_turn < -0.95:
+                    # Per user 2026-05-04: only reject TRUE U-turns
+                    # (cos < -0.99, > 172°).  The -0.95 threshold
+                    # rejected legitimate widenings at SPJC's 34R
+                    # west-side junction (-10130) where the angle
+                    # was 162° (cos = -0.954) — a sharp but valid
+                    # widening arm.  The per-insertion validity +
+                    # overlap guards in ``_attempt_insert`` already
+                    # catch the geometrically degenerate cases.
+                    if cos_turn < -0.99:
                         continue
 
                 alt = corner_alt.get(_key(neighbor))
-                insertions.append((insert_at, neighbor, alt))
-                # Track this neighbor as "now-in-polygon" so we
-                # don't insert duplicates from other shared corners.
-                existing_keys.add(_key(neighbor))
+                if _attempt_insert(insert_at, neighbor, alt):
+                    n_committed += 1
+                    # poly_idx may shift if we inserted before it.
+                    n_cur = len(current_coords)
+                    try:
+                        poly_idx = next(
+                            i for i, v in enumerate(current_coords)
+                            if _key(v) == _key(corner))
+                    except StopIteration:
+                        break
+                    prev_v = current_coords[(poly_idx - 1) % n_cur]
+                    next_v = current_coords[(poly_idx + 1) % n_cur]
 
-        if not insertions:
+        if n_committed == 0:
             continue
-
-        # Apply insertions in REVERSE position order so earlier
-        # indices remain valid.
-        insertions.sort(key=lambda x: -x[0])
-        new_coords = list(coords)
-        new_alts: Optional[List[float]] = (
-            list(node_alts) if node_alts is not None else None)
-        for pos, vert, alt in insertions:
-            new_coords.insert(pos, vert)
-            if new_alts is not None:
-                new_alts.insert(pos, alt if alt is not None else 0.0)
-
-        # Validate polygon.
-        if len(new_coords) < 3:
-            continue
+        # Final polygon from the running coords (already validated
+        # piecewise; guaranteed to be a single valid Polygon).
         try:
-            new_poly = Polygon(new_coords).buffer(0)
+            new_poly = Polygon(current_coords).buffer(0)
         except Exception:
             continue
         if new_poly.is_empty:
@@ -739,41 +901,9 @@ def _do_widen(
             new_poly = max(new_poly.geoms, key=lambda g: g.area)
         if new_poly.geom_type != "Polygon":
             continue
-        if not new_poly.is_valid or not new_poly.is_simple:
-            continue
-        # Allow polygon to GROW (Rule 1 v6 widening) but not shrink
-        # significantly — a > 50 % shrink suggests degenerate snap.
-        if new_poly.area < 0.5 * poly.area:
-            continue
-        # Overlap rejection: if the widened polygon overlaps the
-        # runway OR any other junction polygon by > a tiny noise
-        # tolerance, the insertion wrapped the polygon body across
-        # a neighbour boundary — revert.
-        if runway_union is not None and not runway_union.is_empty:
-            try:
-                ovl = new_poly.intersection(runway_union).area
-            except Exception:
-                ovl = 0.0
-            if ovl > 1.0:
-                continue
-        # Check overlap against OTHER junctions (excluding self).
-        bad = False
-        for other in layout.shapes:
-            if other is shape or other.role != ROLE_JUNCTION:
-                continue
-            if other.polygon is None or other.polygon.is_empty:
-                continue
-            try:
-                if new_poly.intersection(other.polygon).area > 1.0:
-                    bad = True
-                    break
-            except Exception:
-                pass
-        if bad:
-            continue
         shape.polygon = new_poly
-        if new_alts is not None:
-            shape.node_altitudes = new_alts + [new_alts[0]]
+        if current_alts is not None:
+            shape.node_altitudes = current_alts + [current_alts[0]]
 
 
 def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
@@ -836,6 +966,29 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
 
     adjacency_tol = RUNWAY_ADJACENCY_TOL_M
     vertex_tol = SHARED_VERTEX_TOL_M
+
+    # Per user 2026-05-04: collect every sloping-rect corner.  A
+    # junction vertex that already coincides with a rect corner must
+    # NOT be replaced by a runway corner — the rect corner is a
+    # legitimate 1:1 share that the rect-corner snap pass already
+    # established.  Without this guard, the runway-snap run would
+    # absorb V3-stub corner -84 (which sat 20 m from the runway) and
+    # the polygon edge from V3 corner -85 to the new runway corner
+    # would cut across V3, producing a 1012 m² overlap.
+    rect_corner_buckets: set = set()
+    bucket_size = SHARED_VERTEX_TOL_M
+    for s in layout.shapes:
+        if s.role not in SLOPING_RECT_ROLES:
+            continue
+        if s.polygon is None or s.polygon.is_empty \
+                or s.polygon.geom_type != "Polygon":
+            continue
+        rc = list(s.polygon.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        for cx, cy in rc:
+            rect_corner_buckets.add(
+                (round(cx / bucket_size), round(cy / bucket_size)))
     # A snap "would shrink" when the candidate target is within
     # this distance of any OTHER existing junction vertex
     # (collision = unintended dedupe).
@@ -897,10 +1050,15 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
             continue
 
         # Pass 1: classify each vertex (runway-adjacent? closest segment?).
+        # A vertex already at a sloping-rect corner stays put — the
+        # rect-corner share is a legitimate anchor.
         nearest_seg: List[
             Optional[Tuple[Tuple[float, float], Tuple[float, float]]]
         ] = [None] * n
         for i, (vx, vy) in enumerate(coords):
+            bk = (round(vx / bucket_size), round(vy / bucket_size))
+            if bk in rect_corner_buckets:
+                continue
             best_d = adjacency_tol
             best_endpoints = None
             for ax, ay, bx, by, c1, c2 in rwy_segs:
@@ -1284,7 +1442,7 @@ PAVEMENT_INSIDE_TOL_M = 0.1  # treat vertices within this of boundary as on-it
 # from the pavement boundary aren't push candidates.  Vertices inside
 # pavement at greater depths are typically:
 #   * Interior cut-line endpoints from ``_decompose_polygon_with_holes``
-#   * Densification midpoints near runway/rect long edges (handled by
+#   * Densification midpoints near runway/rect sloping edges (handled by
 #     Rule 1 v2 / Rule 2 instead)
 #   * Shared-vertex centroid drift artefacts
 # Moving them by ≤ 1 m wouldn't get them outside, and a larger move
@@ -1326,14 +1484,14 @@ def _push_junction_vertices_outside_pavement(
     # placed near anchor boundaries:
     #   * Runway edges → exempt within ``RUNWAY_BOUNDARY_TOL_M`` (Rule 1
     #     legitimately leaves vertices there).
-    #   * Sloping rect long edges → exempt within
-    #     ``LONG_EDGE_SNAP_M`` PERPENDICULAR (Rule 2 keeps short-end
+    #   * Sloping rect SLOPING edges → exempt within
+    #     ``SLOPING_EDGE_SNAP_M`` PERPENDICULAR (Rule 2 keeps short-end
     #     reach-corners there).
     #   * Terminal & rect short edges → exempt within
     #     ``SHARED_VERTEX_TOL_M`` (legitimate anchor sharing only).
-    from .config import LONG_EDGE_SNAP_M
+    from .config import SLOPING_EDGE_SNAP_M
     runway_edges: List[Tuple[float, float, float, float]] = []
-    rect_long_edges: List[Tuple[float, float, float, float]] = []
+    rect_sloping_edges: List[Tuple[float, float, float, float]] = []
     other_anchor_edges: List[Tuple[float, float, float, float]] = []
     for s in layout.shapes:
         if s.polygon is None or s.polygon.is_empty:
@@ -1356,7 +1514,7 @@ def _push_junction_vertices_outside_pavement(
                 sloping = _rect_sloping_edges(s.polygon, s.source_axis)
                 sloping_keys = set()
                 for sa, sb, _, _ in sloping:
-                    rect_long_edges.append(
+                    rect_sloping_edges.append(
                         (float(sa[0]), float(sa[1]),
                          float(sb[0]), float(sb[1])))
                     sloping_keys.add((round(sa[0] * 2.0),
@@ -1415,7 +1573,7 @@ def _push_junction_vertices_outside_pavement(
                 new_coords.append((vx, vy))
                 continue
             if _vertex_on_any_anchor_edge(
-                    vx, vy, rect_long_edges, LONG_EDGE_SNAP_M):
+                    vx, vy, rect_sloping_edges, SLOPING_EDGE_SNAP_M):
                 new_coords.append((vx, vy))
                 continue
             if _vertex_on_any_anchor_edge(
@@ -1497,6 +1655,230 @@ def _push_junction_vertices_outside_pavement(
         if new_poly.geom_type != "Polygon":
             continue
         shape.polygon = new_poly
+
+
+STITCH_PAVEMENT_ROLES = (
+    ROLE_JUNCTION,
+    ROLE_APRON,
+    "primary_parallel",
+    "secondary_parallel",
+    "stub",
+    "cross_connector",
+)
+
+
+def stitch_pavement_to_terminals(
+    layout: PavementLayout,
+    snap_corner_m: float = 5.0,
+    on_edge_tol_m: float = SHARED_VERTEX_TOL_M,
+) -> None:
+    """Make terminal pads share an identical vertex set with adjacent
+    pavement on every shared boundary segment (user 2026-05-04).
+
+    For each pavement vertex (junction / apron / parallel / stub /
+    cross_connector) that lies within ``on_edge_tol_m`` of a terminal
+    edge interior:
+
+      * If the vertex is within ``snap_corner_m`` of one of that
+        edge's endpoints (a terminal corner), rewrite the pavement
+        polygon to use the corner instead — the pavement loses a
+        vertex and gains exact alignment with the existing terminal
+        corner.
+      * Otherwise insert the vertex into the terminal polygon at the
+        correct position along the edge — the terminal grows a
+        vertex so it matches the pavement node.
+
+    Either way both polygons end up with the same vertex sequence on
+    the shared segment, so X-Plane renders a seamless meld with no
+    sub-metre overlaps.
+
+    ``node_altitudes`` is updated in lockstep with polygon rewrites.
+    Run as the last geometry pass before OSM emit.
+    """
+    terminals = [s for s in layout.shapes if s.role == ROLE_TERMINAL]
+    if not terminals:
+        return
+    pavements = [s for s in layout.shapes
+                 if s.role in STITCH_PAVEMENT_ROLES]
+    if not pavements:
+        return
+
+    # Per-terminal: list of (a_idx, b_idx, ax, ay, bx, by) edges.
+    # ``a_idx`` and ``b_idx`` are positions in the terminal's open
+    # ring (no closing-duplicate vertex).
+    snap_tol2 = snap_corner_m * snap_corner_m
+    on_edge_tol2 = on_edge_tol_m * on_edge_tol_m
+
+    # Inserts collected per terminal: edge_idx → list of
+    # (frac_along_edge, x, y).  Applied after the pavement-vertex
+    # walk so we don't disturb the terminal geometry mid-iteration.
+    pending_inserts: dict = {id(t): {} for t in terminals}
+
+    for pav in pavements:
+        poly = pav.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        try:
+            coords = list(poly.exterior.coords)
+        except Exception:
+            continue
+        ring_closed = (
+            len(coords) > 1 and coords[0] == coords[-1])
+        coords_open = coords[:-1] if ring_closed else list(coords)
+        if len(coords_open) < 3:
+            continue
+
+        node_alts = pav.node_altitudes
+        # Mirror the closed/open form for altitudes if present.
+        alts_open: Optional[List[float]] = None
+        if node_alts is not None:
+            alts = list(node_alts)
+            alts_open = alts[:-1] if (
+                ring_closed and len(alts) == len(coords)) else alts
+            if len(alts_open) != len(coords_open):
+                alts_open = None
+
+        new_coords: List[Tuple[float, float]] = []
+        new_alts: Optional[List[float]] = (
+            [] if alts_open is not None else None)
+        mutated = False
+        for vi, (vx, vy) in enumerate(coords_open):
+            snapped = False
+            for term in terminals:
+                tcoords = list(term.polygon.exterior.coords)
+                if tcoords and tcoords[0] == tcoords[-1]:
+                    tcoords = tcoords[:-1]
+                m = len(tcoords)
+                if m < 3:
+                    continue
+                # Skip if vertex matches an existing terminal corner —
+                # already shared, no work needed.
+                already_corner = False
+                for (cx, cy) in tcoords:
+                    if (vx - cx) * (vx - cx) \
+                            + (vy - cy) * (vy - cy) <= on_edge_tol2:
+                        already_corner = True
+                        break
+                if already_corner:
+                    break
+                for ei in range(m):
+                    ax, ay = tcoords[ei]
+                    bx, by = tcoords[(ei + 1) % m]
+                    dx = bx - ax
+                    dy = by - ay
+                    seg2 = dx * dx + dy * dy
+                    if seg2 < 1.0:
+                        continue
+                    t = ((vx - ax) * dx + (vy - ay) * dy) / seg2
+                    if t <= 0.0 or t >= 1.0:
+                        continue
+                    cx = ax + t * dx
+                    cy = ay + t * dy
+                    d2 = (vx - cx) * (vx - cx) + (vy - cy) * (vy - cy)
+                    if d2 > on_edge_tol2:
+                        continue
+                    # Vertex sits on this terminal edge interior.
+                    # Decide: snap to nearest endpoint, or insert.
+                    da2 = (vx - ax) * (vx - ax) + (vy - ay) * (vy - ay)
+                    db2 = (vx - bx) * (vx - bx) + (vy - by) * (vy - by)
+                    if da2 <= snap_tol2 and da2 <= db2:
+                        new_coords.append((ax, ay))
+                        if new_alts is not None:
+                            new_alts.append(alts_open[vi])
+                        mutated = True
+                        snapped = True
+                    elif db2 <= snap_tol2:
+                        new_coords.append((bx, by))
+                        if new_alts is not None:
+                            new_alts.append(alts_open[vi])
+                        mutated = True
+                        snapped = True
+                    else:
+                        # Schedule terminal-side insertion at frac t.
+                        pending_inserts[id(term)].setdefault(
+                            ei, []).append((t, cx, cy))
+                        new_coords.append((cx, cy))
+                        if new_alts is not None:
+                            new_alts.append(alts_open[vi])
+                        # Move pavement vertex onto the EXACT edge
+                        # geometry so the bucket-intern in to_osm
+                        # collapses both to the same nid.
+                        if d2 > 1e-9:
+                            mutated = True
+                        snapped = True
+                    break  # done with this pavement vertex
+                if snapped:
+                    break
+            if not snapped:
+                new_coords.append((vx, vy))
+                if new_alts is not None:
+                    new_alts.append(alts_open[vi])
+
+        if not mutated:
+            continue
+        # Drop consecutive duplicates introduced by snap-to-corner.
+        deduped: List[Tuple[float, float]] = []
+        deduped_alts: Optional[List[float]] = (
+            [] if new_alts is not None else None)
+        for k, p in enumerate(new_coords):
+            if (deduped
+                    and abs(deduped[-1][0] - p[0]) < 1e-6
+                    and abs(deduped[-1][1] - p[1]) < 1e-6):
+                continue
+            deduped.append(p)
+            if deduped_alts is not None:
+                deduped_alts.append(new_alts[k])
+        if len(deduped) < 3:
+            continue
+        try:
+            new_poly = Polygon(deduped + [deduped[0]])
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if (new_poly.is_empty
+                    or new_poly.geom_type != "Polygon"):
+                continue
+        except Exception:
+            continue
+        pav.polygon = new_poly
+        if deduped_alts is not None:
+            pav.node_altitudes = deduped_alts + [deduped_alts[0]]
+
+    # Apply terminal-side inserts.
+    for term in terminals:
+        inserts = pending_inserts.get(id(term))
+        if not inserts:
+            continue
+        tcoords = list(term.polygon.exterior.coords)
+        ring_closed = (
+            len(tcoords) > 1 and tcoords[0] == tcoords[-1])
+        tcoords_open = tcoords[:-1] if ring_closed else list(tcoords)
+        m = len(tcoords_open)
+        out: List[Tuple[float, float]] = []
+        for ei in range(m):
+            out.append(tcoords_open[ei])
+            if ei in inserts:
+                # Sort by t ascending; dedup near-duplicates.
+                pts = sorted(inserts[ei], key=lambda x: x[0])
+                last_t: float = -1.0
+                for t, cx, cy in pts:
+                    if t - last_t < 1e-4:
+                        continue
+                    out.append((cx, cy))
+                    last_t = t
+        if len(out) < 3:
+            continue
+        try:
+            new_poly = Polygon(out + [out[0]])
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if (new_poly.is_empty
+                    or new_poly.geom_type != "Polygon"):
+                continue
+        except Exception:
+            continue
+        term.polygon = new_poly
+        # Terminals carry a single ``s.altitude`` (uniform plane); no
+        # ``node_altitudes`` to update.
 
 
 def _vertex_on_any_anchor_edge(
