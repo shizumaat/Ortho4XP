@@ -715,6 +715,18 @@ def _do_widen(
         if n < 3:
             continue
 
+        # Snapshot the pre-widen polygon body for the body-
+        # proximity cap (per user 2026-05-05 followup).  Multi-step
+        # walking + bumped cap let the queue extend the runway-
+        # shared edge by 4-6 chain corners; without a geometric
+        # cap, polygons whose body is small but adjacent to a long
+        # runway-side stretch end up sharing 6+ corners that span
+        # 200+ m of runway, much further than the polygon's
+        # natural extent.  Reject any chain neighbor whose
+        # distance to the original body exceeds
+        # ``WIDEN_BODY_PROX_M``.
+        original_body = poly
+
         # Identify runway-shared vertices in the polygon.
         # shared_in_poly: list of (poly_idx, chain_corner_position)
         existing_keys = set(_key(v) for v in coords)
@@ -845,7 +857,45 @@ def _do_widen(
         # each newly-inserted corner reaches one chain step
         # further, which corresponds to the natural extent of the
         # polygon's runway-shared edge.
-        WIDEN_MAX_ROUNDS = 2
+        # Multi-step walking gate (per user 2026-05-05 followup):
+        # round 0 always runs (single-step from each original
+        # anchor).  Round 1+ (multi-step) runs only when the
+        # polygon has a non-anchor vertex that's substantially
+        # off the runway boundary — geometrically, this is the
+        # runway-end-wrap case (J-10131 at SPJC) where the
+        # polygon body extends well off the runway and we need
+        # to wrap further along the runway to reach the corner
+        # at the body's far edge.  When all non-anchor verts are
+        # already adjacent to runway corners (the typical
+        # apt.dat-aware-segmenter case at SPJC -10137), the
+        # polygon is naturally aligned and round-1 walks would
+        # extend the runway-shared edge past the body's natural
+        # extent.
+        # Distance from each non-anchor vertex to the nearest
+        # runway-shared anchor in the same polygon: if all non-
+        # anchors are within ``NON_ANCHOR_NEAR_ANCHOR_M`` of an
+        # anchor, the polygon is tight against the runway with no
+        # interior reach (the apt.dat-aware-segmenter case where
+        # the polygon naturally aligns with runway corners — no
+        # widening needed past round 0).  Otherwise the polygon
+        # has a body that extends off the runway, and round 1
+        # multi-step walking lets us wrap further along the
+        # runway to reach the corner aligned with the body's far
+        # extent (the runway-end-wrap case at SPJC J-10131).
+        NON_ANCHOR_NEAR_ANCHOR_M = 50.0
+        far_non_anchor_exists = False
+        if shared_in_poly:
+            anchor_pts = [c for _, c in shared_in_poly]
+            for v in coords:
+                if any(math.hypot(v[0] - a[0], v[1] - a[1]) < 1e-3
+                       for a in anchor_pts):
+                    continue
+                d = min(math.hypot(v[0] - a[0], v[1] - a[1])
+                        for a in anchor_pts)
+                if d > NON_ANCHOR_NEAR_ANCHOR_M:
+                    far_non_anchor_exists = True
+                    break
+        WIDEN_MAX_ROUNDS = 2 if far_non_anchor_exists else 1
         round_processed_keys = set(_key(c) for _, c in shared_in_poly)
         widen_queue: List[Tuple[Tuple[float, float], int]] = [
             (c, 0) for _, c in shared_in_poly]
