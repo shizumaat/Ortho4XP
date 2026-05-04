@@ -387,7 +387,11 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             # Sample points as fraction of phys_dist (0 = end A, 1 = end B)
             fractions = [float(i) / n_segs for i in range(n_segs + 1)]
 
-            # Ensure thresholds are in the list
+            # Ensure thresholds are in the list.  ``anchored_t``
+            # tracks t-values that MUST stay (physical ends and
+            # CIFP threshold positions) so the pav_intersection
+            # dedup below can distinguish them from uniform seams.
+            anchored_t: List[float] = [0.0, 1.0]
             if phys_dist > 0:
                 t_a = (displaced_a / phys_dist) if displaced_a > 0 else 0.0
                 t_b = 1.0 - (displaced_b / phys_dist) if displaced_b > 0 else 1.0
@@ -396,14 +400,29 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                         # Insert if not already near an existing fraction
                         if not any(abs(t - f) < 0.01 for f in fractions):
                             fractions.append(t)
+                        if not any(abs(t - a) < 1e-6 for a in anchored_t):
+                            anchored_t.append(t)
                 fractions.sort()
 
             # Per user 2026-05-05: inject pav_intersection breakpoints
             # so segment seam corners align with apt.dat-pavement
             # boundary points where the apron / taxiway meets the
             # runway.  These are NOT elevation anchors — just
-            # geometric segment seams.  Dedup within 2 m of an
-            # existing fraction (a junction can span a 2 m gap).
+            # geometric segment seams.
+            #
+            # Dedup behaviour (user 2026-05-05 followup): when a
+            # pav_intersection lands close to a NON-anchored
+            # (uniform 100 m) seam, REPLACE the uniform seam with
+            # the apt.dat position.  Otherwise the runway ends up
+            # with 3-12 m sliver segments between a uniform seam
+            # and an apt.dat intersection, and junctions only share
+            # the apt.dat one — the uniform seam is dead weight.
+            # Threshold 12 m of centerline distance: large enough
+            # to consolidate the typical sliver, small enough to
+            # leave genuinely independent intersections alone.
+            # Anchored fractions (thresholds, physical ends) are
+            # never replaced; pav_intersections within
+            # ``anchor_dedup_m`` of an anchor are dropped.
             if pav_intersections and phys_dist > 0:
                 pav_pts = []
                 for pkey in (
@@ -417,8 +436,8 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                         pav_pts = pav_intersections[pkey]
                         break
                 rL2 = dx_phys * dx_phys + dy_phys * dy_phys
-                t_dedup = 2.0 / phys_dist
-                inserted_pav_t: List[float] = []
+                merge_t = 12.0 / phys_dist
+                anchor_dedup_t = 2.0 / phys_dist
                 for pp_lat, pp_lon in pav_pts:
                     px = (pp_lon - phys_end_a[1]) * cos_lat_v * DEG_TO_M
                     py = (pp_lat - phys_end_a[0]) * DEG_TO_M
@@ -427,17 +446,27 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     pt = (px * dx_phys + py * dy_phys) / rL2
                     if pt <= 0.001 or pt >= 0.999:
                         continue
-                    # Dedup against ALL existing fractions (uniform +
-                    # threshold + previously-inserted pav) and the
-                    # ones we've already added this loop.
-                    if any(abs(pt - f) < t_dedup for f in fractions):
+                    # If close to an anchor (threshold/end), drop
+                    # the apt.dat intersection (anchor wins).
+                    if any(abs(pt - a) < anchor_dedup_t for a in anchored_t):
                         continue
-                    if any(abs(pt - f) < t_dedup for f in inserted_pav_t):
-                        continue
-                    inserted_pav_t.append(pt)
-                if inserted_pav_t:
-                    fractions.extend(inserted_pav_t)
-                    fractions.sort()
+                    # Otherwise, replace the closest non-anchored
+                    # fraction within merge_t (= uniform-seam
+                    # snap), or append if none in range.
+                    closest_idx = None
+                    closest_d = merge_t
+                    for i, f in enumerate(fractions):
+                        if any(abs(f - a) < 1e-6 for a in anchored_t):
+                            continue
+                        d = abs(pt - f)
+                        if d < closest_d:
+                            closest_d = d
+                            closest_idx = i
+                    if closest_idx is not None:
+                        fractions[closest_idx] = pt
+                    else:
+                        fractions.append(pt)
+                fractions.sort()
 
             # For each sample point, compute lat/lon and seed elevation
             sample_pts = []  # [(lat, lon, seeded_elev, is_anchored), ...]

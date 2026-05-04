@@ -731,8 +731,16 @@ def _do_widen(
         # in the typical case.  Bumped to 5 per user 2026-05-02
         # follow-up for cases where 5 connections are needed (e.g.
         # diagonal stubs converging plus an internal runway-seam
-        # corner falling within the joining region).
-        max_total_shared = 5
+        # corner falling within the joining region).  Bumped again
+        # to 7 per user 2026-05-05 followup: with the apt.dat-aware
+        # segmenter (commit 15d3a89), the chain has more corners
+        # adjacent to each junction's runway-side edge, and the
+        # 2-round multi-step walker can naturally reach 6+ chain
+        # corners total (2 originals + 2 round-0 inserts + 2
+        # round-1 inserts).  At SPJC J-10131 / way -10138 the cap-5
+        # cut off the round-1 walk from A[8] to B[9], leaving the
+        # Northern corner of taxiway C uncovered.
+        max_total_shared = 7
         current_shared_count = len(shared_in_poly)
         max_inserts = max(0, max_total_shared - current_shared_count)
         if max_inserts == 0:
@@ -885,27 +893,48 @@ def _do_widen(
                     d = abs(a - b) % (2 * math.pi)
                     return min(d, 2 * math.pi - d)
 
-                d_to_prev = _ang_diff(a_n, a_p)
-                d_to_next = _ang_diff(a_n, a_x)
-                if d_to_prev <= d_to_next:
-                    insert_at = poly_idx
-                    flank_v = prev_v
-                    e1 = (neighbor[0] - flank_v[0],
-                          neighbor[1] - flank_v[1])
-                    e2 = (corner[0] - neighbor[0],
-                          corner[1] - neighbor[1])
-                else:
+                # Pick the side that produces the LESS-acute polygon
+                # corner at the inserted neighbor (per user 2026-05-05
+                # followup).  When both flanks are roughly opposite
+                # the neighbor's bearing (multi-step walks where the
+                # polygon's runway-shared edge sits between two near-
+                # 180° flanks), the bearing-closeness tie-breaker
+                # picks one side arbitrarily and the U-turn check
+                # rejects the resulting near-spike — even though the
+                # OTHER side would have produced an acceptable
+                # corner.  Compute cos_turn for both sides; pick
+                # whichever is higher (= more obtuse, less spike).
+                def _side_cos(insert_at_b, flank_b, side_b):
+                    if side_b == "before":
+                        e1 = (neighbor[0] - flank_b[0],
+                              neighbor[1] - flank_b[1])
+                        e2 = (corner[0] - neighbor[0],
+                              corner[1] - neighbor[1])
+                    else:
+                        e1 = (neighbor[0] - corner[0],
+                              neighbor[1] - corner[1])
+                        e2 = (flank_b[0] - neighbor[0],
+                              flank_b[1] - neighbor[1])
+                    m1 = math.hypot(*e1)
+                    m2 = math.hypot(*e2)
+                    if m1 < 1e-6 or m2 < 1e-6:
+                        return None, e1, e2
+                    return ((e1[0]*e2[0] + e1[1]*e2[1]) / (m1*m2),
+                            e1, e2)
+                cos_before, _, _ = _side_cos(poly_idx, prev_v, "before")
+                cos_after, _, _ = _side_cos(poly_idx + 1, next_v,
+                                            "after")
+                if (cos_after is not None
+                        and (cos_before is None
+                             or cos_after > cos_before)):
                     insert_at = poly_idx + 1
                     flank_v = next_v
-                    e1 = (neighbor[0] - corner[0],
-                          neighbor[1] - corner[1])
-                    e2 = (flank_v[0] - neighbor[0],
-                          flank_v[1] - neighbor[1])
-                m1 = math.hypot(*e1)
-                m2 = math.hypot(*e2)
-                if m1 > 1e-6 and m2 > 1e-6:
-                    cos_turn = (e1[0] * e2[0]
-                                + e1[1] * e2[1]) / (m1 * m2)
+                    cos_turn = cos_after
+                else:
+                    insert_at = poly_idx
+                    flank_v = prev_v
+                    cos_turn = cos_before
+                if cos_turn is not None:
                     # Per user 2026-05-04: only reject TRUE U-turns
                     # (cos < -0.99, > 172°).  The -0.95 threshold
                     # rejected legitimate widenings at SPJC's 34R
