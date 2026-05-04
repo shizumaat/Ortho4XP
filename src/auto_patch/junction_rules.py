@@ -882,7 +882,7 @@ def _do_widen(
         # multi-step walking lets us wrap further along the
         # runway to reach the corner aligned with the body's far
         # extent (the runway-end-wrap case at SPJC J-10131).
-        NON_ANCHOR_NEAR_ANCHOR_M = 50.0
+        NON_ANCHOR_NEAR_ANCHOR_M = 70.0
         far_non_anchor_exists = False
         if shared_in_poly:
             anchor_pts = [c for _, c in shared_in_poly]
@@ -896,7 +896,30 @@ def _do_widen(
                     far_non_anchor_exists = True
                     break
         WIDEN_MAX_ROUNDS = 2 if far_non_anchor_exists else 1
+        # Skip widening entirely when the polygon's anchors are
+        # chain-adjacent (a contiguous run of chain corners) AND
+        # no non-anchor reaches off the runway: the polygon is
+        # already naturally aligned with runway corners and any
+        # round-0 walk would extend its runway-shared edge past
+        # its body extent (the SPJC -10137 case).
+        if not far_non_anchor_exists and len(shared_in_poly) >= 2:
+            anchor_cis = sorted(
+                corner_index[_key(c)] for _, c in shared_in_poly
+                if _key(c) in corner_index)
+            if anchor_cis:
+                contiguous = True
+                for i in range(len(anchor_cis) - 1):
+                    gap = (anchor_cis[i + 1] - anchor_cis[i]) % n_chain
+                    if gap != 1:
+                        contiguous = False
+                        break
+                if contiguous:
+                    continue  # skip widening for this junction
         round_processed_keys = set(_key(c) for _, c in shared_in_poly)
+        # Track which corners were newly inserted by widening, so
+        # the post-widen interior-vert prune below knows which
+        # adjacent non-anchor verts to consider redundant.
+        newly_inserted_keys: set = set()
         widen_queue: List[Tuple[Tuple[float, float], int]] = [
             (c, 0) for _, c in shared_in_poly]
 
@@ -999,6 +1022,7 @@ def _do_widen(
                 alt = corner_alt.get(_key(neighbor))
                 if _attempt_insert(insert_at, neighbor, alt):
                     n_committed += 1
+                    newly_inserted_keys.add(_key(neighbor))
                     # Push the newly-inserted neighbor for one more
                     # round of walking, unless we've already hit the
                     # round cap.  ``round_processed_keys`` guards
@@ -1020,6 +1044,85 @@ def _do_widen(
 
         if n_committed == 0:
             continue
+
+        # Targeted interior-vert prune (per user 2026-05-05
+        # followup): when widening inserts a chain corner, the
+        # polygon vertex IMMEDIATELY ADJACENT to that corner in
+        # walk-order may be a leftover interior vertex from the
+        # pre-widen polygon's path through pavement interior.
+        # If that adjacent vert is NOT itself an anchor (chain
+        # corner / rect corner / shape boundary point) and sits
+        # > INTERIOR_PRUNE_M from any apt.dat-pavement /
+        # runway-union boundary, drop it — the new arm to the
+        # chain corner supersedes the old interior detour.
+        # (Example at SPJC -10138: A9_INT vertex sits 14 m inside
+        # pav_union after widen reaches B[9] — drop it so the
+        # polygon walks A[8] → B[9] → A[0] cleanly.)
+        INTERIOR_PRUNE_M = 5.0
+        on_pav_boundary_obj = None
+        if pav_union is not None and not pav_union.is_empty:
+            try:
+                on_pav_combined = (unary_union([pav_union, runway_union])
+                                   if runway_union is not None
+                                   and not runway_union.is_empty
+                                   else pav_union)
+                on_pav_boundary_obj = on_pav_combined.boundary
+            except Exception:
+                on_pav_boundary_obj = None
+        if on_pav_boundary_obj is not None and newly_inserted_keys:
+            pruned_coords: List[Tuple[float, float]] = []
+            pruned_alts: Optional[List[float]] = (
+                [] if current_alts is not None else None)
+            n_cur_pre = len(current_coords)
+            for i, v in enumerate(current_coords):
+                k = _key(v)
+                # Always keep chain corners and verts widening
+                # just inserted.
+                if k in corner_index or k in newly_inserted_keys:
+                    pruned_coords.append(v)
+                    if pruned_alts is not None:
+                        pruned_alts.append(current_alts[i])
+                    continue
+                # Check if THIS vert is adjacent in walk order to a
+                # newly-inserted chain corner.
+                prev_k = _key(current_coords[(i - 1) % n_cur_pre])
+                next_k = _key(current_coords[(i + 1) % n_cur_pre])
+                adj_to_new = (prev_k in newly_inserted_keys
+                              or next_k in newly_inserted_keys)
+                if not adj_to_new:
+                    pruned_coords.append(v)
+                    if pruned_alts is not None:
+                        pruned_alts.append(current_alts[i])
+                    continue
+                # Interior check: drop only if the vert sits >
+                # INTERIOR_PRUNE_M from any pav_union/runway
+                # boundary.
+                try:
+                    d = on_pav_boundary_obj.distance(Point(v))
+                except Exception:
+                    d = 0.0
+                if d > INTERIOR_PRUNE_M:
+                    continue  # drop
+                pruned_coords.append(v)
+                if pruned_alts is not None:
+                    pruned_alts.append(current_alts[i])
+            if (len(pruned_coords) >= 3
+                    and len(pruned_coords) < len(current_coords)):
+                # Validate the pruned polygon before committing.
+                try:
+                    test_poly = Polygon(pruned_coords).buffer(0)
+                except Exception:
+                    test_poly = None
+                if (test_poly is not None
+                        and not test_poly.is_empty
+                        and test_poly.geom_type == "Polygon"
+                        and test_poly.is_valid
+                        and test_poly.is_simple
+                        and test_poly.area >= 0.5 * poly.area):
+                    current_coords = pruned_coords
+                    if pruned_alts is not None:
+                        current_alts = pruned_alts
+
         # Final polygon from the running coords (already validated
         # piecewise; guaranteed to be a single valid Polygon).
         try:
