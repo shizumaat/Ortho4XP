@@ -144,7 +144,15 @@ def _extract_osm_taxi_centerlines(
     from .rects import _natural_half_width
     by_ref: Dict[str, List[LineString]] = {}
     for wid, nds, tags in ways:
-        if tags.get("aeroway") != "taxiway":
+        # Per user 2026-05-04: treat aeroway=parking_position as
+        # taxiway.  At SPJC and similar airports, parking_position
+        # ways outnumber taxiway ways (244 vs 234) and represent the
+        # painted yellow lines aircraft follow from taxi to gate —
+        # functionally part of the apron taxi network.  Without
+        # them, the apron lacks junction-attachments at parking
+        # stands and ends up with the aprons spanning past the rect
+        # corners that ought to bound it.
+        if tags.get("aeroway") not in ("taxiway", "parking_position"):
             continue
         ref = tags.get("ref", "")
         pts = []

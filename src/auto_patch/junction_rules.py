@@ -128,11 +128,14 @@ def apply_junction_rules(layout: PavementLayout) -> None:
     # Phase 3 (landed): Rule 4 — split narrow necks.
     _split_narrow_necks(layout, runway_axis_deg)
 
-    # Phase 5 (landed): Rule 5 — push junction vertices outside
-    # apt.dat pavement boundary.  Runs LAST so the rule sees the
-    # final polygon shapes (after Rule 1/2/4 reshapes); any vertex
-    # that ended up inside the pavement gets pushed back out.
-    _push_junction_vertices_outside_pavement(layout)
+    # Per user 2026-05-05: ``_push_junction_vertices_outside_pavement``
+    # disabled.  It nudges junction verts ~1 m perpendicular off
+    # rect edges to defend against z-fighting, but breaks 1:1
+    # corner sharing — every flat-edge violation we've fought
+    # ("d=1.00 m") traced back to this push.  In the minimal-emit
+    # pipeline residue boundaries already inherit exact rect /
+    # terminal / runway corner positions from the subtraction.
+    # _push_junction_vertices_outside_pavement(layout)
 
     # Phase 4 (TODO): Rule 3 — axis-align cut lines.
     # _axis_align_non_pavement_borders(layout, runway_axis_deg)
@@ -308,43 +311,51 @@ def _point_perp_dist_within_segment(
 
 
 def _snap_to_sloping_edge_corners(layout: PavementLayout) -> None:
-    """Snap each junction vertex within ``SLOPING_EDGE_SNAP_M`` of
-    any sloping-rect EDGE to the nearest rect corner — corner-only
-    1:1 sharing along every edge of every sloping rect.
+    """Rule 2: snap each junction vertex within ``SLOPING_EDGE_SNAP_M``
+    of a sloping-rect's SLOPING edge to the nearest of that edge's
+    two endpoints (which are rect corners).  After snapping, dedup
+    consecutive identical vertices.
 
-    Per user 2026-05-04: the rule applies to BOTH sloping edges
-    (parallel to ``source_axis``) AND cross edges (perpendicular).
-    Junctions adjacent to a sloping rect must share only the rect's
-    4 corners; intermediate vertices on a cross edge from
-    densification get snapped to whichever corner is nearer, then
-    consecutive duplicates collapse.
+    Per user 2026-05-04 (regression analysis): the rule operates on
+    SLOPING edges only, NOT cross edges.  Snapping on cross edges
+    pulls junction vertices that legitimately sit BETWEEN a rect's
+    cross-edge corners — and which the polygon walks AROUND the rect
+    via — onto one of the corners, distorting the polygon's wrap
+    path.  At ``best-elevation-model`` (commit 187d2cd) total sloping-
+    rect-vs-junction overlap was 0 m²; the all-4-edges variant in
+    commit 5a50d00 introduced the V3 stub overlap, which was then
+    band-aided with a "drop intervening verts" rule that produced
+    self-intersecting polygons → buffer(0) splits → slivers along
+    sloping edges.  Both changes reverted here.
+
+    Flat-rect gate: skip rects whose altitude_high/altitude_low
+    aren't set yet (which means they're either flat or per-surface-
+    solver hasn't run; in both cases the corner-only sharing rule
+    is unnecessary).  Re-runs after the post-elevation phase pick up
+    rects whose altitudes are now set.
 
     When ``node_altitudes`` is set on a junction shape, drop the
     altitude entry alongside the vertex it corresponds to so the
     per-vertex altitude list stays aligned with the polygon's ring
     length.
     """
-    # Pre-compute corners + edges per rect.  Each rect has 4 corners
-    # (indexed 0..3) and 4 edges (each connecting consecutive corners
-    # i and (i+1)%4).  We snap to corners and use the (rect_idx,
-    # corner_idx) pair to detect "adjacent rect corners" pairs in the
-    # snapped polygon.  Read from ``layout.shapes`` so we snap
-    # against the FINAL rect polygons (after overlap clip + shared-
-    # vertex collapse).
-    #
-    # Per user 2026-05-04: don't gate on altitude_high/low.  Under
-    # the per-surface solver path, altitudes get assigned AFTER this
-    # snap pass; the previous gate left every sloping-role rect un-
-    # snapped.  Treat all sloping-role rects as sloping at this
-    # stage; if the rect turns out flat after the elevation pass the
-    # corner-only sharing is still valid (flat rects allow free
-    # sharing but don't require it).
+    # Pre-compute sloping edges per rect.  Read from layout.shapes so
+    # we snap against the FINAL rect polygons (after overlap clip +
+    # shared-vertex collapse).  The rect_idx + corner_idx tuple is
+    # carried for downstream adjacency-aware processing (e.g. dedup-
+    # consecutive that crosses through identical-corner snap targets).
     rect_corners_per_rect: List[List[Tuple[float, float]]] = []
     rect_edges: List[Tuple[float, float, float, float, int, int, int]] = []
-    # rect_edges entries are
-    # (ax, ay, bx, by, rect_idx, corner_idx_a, corner_idx_b).
     for shape in layout.shapes:
         if shape.role not in SLOPING_RECT_ROLES:
+            continue
+        # Flat-rect exemption (restored from best-elevation-model).
+        # Without an altitude pair, the rect either hasn't been
+        # elevated yet or is intentionally flat — in both cases
+        # junctions can connect anywhere on its boundary without
+        # breaking the linear-slope rendering invariant.
+        if (shape.altitude_high is None
+                or shape.altitude_low is None):
             continue
         rect = shape.polygon
         if rect is None or rect.is_empty or rect.geom_type != "Polygon":
@@ -357,12 +368,14 @@ def _snap_to_sloping_edge_corners(layout: PavementLayout) -> None:
         rect_idx = len(rect_corners_per_rect)
         rect_corners_per_rect.append(
             [(float(c[0]), float(c[1])) for c in rc])
-        for i in range(4):
-            ax, ay = rc[i]
-            bx, by = rc[(i + 1) % 4]
+        # Sloping edges only — corners (0,1) and (2,3) per the
+        # _rect_from_axis_extended convention.
+        for ci_a, ci_b in ((0, 1), (2, 3)):
+            ax, ay = rc[ci_a]
+            bx, by = rc[ci_b]
             rect_edges.append(
                 (float(ax), float(ay), float(bx), float(by),
-                 rect_idx, i, (i + 1) % 4))
+                 rect_idx, ci_a, ci_b))
     if not rect_edges:
         return
 
@@ -463,54 +476,12 @@ def _snap_to_sloping_edge_corners(layout: PavementLayout) -> None:
                 if math.hypot(cx - px, cy - py) <= corner_tol:
                     continue
             deduped.append(entry)
-        # Per user 2026-05-04: when two NON-consecutive corner-snapped
-        # vertices land on adjacent corners of the same rect (i.e.
-        # the two endpoints of one rect edge), the polygon edge
-        # between them follows that rect edge — drop any intervening
-        # non-corner vertices so the junction polygon traces the rect
-        # boundary corner-to-corner with no extras.  Without this,
-        # vertices like SPJC junction -10153's v4 stay between V3
-        # corners -85 and -84, forcing the polygon's edge to cut
-        # across V3 and produce the 1012 m² overlap.
-        n_d = len(deduped)
-        if n_d >= 4:
-            keep = [True] * n_d
-            for i in range(n_d):
-                cid_a = deduped[i][2]
-                if cid_a is None:
-                    continue
-                # Look ahead (circular) for the next corner-snapped
-                # vertex; intervening must all be non-corner.
-                k = 1
-                while k < n_d:
-                    j = (i + k) % n_d
-                    if deduped[j][2] is not None:
-                        break
-                    k += 1
-                if k <= 1 or k >= n_d:
-                    continue
-                # Only fire on the SHORTER side around the polygon —
-                # the other side is the polygon's main body wrapping
-                # around the rect, which has its own legitimate
-                # vertices.  When the two halves are equal length,
-                # process forward only.
-                if k > n_d - k:
-                    continue
-                j = (i + k) % n_d
-                cid_b = deduped[j][2]
-                if cid_b is None:
-                    continue
-                if cid_a[0] != cid_b[0]:
-                    continue
-                # Adjacent rect corners?  |a − b| == 1 (mod 4).
-                diff = (cid_b[1] - cid_a[1]) % 4
-                if diff != 1 and diff != 3:
-                    continue
-                # Drop the intervening vertices.
-                for off in range(1, k):
-                    keep[(i + off) % n_d] = False
-            if not all(keep):
-                deduped = [e for e, k in zip(deduped, keep) if k]
+        # Note: a "drop intervening corner-snapped vertices" rule was
+        # added in commit 5a50d00 to band-aid a V3 stub overlap that
+        # the all-4-edges snap (also from 5a50d00) had introduced.
+        # Both reverted here per regression analysis.  Sloping-edges-
+        # only snap doesn't produce the V3 overlap, so the band-aid
+        # isn't needed.
         if len(deduped) < 3:
             continue
         new_pts = [e[0] for e in deduped]

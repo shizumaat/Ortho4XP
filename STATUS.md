@@ -1,294 +1,236 @@
-# Auto-Patch Status — handoff 2026-05-05 (evening)
+# Auto-Patch Status — GEOMETRY BASELINE 2026-05-05
 
 ## TL;DR
 
-Five passes landed today on the runway-junction widening problem.
-SPJC's runway junctions are now all clean per user verification.
+This session reduced the pavement-builder to a clean **geometry-only**
+pipeline with a single source of truth for the pavement boundary, and
+established the user-approved geometry as a tagged baseline for future
+work.  Phase-2 elevations / widening / runway segmentation are
+**disabled** on this baseline so the geometry can be reviewed in
+isolation; a follow-up agent will re-enable them.
 
-| commit | summary |
-|---|---|
-| 6b3eb4e | Pass 1: boundary-traced widening + multi-step + sliver pre-emption (mostly reverted later) |
-| 15d3a89 | **Pass 2: apt.dat-aware runway segmenter** — seam corners at every apt.dat-pavement intersection |
-| 9cefc66 | Pass 3: strip Pass 1's complexity (boundary-trace, interior pruning) post-Pass 2 |
-| 7d856f7 | Pass 4: smart side-picker + max_total_shared 5→7 + segmenter dedup (apt.dat replaces uniform seams within 12 m) |
-| f41a09b | Pass 5: gate multi-step on whether polygon body has a non-anchor far from anchors |
-| 8f6d517 | **Pass 6 (final): skip widening when polygon naturally aligned + targeted interior-vert prune** |
+**Branch / tag:** ``dev`` branch, tagged ``geometry-baseline``.
 
-Today's tests (SPJC only):
-```
-O4_TEST_AIRPORTS=SPJC ./venv/bin/pytest tests/
-→ 218 passed, 2 failed (test_pavement_grade SPJC + SPLP — out
-  of scope per prior STATUS).  Zero new regressions.
-```
+**Build artifact:** [/tmp/SPJC_now.osm](file:///tmp/SPJC_now.osm) —
+SPJC built with ``compute_elevations=False``.  All 188 rect corners
+land on ``pav_union.boundary`` (worst distance 0.0 m).
 
-User confirmed all SPJC runway junctions look correct at HEAD.
-Latest build: `/tmp/SPJC_v8.osm`.
-
----
-
-## What landed (in commit order, current code state)
-
-### Pass 2 — Apt.dat-aware runway segmenter
-
-Place runway-segment seam corners at every point where an apt.dat
-row-110 pavement polygon's boundary touches the runway boundary.
-Variable-length segments — elevation/grade interpolation works
-regardless of segment length.
-
-**Where the code lives:**
-
-* `src/auto_patch/pipeline.py:340-411` — collects pav-runway
-  intersection points after shoulder absorption.  Walks each
-  apt.dat row-110 pavement polygon's exterior; for each vertex
-  within 0.5 m of any runway 4-corner rect AND projecting to
-  centerline ``t`` in (5 m end-skirt, 1 - 5 m end-skirt), records
-  ``(t, lat, lon)``.  Sorts and dedups within 2 m centerline
-  distance.  Stashes on ``layout._pav_runway_intersections`` keyed
-  by all four designator orderings.
-
-* `src/auto_patch/elevation.py:374-385` — reads the stash, passes
-  to ``generate_patch_osm``.
-
-* `src/auto_patch/pavement/runway_segments.py:404-440` — new
-  ``pav_intersections`` parameter.  Inside the per-runway loop,
-  projects each (lat, lon) onto the phys-end-A → phys-end-B
-  centerline, derives ``t``.  When an apt.dat ``t`` lands within
-  12 m of a NON-anchored uniform seam, REPLACE the uniform seam
-  with the apt.dat position (= dedup; eliminated all sub-12 m
-  sliver segments).  Anchor fractions (CIFP thresholds, physical
-  ends) are protected — apt.dat points within 2 m of an anchor
-  are dropped instead.
-
-### Junction widening rule (current state)
-
-`src/auto_patch/junction_rules.py::_do_widen` — three coupled
-gates determine widening behavior per junction:
-
-1. **Skip widening when polygon naturally aligned** — if the
-   polygon's runway-shared anchors form a chain-adjacent
-   contiguous run AND no non-anchor sits more than 70 m from any
-   anchor, skip widening entirely.  These polygons sit tight
-   against the runway with their runway-side edge already
-   aligned with runway corners; round-0 widening would extend
-   them past the body's natural extent.
-
-2. **Multi-step gate** — round 0 (single-step from each original
-   anchor) always runs.  Round 1 (multi-step from newly-inserted
-   corners) runs only when the polygon has a non-anchor vertex
-   more than 50 m from any anchor.  Otherwise round 0 only.
-   Cap: 2 rounds total.
-
-3. **max_total_shared = 7** — caps how many runway-shared
-   corners a junction can have post-widen (originals + inserts).
-   Bumped from 5 because the apt.dat-aware chain has more
-   corners adjacent to each junction's runway-side edge, and
-   J-10131 / way -10138 needs 6 to reach B[9].
-
-After widening, **targeted interior-vert prune**: drop polygon
-vertices that sit > 5 m from any pav_union/runway boundary AND
-are adjacent (in walk order) to a newly-inserted chain corner.
-The new chain-corner arm supersedes the old interior detour.
-Validates the pruned polygon (valid + simple + area ≥ 0.5 ×
-original) before committing.
-
-**Smart side-picker** in the inner walk loop: when picking which
-side (BEFORE / AFTER the chain corner in polygon walk order) to
-insert a chain neighbor, compute cos_turn for both sides and pick
-whichever produces the LESS-acute corner (= higher cos).
-Previously picked by bearing-closeness which arbitrarily chose
-spike-prone sides at near-180° flank angles.
-
-**Sliver-corner pre-emption** inside ``_attempt_insert``:
-rejects any trial polygon whose ring would have an interior
-angle below ``SLIVER_ANGLE_THRESHOLD_DEG`` (≈ 2°).  Without this
-guard the OSM emitter silently drops the whole junction at emit
-time.
-
----
-
-## Effect on SPJC
-
-* 73 → 80 runway segments (apt.dat intersections add ~12
-  per-runway, dedup with uniform seams nets the count up by 7).
-* Chain corners aligned with apt.dat-pavement boundary
-  intersections — chain-walk-based passes (Rule 1 v4 sharing,
-  widening) reach the right corners naturally.
-* User-verified runway junctions:
-  * way -10138 (J-10131): 12 verts, 6 runway-shared incl. B[9],
-    A9_INT correctly pruned post-widen.
-  * way -10137: 4 verts, 2 runway-shared (back to pre-widen
-    state — no over-extension).
-  * way -10136: 8 verts, 2 runway-shared (back to pre-widen
-    state — no over-extension).
-
----
-
-## Multi-airport status
-
-Default ``O4_TEST_AIRPORTS=SPJC`` is the only set we run.
-Multi-airport tests (CYXY/HECA/KBNA/SPLP) all show 23 pre-
-existing failures unrelated to today's work — verified by
-checking out 5a50d00 (pre-this-session commit) and seeing the
-same failure set.  Don't worry about other airports unless the
-user asks.
-
----
-
-## Outstanding items (next session focus per user 2026-05-05)
-
-### §1 — Holes in the apron
-
-User flagged for next session: holes appearing in the apron.
-Specifics TBD — user will point at examples in JOSM at next
-session.  Likely root cause candidates:
-* Over-aggressive subtraction (taxi rects / runway / groundside
-  taking too much from pav_union).
-* Sliver gaps between adjacent shapes that don't share vertices.
-* DSF overlay polygons missing from pav_union.
-
-### §2 — Junctions / aprons bordering the SLOPING edge of taxi rects
-
-This is §1 from the prior STATUS, restated by user 2026-05-05:
-junctions and aprons that share boundary with the SLOPING edge
-of a taxiway rect cause grass areas to be lost (e.g. east of
-terminal 2 along taxiways M and L at SPJC).
-
-Existing rule passes:
-* ``_snap_to_sloping_edge_corners`` snaps junction vertices
-  WITHIN ``SLOPING_EDGE_SNAP_M`` (= 20 m) of a sloping rect's
-  sloping edge to the nearest cross-edge corner.
-* ``_push_junction_vertices_outside_pavement`` (Rule 5) pushes
-  junction vertices outside apt.dat pavement.
-
-These run BEFORE / AFTER widening.  But junctions can still
-end up sharing boundary with sloping edges (not just vertices).
-The fix likely needs a polygon-edge-vs-sloping-edge check, not
-just vertex-distance.
-
-Investigation suggestions:
-* Walk each junction's polygon edges; for each edge that runs
-  parallel to and within ``SLOPING_EDGE_SNAP_M`` of a sloping
-  rect's sloping edge, log it as a violation.
-* Visual inspection in JOSM: open ``/tmp/SPJC_v8.osm`` at the
-  east-of-terminal-2 region (around lat -12.020, lon -77.114?).
-
-### §3 — Things to NOT do (carried over)
-
-1. Don't add "search-and-repair" passes for visual artefacts —
-   user prefers root-cause fixes.
-2. Don't change the absorption rule semantics.
-3. Don't reclassify junctions to apron based on centerline-
-   distance.
-4. Don't whole-rect-flip rects to apron.
-5. Don't re-disable bridges/tunnels.
-6. Don't re-instate the altitude gate in
-   ``_snap_to_sloping_edge_corners`` or in
-   ``_densify_long_boundary_edges``'s ``sloping_rect_edges``
-   collection.
-7. Don't reduce the 20 m runway-snap radius without user
-   discussion.
-8. **Don't multi-airport-test as a regression gate** — pre-
-   existing failures at CYXY/HECA/KBNA/SPLP are not in scope.
-   Use ``O4_TEST_AIRPORTS=SPJC`` only.
-
----
-
-## Pipeline order reference (unchanged)
+## Final SPJC numbers
 
 ```
-build_airport_pavement(icao, xplane_root, compute_elevations=True)
-├── load_airport (apt_dat_reader)
-├── runway_polys built (4-corner rect each)
-├── pav_polys built (apt.dat row-110 in meter space)
-├── runway-shoulder absorption
-├── ★ pav_runway_intersections collected (Pass 2 hook)
-├── pav_union = unary_union(pav_polys) - runway - groundside
-├── emit rect shapes
-├── junction_emit.emit_junctions_and_finalize
-│   └── apply_junction_rules
-│       ├── _align_rect_slope_to_axis
-│       ├── _snap_to_sloping_edge_corners
-│       ├── _enforce_runway_1to1_sharing
-│       ├── widen_junctions_to_runway_corners  ← Pass 6 lives here
-│       └── _push_junction_vertices_outside_pavement
-└── if compute_elevations:
-    ├── finalize.run_phase2 → _compute_elevations
-    │   ├── ★ generate_patch_osm with pav_intersections (Pass 2)
-    │   ├── _push_junction_vertices_off_taxi_rect_edges
-    │   └── _triangulate_junctions
-    ├── Post-elevation rule passes (rerun in pipeline.py):
-    │   _align_rect_slope_to_axis
-    │   _snap_to_sloping_edge_corners
-    │   _enforce_runway_1to1_sharing
-    │   widen_junctions_to_runway_corners
-    │   _push_junction_vertices_outside_pavement
-    ├── per_surface_solve (Jacobi)
-    ├── stitch_pavement_to_terminals
-    └── _report_within_shape_violations (WARN audit)
+junctions emitted    : 38   (5 sliver triangles dropped at to_osm)
+rects (taxi)         : 46   (4 F primary_parallel + 1 F stub absorbed/dropped)
+terminals            : 2
+runway segments      : 2    (un-segmented; phase-2 disabled)
+total OSM ways       : 89
+rect corners on pav  : 188 / 188 (worst d = 0.000 m)
 ```
 
----
+## Architectural changes this session
 
-## Memory pointers (loaded into every agent session)
+### 1. Single ``pav_union`` for everything
+Removed the ``pav_union_for_rects`` split.  Both rect building and
+junction emit now operate on the same pav_union (pav − effective_runway
+− groundside).  Earlier two-variant scheme caused rect corners to
+land on a boundary that didn't match the boundary residue subtraction
+used at junction emit, producing thin sliver tabs.
 
-* `feedback_shape_rules.md` — authoritative shape rules.
-* `feedback_extraction_pattern.md` — refactor extraction recipe.
-* `feedback_general_solutions.md` — no airport-specific fixes.
-* `project_target_osm.md` — role schema, vertex tolerances.
-* `feedback_grade_rules.md` — TAXI 1.5 % / APRON 1.0 % per-axis.
-* `project_refactor_state.md` — historical refactor state.
+* [pipeline.py:712-732](src/auto_patch/pipeline.py:712) — pav_union
+  built, simplified, mutated.  ``layout._pav_union_for_rects`` is no
+  longer consulted.
+* [pavement/rects.py:_build_taxi_rects](src/auto_patch/pavement/rects.py)
+  — removed internal ``pav_union − rwy_union`` step; uses pav_union
+  directly.
 
-### New memory entry recommended (Pass 2 — landed)
+### 2. ``pav_union`` simplified at construction
+Apt.dat row-110 polygons routinely contain over-resolved curves
+(sub-meter steps) and 0.2 m doubled-vertex needles.  Without
+simplification, OSM-emit bucket-collision dedup inflates polygons by
+~196K m² and creates sliver corners.
 
-* **Apt.dat-aware runway segmenter** (user 2026-05-05): runway
-  segment seam corners are placed at every apt.dat row-110
-  pavement-boundary intersection with the runway (within 0.5 m).
-  Apt.dat intersections REPLACE non-anchor uniform 100 m seams
-  within 12 m (eliminates sliver segments).  CIFP thresholds and
-  physical ends are anchored — apt.dat intersections within 2 m
-  of an anchor are dropped instead.  Effect: chain corners (=
-  segment seams) naturally align with apt.dat-pavement
-  boundaries, so chain-walk-based passes (Rule 1 sharing, widen)
-  reach the right corners without boundary-trace waypoints.
+* [pavement/union_helpers.py:_simplify_pavement_polygon](src/auto_patch/pavement/union_helpers.py)
+  — DP simplify (1 m tolerance, preserve_topology=True) followed by
+  ``_drop_sliver_corners`` to snip needle tips.
+* [pipeline.py:725](src/auto_patch/pipeline.py:725) — applied at
+  construction so all downstream consumers see the clean polygon.
+* Terminals also simplified before subtraction in
+  [junction_emit.py](src/auto_patch/junction_emit.py).
 
-### New memory entry recommended (Pass 6 — junction widening gates)
+### 3. Stub classifier revised
+Per user 2026-05-05: a stub can be at a wide range of angles BUT
+cannot be directly parallel to the runway.
 
-* **Junction widening conditional gates** (user 2026-05-05):
-  widen_junctions_to_runway_corners now SKIPS widening entirely
-  for junctions whose anchors are chain-adjacent AND no non-
-  anchor reaches > 70 m off any anchor (the polygon is naturally
-  aligned post-Rule-1; round-0 walking would extend it past its
-  body extent).  Multi-step (round 1) runs only when a
-  non-anchor reaches > 50 m off any anchor (the wrap case at
-  J-10131).  Targeted interior-vert prune drops adjacent
-  interior verts after a chain-step insert (e.g., A9_INT in
-  -10138).
+* [pavement/rects.py:_classify_role](src/auto_patch/pavement/rects.py)
+  — db < 20° (parallel) → always primary_parallel or
+  secondary_parallel based on distance to runway, never stub.  The
+  earlier "short parallel → stub" branch is removed.  Sub-ref
+  digit-suffix and diagonal-parent-ref overrides apply only when the
+  rect is non-parallel.
 
----
+Result at SPJC: F was 3 primary_parallel + 2 stubs → now 4 primary_parallel
++ 1 stub.  (The remaining stub was then absorbed by long-edge
+adjacency — see #5.)
 
-## Files of interest (refer at next-session start)
+### 4. Corner-snap node preference (5 m radius)
+Per user 2026-05-05: rect corners should prefer a pav.boundary
+**vertex** over an arbitrary boundary edge-projection when a vertex
+is close, so corners share exact node IDs with pav.
 
-* User's hand-edited target: `/private/tmp/SPJC_root_fix_EDITED.osm`
-  (no longer matches HEAD position-for-position because the new
-  segmenter places seam corners at apt.dat intersections, not at
-  100 m-fixed positions; SHAPES are now correct per user).
+* [pavement/rects.py:_prefer_pav_node](src/auto_patch/pavement/rects.py)
+  — helper, 5 m radius.
+* Applied in
+  [pavement/rects.py:_snap_corners_to_pavement](src/auto_patch/pavement/rects.py)
+  and
+  [pavement/rects.py:_extend_rect_corners_perpendicular](src/auto_patch/pavement/rects.py).
 
-* Latest auto-patch build: `/tmp/SPJC_v8.osm`.
+### 5. Hole-aware sloping-edge snap revised
+``_snap_rect_sloping_edges_to_holes`` now validates all 4 corners on
+pav.boundary after alignment.  Off-boundary corners snap to nearest
+pav node within 5 m; if no node within range, axis is shortened 5 m
+and the snap+validate cycle retries (up to 5 iterations).  If all
+retries fail, the function falls back to the **original** rect
+(pre-alignment) so we never ship a partially-modified rect with
+off-boundary corners.
 
-* Geometry dumps for visual inspection:
-  - `/tmp/SPJC_geometry_dump.osm` — pav_union + runway_union
-    outlines + probe points.
-  - `/tmp/SPJC_compare_J131_J136.osm` — overlay of mine vs
-    EDITED for the two hand-edited junctions.
+* [pavement/rects.py:_snap_rect_sloping_edges_to_holes](src/auto_patch/pavement/rects.py)
+* [pavement/rects.py:_try_align_sloping_to_hole](src/auto_patch/pavement/rects.py)
+  — alignment logic factored out for the retry loop.
 
-* Production patch path (rebuild via
-  `tools/build_target_osm.py SPJC --out <path>` if you want the
-  X-Plane-installed file refreshed):
-  `/Users/noah/Ortho4XP-shred86/Patches/-20-080/-13-078/SPJC_auto.patch.osm`.
+### 6. ``_extend_rect_corners_perpendicular`` walk-inward fix
+When the natural rect corner is OUTSIDE pav (in a void), the function
+previously returned ``base_dist`` unchanged, leaving corners 19-22 m
+off pav.boundary.  Now walks INWARD until it crosses into pav,
+landing on the boundary.
 
----
+* [pavement/rects.py:_ray_extent](src/auto_patch/pavement/rects.py)
+  (inside ``_extend_rect_corners_perpendicular``).
 
-## Stray leftover
+### 7. Long-edge absorption now snaps kept-fragment corners
+``_drop_primary_parallels_embedded_in_pavement`` reconstructs corners
+along the axis after absorption, which previously left them off
+pav.boundary.  Now snapped to pav.boundary; if snap fails (apron-
+interior detection: ≥2 corners deep), the fragment is **dropped**
+rather than emitted with off-boundary natural corners.
 
-`+60-140/` directory at repo root — 24 .hgt elevation tiles,
-untracked.  Don't `git add -A`.
+* [pavement/absorption.py:_drop_primary_parallels_embedded_in_pavement](src/auto_patch/pavement/absorption.py)
+  — kept-interval reconstruction now calls ``_snap_corners_to_pavement``.
+
+## Critical invariants this baseline maintains
+
+1. **Single boundary source of truth.**  Both rect snapping and
+   junction emit consume the same ``pav_union``.
+2. **All rect corners on pav.boundary.**  Verified: 0/188 off.
+3. **Only terminals are simplified before subtraction in junction
+   emit** — rects are aligned by construction (corners snapped to
+   simplified pav_union), runway is authoritative apt.dat geometry.
+4. **Stub ≠ parallel.**  A rect classified as stub has db ≥ 20° to
+   the nearest runway.
+
+## What's NOT in this baseline (intentionally)
+
+The following passes are **disabled** for the geometry baseline so
+the geometry can be reviewed in isolation.  A follow-up agent will
+re-enable them.
+
+* **Phase-2 elevations**: ``compute_elevations=False`` in build calls.
+  No per-vertex altitudes, no Jacobi solver, no within-shape grade
+  enforcement.
+* **Runway segmentation**: runway emits as 2 polygons (one per
+  runway end), not the 50+ segmented chain produced when
+  ``compute_elevations=True``.  Re-segmentation depends on
+  CIFP-driven splice points and the current widen passes.
+* **Junction widening to runway corners**:
+  ``widen_junctions_to_runway_corners`` runs only post-elevation in
+  pipeline; without phase-2 it doesn't run.
+* **Slope alignment / runway 1:1 sharing /
+  ``_snap_to_sloping_edge_corners``**: all post-elevation rules in
+  ``junction_rules.py`` are skipped.
+
+## Known residual issues at SPJC
+
+1. **5 sliver-corner junction triangles dropped at to_osm.**  Min
+   angles 0.5° – 1.9°.  Tiny residue artifacts (3-vert triangles) —
+   not user-visible.  Caused by sub-tolerance geometric mismatches at
+   rect-rect-pav intersections.  Could be addressed by a residue
+   sliver-tip pass; left for follow-up.
+2. **F-stub at 71° bearing absorbed away.**  After the long-edge
+   absorption pass, the kept fragment of this F-stub had no corners
+   snappable to pav.boundary, so it was dropped.  Output has 4 F
+   primary_parallel + 0 F stub; user expected 1 F stub.  May or may
+   not be a real concern — verify in JOSM.
+
+## Next agent — task spec
+
+**Goal**: re-enable runway segmentation + Phase-2 elevations on the
+geometry baseline without regressing the corner-on-boundary invariant.
+
+**Starting point**: tag ``geometry-baseline`` (commit recorded by
+``git log`` after this status update).
+
+**What to re-enable**:
+
+1. **Runway segmentation**: in
+   [pipeline.py](src/auto_patch/pipeline.py), the runway is currently
+   emitted as 2 polygons.  When ``compute_elevations=True`` runs,
+   ``run_phase2`` segments the runway based on CIFP breakpoints and
+   surrounding pavement boundaries.  Trace where segmentation lives
+   (likely in ``finalize.run_phase2`` and the ``_segment_runway*``
+   helpers in ``elevation.py``) and ensure it works against the
+   simplified pav_union.
+
+2. **Phase-2 elevation pass**: re-run ``run_phase2`` with the
+   geometry baseline.  Watch for grade-violation warnings — the
+   simplified pav_union may produce slightly different junction
+   shapes than the pre-baseline build had.
+
+3. **Junction widening / slope alignment / runway 1:1 sharing**:
+   the post-elevation rules in
+   [junction_rules.py](src/auto_patch/junction_rules.py) need to
+   work against the new geometry.  ``widen_junctions_to_runway_corners``
+   in particular has gates the prior baseline tuned (skip-when-aligned,
+   multi-step gate, max_total_shared=7, targeted interior prune —
+   see ``MEMORY.md`` → feedback_widen_gates) — these may need
+   re-tuning.
+
+**Invariants to preserve**:
+
+* All rect corners stay on ``pav_union.boundary``.  Verify with
+  the diagnostic in ``/tmp/diag_corners_summary.py`` (regenerate as
+  needed).
+* No rect's long edge runs alongside a junction polygon (per user
+  2026-04-27 invariant).  This is enforced by absorption +
+  hole-aware sloping snap.
+* Single pav_union — don't reintroduce ``pav_for_rects``.
+
+**Build / verify commands**:
+
+```bash
+# Build SPJC with phase-2 elevations enabled
+/Users/noah/Ortho4XP-shred86/venv/bin/python -c "
+import os, sys
+sys.path.insert(0, '/Users/noah/Ortho4XP-shred86/src')
+from auto_patch.pipeline import build_airport_pavement
+layout = build_airport_pavement('SPJC',
+    os.environ.get('XPLANE_ROOT', '/Users/noah/X-Plane 12'),
+    compute_elevations=True)
+layout.to_osm('/tmp/SPJC_phase2.osm')
+print(f'shapes={len(layout.shapes)}')
+"
+
+# Run compare-target test
+/Users/noah/Ortho4XP-shred86/venv/bin/python -m pytest \
+    tests/test_compare_target.py -x
+
+# Verify all rect corners still on pav.boundary
+/Users/noah/Ortho4XP-shred86/venv/bin/python /tmp/diag_corners_summary.py
+```
+
+**Reference artifacts**:
+
+* [/tmp/SPJC_now.osm](file:///tmp/SPJC_now.osm) — geometry baseline
+  (no elevations, no widening)
+* [/tmp/SPJC_raw_pav.osm](file:///tmp/SPJC_raw_pav.osm) — raw
+  pav_union with only runway + terminals subtracted (visualization
+  reference for what pavement looks like)
+* ``tests/fixtures/SPJC_target.osm`` — hand-fix target for
+  ``test_compare_target_spjc``

@@ -658,11 +658,30 @@ def _enforce_shared_vertices(layout: "PavementLayout",
                 new_interiors.append(dedup_ring)
         try:
             new_poly = Polygon(dedup_ext, new_interiors)
-            # Always apply the rewrite — the invariant (shared
-            # vertices with adjacent shapes) is our priority.  If
-            # the rewrite makes the polygon self-intersect, accept
-            # it: the OSM/JOSM representation stores the vertex
-            # list as-is; downstream tools can validate separately.
+            # The cluster-rewrite step can create a self-touching
+            # ring when two NON-adjacent ring vertices end up at
+            # the same canonical cluster point — the consecutive-
+            # dedup above only catches adjacent duplicates.
+            # ``_drop_overlap_against_fixed_shapes`` runs buffer(0)
+            # on each shape and DROPS the whole shape if the result
+            # is a MultiPolygon.  Recover here by buffer(0) → keep
+            # largest piece, before the clip sees it (per user
+            # 2026-05-04 south-of-terminal1 130K-m² apron drop).
+            if (new_poly.geom_type == "Polygon"
+                    and not new_poly.is_empty
+                    and not new_poly.is_valid):
+                try:
+                    fixed = new_poly.buffer(0)
+                    if not fixed.is_empty:
+                        if fixed.geom_type == "MultiPolygon":
+                            fixed = max(fixed.geoms,
+                                        key=lambda g: g.area)
+                        if (fixed.geom_type == "Polygon"
+                                and fixed.is_valid
+                                and not fixed.is_empty):
+                            new_poly = fixed
+                except Exception:
+                    pass
             if (new_poly.geom_type == "Polygon"
                     and not new_poly.is_empty):
                 shape.polygon = new_poly

@@ -56,6 +56,7 @@ __all__ = [
     "_rect_from_axis_extended",
     "_refine_roles",
     "_snap_corners_to_pavement",
+    "_snap_rect_sloping_edges_to_holes",
     "_trim_to_narrow",
 ]
 
@@ -89,9 +90,17 @@ def _build_taxi_rects(
     if pav_union is None:
         return []
 
+    # Per user 2026-05-05: single source of truth for the pavement
+    # boundary.  Previously this function did its own additional
+    # runway subtraction (``pav_non_rwy = pav_union - rwy_union``)
+    # to keep rect corners off runway edges, but that produced a
+    # different boundary than ``pav_union`` carries into junction
+    # emit — corners snapped here landed on a boundary that doesn't
+    # exist when residue is computed.  Use ``pav_union`` directly
+    # so corners snap to the same boundary residue subtraction
+    # uses.  The ``rwy_union`` parameter is retained for the role
+    # / dedup classifier but no longer gates rect geometry.
     pav_non_rwy = pav_union
-    if rwy_union is not None:
-        pav_non_rwy = pav_non_rwy.difference(rwy_union)
 
     centerlines = sorted(centerlines, key=lambda x: -x[0].length)
 
@@ -200,9 +209,12 @@ def _build_taxi_rects(
             # Self-intersection of accumulated union — skip update.
             pass
 
-    # Post-classify: secondary passes to fix roles based on neighbour
-    # topology (stubs touch parallels, cross_connector touches 2 parallels)
-    _refine_roles(emitted, rwy_centerlines)
+    # Per user 2026-05-05: ``_refine_roles`` disabled.  It demoted
+    # short perpendicular PRIMARY_PARALLEL segments to STUB; with
+    # the 20 m cross_connector threshold those segments classify
+    # correctly the first time and the demote rule no longer earns
+    # its keep.
+    # _refine_roles(emitted, rwy_centerlines)
 
     # Stub-ref dedup: OSM often has multiple disjoint ways with the
     # same sub-ref label (e.g. V2 has 3 separate OSM pieces, each
@@ -703,27 +715,45 @@ def _extend_rect_corners_perpendicular(
                     dir_x: float, dir_y: float,
                     base_dist: float) -> float:
         """From axis point (ax, ay) heading (dir_x, dir_y), find
-        the FURTHEST distance d such that (ax+d*dir,ay+d*dir) is
-        inside ``pav``.  Start at base_dist and walk OUTWARD only
-        (we never shrink past base_dist; the rect keeps at least
-        its nominal half-width)."""
-        # If even base_dist is OUTSIDE pav, the original rect
-        # corner is already outside; keep base.
-        if not pav.contains(
+        the distance d at which ``(ax+d*dir, ay+d*dir)`` is on
+        ``pav``'s boundary.
+
+        If ``base_dist`` is INSIDE pav: walk OUTWARD to find pav
+        exit (rect corner expands to pav width at that location).
+
+        Per user 2026-05-05: if ``base_dist`` is OUTSIDE pav (the
+        natural rect corner sits in a void), walk INWARD from
+        base_dist toward the axis until we cross into pav.  The
+        first inside point is the boundary on the inward side.
+        Without this branch, the corner is left in the void and
+        the rect's polygon spills outside pav.
+        """
+        if pav.contains(
                 Point(ax + dir_x * base_dist,
                       ay + dir_y * base_dist)):
-            return base_dist
+            # Inside: walk outward to find exit.
+            d = base_dist
+            while d < max_dist:
+                d_test = d + STEP
+                if not pav.contains(
+                        Point(ax + dir_x * d_test,
+                              ay + dir_y * d_test)):
+                    return d
+                d = d_test
+            return d
+        # Outside: walk inward toward axis until we enter pav.
         d = base_dist
-        while d < max_dist:
-            d_test = d + STEP
-            if not pav.contains(
+        while d > STEP:
+            d_test = d - STEP
+            if pav.contains(
                     Point(ax + dir_x * d_test,
                           ay + dir_y * d_test)):
-                return d
+                return d_test
             d = d_test
-        return d
+        return 0.0
 
     new_corners: List[Tuple[float, float]] = []
+    pav_nodes = _pav_boundary_nodes(pav)
     for cx, cy in coords:
         # For each corner: project onto axis to determine which
         # endpoint (p1 or p2) it belongs to and which perp side.
@@ -745,8 +775,9 @@ def _extend_rect_corners_perpendicular(
             new_corners.append((cx, cy))
             continue
         d = _ray_extent(ax_pt[0], ax_pt[1], dir_x, dir_y, base)
-        new_corners.append(
-            (ax_pt[0] + dir_x * d, ax_pt[1] + dir_y * d))
+        boundary_pt = (ax_pt[0] + dir_x * d, ax_pt[1] + dir_y * d)
+        # Prefer a pav.boundary node within 5 m (user 2026-05-05).
+        new_corners.append(_prefer_pav_node(boundary_pt, pav_nodes))
 
     try:
         new_rect = Polygon(new_corners)
@@ -823,18 +854,8 @@ def _rect_from_axis_extended(axis: LineString, width: float,
         ]
         snapped = _snap_corners_to_pavement(
             corners, pav, apt_vertices)
-        # Reject degenerate rects where snap collapsed two corners
-        # onto the same apt.dat vertex.
-        degenerate = False
-        for i in range(4):
-            for j in range(i + 1, 4):
-                if math.hypot(snapped[i][0] - snapped[j][0],
-                              snapped[i][1] - snapped[j][1]) < 1.0:
-                    degenerate = True
-                    break
-            if degenerate:
-                break
-        if degenerate:
+        if snapped is None:
+            # apron-interior or degenerate rect — reject
             return None
 
         # Symmetry check: equal widths (end1 vs end2) AND equal
@@ -874,159 +895,109 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     return None
 
 
-VERTEX_SNAP_RADIUS_M = 8.0  # first-choice: snap to real apt.dat vertex
-EDGE_SNAP_RADIUS_M = 15.0   # fallback: nearest point on pav boundary
+APRON_INTERIOR_DEPTH_M = 15.0   # if 2+ natural corners are deeper
+                                 # than this from pav.boundary, the
+                                 # rect is sitting in apron interior
+                                 # — reject so apron stays as residue
+
+
+PAV_NODE_PREFER_RADIUS_M = 5.0
+
+
+def _pav_boundary_nodes(pav: Polygon) -> List[Tuple[float, float]]:
+    """Return all pav_union ring vertices (exterior + interiors)."""
+    out: List[Tuple[float, float]] = []
+    parts = (list(pav.geoms)
+             if pav.geom_type == "MultiPolygon" else [pav])
+    for poly in parts:
+        if poly.geom_type != "Polygon":
+            continue
+        ext = list(poly.exterior.coords)
+        if ext and ext[0] == ext[-1]:
+            ext = ext[:-1]
+        out.extend(ext)
+        for ring in poly.interiors:
+            ri = list(ring.coords)
+            if ri and ri[0] == ri[-1]:
+                ri = ri[:-1]
+            out.extend(ri)
+    return out
+
+
+def _prefer_pav_node(snapped: Tuple[float, float],
+                     pav_nodes: List[Tuple[float, float]],
+                     radius: float = PAV_NODE_PREFER_RADIUS_M
+                     ) -> Tuple[float, float]:
+    """If a pav-boundary vertex sits within ``radius`` of the
+    boundary-snapped point, return that vertex.  Otherwise return
+    ``snapped`` unchanged.
+
+    Per user 2026-05-05: rect corners should prefer a pav.boundary
+    NODE over an arbitrary boundary edge-projection when one is
+    close, so the corner shares an exact vertex with pav and
+    downstream OSM-emit bucketing assigns the same node ID.  Tight
+    radius (5 m) keeps this a refinement, not a major reposition —
+    the snap-to-nearest-edge has already placed the corner on
+    pav.boundary; this merely prefers an adjacent vertex when one
+    is close enough.
+    """
+    best = snapped
+    best_d2 = radius * radius
+    for v in pav_nodes:
+        d2 = (v[0] - snapped[0]) ** 2 + (v[1] - snapped[1]) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best = (float(v[0]), float(v[1]))
+    return best
 
 
 def _snap_corners_to_pavement(
     corners: List[Tuple[float, float]],
     pav: Polygon,
     apt_vertices: Optional[List[Tuple[float, float]]] = None,
-) -> List[Tuple[float, float]]:
-    """Two-stage corner snap per the user's rule (2026-04-18):
+) -> Optional[List[Tuple[float, float]]]:
+    """Snap each rect corner to ``pav.boundary``.  Per user
+    2026-05-05:
 
-    1. First try nearest apt.dat pavement VERTEX within
-       ``VERTEX_SNAP_RADIUS_M``.  Apt.dat vertices are the
-       authoritative coordinate set the target also snaps to, so
-       snapping rect corners to them produces exact shared-vertex
-       alignment.
-    2. If no apt.dat vertex within range, fall back to the nearest
-       POINT on the pav boundary within ``EDGE_SNAP_RADIUS_M``.
-    3. If neither within range, leave the corner unsnapped.
+      * Snap to nearest boundary point first (no radius cap on the
+        boundary projection — corners far from any boundary still
+        snap in).
+      * Then prefer a pav.boundary VERTEX within
+        ``PAV_NODE_PREFER_RADIUS_M`` of the boundary-snapped point;
+        if a vertex is close, use it instead so the corner shares
+        an exact node with pav.
 
-    GUARD: a vertex-snap that would collapse two corners onto the
-    SAME apt.dat vertex (producing a degenerate rect) is rejected
-    — that corner falls through to edge snap instead.  Rects with
-    two coincident corners violate rule 7 and are rejected
-    downstream anyway, so we'd rather keep the 4 distinct corners.
+    Returns ``None`` when the rect is sitting inside an apron —
+    detected as ≥2 of 4 natural corners further than
+    ``APRON_INTERIOR_DEPTH_M`` from the pav boundary.  In that case
+    the centerline runs through wide apron pavement, not a real
+    corridor, and shouldn't generate a rect (the apron stays as
+    residue → junction).
+
+    Also returns ``None`` when the snap collapses two corners onto
+    near-identical points (degenerate rect).
     """
     boundary = pav.boundary
-    # Pre-filter apt.dat vertices to ONLY those that actually sit
-    # on the pav_union boundary.  When two apt.dat pavement
-    # polygons overlap (common at aprons / terminal pads), a
-    # corner vertex of one polygon ends up in the interior of the
-    # union.  Snapping a rect corner to such an interior vertex
-    # violates rule 7 ("corners ALWAYS on pavement boundary") and
-    # produces a rect that floats inside the pavement, leaving a
-    # sliver that a junction wraps around.  Discovered at SPJC V1
-    # (2026-04-23): c0 snapped to an apt.dat vertex 5.88 m inside
-    # the union, leaving the junction to wrap around V1's short
-    # side.
-    #
-    # Per user 2026-04-27: tolerance is STRICT (1 cm).  Snap means
-    # EXACTLY on the boundary, not "close to it" — a 0.36 m offset
-    # at SPJC G's NW corner caused the surrounding junction to
-    # add two extra nodes wrapping around the offset.  Vertices
-    # that aren't on the boundary fall through to Stage 2 (edge
-    # snap), which projects directly onto the boundary line.
-    BOUNDARY_TOL_M = 0.01
-    boundary_verts: Optional[List[Tuple[float, float]]] = None
-    if apt_vertices:
-        boundary_verts = [
-            v for v in apt_vertices
-            if Point(v[0], v[1]).distance(boundary) <= BOUNDARY_TOL_M
-        ]
-    # Stage 1: pick nearest apt.dat boundary vertex per corner.
-    candidates: List[Optional[Tuple[float, float]]] = []
-    for (cx, cy) in corners:
-        best_v = None
-        best_d = VERTEX_SNAP_RADIUS_M
-        if boundary_verts:
-            for (vx, vy) in boundary_verts:
-                d = math.hypot(cx - vx, cy - vy)
-                if d < best_d:
-                    best_v = (vx, vy)
-                    best_d = d
-        candidates.append(best_v)
-
-    # Collision handling: when two vertex-snap candidates collide
-    # (would coincide), keep the nearer one on the vertex.  The
-    # other corner uses the ORIGINAL pre-snap coordinate (NOT
-    # edge-snap, which could pull back to the same region).  This
-    # preserves a valid 4-corner rect while still placing the
-    # kept corner exactly on an apt.dat vertex.
-    # Use proximity (not identity) — two candidates within 1 m
-    # would also collapse the rect corner.  Collapse collision:
-    # drop the farther-from-original candidate, use pre-snap.
-    use_original: List[bool] = [False] * len(candidates)
-    COLLISION_TOL = 1.0
-    for i in range(len(candidates)):
-        if candidates[i] is None:
-            continue
-        for j in range(i + 1, len(candidates)):
-            if candidates[j] is None:
-                continue
-            d_cand = math.hypot(candidates[i][0] - candidates[j][0],
-                                candidates[i][1] - candidates[j][1])
-            if d_cand <= COLLISION_TOL:
-                di = math.hypot(corners[i][0] - candidates[i][0],
-                                corners[i][1] - candidates[i][1])
-                dj = math.hypot(corners[j][0] - candidates[j][0],
-                                corners[j][1] - candidates[j][1])
-                if di <= dj:
-                    candidates[j] = None
-                    use_original[j] = True
-                else:
-                    candidates[i] = None
-                    use_original[i] = True
-                    # candidates[i] is now None; subsequent j
-                    # iterations would dereference it.  Break and
-                    # let the outer i loop advance.
-                    break
-
+    pav_nodes = _pav_boundary_nodes(pav)
+    deep_count = 0
     snapped: List[Tuple[float, float]] = []
-    for i, (cx, cy) in enumerate(corners):
-        if candidates[i] is not None:
-            snapped.append(candidates[i])
-            continue
-        if use_original[i]:
-            # Collision fallback — keep pre-snap coord to avoid
-            # coincident corners.
-            snapped.append((cx, cy))
-            continue
-        # Stage 2: nearest pav edge point.
+    for (cx, cy) in corners:
         p = Point(cx, cy)
+        if p.distance(boundary) > APRON_INTERIOR_DEPTH_M:
+            deep_count += 1
         near, _ = nearest_points(boundary, p)
-        if p.distance(near) <= EDGE_SNAP_RADIUS_M:
-            snapped.append((near.x, near.y))
-        else:
-            snapped.append((cx, cy))
-
-    # Final coincidence sweep: vertex-snap AND edge-snap can BOTH
-    # pull two corners onto the same area (e.g. edge-snap falls
-    # through to the same boundary vertex a vertex-snap picked
-    # from the other corner).  If any two final coords are within
-    # 1 m, revert the farther-from-original to its pre-snap coord.
-    FINAL_COLLISION_TOL = 1.0
-    for i in range(len(snapped)):
-        for j in range(i + 1, len(snapped)):
-            d = math.hypot(snapped[i][0] - snapped[j][0],
-                           snapped[i][1] - snapped[j][1])
-            if d <= FINAL_COLLISION_TOL:
-                di = math.hypot(corners[i][0] - snapped[i][0],
-                                corners[i][1] - snapped[i][1])
-                dj = math.hypot(corners[j][0] - snapped[j][0],
-                                corners[j][1] - snapped[j][1])
-                if di <= dj:
-                    snapped[j] = corners[j]
-                else:
-                    snapped[i] = corners[i]
-
-    # Symmetry check: rect corners come in as [end1_side1, end2_side1,
-    # end2_side2, end1_side2] per _rect_from_axis_extended.  The two
-    # widths (end1_side1 → end1_side2 and end2_side1 → end2_side2)
-    # should be equal for a proper rectangle.  When snap pulls
-    # corners to apt.dat vertices at asymmetric offsets (one rect
-    # end near a wider pavement apron than the other), the widths
-    # diverge and the shape reads as a trapezoid.  Per user
-    # (2026-04-21): "the perpendicular stub is asymmetrical and
-    # looks like it's coming into the space of the primary
-    # parallel."  If the snapped widths differ by more than
-    # ``ASYM_WIDTH_TOL_M``, revert ONE corner on each side to
-    # its pre-snap coord so the rect stays symmetric.  We keep
-    # the NARROWER side's snap (matching the tighter pavement) and
-    # revert the wider side's corners to the pre-snap perpendicular
-    # offset.
+        boundary_pt = (float(near.x), float(near.y))
+        prefered = _prefer_pav_node(boundary_pt, pav_nodes)
+        snapped.append(prefered)
+    if deep_count >= 2:
+        return None
+    # Reject degenerate rects where two corners collapsed onto the
+    # same point (within 1 m).
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if math.hypot(snapped[i][0] - snapped[j][0],
+                          snapped[i][1] - snapped[j][1]) < 1.0:
+                return None
     return snapped
 
 
@@ -1159,27 +1130,54 @@ def _classify_role(axis: LineString, width: float,
         PRIMARY_PARALLEL even though there's no actual B parallel
         taxiway.
 
-    Roles:
-      * PRIMARY_PARALLEL  — db < 20°, length ≥ 50 m, < 400 m from runway
-      * SECONDARY_PARALLEL — db < 20°, length ≥ 50 m, ≥ 400 m from runway
-      * CROSS_CONNECTOR   — db > 45°, length ≥ 80 m, > 250 m from runway
-      * STUB              — everything else (short, runway-adjacent perp, etc.)
-    """
-    if ref and any(c.isdigit() for c in ref):
-        # Sub-refs are always stubs.
-        return ROLE_STUB
+    Per user 2026-05-05 (revised stub definition): a stub can be at
+    a wide range of angles BUT cannot be directly parallel to the
+    runway.  When db < 20° (parallel), the rect is always a parallel
+    classification regardless of length — never a stub.
 
+    Roles:
+      * PRIMARY_PARALLEL  — db < 20°, < 400 m from runway
+      * SECONDARY_PARALLEL — db < 20°, ≥ 400 m from runway
+      * CROSS_CONNECTOR   — db > 45°, length ≥ 20 m, > 250 m from runway
+      * STUB              — db ≥ 20° (not parallel), runway-adjacent
+                             perp/diagonal segment
+    """
     db = _axis_to_nearest_rwy_db(axis, rwy_centerlines)
     if db is None:
+        # No runway to compare against — fall back to STUB (only
+        # case where a parallel determination is impossible).
+        return ROLE_STUB
+
+    try:
+        mid = axis.interpolate(0.5, normalized=True)
+        dist_rwy = min(mid.distance(r) for r in rwy_centerlines)
+    except Exception:
+        dist_rwy = 1e6
+    length = axis.length
+
+    # Per user 2026-05-05: parallel rects (db < 20°) are NEVER stubs.
+    # Classify by distance to runway alone.  Sub-refs (digit-suffixed)
+    # and diagonal-parent overrides apply only when the local axis
+    # is NOT parallel — a sub-ref like A1 that happens to run parallel
+    # to the runway is a parallel segment of A, not a stub.
+    if db < 20.0:
+        if dist_rwy < 400.0:
+            return ROLE_PRIMARY_PARALLEL
+        return ROLE_SECONDARY_PARALLEL
+
+    # db ≥ 20° from here on.  Sub-ref + diagonal-parent rules force
+    # STUB (the rect is a runway-side connector even if the local
+    # axis is perpendicular enough for cross-connector classification).
+    if ref and any(c.isdigit() for c in ref):
         return ROLE_STUB
 
     # Diagonal-parent check: if this rect's REF has an overall-
     # DIAGONAL parent OSM way (parent db_overall ∈ [20°, 45°)),
-    # force STUB regardless of the local segment bearing.  See
-    # the ``Diagonal parent ref`` rule above.  Excludes
-    # perpendicular parents (db ≥ 45°, e.g. cross-connectors
-    # like Q/R at SPJC) which legitimately classify as
-    # CROSS_CONNECTOR via the local-axis check below.
+    # force STUB regardless of the local segment bearing.  At SPJC
+    # B/C/E/G enter the runway at shallow angles; without this check,
+    # a curving end-segment of B (db_local = 18°, but parallel-band
+    # disqualifies it now) — actually parallel-band is db < 20° and
+    # already returned, so this branch only hits when local db ≥ 20°.
     if (ref and ref_overall_bearings
             and ref in ref_overall_bearings
             and rwy_centerlines):
@@ -1199,19 +1197,8 @@ def _classify_role(axis: LineString, width: float,
                     return ROLE_STUB
         except Exception:
             pass
-    try:
-        mid = axis.interpolate(0.5, normalized=True)
-        dist_rwy = min(mid.distance(r) for r in rwy_centerlines)
-    except Exception:
-        dist_rwy = 1e6
-    length = axis.length
-    if db < 20.0:
-        if length >= 50.0:
-            if dist_rwy < 400.0:
-                return ROLE_PRIMARY_PARALLEL
-            return ROLE_SECONDARY_PARALLEL
-        return ROLE_STUB
-    if db > 45.0 and length >= 80.0:
+
+    if db > 45.0 and length >= 20.0:
         if dist_rwy > 250.0:
             return ROLE_CROSS_CONNECTOR
         return ROLE_STUB
@@ -1254,3 +1241,378 @@ def _refine_roles(emitted, rwy_centerlines):
             continue
         if db >= 40.0 and axis.length < 150.0:
             emitted[i] = (rect, axis, ROLE_STUB, ref)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Hole-aware sloping-edge snap
+# ──────────────────────────────────────────────────────────────────────
+
+def _try_align_sloping_to_hole(
+    rect: Polygon,
+    axis: Optional[LineString],
+    hole_segs: List[Tuple[float, float, float, float]],
+    perp_tol_m: float,
+    length_overlap_frac: float,
+    max_corner_shift_m: float,
+) -> Tuple[Optional[Polygon], Optional[LineString]]:
+    """Try to align one of ``rect``'s sloping (long) edges with the
+    nearest matching apt.dat hole-boundary segment.
+
+    Returns ``(new_rect, new_axis)`` if a match is found and the
+    realigned rect is valid; ``(None, None)`` otherwise.
+
+    See ``_snap_rect_sloping_edges_to_holes`` for the matching rule.
+    """
+    rc = list(rect.exterior.coords)
+    if rc and rc[0] == rc[-1]:
+        rc = rc[:-1]
+    if len(rc) != 4:
+        return None, None
+
+    sloping_edges = [
+        (0, 1, rc[0], rc[1]),
+        (2, 3, rc[2], rc[3]),
+    ]
+
+    best: Optional[Tuple[int, int, Tuple[float, float],
+                          Tuple[float, float]]] = None
+    best_score = float("inf")
+    for ca_idx, cb_idx, ca, cb in sloping_edges:
+        edge_len = math.hypot(cb[0] - ca[0], cb[1] - ca[1])
+        if edge_len < 1.0:
+            continue
+        for ax, ay, bx, by in hole_segs:
+            hx = bx - ax
+            hy = by - ay
+            h_len = math.hypot(hx, hy)
+            if h_len < 1.0:
+                continue
+            mx = 0.5 * (ca[0] + cb[0])
+            my = 0.5 * (ca[1] + cb[1])
+            t = ((mx - ax) * hx + (my - ay) * hy) / (h_len * h_len)
+            t_clamped = max(0.0, min(1.0, t))
+            px = ax + t_clamped * hx
+            py = ay + t_clamped * hy
+            perp_d = math.hypot(mx - px, my - py)
+            if perp_d > perp_tol_m:
+                continue
+            ta = ((ca[0] - ax) * hx + (ca[1] - ay) * hy) / (h_len * h_len)
+            tb = ((cb[0] - ax) * hx + (cb[1] - ay) * hy) / (h_len * h_len)
+            t_lo = max(0.0, min(ta, tb))
+            t_hi = min(1.0, max(ta, tb))
+            if t_hi <= t_lo:
+                continue
+            overlap = (t_hi - t_lo) * h_len
+            rect_overlap = overlap / edge_len
+            hole_overlap = overlap / h_len
+            if max(rect_overlap, hole_overlap) < length_overlap_frac:
+                continue
+            ta_c = max(0.0, min(1.0, ta))
+            tb_c = max(0.0, min(1.0, tb))
+            new_a = (ax + ta_c * hx, ay + ta_c * hy)
+            new_b = (ax + tb_c * hx, ay + tb_c * hy)
+            shift_a = math.hypot(new_a[0] - ca[0], new_a[1] - ca[1])
+            shift_b = math.hypot(new_b[0] - cb[0], new_b[1] - cb[1])
+            if max(shift_a, shift_b) > max_corner_shift_m:
+                continue
+            score = shift_a + shift_b
+            if score < best_score:
+                best_score = score
+                best = (ca_idx, cb_idx, new_a, new_b)
+
+    if best is None:
+        return None, None
+
+    ca_idx, cb_idx, new_a, new_b = best
+    width = math.hypot(rc[0][0] - rc[3][0], rc[0][1] - rc[3][1])
+    if width < 1.0:
+        return None, None
+    dxn = new_b[0] - new_a[0]
+    dyn = new_b[1] - new_a[1]
+    new_len = math.hypot(dxn, dyn)
+    if new_len < 1.0:
+        return None, None
+    ux, uy = dxn / new_len, dyn / new_len
+    perp_x, perp_y = -uy, ux
+    old_axis_coords = list(axis.coords) if axis is not None else []
+    if len(old_axis_coords) >= 2:
+        old_mid_x = 0.5 * (old_axis_coords[0][0]
+                            + old_axis_coords[-1][0])
+        old_mid_y = 0.5 * (old_axis_coords[0][1]
+                            + old_axis_coords[-1][1])
+    else:
+        old_mid_x = 0.5 * (rc[0][0] + rc[2][0])
+        old_mid_y = 0.5 * (rc[0][1] + rc[2][1])
+    new_edge_mid_x = 0.5 * (new_a[0] + new_b[0])
+    new_edge_mid_y = 0.5 * (new_a[1] + new_b[1])
+    offset_x = old_mid_x - new_edge_mid_x
+    offset_y = old_mid_y - new_edge_mid_y
+    sign = 1.0 if offset_x * perp_x + offset_y * perp_y > 0 else -1.0
+    half = width / 2.0
+    new_p1 = (new_a[0] + sign * perp_x * half,
+              new_a[1] + sign * perp_y * half)
+    new_p2 = (new_b[0] + sign * perp_x * half,
+              new_b[1] + sign * perp_y * half)
+    if (ca_idx, cb_idx) == (2, 3):
+        new_p1, new_p2 = new_p2, new_p1
+        ux, uy = -ux, -uy
+        perp_x, perp_y = -perp_x, -perp_y
+        sign = -sign
+        new_p1 = (new_b[0] + sign * perp_x * half,
+                  new_b[1] + sign * perp_y * half)
+        new_p2 = (new_a[0] + sign * perp_x * half,
+                  new_a[1] + sign * perp_y * half)
+    new_rc = [
+        (new_p1[0] + perp_x * half, new_p1[1] + perp_y * half),  # 0
+        (new_p2[0] + perp_x * half, new_p2[1] + perp_y * half),  # 1
+        (new_p2[0] - perp_x * half, new_p2[1] - perp_y * half),  # 2
+        (new_p1[0] - perp_x * half, new_p1[1] - perp_y * half),  # 3
+    ]
+    try:
+        new_rect = Polygon(new_rc)
+        new_axis = LineString([new_p1, new_p2])
+    except Exception:
+        return None, None
+    if (not new_rect.is_valid) or new_rect.is_empty:
+        return None, None
+    return new_rect, new_axis
+
+
+def _snap_rect_sloping_edges_to_holes(
+    taxi_rects: List[Tuple[Polygon, LineString, str, str]],
+    pav_union: Optional[Polygon],
+    perp_tol_m: float = 3.0,
+    length_overlap_frac: float = 0.30,
+    min_hole_area_m2: float = 100.0,
+    max_corner_shift_m: float = 8.0,
+) -> List[Tuple[Polygon, LineString, str, str]]:
+    """Per user 2026-05-04 (apron-boundary rule): when a sloping rect's
+    long edge runs near and parallel to an apt.dat row-110 hole's
+    boundary, snap the rect so its sloping edge LIES ON the hole
+    boundary.  This makes the rect "form one side of the hole" — the
+    surrounding junction then traces around the hole via the rect's
+    cross (short) edges, never sharing boundary with the rect's
+    sloping side.
+
+    Per user 2026-05-05: hole alignment alone isn't sufficient — the
+    snap can leave one of the OTHER (non-aligned) corners off any
+    pav.boundary, which produces a long thin sliver between the
+    rect's straight edge and pav.boundary along the rect's full
+    length.  After alignment, this function ensures **all 4 corners
+    sit on pav_union.boundary** (within ``BOUNDARY_TOL_M``):
+
+      * Corner already on boundary: keep.
+      * Corner not on boundary, within ``NODE_SNAP_RADIUS_M`` of an
+        apt.dat pavement vertex: snap to the closest one.
+      * No nearby boundary or vertex: shorten rect axis by
+        ``AXIS_SHORTEN_M`` (centered) and retry the whole
+        snap+validate cycle.  Cap retries at ``MAX_SHORTEN_RETRIES``.
+
+    For each rect's two sloping edges (corners [0,1] and [2,3] per the
+    ``_rect_from_axis_extended`` corner convention):
+      1. Find the closest apt.dat hole boundary segment that is
+         within ``perp_tol_m`` perpendicular distance AND has at
+         least ``length_overlap_frac`` of length-overlap with the
+         rect's sloping edge.
+      2. Project the rect's two sloping-edge corners onto that hole
+         segment (= where they'd land if the rect's edge moved onto
+         the segment).
+      3. If the corner shifts are within ``max_corner_shift_m``,
+         rebuild the rect with the new sloping-edge corners and the
+         opposite-side corners shifted to preserve width.
+
+    Width is preserved; axis direction is updated to be parallel to
+    the new sloping edge; axis MIDPOINT shifts perpendicular to the
+    new sloping edge by half-width on the side where the old axis
+    was (preserves orientation).
+
+    Returns updated list.  Original taxi_rects list is not mutated.
+    """
+    if pav_union is None or pav_union.is_empty or not taxi_rects:
+        return list(taxi_rects)
+
+    SLOPING_RECT_ROLES_LOCAL = (
+        ROLE_PRIMARY_PARALLEL,
+        ROLE_SECONDARY_PARALLEL,
+        ROLE_STUB,
+        ROLE_CROSS_CONNECTOR,
+    )
+
+    # Corner-validation tolerances.
+    BOUNDARY_TOL_M = 0.5      # corner is "on boundary" if within this
+    NODE_SNAP_RADIUS_M = 5.0  # snap off-boundary corner to nearest node
+    AXIS_SHORTEN_M = 5.0      # shorten by this when no node within range
+    MAX_SHORTEN_RETRIES = 5
+    MIN_AXIS_LENGTH_M = 30.0  # don't shorten below this
+
+    # Collect big holes from pav_union as polygons + boundary segments.
+    holes: List[Polygon] = []
+    parts = (list(pav_union.geoms)
+             if pav_union.geom_type == "MultiPolygon" else [pav_union])
+    for p in parts:
+        if p.geom_type != "Polygon":
+            continue
+        for h in p.interiors:
+            hp = Polygon(h)
+            if hp.area > min_hole_area_m2:
+                holes.append(hp)
+    hole_segs: List[Tuple[float, float, float, float]] = []
+    for H in holes:
+        coords = list(H.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        n = len(coords)
+        for i in range(n):
+            a = coords[i]
+            b = coords[(i + 1) % n]
+            hole_segs.append((a[0], a[1], b[0], b[1]))
+
+    # Collect ALL pav_union boundary nodes (exterior + holes) for
+    # the corner-validation node snap.  Used regardless of whether
+    # holes exist — corners may need to snap to exterior verts.
+    pav_nodes: List[Tuple[float, float]] = []
+    for p in parts:
+        if p.geom_type != "Polygon":
+            continue
+        ext = list(p.exterior.coords)
+        if ext and ext[0] == ext[-1]:
+            ext = ext[:-1]
+        pav_nodes.extend(ext)
+        for h in p.interiors:
+            ri = list(h.coords)
+            if ri and ri[0] == ri[-1]:
+                ri = ri[:-1]
+            pav_nodes.extend(ri)
+
+    from shapely.ops import substring
+
+    out: List[Tuple[Polygon, LineString, str, str]] = []
+    for rect, axis, role, ref in taxi_rects:
+        if role not in SLOPING_RECT_ROLES_LOCAL:
+            out.append((rect, axis, role, ref))
+            continue
+        if rect is None or rect.is_empty or rect.geom_type != "Polygon":
+            out.append((rect, axis, role, ref))
+            continue
+        rc0 = list(rect.exterior.coords)
+        if rc0 and rc0[0] == rc0[-1]:
+            rc0 = rc0[:-1]
+        if len(rc0) != 4:
+            out.append((rect, axis, role, ref))
+            continue
+        original_width = math.hypot(rc0[0][0] - rc0[3][0],
+                                     rc0[0][1] - rc0[3][1])
+        if original_width < 1.0:
+            out.append((rect, axis, role, ref))
+            continue
+
+        cur_rect = rect
+        cur_axis = axis
+        # Default fallback: if no retry produces a fully-on-boundary
+        # rect, keep the ORIGINAL.  Don't ship a partially-shortened/
+        # realigned rect with off-boundary corners we couldn't fix —
+        # that often makes the residue worse than leaving the rect
+        # alone (esp. in apron-merged-runway areas where pav_union's
+        # boundary doesn't match pav_for_rects, so the corners can't
+        # land on pav_union.boundary at all).
+        final_rect = rect
+        final_axis = axis
+        for retry_i in range(MAX_SHORTEN_RETRIES + 1):
+            # Step 1: try to align a sloping edge with a hole.
+            if hole_segs:
+                aligned, aligned_axis = _try_align_sloping_to_hole(
+                    cur_rect, cur_axis, hole_segs,
+                    perp_tol_m, length_overlap_frac,
+                    max_corner_shift_m)
+                if aligned is not None:
+                    cur_rect = aligned
+                    cur_axis = aligned_axis
+
+            # Step 2: validate all 4 corners on pav.boundary.  Snap
+            # off-boundary corners to nearest pav node within
+            # NODE_SNAP_RADIUS_M.
+            cc = list(cur_rect.exterior.coords)
+            if cc and cc[0] == cc[-1]:
+                cc = cc[:-1]
+            if len(cc) != 4:
+                # Degenerate after alignment — bail out with original.
+                break
+            new_corners = list(cc)
+            unfixable = False
+            for i, c in enumerate(cc):
+                d = Point(c).distance(pav_union.boundary)
+                if d <= BOUNDARY_TOL_M:
+                    continue
+                # Snap to nearest pav node within radius.
+                best_node = None
+                best_d = NODE_SNAP_RADIUS_M
+                for v in pav_nodes:
+                    vd = math.hypot(v[0] - c[0], v[1] - c[1])
+                    if vd < best_d:
+                        best_d = vd
+                        best_node = v
+                if best_node is not None:
+                    new_corners[i] = (float(best_node[0]),
+                                       float(best_node[1]))
+                else:
+                    unfixable = True
+                    break
+
+            if not unfixable:
+                # Validate corner-pair separations after snap.
+                ok = True
+                for i in range(4):
+                    for j in range(i + 1, 4):
+                        if math.hypot(
+                                new_corners[i][0] - new_corners[j][0],
+                                new_corners[i][1] - new_corners[j][1]
+                                ) < 1.0:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if ok:
+                    try:
+                        candidate = Polygon(new_corners)
+                        if (candidate.is_valid
+                                and not candidate.is_empty):
+                            final_rect = candidate
+                            final_axis = cur_axis
+                            break
+                    except Exception:
+                        pass
+                # Polygon invalid — fall through to shorten retry.
+
+            # Step 3: shorten axis by AXIS_SHORTEN_M (centered) and
+            # retry from step 1.
+            if (cur_axis is None
+                    or cur_axis.length
+                    < MIN_AXIS_LENGTH_M + AXIS_SHORTEN_M):
+                # Axis too short to shrink further; the alignment +
+                # node-snap couldn't produce a fully-on-boundary
+                # rect.  Fall back to the ORIGINAL (which still has
+                # corners on pav.boundary from _rect_from_axis_
+                # extended's snap) — better to skip the hole
+                # alignment than to ship a rect with corners 30 m+
+                # into pav's interior.
+                break
+            half_shorten = AXIS_SHORTEN_M / 2.0
+            try:
+                cur_axis = substring(
+                    cur_axis,
+                    half_shorten,
+                    cur_axis.length - half_shorten)
+            except Exception:
+                break
+            new_rect = _rect_from_axis_extended(
+                cur_axis, original_width, pav_union,
+                apt_vertices=None)
+            if new_rect is None or new_rect.is_empty:
+                break
+            cur_rect = new_rect
+            # Loop back to step 1 (alignment + validation).
+        # Loop exited without break (all retries failed): final_rect
+        # remains the original (set before the loop).
+        out.append((final_rect, final_axis, role, ref))
+
+    return out

@@ -373,12 +373,13 @@ def _drop_primary_parallels_embedded_in_pavement(
             pav_boundary = None
         n_dropped_interior = 0
         new_rects: List[Tuple[Polygon, LineString, str, str]] = []
+        from .rects import _snap_corners_to_pavement
         for u_lo, u_hi in kept_intervals:
             new_a_mid = (a_mid[0] + u_lo * ux,
                          a_mid[1] + u_lo * uy)
             new_b_mid = (a_mid[0] + u_hi * ux,
                          a_mid[1] + u_hi * uy)
-            new_corners = [
+            natural_corners = [
                 (new_a_mid[0] + nx * half_w,
                  new_a_mid[1] + ny * half_w),
                 (new_b_mid[0] + nx * half_w,
@@ -388,6 +389,20 @@ def _drop_primary_parallels_embedded_in_pavement(
                 (new_a_mid[0] - nx * half_w,
                  new_a_mid[1] - ny * half_w),
             ]
+            # Per user 2026-05-05: snap the kept fragment's corners
+            # to pav.boundary (with node preference within 5 m) so
+            # they don't sit off-boundary in pav's interior.  The
+            # axis-perpendicular reconstruction can leave corners
+            # 20+ m off pav.boundary when the rect runs near a
+            # narrowing — F-stub at SPJC.  If snap returns None
+            # (apron-interior: ≥2 corners deep inside pav far from
+            # any boundary), drop the fragment entirely; the
+            # surrounding apron / junction will absorb it correctly.
+            snapped = _snap_corners_to_pavement(
+                natural_corners, apt_pav_union)
+            if snapped is None:
+                continue
+            new_corners = snapped
             try:
                 new_rect = Polygon(new_corners)
                 if not new_rect.is_valid:

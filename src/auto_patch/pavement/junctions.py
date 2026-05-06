@@ -99,24 +99,23 @@ def _decompose_polygon_with_holes(polygon: Polygon,
                                   min_area_m2: float = 50.0,
                                   max_depth: int = 8,
                                   runway_axis_deg: Optional[float] = None,
+                                  corner_snap_pts: Optional[
+                                      List[Tuple[float, float]]] = None,
+                                  corner_snap_tol_m: float = 5.0,
                                   ) -> List[Polygon]:
-    """Return a list of simple (no-hole) polygons that tile the
-    same area as ``polygon``.  Cuts through each hole's centroid
-    along a direction chosen to satisfy Rule 3 (axis-aligned non-
-    pavement borders) when ``runway_axis_deg`` is supplied; falls
-    back to the legacy hole-MRR / centroid-spread heuristic
-    otherwise.
+    """Return a list of simple (no-hole) polygons that tile the same
+    area as ``polygon``.
 
-    Per Rule 3 (user 2026-05-01): every junction edge that isn't on
-    the apt.dat pavement boundary or a shared anchor edge must run
-    parallel or perpendicular to the longest runway.  When the
-    runway axis is supplied, cut lines align to it; when omitted,
-    we use the legacy heuristic so non-Phase-2 callers keep working.
+    Strategy: cut the largest interior hole through its centroid in
+    the runway-parallel-or-perpendicular direction that yields the
+    most-balanced split.  Recurse on each piece.  Pieces with no
+    holes are returned as-is.
 
-    Legacy heuristic (kept as fallback per user 2026-04-28):
-      * Multiple holes ⇒ cut PERPENDICULAR to the centroid-spread
-        direction.
-      * Single hole ⇒ cut along its MRR long-axis direction.
+    Per user 2026-05-04: this function should ideally be a no-op —
+    if every apt.dat hole is bordered by a rect/runway/terminal
+    upstream, every residue piece is simply connected and the cut
+    machinery is unnecessary.  The cut path here is a defensive
+    fallback for residue pieces that still have interior holes.
     """
     from shapely.ops import split as _shp_split
     from shapely.geometry import LineString as _LS
@@ -125,101 +124,60 @@ def _decompose_polygon_with_holes(polygon: Polygon,
         return []
     if not polygon.interiors:
         return [polygon]
-    if max_depth <= 0:
-        # Recursion guard — emit the exterior with holes dropped
-        # rather than retry forever.  Should never trigger for
-        # realistic airport geometry.
-        return [Polygon(polygon.exterior.coords)]
-    # Pick the largest remaining hole — it'll be on one side of
-    # the cut after slicing.
     interiors = list(polygon.interiors)
-    interiors.sort(key=lambda h: -Polygon(h).area)
-    hole = interiors[0]
+    big_interiors = [h for h in interiors
+                     if Polygon(h).area >= min_area_m2]
+    if not big_interiors:
+        return [Polygon(polygon.exterior.coords)]
+    if max_depth <= 0:
+        clean = Polygon(polygon.exterior.coords, big_interiors)
+        spliced_coords = _splice_holes(clean)
+        try:
+            return [Polygon(spliced_coords).buffer(0)]
+        except Exception:
+            return [Polygon(polygon.exterior.coords)]
+    big_interiors.sort(key=lambda h: -Polygon(h).area)
+    hole = big_interiors[0]
     cx = float(hole.centroid.x)
     cy = float(hole.centroid.y)
     minx, miny, maxx, maxy = polygon.bounds
+    span = max(maxx - minx, maxy - miny) + 2.0
 
-    # Decide cut direction.  The cut is a line through the hole
-    # centroid; ``angle_rad`` is the angle of the cut LINE (not
-    # the perpendicular), measured from +x.  Default = horizontal.
     angle_rad = 0.0
     if runway_axis_deg is not None:
-        # Per Rule 3: cut parallel to the runway axis (or
-        # perpendicular).  Bearing convention: 0° = +Y (north),
-        # 90° = +X (east); convert to "atan2 from +x" by
-        # angle_x = π/2 − bearing_rad.  Choose the one of
-        # {parallel, perpendicular} that produces the more balanced
-        # split — measured by area ratio of the resulting pieces;
-        # we proxy this by picking the direction that runs along
-        # the polygon's longer side.
         bearing_rad = math.radians(runway_axis_deg)
         runway_x_angle = math.pi / 2.0 - bearing_rad
-        # Two candidate cut directions: along runway, perpendicular.
         cand_a = runway_x_angle % math.pi
         cand_b = (runway_x_angle + math.pi / 2.0) % math.pi
-        # Pick whichever produces a longer cut chord through the
-        # polygon (proxy for "more balanced split").
-        def _chord_len(theta):
+
+        def _min_piece_area(theta):
             ux, uy = math.cos(theta), math.sin(theta)
-            span = max(maxx - minx, maxy - miny) + 2.0
             line = _LS([(cx - span * ux, cy - span * uy),
                         (cx + span * ux, cy + span * uy)])
             try:
-                inter = line.intersection(polygon)
+                result = _shp_split(polygon, line)
             except Exception:
-                return 0.0
-            if inter.is_empty:
-                return 0.0
-            if inter.geom_type == "LineString":
-                return inter.length
-            if inter.geom_type == "MultiLineString":
-                return sum(g.length for g in inter.geoms)
-            return 0.0
-        len_a = _chord_len(cand_a)
-        len_b = _chord_len(cand_b)
-        angle_rad = cand_a if len_a >= len_b else cand_b
-    elif len(interiors) >= 2:
-        # Multi-hole: cut perpendicular to the centroid-spread
-        # axis so the cut SEPARATES the holes rather than slicing
-        # parallel to their alignment.  E.g. holes spread along
-        # +x → cut vertically (angle = π/2) between them.
-        cs = [h.centroid for h in interiors]
-        x_spread = max(c.x for c in cs) - min(c.x for c in cs)
-        y_spread = max(c.y for c in cs) - min(c.y for c in cs)
-        # We want the cut LINE to be perpendicular to the spread
-        # direction.  spread_along_x ⇒ cut vertical (π/2);
-        # spread_along_y ⇒ cut horizontal (0).
-        if x_spread > y_spread:
-            angle_rad = math.pi / 2.0  # vertical
-        else:
-            angle_rad = 0.0            # horizontal
-    else:
-        # Single hole: cut along its MRR long-axis direction.
-        try:
-            mrr = hole.minimum_rotated_rectangle
-            if (mrr is not None and not mrr.is_empty
-                    and mrr.geom_type == "Polygon"):
-                mc = list(mrr.exterior.coords)
-                if len(mc) >= 5:
-                    sides = []
-                    for i in range(4):
-                        ax, ay = mc[i]
-                        bx, by = mc[i + 1]
-                        sides.append(
-                            (math.hypot(bx - ax, by - ay),
-                             math.atan2(by - ay, bx - ax)))
-                    sides.sort(reverse=True)
-                    angle_rad = sides[0][1]
-        except Exception:
-            angle_rad = 0.0
+                return -1.0
+            geoms = (list(getattr(result, "geoms", []))
+                     if result.geom_type != "Polygon" else [result])
+            areas = [g.area for g in geoms
+                     if g.geom_type == "Polygon" and not g.is_empty]
+            return min(areas) if len(areas) >= 2 else 0.0
 
-    # Build a cut line through (cx, cy) at angle_rad, extended well
-    # past the polygon bounds on both sides.
-    span = max(maxx - minx, maxy - miny) + 2.0
+        angle_rad = (cand_a if _min_piece_area(cand_a) >= _min_piece_area(cand_b)
+                     else cand_b)
+    else:
+        cs = [h.centroid for h in big_interiors]
+        if len(cs) > 1:
+            x_spread = max(c.x for c in cs) - min(c.x for c in cs)
+            y_spread = max(c.y for c in cs) - min(c.y for c in cs)
+            angle_rad = math.pi / 2.0 if x_spread > y_spread else 0.0
+
     dx = math.cos(angle_rad)
     dy = math.sin(angle_rad)
     cut = _LS([(cx - span * dx, cy - span * dy),
                (cx + span * dx, cy + span * dy)])
+
     try:
         result = _shp_split(polygon, cut)
     except Exception:
@@ -229,14 +187,129 @@ def _decompose_polygon_with_holes(polygon: Polygon,
     pieces: List[Polygon] = []
     geoms = (list(getattr(result, "geoms", []))
              if result.geom_type != "Polygon" else [result])
+
+    # Per user 2026-05-04: snap cut-induced vertices on each piece's
+    # boundary to the nearest existing polygon vertex within 5 m
+    # that's MORE aligned with the hole-centroid axis (smaller
+    # perpendicular distance to the cut line).  This eliminates
+    # mid-rect-edge nodes by replacing the cut crossing with an
+    # existing on-axis vertex (typically a rect corner that was
+    # already on the polygon's boundary via seam injection).
+    SNAP_RADIUS_M = 5.0
+
+    def _perp_to_cut(px, py):
+        return abs((px - cx) * dy - (py - cy) * dx)
+
+    # Pre-compute the natural crossing points so we can identify
+    # cut-induced verts on each piece.
+    try:
+        natural_inter = polygon.exterior.intersection(cut)
+    except Exception:
+        natural_inter = None
+    natural_pts: List[Tuple[float, float]] = []
+    if natural_inter is not None and not natural_inter.is_empty:
+        if natural_inter.geom_type == "Point":
+            natural_pts = [(natural_inter.x, natural_inter.y)]
+        elif natural_inter.geom_type == "MultiPoint":
+            natural_pts = [(p.x, p.y) for p in natural_inter.geoms]
+        elif natural_inter.geom_type == "GeometryCollection":
+            for g in natural_inter.geoms:
+                if g.geom_type == "Point":
+                    natural_pts.append((g.x, g.y))
+    # Existing polygon boundary verts (exterior + interiors) — these
+    # are the candidates for snapping.
+    pre_cut_verts: List[Tuple[float, float]] = []
+    pe = list(polygon.exterior.coords)
+    if pe and pe[0] == pe[-1]:
+        pe = pe[:-1]
+    pre_cut_verts.extend(pe)
+    for h in polygon.interiors:
+        hv = list(h.coords)
+        if hv and hv[0] == hv[-1]:
+            hv = hv[:-1]
+        pre_cut_verts.extend(hv)
+
+    def _snap_cut_verts(piece: Polygon) -> Polygon:
+        """Replace each cut-induced vertex on this piece's boundary
+        with the NEAREST existing pre-cut vertex within
+        SNAP_RADIUS_M, provided that vertex is itself within
+        ``ON_AXIS_TOL_M`` of the cut line (i.e. it's a candidate
+        node that's already aligned with the hole-centroid axis).
+        Prevents mid-rect-edge cut-induced verts when an existing
+        rect corner sits near the cut line."""
+        if not natural_pts:
+            return piece
+        ON_AXIS_TOL_M = 2.0  # max perp distance from cut line for a
+                              # candidate to be considered "aligned"
+        coords = list(piece.exterior.coords)
+        if not coords:
+            return piece
+        had_close = (coords[0] == coords[-1])
+        if had_close:
+            coords = coords[:-1]
+        modified = False
+        for i, (vx, vy) in enumerate(coords):
+            is_cut_vert = any(
+                math.hypot(vx - nx, vy - ny) < 0.5
+                for nx, ny in natural_pts)
+            if not is_cut_vert:
+                continue
+            # Find the nearest existing pre-cut vertex within range
+            # that's also on-axis.  Skip candidates farther from the
+            # cut line than ON_AXIS_TOL_M — those would degrade
+            # alignment.
+            best_v: Optional[Tuple[float, float]] = None
+            best_d = SNAP_RADIUS_M
+            for px, py in pre_cut_verts:
+                if abs(px - vx) > SNAP_RADIUS_M or abs(py - vy) > SNAP_RADIUS_M:
+                    continue
+                d = math.hypot(px - vx, py - vy)
+                if d < 0.01:
+                    continue  # same vertex
+                if d > best_d:
+                    continue
+                if _perp_to_cut(px, py) > ON_AXIS_TOL_M:
+                    continue
+                best_d = d
+                best_v = (float(px), float(py))
+            if best_v is not None:
+                coords[i] = best_v
+                modified = True
+        if not modified:
+            return piece
+        # Reconstruct the polygon, dedupe consecutive duplicates.
+        deduped: List[Tuple[float, float]] = []
+        for c in coords:
+            if deduped and (math.hypot(c[0] - deduped[-1][0],
+                                        c[1] - deduped[-1][1]) < 0.01):
+                continue
+            deduped.append(c)
+        if len(deduped) < 3:
+            return piece
+        try:
+            new_p = Polygon(deduped, [list(h.coords) for h in piece.interiors])
+            if new_p.is_valid and not new_p.is_empty:
+                return new_p
+            fixed = new_p.buffer(0)
+            if (fixed.geom_type == "Polygon" and not fixed.is_empty):
+                return fixed
+        except Exception:
+            pass
+        return piece
+
     for g in geoms:
         if g.geom_type != "Polygon" or g.is_empty:
             continue
         if g.area < min_area_m2:
             continue
+        g = _snap_cut_verts(g)
+        if g.geom_type != "Polygon" or g.is_empty:
+            continue
         pieces.extend(_decompose_polygon_with_holes(
             g, min_area_m2=min_area_m2, max_depth=max_depth - 1,
-            runway_axis_deg=runway_axis_deg))
+            runway_axis_deg=runway_axis_deg,
+            corner_snap_pts=corner_snap_pts,
+            corner_snap_tol_m=corner_snap_tol_m))
     # Sliver clean-up: smart-cut alignment eliminates the most
     # egregious wide-band strips (5 m × 67 m, 10 m × 119 m) that
     # appeared with horizontal-only cuts, but recursive splits can
@@ -813,30 +886,20 @@ def _find_junction_points(
         for n in nds:
             refs_at_node[n].add(ref)
 
-    # Second pass: unrefed taxi ways act as CONNECTORS between
-    # refed taxis at SPJC (e.g. 6 short unrefed ways bridge V to U,
-    # marking the chart-level V↔U intersection points that split V
-    # into multiple rects).  Only contribute a connector node when
-    # it's also on a refed taxi way — this filters pure apron-area
-    # markings (whose nodes touch only other unrefed ways).  Length
-    # cap filters the long apron-boundary unrefed ways.
+    # Per user 2026-05-05: any ``aeroway=taxiway`` (refed OR not)
+    # AND any ``aeroway=parking_position`` way contributes a
+    # connector node where it meets a refed taxiway.  At SPJC F
+    # crosses 2 parking_position centerlines that split it into 3
+    # rects; CYXY's V↔U pair has 6 short unrefed taxiway connectors
+    # marking the chart-level intersections.  No length filter —
+    # any aeroway crossing splits.  Apron-only nodes are still
+    # filtered because the connector tag is added ONLY when the
+    # node is shared with a refed taxiway.
     for wid, nds, tags in ways:
-        if tags.get("aeroway") != "taxiway":
-            continue
-        if tags.get("ref", ""):
-            continue
-        # Compute unrefed way length
-        path_len = 0.0
-        prev = None
-        for n in nds:
-            if n not in nodes:
-                continue
-            lat, lon = nodes[n]
-            cur = to_m(lon, lat)
-            if prev is not None:
-                path_len += math.hypot(cur[0] - prev[0], cur[1] - prev[1])
-            prev = cur
-        if path_len > 200.0 or path_len < 20.0:
+        aw = tags.get("aeroway")
+        if aw == "taxiway" and tags.get("ref", ""):
+            continue  # already handled in the refed-taxiway pass above
+        if aw not in ("taxiway", "parking_position"):
             continue
         for n in nds:
             if n in refed_taxi_nodes:

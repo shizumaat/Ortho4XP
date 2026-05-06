@@ -713,6 +713,16 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # Merge near-touching apt.dat polygons so the union is one big
     # coverage (with real holes only) — see ``_merge_near_touching``.
     pav_union = _merge_near_touching(pav_union)
+    # Per user 2026-05-05: simplify pav_union FIRST so all
+    # downstream consumers (rect snap, junction emit) see a clean
+    # 1 m-resolution coverage polygon.  Apt.dat row-110 polygons
+    # routinely contain over-resolved curves (sub-meter steps) and
+    # 0.2 m doubled-vertex needles that would otherwise survive
+    # into the residue.  Rect corners snap to this simplified
+    # boundary, so subtracting rects from pav_union should align
+    # perfectly.
+    from .pavement.union_helpers import _simplify_pavement_polygon
+    pav_union = _simplify_pavement_polygon(pav_union, tol=1.0)
     # Stash the pre-runway-subtraction pavement polygon list for
     # the apron-merged-runway detection in _compute_elevations.
     # A runway segment is "apron-merged" when the apt.dat polygon
@@ -1502,24 +1512,23 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # Uniform pipeline per user (2026-04-20): intersections +
     # sharp curves define break points; 70% rect between
     # consecutive breaks.  No width analysis.
-    # Use ``pav_union_for_rects`` (full runway subtraction, no
-    # apron-merged-runway carve-out) for centerline splitting + rect
-    # building.  The apron-merge exclusion was added to ``pav_union``
-    # to keep apron junctions seamless across apron-merged runway
-    # ends, but it makes the pavement boundary expand outward into
-    # those former runway regions — primary parallels at the airport
-    # NW (e.g. CYXY's F) then have their natural corridor end (where
-    # the pavement narrows back to taxi width) lost in the expanded
-    # pav_union, and the apron-interior corner check rejects them.
-    _pav_for_rects = getattr(layout, "_pav_union_for_rects", pav_union)
+    # Per user 2026-05-05: use the SAME pav_union for rect building
+    # and junction emit.  Previously rects used ``pav_union_for_rects``
+    # (full runway subtraction) while junctions used ``pav_union``
+    # (effective_runway subtraction, retaining apron-merged-runway
+    # pavement).  The split was added to fix CYXY's F primary
+    # parallel, but it caused SPJC rect corners to land on
+    # pav_for_rects.boundary that doesn't exist on pav_union.boundary
+    # — leaving thin tabs in the residue.  Single-source-of-truth
+    # boundary lets corners snap consistently.
     osm_centerlines = _split_centerlines_at_points(
         osm_centerlines, junction_points, approach_tol_m=25.0,
-        pav_union=_pav_for_rects, rwy_union=layout.runway_union,
+        pav_union=pav_union, rwy_union=layout.runway_union,
         rwy_centerlines=rwy_centerlines)
 
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
-        osm_centerlines, _pav_for_rects, layout.runway_union,
+        osm_centerlines, pav_union, layout.runway_union,
         rwy_centerlines, apt_vertices=apt_pav_vertices,
         ref_overall_bearings=ref_overall_bearings)
 
@@ -1758,6 +1767,19 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 except Exception:
                     continue
 
+    # ── Hole-aware sloping-edge snap (user 2026-05-04) ────────────
+    # When a sloping rect's long edge runs near and parallel to an
+    # apt.dat row-110 hole boundary, snap the rect so its sloping
+    # edge LIES ON the hole boundary.  Without this, the rect's body
+    # sits inside the hole's interior or crosses the hole's perimeter,
+    # which then gets absorbed by ``pav_union.difference(rect)`` (the
+    # "tunnel" effect): the apron polygon then spans across the hole
+    # and ends up sharing boundary with the rect's sloping side.
+    # Aligning the rect's sloping edge with the hole boundary makes
+    # the surrounding junction wrap around the hole via the rect's
+    # CROSS edges instead.
+    taxi_rects = _snap_rect_sloping_edges_to_holes(taxi_rects, pav_union)
+
     # Emit taxi rects (already trimmed to narrow-width portion).
     emitted_taxi_rects: List[Polygon] = []
     for ri, (rect, axis, role, ref) in enumerate(taxi_rects):
@@ -1814,7 +1836,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # because the cascade with Rule 4 + segmentation re-run
         # over-grew junctions past the 4-node cap.
         widen_junctions_to_runway_corners(layout)
-        _push_junction_vertices_outside_pavement(layout)
+        # Per user 2026-05-05: disabled — see junction_rules.py for
+        # rationale.  The push pass introduces 1 m flat-edge mid-edge
+        # nodes on every adjacent rect.
+        # _push_junction_vertices_outside_pavement(layout)
 
         # Per user 2026-05-03: per-surface solver runs AS THE LAST
         # STEP of the pipeline, after every junction rule and
@@ -1968,4 +1993,5 @@ from .pavement.centerlines import (
 from .pavement.rects import (
     _build_taxi_rects,
     _classify_role,
+    _snap_rect_sloping_edges_to_holes,
 )

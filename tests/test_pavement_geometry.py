@@ -306,6 +306,154 @@ def test_no_vertex_on_sloping_rect_edge(icao):
         assert False, msg
 
 
+def _rect_flat_edges_from_shape(shape):
+    """The two FLAT edges of a 4-corner rect — perpendicular to
+    ``source_axis`` (where altitude is constant along the edge).
+    Mirror of ``_rect_sloping_edges_from_shape`` (in
+    test_junction_rules.py) but selects the bottom-2-dot-product
+    indices.  Returns [] if shape isn't a 4-corner rect.
+    """
+    import math
+    poly = shape.polygon
+    coords = list(poly.exterior.coords)
+    if not coords:
+        return []
+    if coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) != 4:
+        return []
+    edges = [(coords[i], coords[(i + 1) % 4]) for i in range(4)]
+    sa = getattr(shape, "source_axis", None)
+    if sa is not None and not sa.is_empty:
+        ax_pts = list(sa.coords)
+        if len(ax_pts) >= 2:
+            axdx = ax_pts[-1][0] - ax_pts[0][0]
+            axdy = ax_pts[-1][1] - ax_pts[0][1]
+            axlen = math.hypot(axdx, axdy)
+            if axlen >= 1e-6:
+                aux, auy = axdx / axlen, axdy / axlen
+                dots = []
+                for a, b in edges:
+                    ex, ey = b[0] - a[0], b[1] - a[1]
+                    elen = math.hypot(ex, ey)
+                    if elen < 1e-6:
+                        dots.append(0.0)
+                        continue
+                    dots.append(abs(ex * aux + ey * auy) / elen)
+                flat_idx = sorted(range(4), key=lambda i: dots[i])[:2]
+                return [edges[i] for i in flat_idx]
+    lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in edges]
+    short_idx = sorted(range(4), key=lambda i: lengths[i])[:2]
+    return [edges[i] for i in short_idx]
+
+
+@pytest.mark.parametrize("icao", airports_under_test() or [
+    pytest.param("(no airports)", marks=pytest.mark.skip(
+        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+def test_no_vertex_on_sloping_rect_flat_edge(icao):
+    """A sloping rect's FLAT (cross/short) edge — the side
+    perpendicular to ``source_axis`` — is where the rect meets a
+    junction (or runway, or another rect).  That meeting must be
+    1:1 vertex sharing: only the rect's 2 flat-edge CORNERS are
+    legal shared vertices, never a node on the edge interior.
+
+    A third node mid-flat-edge constrains the rect's slope at a
+    non-corner location, producing a step where the junction's
+    elevation diverges from the rect's linear-corner slope.
+
+    Tolerance 1.0 m: a vertex within 1 m perpendicular of the flat
+    edge that isn't within 1 m of either corner is flagged.  This
+    catches the post-elevation ``_push_junction_vertices_outside_-
+    pavement`` behaviour that nudges junction verts ~1 m off the
+    rect — at exactly the threshold the original 0.5 m all-edge
+    test misses.
+    """
+    import math
+    layout = _build_layout(icao)
+    sloping_roles = {
+        "primary_parallel", "secondary_parallel",
+        "stub", "cross_connector"}
+    sloping = []
+    for s in layout.shapes:
+        if s.role not in sloping_roles:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        # Per user 2026-05-02: flat (no slope) rects exempt — those
+        # have a single ``altitude`` and tolerate mid-edge nodes.
+        if s.altitude_high is None or s.altitude_low is None:
+            continue
+        sloping.append(s)
+    if not sloping:
+        pytest.skip(f"{icao}: no sloping rects emitted")
+
+    EDGE_PROX_M = 1.0
+    CORNER_GUARD_M = 1.0
+
+    violations = []
+    for s in sloping:
+        coords = list(s.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        flat_edges = _rect_flat_edges_from_shape(s)
+        if not flat_edges:
+            continue
+        for o in layout.shapes:
+            if o is s:
+                continue
+            if o.polygon is None or o.polygon.is_empty:
+                continue
+            # Other sloping rects share corners at junction points;
+            # checking them produces noise without adding signal.
+            # Junctions, terminals, aprons, retaining_walls are the
+            # interesting violators here.
+            if o.role in sloping_roles:
+                continue
+            ocoords = list(o.polygon.exterior.coords)
+            if ocoords and ocoords[0] == ocoords[-1]:
+                ocoords = ocoords[:-1]
+            for px, py in ocoords:
+                if any(math.hypot(px - cx, py - cy) <= CORNER_GUARD_M
+                       for cx, cy in coords):
+                    continue
+                for (ax, ay), (bx, by) in flat_edges:
+                    dx = bx - ax
+                    dy = by - ay
+                    L2 = dx * dx + dy * dy
+                    if L2 <= 0:
+                        continue
+                    t = ((px - ax) * dx + (py - ay) * dy) / L2
+                    if t <= 0.001 or t >= 0.999:
+                        continue
+                    proj_x = ax + t * dx
+                    proj_y = ay + t * dy
+                    d = math.hypot(px - proj_x, py - proj_y)
+                    d_a = math.hypot(px - ax, py - ay)
+                    d_b = math.hypot(px - bx, py - by)
+                    if (d <= EDGE_PROX_M
+                            and d_a > CORNER_GUARD_M
+                            and d_b > CORNER_GUARD_M):
+                        violations.append(
+                            (s.role, s.ref or "?", o.role,
+                             o.ref or "?", t, d))
+                        break
+
+    if violations:
+        def _fmt(v):
+            return (f"{v[2]}({v[3]}) vertex on {v[0]}({v[1]}) "
+                    f"flat edge t={v[4]:.3f} d={v[5]:.2f}m")
+        summary = "; ".join(_fmt(v) for v in violations[:8])
+        msg = (f"{icao}: {len(violations)} sloping-rect flat-edge "
+               f"invariant violation(s).  Sloping rects must share "
+               f"flat (cross) edges 1:1 — only the 2 corners are "
+               f"legal shared vertices.  First "
+               f"{min(8, len(violations))}: {summary}.")
+        assert False, msg
+
+
 @pytest.mark.parametrize("icao", airports_under_test() or [
     pytest.param("(no airports)", marks=pytest.mark.skip(
         reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
