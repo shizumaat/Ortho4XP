@@ -494,10 +494,10 @@ def _triangulate_junctions(
                 continue
         if len(ring) < 3:
             continue
-        ring = _drop_colinear_boundary_vertices(
-            ring, corner_elev, shared_junction_buckets)
-        if len(ring) < 3:
-            continue
+        # Colinear-vertex pruning disabled (user 2026-05-05): the
+        # geometry-baseline pav_union no longer produces near-colinear
+        # ear-clip slivers that this pass was added to mop up.  Keep
+        # apt.dat curve detail intact.
         ring = _drop_spike_vertices(ring)
         if len(ring) < 3:
             continue
@@ -644,37 +644,10 @@ def _triangulate_junctions(
     # passed through the existing densify + FLAT/PLANAR/COMPOUND
     # classifier.
     for (shape, ring, vert_elev) in iter_results:
-        # Densify long boundary edges (user 2026-04-25): for any
-        # ring segment longer than MAX_BOUNDARY_EDGE_M, insert
-        # interpolated midpoints.  Each midpoint's elevation is
-        # the linear interpolation between the edge's endpoints,
-        # so the rendered surface along the edge is unchanged ON
-        # THE EDGE — adjacent shapes that share this edge (rect
-        # boundaries) interpolate to the same value at the midpoint
-        # so no step is introduced.  The benefit is INTERIOR
-        # triangulation: Triangle4XP's quality refinement can
-        # connect interior Steiners to the new closer boundary
-        # vertices, producing smaller triangles and gentler
-        # gradients within the polygon (especially helpful for
-        # long cut edges from hole-decomposition).
-        densified_ring, densified_elev = _densify_long_boundary_edges(
-            ring, vert_elev, neighbour_edges,
-            sloping_rect_edges=sloping_rect_edges,
-            runway_edges=runway_edges,
-            terminal_edges=terminal_edges)
-        # Validate: a densification midpoint can occasionally land
-        # on a non-adjacent ring edge (concave polygons with
-        # near-touches), turning a valid polygon into a self-
-        # touching one.  X-Plane crashes on those.  Revert to the
-        # pre-densification ring if the densified polygon fails
-        # validity.
-        if len(densified_ring) > len(ring):
-            try:
-                test_poly = Polygon(densified_ring)
-                if test_poly.is_valid:
-                    ring, vert_elev = densified_ring, densified_elev
-            except Exception:
-                pass
+        # Long-edge densification disabled (user 2026-05-05):
+        # the area-gated re-enable for >50k m² junctions did not
+        # measurably reduce the visible DEM-spike bumps in X-Plane,
+        # so the synthetic midpoints aren't paying for themselves.
 
         # ── Surface-complexity classification ───────────────────
         # User 2026-04-25: only triangulate where the surface has

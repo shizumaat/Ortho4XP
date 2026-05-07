@@ -87,7 +87,7 @@ AXIS_ALIGN_TOL_DEG = 2.0
 # straight runs and produces visible cliffs.  Shared between the
 # junction-decomposition pass (densification) and the elevation
 # layer (vertex-aware grade clamp).
-MAX_BOUNDARY_EDGE_M = 30.0
+MAX_BOUNDARY_EDGE_M = 50.0
 
 
 # Drop emitted line/segment fragments shorter than this length.

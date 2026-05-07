@@ -702,12 +702,17 @@ def _densify_long_boundary_edges(
             if _point_on_neighbour(mx, my):
                 continue
             # Per Rule 2 (user 2026-05-01) + 1:1-corner-sharing rule
-            # (user 2026-05-04): no junction midpoint within
-            # ``SLOPING_EDGE_SNAP_M`` of any edge of a sloping rect
-            # (both sloping and cross edges) — junctions share
-            # corners only.
+            # (user 2026-05-04): no junction midpoint near a sloping
+            # rect edge — junctions share corners only.  Tightened
+            # from SLOPING_EDGE_SNAP_M (20 m) to 10 m on 2026-05-05
+            # so densification can place ring anchors on long edges
+            # that pass within the 10–20 m corridor of an adjacent
+            # F-taxi rect (otherwise large junctions retain unanchored
+            # 200 m+ stretches that let DEM spikes through).
+            DENSIFY_SLOPING_RECT_TOL_M = 10.0
             if sloping_rect_edges and _point_within_of_edge(
-                    mx, my, sloping_rect_edges, SLOPING_EDGE_SNAP_M):
+                    mx, my, sloping_rect_edges,
+                    DENSIFY_SLOPING_RECT_TOL_M):
                 continue
             # Per Rule 1 (user 2026-05-01): no junction vertex within
             # ``RUNWAY_BOUNDARY_TOL_M`` of a runway boundary edge.
@@ -728,16 +733,15 @@ def _densify_long_boundary_edges(
     return new_ring, new_elev
 
 
-COLINEAR_DROP_M = 3.0  # max perpendicular distance to neighbours
+COLINEAR_DROP_M = 0.5  # max perpendicular distance to neighbours
                         # for a non-anchor vertex to be removed.
-                        # Bumped from 0.5 m → 3.0 m (user 2026-04-25)
-                        # to thin apt.dat boundary curves more
-                        # aggressively — eliminates most ear-clip
-                        # sliver triangles whose 3 anchored vertices
-                        # are nearly colinear.  Preserves rect /
-                        # runway / terminal corners (sharp 90° turns
-                        # are well above this threshold by definition)
-                        # and any vertex shared between junctions.
+                        # Originally 0.5 m; bumped to 3.0 m on
+                        # 2026-04-25 to thin apt.dat curves; reverted
+                        # to 0.5 m on 2026-05-05 once the geometry
+                        # baseline produced precise pavement curves
+                        # the user wants preserved.  Still strips
+                        # near-duplicate vertices (sub-metre noise)
+                        # without flattening genuine curve detail.
 
 
                              # ring vertex to a non-adjacent edge
@@ -1100,7 +1104,6 @@ def _build_junction_constructive(
     terminal_union,
     max_corner_dist_m: float = 80.0,
     local_disc_radius_m: float = 120.0,
-    max_arc_vertices: int = 4,
 ) -> Optional[Polygon]:
     """Constructive junction-polygon build per the user's
     authoritative shape rule
@@ -1249,12 +1252,6 @@ def _build_junction_constructive(
         else:
             arc_verts = [v for (vp, v) in ext_vert_params
                          if cur_param < vp < nxt_param]
-        # Per user rule (2026-04-18): "use a maximum of 4 points
-        # between each" rect corner pair.  Sub-sample evenly.
-        if len(arc_verts) > max_arc_vertices:
-            step = len(arc_verts) / max_arc_vertices
-            arc_verts = [arc_verts[int(k * step)]
-                         for k in range(max_arc_vertices)]
         for v in arc_verts:
             poly_coords.append(v)
 

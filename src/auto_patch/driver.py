@@ -269,6 +269,10 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
             #     reused by Phase-2 elevation + boundary emit so
             #     auto_patch reads the SAME smoothed DEM that
             #     drives flattening, instead of loading its own.
+            #     User 2026-05-07: tested raw-DEM switch; reverted
+            #     because it didn't fix the SPJC apron rough spot
+            #     and risked re-introducing terrain artefacts the
+            #     smoothing was added to remove.
             #   * ``dico_apt_entry['boundary']`` — currently
             #     reserved (parameter slot only); auto_patch's
             #     boundary emit still derives its outline from

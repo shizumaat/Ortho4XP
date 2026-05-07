@@ -1,3 +1,272 @@
+# Auto-Patch Status — PHASE-2 RE-ENABLED + ELEVATION POLISH 2026-05-07
+
+## TL;DR
+
+Phase-2 is **re-enabled and validated** on top of the
+``geometry-baseline`` tag from 2026-05-05.  Runway segmentation,
+elevation solver, junction widening, slope alignment, and runway
+1:1 sharing all run end-to-end.  Several over-aggressive
+simplification passes were disabled / removed.  ``compare-target``
+now passes for the first time this branch.
+
+One known visual issue **remains unresolved** on SPJC: a 100k m²
+junction polygon over the eastern apron sits over an unfiltered
+DEM spike (~9 m above ring elevations, 85k m² footprint), producing
+"sharp hills and drops" in X-Plane.  Multiple subdivide approaches
+were prototyped during this session (4-way runway-aligned split,
+DEM-aware 3-way slice with flat ends + sloping rect middle, raw-DEM
+override) — all left in-tree, but **none successfully eliminated
+the bumps when tested in X-Plane**.  Spike-slice machinery is
+disabled at the call site; the function is preserved in
+``junction_repair.py`` for follow-up.  Everything else looks good
+in JOSM and in flight.
+
+**Branch:** ``dev``.  **Tag baseline:** ``geometry-baseline``
+(commit ``a686e5e``).
+
+**Build artifact:** [/tmp/SPJC_phase2_v17.osm](file:///tmp/SPJC_phase2_v17.osm)
+— SPJC with ``compute_elevations=True``, 276 ways, 41 junctions,
+phase-2 elevations applied.
+
+## Final SPJC numbers (this session)
+
+```
+junctions emitted     : 41   (5 sliver triangles dropped at to_osm)
+rects (taxi)          : 50
+terminals             : 2
+runway segments       : 80   (segmented chain via finalize.run_phase2)
+retaining_wall        : 66
+tunnel_ramp           : 36
+total OSM ways        : 276
+rect corners on pav   : 200 / 200  (worst d = 0.000 m)
+within-shape grade    : 0 WARN
+per-surface solver    : 217 iters / ~7 s
+compare-target test   : PASS  (was failing F-stub residual all session)
+```
+
+## Changes this session
+
+### 1. Phase-2 re-enabled end-to-end
+Verified that ``pipeline.py`` builds correctly with
+``compute_elevations=True`` against the geometry baseline.  Order
+of operations restored:
+``run_phase2`` → ``_align_rect_slope_to_axis`` →
+``_snap_to_sloping_edge_corners`` → ``_enforce_runway_1to1_sharing``
+→ ``widen_junctions_to_runway_corners`` → ``per_surface_solve`` →
+``stitch_pavement_to_terminals`` → ``_report_within_shape_violations``.
+All passes converge cleanly.
+
+### 2. Removed apt.dat-arc 4-vertex cap
+[pavement/junctions.py:1252](src/auto_patch/pavement/junctions.py:1252)
+— ``_build_junction_constructive`` no longer subsamples apt.dat
+boundary vertices between rect-corner pairs to 4.  Sharp curves
+now preserve every apt.dat boundary vertex.  ``max_arc_vertices``
+parameter removed from the function signature.
+
+### 3. Disabled long-edge densification
+[triangulation.py:660](src/auto_patch/triangulation.py:660) — the
+``_densify_long_boundary_edges`` call inside the per-junction
+post-elevation cleanup is **disabled**.  The geometry-baseline
+boundary trace is precise enough that synthetic midpoints just
+add free vertices the per-surface solver pushes around.  An
+area-gated experimental re-enable for >50k m² polygons was tried
+mid-session and reverted (didn't measurably reduce the SPJC bumps).
+
+### 4. Disabled colinear-vertex pruning
+[triangulation.py:497](src/auto_patch/triangulation.py:497) — the
+``_drop_colinear_boundary_vertices`` call is **disabled**.  At its
+prior 3 m perpendicular threshold it was flattening real apt.dat
+curves; the geometry-baseline pav_union no longer produces the
+ear-clip slivers this pass was added to mop up.  Total junction
+vertex count fell from 1075 (with both passes on) to 916 (with
+both off), with sharp curves preserved exactly.
+
+### 5. Spike subdivide infrastructure (DISABLED)
+A full DEM-aware subdivide pass was developed in
+[junction_repair.py:_subdivide_dem_spike_junctions](src/auto_patch/junction_repair.py:675).
+For each junction whose footprint contains DEM samples >5 m above
+its ring max (≥5% of in-polygon samples), the function:
+* Computes the elevation gradient direction from ring vertices
+  (min-alt → max-alt).
+* Cuts perpendicular to the gradient at 25% / 75% positions along
+  the axis.
+* Builds a 4-corner ``primary_parallel`` rect for the middle 50%
+  (clipped to the original polygon for non-convex cases via
+  longest-chord-per-cut).
+* Pins the LOW and HIGH flat-end altitudes to neighbour-shape
+  pin altitudes (rect / runway / terminal corners shared with
+  the end region) — falls back to mean of end-region vertex
+  elevations when no pins exist.
+* Emits LOW and HIGH ends as ``role=junction`` with single
+  ``altitude=`` tag, MIDDLE as ``role=primary_parallel`` with
+  ``altitude_high`` / ``altitude_low`` matching the flats.
+
+The function works correctly when called.  But the slice CALL is
+**disabled** at [pipeline.py:1897](src/auto_patch/pipeline.py:1897)
+because the resulting OSM, when rendered in X-Plane, did not
+visibly improve the rough-spot bumps the user is trying to fix.
+Earlier 4-way runway-aligned variant of the same function was
+also tested and replaced — both implementations are visible in
+git history (commits before the disable comment).
+
+### 6. Grade-based subdivide re-enabled with lower threshold
+[junction_repair.py:349](src/auto_patch/junction_repair.py:349) —
+``SUBDIVIDE_VIOLATION_GRADE`` lowered from 10% → **2%** so the
+existing ``_subdivide_violating_junctions`` pass can fire on the
+1.5–3% violations the per-surface solver leaves on long polygons.
+Wired into the per-surface path at
+[pipeline.py:1908](src/auto_patch/pipeline.py:1908) (the legacy
+unified-solver call site only).  Currently fires zero times on
+SPJC because the per-surface solver eliminates ring-pair
+violations on its own.
+
+### 7. DEM source — kept as Ortho4XP smoothed
+``driver.py`` continues to forward Ortho4XP's
+``smooth_raster_over_airports``-processed ``tile.dem`` into
+``build_airport_pavement``.  A raw-DEM override was tested on
+2026-05-07 and reverted — didn't fix the rough spot and risked
+re-introducing terrain artefacts the smoothing was added to remove.
+
+## Investigation notes for the unresolved SPJC apron bumps
+
+The polygon in question is the eastern apron at SPJC, ~100k m²,
+ring altitudes 32.4–34.6 m.  Sampled DEM under its footprint:
+* p99 = 44.16 m
+* max = 44.86 m
+* 14.9% of samples >5 m above the ring max.
+* Spike footprint ~85k m², 278 m × 308 m, centred at
+  ``(-77.1045, -12.0335)``.
+* This is almost certainly an unfiltered building (hangar /
+  terminal) Ortho4XP's airport smoothing didn't fully flatten
+  for this specific airport.
+
+The polygon's perimeter is grade-compliant (max all-pairs ring
+grade = 1.57%, 1 marginal pair at ~25 m).  Bumps come from
+**Triangle4XP's interior Steiner vertices** which are seeded from
+the DEM at .dsf-assembly time and aren't visible to auto_patch's
+ring-only checks.
+
+Approaches that DIDN'T work in X-Plane testing:
+* **DEM-spike 4-way runway-aligned cut** — produced visually
+  similar bumps; sub-polygons still large enough for Steiners.
+* **DEM-spike 3-way gradient slice** (flat ends + sloping rect
+  middle, with pin-aware altitudes) — produced clean OSM, but
+  didn't change the rendered bumps.
+* **Raw DEM override** — bumps unchanged or worse; smoothing
+  was apparently doing useful work elsewhere.
+* **Re-enabling densification only for big polygons** — added
+  more ring anchors but didn't tighten the per-axis Steiner
+  constraint enough.
+
+Other findings worth carrying forward:
+* The polygon is functionally an **apron** (large parking area)
+  but the auto_patch classifier tags it as **junction** (residue
+  catch-all role).  Apron tagging would apply the tighter 1.0%
+  cap and apron-flatness anchors and likely solve the bump
+  problem on its own.  Worth investigating
+  ``pavement/classifier.py`` for why this polygon falls through
+  to junction.
+* Manual user fix to apt.dat (split overlapping aprons) on
+  2026-05-06 fixed a related rough spot but not this one.
+* The user's working theory is that earlier builds rendered this
+  area correctly.  No git change directly explains the
+  regression.  The smoothed-vs-raw DEM toggle made no visible
+  difference here.
+
+## What's NOT in this baseline (intentionally)
+
+* DEM-spike subdivide function (disabled at the call site).
+* Long-edge densification for big junctions.
+* Colinear-vertex pruning (3 m threshold was too aggressive).
+* Raw-DEM source for elevations (kept the smoothed Ortho4XP
+  ``tile.dem`` after the test was inconclusive).
+
+## Next agent — task spec
+
+**Goal:** eliminate the SPJC eastern-apron rough spot in X-Plane
+without regressing other airports.
+
+**Starting point:** this commit on ``dev``.  Build artifact:
+[/tmp/SPJC_phase2_v17.osm](file:///tmp/SPJC_phase2_v17.osm).
+
+**Hypotheses worth chasing (in priority order):**
+
+1. **Reclassify the polygon as apron, not junction.**  Check
+   ``pavement/classifier.py`` and the apron extraction in
+   ``terminals.py`` to understand why this 100k m² apron-like
+   polygon falls through to junction.  The unified Jacobi solver
+   applies APRON_MAX_GRADE (1.0%) and an apron-flatness anchor
+   for true apron polygons — both would fight the spike harder
+   than the current taxi-grade-cap (1.5%) treatment.
+
+2. **Triangle4XP Steiner constraint.**  The auto_patch builder
+   doesn't directly control Steiner placement; X-Plane / mesh
+   builder inserts them based on its own quality refinement.
+   But auto_patch CAN influence outcomes by choosing polygon
+   tags carefully.  ``primary_parallel`` rects with altitude_high
+   / altitude_low are linearly interpolated between the two
+   short ends — Steiners on those polygons get the linear
+   interpolation, NOT the DEM.  If we could tag this polygon as
+   ``primary_parallel`` (or build several smaller ones) with
+   appropriate slope axes, the rendered surface would be slope-
+   compliant by construction.  The DEM-spike slice prototyped
+   this idea but didn't visibly help — possibly because of how
+   X-Plane handles non-rectangular ``primary_parallel`` polygons.
+
+3. **DEM-spike override at .dsf time.**  Investigate whether
+   Ortho4XP / Triangle4XP can be told to use auto_patch's
+   ring-derived altitudes for Steiners INSIDE patched polygons
+   (instead of the raw DEM).  This would be the architecturally
+   correct fix — the patch should fully describe the surface,
+   not just its boundary.
+
+4. **Per-airport ``smoothing_pix`` tuning.**  SPJC's
+   ``dico_airports['SPJC']['smoothing_pix']`` value (or
+   ``tile.apt_smoothing_pix`` global) may need a larger kernel
+   for this airport so ``smooth_raster_over_airports`` actually
+   flattens the building under the apron.
+
+**Re-enable instructions for the disabled spike machinery:**
+
+```python
+# In pipeline.py around line 1897, replace the disable stub with:
+spike_dem = _load_airport_dem(layout.anchor[0], layout.anchor[1])
+n_dem_spike = _subdivide_dem_spike_junctions(
+    layout, spike_dem, tile_lat, tile_lon,
+    runway_axis_deg=runway_axis_deg)
+```
+
+**Build / verify commands:**
+
+```bash
+/Users/noah/Ortho4XP-shred86/venv/bin/python -c "
+import os, sys
+sys.path.insert(0, '/Users/noah/Ortho4XP-shred86/src')
+from auto_patch.pipeline import build_airport_pavement
+layout = build_airport_pavement('SPJC',
+    os.environ.get('XPLANE_ROOT', '/Users/noah/X-Plane 12'),
+    compute_elevations=True)
+layout.to_osm('/tmp/SPJC_phase2.osm')
+print(f'shapes={len(layout.shapes)}')
+"
+
+/Users/noah/Ortho4XP-shred86/venv/bin/python -m pytest \
+    tests/test_compare_target.py -x
+
+/Users/noah/Ortho4XP-shred86/venv/bin/python /tmp/diag_corners_summary.py
+```
+
+**Reference artifacts:**
+
+* [/tmp/SPJC_phase2_v17.osm](file:///tmp/SPJC_phase2_v17.osm) —
+  current build (slice disabled).
+* [/tmp/SPJC_phase2_v15.osm](file:///tmp/SPJC_phase2_v15.osm) —
+  build with the 3-way gradient slice enabled (for comparison).
+* ``Patches/-20-080/-13-078/SPJC_auto.patch.osm`` — Ortho4XP
+  runtime output.
+
+---
+
 # Auto-Patch Status — GEOMETRY BASELINE 2026-05-05
 
 ## TL;DR

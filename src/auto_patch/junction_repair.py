@@ -52,6 +52,9 @@ from .layout import (
 
 
 __all__ = [
+    "DEM_SPIKE_FRACTION_MIN",
+    "DEM_SPIKE_GRID_N",
+    "DEM_SPIKE_HEIGHT_M",
     "SUBDIVIDE_MAX_PAIR_DIST_M",
     "SUBDIVIDE_MIN_AREA_M2",
     "SUBDIVIDE_SNAP_RADIUS_M",
@@ -59,6 +62,7 @@ __all__ = [
     "_build_clamp_geom_state",
     "_clamp_junction_free_vertices",
     "_merge_sliver_junctions_into_neighbours",
+    "_subdivide_dem_spike_junctions",
     "_subdivide_violating_junctions",
 ]
 
@@ -346,13 +350,17 @@ def _clamp_junction_free_vertices(
     return n_changed
 
 
-SUBDIVIDE_VIOLATION_GRADE = 0.10   # 10 % — only attempt
-                                    # subdivision when the worst
-                                    # vertex pair exceeds this.
-                                    # Below 10 % the rendered cliff
-                                    # is small (< 1.5 m over 15 m)
-                                    # and not worth the polygon-
-                                    # split overhead.
+SUBDIVIDE_VIOLATION_GRADE = 0.02   # 2 % — attempt subdivision
+                                    # whenever the worst within-
+                                    # shape pair exceeds the taxi
+                                    # grade cap.  Lowered from 10 %
+                                    # on 2026-05-05: the per-surface
+                                    # solver leaves residual 1.5–3 %
+                                    # violations on very large
+                                    # junctions sitting over DEM
+                                    # spikes; cutting them lets
+                                    # each sub-polygon converge to
+                                    # its own DEM-floor.
 SUBDIVIDE_MAX_PAIR_DIST_M = 60.0   # only consider pairs within
                                     # this radius — same as
                                     # check_grade's
@@ -648,6 +656,436 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
                 closed = list(sub_elevs) + [sub_elevs[0]]
                 sub_shape.node_altitudes = closed
             new_shapes.append(sub_shape)
+        n_subdivided += 1
+    layout.shapes = new_shapes
+    return n_subdivided
+
+
+DEM_SPIKE_HEIGHT_M = 5.0       # only flag junctions whose footprint
+                                # contains DEM samples this many
+                                # metres above the ring max.
+DEM_SPIKE_FRACTION_MIN = 0.05  # at least 5 % of in-polygon samples
+                                # must exceed the threshold to
+                                # justify a cut.
+DEM_SPIKE_GRID_N = 30          # grid resolution per axis for DEM
+                                # sampling (≤ 900 candidate samples
+                                # per polygon).
+
+
+def _subdivide_dem_spike_junctions(
+        layout: "PavementLayout",
+        dem,
+        tile_lat: int,
+        tile_lon: int,
+        runway_axis_deg: Optional[float] = None,
+        ) -> int:
+    """Cut junction polygons whose footprint contains a DEM spike
+    significantly above the polygon's own ring elevations.
+
+    Triangle4XP inserts interior Steiner vertices for mesh-quality
+    refinement; each Steiner is seeded from the DEM at its location.
+    When a junction is large and its ring vertices don't reach a
+    high-DEM region inside the polygon, Steiners over the spike
+    inherit raw DEM values that the per-surface solver can only
+    constrain via the grade cap from distant ring anchors —
+    leaving visible bumps in the rendered surface.
+
+    Strategy (user 2026-05-06, supersedes the runway-aligned 4-way
+    split): when a polygon's footprint exceeds the spike threshold,
+    cut it into THREE strips along the polygon's own elevation
+    gradient (low → high direction inferred from ``node_altitudes``):
+
+      * LOW end (≈25 % of the gradient extent) — flattened to a
+        single ``altitude`` matching the rect/terminal/runway pin
+        on its boundary (or the mean of its end-region vertex
+        elevations when no pin is present).
+      * HIGH end (≈25 %) — same treatment with its own pin / mean.
+      * MIDDLE (≈50 %) — replaced by a clean 4-corner parallelogram
+        ``primary_parallel`` rect whose short ends sit along the
+        two cut lines; ``altitude_high`` / ``altitude_low`` come
+        from the two flat ends so the rect joins them 1:1.  The
+        rect is intersected with the original polygon to keep its
+        footprint inside legitimate pavement; concave-side strips
+        between the rect's straight long sides and the original
+        boundary may be orphaned.
+
+    Pin priority: when an end region's boundary contains a vertex
+    shared with a non-junction shape (rect / terminal / runway),
+    that shape's altitude at the shared vertex is used as the flat
+    altitude — guarantees continuity at the connection regardless
+    of what the per-surface solver settled the junction at.
+
+    Returns the number of polygons subdivided.
+
+    ``runway_axis_deg`` is unused with the gradient-based slice but
+    kept for caller signature stability.
+    """
+    if not layout.shapes or dem is None:
+        return 0
+    from .elevation import _sample_dem, _corner_elevation_bucket
+    from shapely.ops import split as _shapely_split
+
+    # ── Pin map ─────────────────────────────────────────────────
+    # Bucket → list of (alt) from every NON-junction shape (rects,
+    # terminals, runways).  Used to detect end-region vertices that
+    # are shared with a neighbour polygon — the neighbour's altitude
+    # at that vertex is the flat altitude we must adopt to preserve
+    # 1:1 continuity at the connection.
+    pin_map: Dict[Tuple[int, int], List[float]] = {}
+    for ps in layout.shapes:
+        if ps.role == ROLE_JUNCTION:
+            continue
+        try:
+            pring = list(ps.polygon.exterior.coords)
+        except Exception:
+            continue
+        if pring and pring[0] == pring[-1]:
+            pring = pring[:-1]
+        if len(pring) < 3:
+            continue
+        if ps.altitude is not None:
+            palts = [float(ps.altitude)] * len(pring)
+        elif ps.node_altitudes is not None:
+            palts = list(ps.node_altitudes)
+            if len(palts) == len(pring) + 1:
+                palts = palts[:-1]
+            if len(palts) != len(pring):
+                continue
+            palts = [float(e) for e in palts]
+        elif (ps.altitude_high is not None
+                and ps.altitude_low is not None
+                and len(pring) == 4):
+            # Sloping rect: project corners onto source_axis to
+            # decide which pair is HIGH and which is LOW.  Without
+            # source_axis fall back to legacy [0,3]/[1,2] pairing.
+            ah = float(ps.altitude_high)
+            al = float(ps.altitude_low)
+            sx_pair = (0, 3)
+            ex_pair = (1, 2)
+            if ps.source_axis is not None:
+                try:
+                    from .pavement.junctions import _short_end_pairs_by_axis
+                    sp_, ep_ = _short_end_pairs_by_axis(
+                        pring, ps.source_axis)
+                    if sp_ is not None and ep_ is not None:
+                        sx_pair, ex_pair = sp_, ep_
+                except Exception:
+                    pass
+            # Decide which pair is HIGH (greater altitude).  Pick
+            # whichever pair's ring positions yield the larger
+            # source-axis projection — but since we don't have
+            # easy access to that here, just use legacy convention:
+            # corners 0,3 → HIGH, 1,2 → LOW.  ah/al are already
+            # ordered so this is correct.
+            palts = [0.0] * 4
+            palts[sx_pair[0]] = ah
+            palts[sx_pair[1]] = ah
+            palts[ex_pair[0]] = al
+            palts[ex_pair[1]] = al
+        else:
+            continue
+        for vi, (x, y) in enumerate(pring):
+            if vi >= len(palts):
+                break
+            b = _corner_elevation_bucket(x, y)
+            pin_map.setdefault(b, []).append(palts[vi])
+
+    new_shapes: List[BuiltShape] = []
+    n_subdivided = 0
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            new_shapes.append(s)
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            new_shapes.append(s)
+            continue
+        try:
+            ring = list(s.polygon.exterior.coords)
+        except Exception:
+            new_shapes.append(s)
+            continue
+        if ring and ring[0] == ring[-1]:
+            ring = ring[:-1]
+        n = len(ring)
+        if n < 4:
+            new_shapes.append(s)
+            continue
+        if s.altitude is not None:
+            elevs = [float(s.altitude)] * n
+        elif s.node_altitudes is not None:
+            na = list(s.node_altitudes)
+            if len(na) == n + 1:
+                na = na[:-1]
+            if len(na) != n:
+                new_shapes.append(s)
+                continue
+            elevs = [float(e) for e in na]
+        else:
+            new_shapes.append(s)
+            continue
+        ring_max = max(elevs)
+        spike_threshold = ring_max + DEM_SPIKE_HEIGHT_M
+
+        # Grid-sample the DEM over the polygon footprint.
+        minx, miny, maxx, maxy = s.polygon.bounds
+        spike_xs: List[float] = []
+        spike_ys: List[float] = []
+        n_samples = 0
+        n_spike = 0
+        for gi in range(DEM_SPIKE_GRID_N):
+            for gj in range(DEM_SPIKE_GRID_N):
+                sx = minx + (maxx - minx) * (gi + 0.5) / DEM_SPIKE_GRID_N
+                sy = miny + (maxy - miny) * (gj + 0.5) / DEM_SPIKE_GRID_N
+                if not s.polygon.contains(Point(sx, sy)):
+                    continue
+                n_samples += 1
+                lat, lon = layout.m_to_ll(sx, sy)
+                z = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
+                if z is not None and z > spike_threshold:
+                    n_spike += 1
+                    spike_xs.append(sx)
+                    spike_ys.append(sy)
+        if n_samples == 0:
+            new_shapes.append(s)
+            continue
+        if n_spike / n_samples < DEM_SPIKE_FRACTION_MIN:
+            new_shapes.append(s)
+            continue
+
+        # ── Gradient direction ──────────────────────────────────
+        # Vector from the lowest-elevation ring vertex to the
+        # highest.  Skip if the polygon is essentially level (no
+        # meaningful gradient → the slice has no axis to align to).
+        if max(elevs) - min(elevs) < 1.0:
+            new_shapes.append(s)
+            continue
+        i_low = min(range(n), key=lambda k: elevs[k])
+        i_high = max(range(n), key=lambda k: elevs[k])
+        gx0 = ring[i_high][0] - ring[i_low][0]
+        gy0 = ring[i_high][1] - ring[i_low][1]
+        glen = math.hypot(gx0, gy0)
+        if glen < 1.0:
+            new_shapes.append(s)
+            continue
+        gx = gx0 / glen
+        gy = gy0 / glen
+        # Perpendicular unit (rotate +90°).
+        px = -gy
+        py = gx
+
+        # Project every ring vertex onto the gradient axis through
+        # the polygon centroid.
+        cx, cy = s.polygon.centroid.x, s.polygon.centroid.y
+        projections = [(rx - cx) * gx + (ry - cy) * gy
+                       for (rx, ry) in ring]
+        proj_min = min(projections)
+        proj_max = max(projections)
+        proj_range = proj_max - proj_min
+        if proj_range < 10.0:
+            new_shapes.append(s)
+            continue
+        cut_low_proj = proj_min + 0.25 * proj_range
+        cut_high_proj = proj_min + 0.75 * proj_range
+
+        # Build the two cut lines, perpendicular to gradient at
+        # the 25 % and 75 % positions.
+        bbox_diag = math.hypot(maxx - minx, maxy - miny)
+        L = max(bbox_diag * 2.0, 1000.0)
+        cut_low_centre = (cx + cut_low_proj * gx,
+                          cy + cut_low_proj * gy)
+        cut_high_centre = (cx + cut_high_proj * gx,
+                           cy + cut_high_proj * gy)
+        cut_low_line = LineString([
+            (cut_low_centre[0] - L * px, cut_low_centre[1] - L * py),
+            (cut_low_centre[0] + L * px, cut_low_centre[1] + L * py),
+        ])
+        cut_high_line = LineString([
+            (cut_high_centre[0] - L * px, cut_high_centre[1] - L * py),
+            (cut_high_centre[0] + L * px, cut_high_centre[1] + L * py),
+        ])
+
+        # Find each cut line's chord through the polygon.  For a
+        # convex polygon the line ∩ polygon is a single segment
+        # whose two endpoints sit on the boundary.  For non-convex
+        # polygons the intersection can be a MultiLineString — in
+        # that case we take the LONGEST in-polygon segment and use
+        # ITS two endpoints, which gives the dominant cross-section
+        # chord at that gradient position.  Side wedges between
+        # other small in-polygon segments and the chord become the
+        # orphan strips noted in the docstring.
+        def _cut_chord(line):
+            try:
+                inter = s.polygon.intersection(line)
+            except Exception:
+                return None
+            if inter.is_empty:
+                return None
+            segments: List[LineString] = []
+            if inter.geom_type == "LineString":
+                segments = [inter]
+            elif inter.geom_type == "MultiLineString":
+                segments = [g for g in inter.geoms]
+            elif inter.geom_type == "GeometryCollection":
+                segments = [g for g in inter.geoms
+                            if g.geom_type == "LineString"]
+            else:
+                return None
+            if not segments:
+                return None
+            segments.sort(key=lambda ls: -ls.length)
+            coords = list(segments[0].coords)
+            if len(coords) < 2:
+                return None
+            return [coords[0], coords[-1]]
+
+        low_hits = _cut_chord(cut_low_line)
+        high_hits = _cut_chord(cut_high_line)
+        if low_hits is None or high_hits is None:
+            new_shapes.append(s)
+            continue
+
+        # Order the 4 corners by perpendicular projection so the
+        # rect ring goes HIGH-perp-min → LOW-perp-min → LOW-perp-max
+        # → HIGH-perp-max (matches the [0,3]=HIGH / [1,2]=LOW
+        # legacy convention used by the elevation pass).
+        def _perp_proj(pt):
+            return (pt[0] - cx) * px + (pt[1] - cy) * py
+        low_hits.sort(key=_perp_proj)
+        high_hits.sort(key=_perp_proj)
+        rect_corners = [
+            high_hits[0],   # HIGH side, perp-min  → corner 0
+            low_hits[0],    # LOW  side, perp-min  → corner 1
+            low_hits[1],    # LOW  side, perp-max  → corner 2
+            high_hits[1],   # HIGH side, perp-max  → corner 3
+        ]
+        try:
+            mid_rect_poly = Polygon(rect_corners)
+            if not mid_rect_poly.is_valid:
+                mid_rect_poly = mid_rect_poly.buffer(0)
+            # Clip to original polygon — keeps the rect inside
+            # legitimate pavement when the polygon is non-convex
+            # along the perpendicular axis.  Intersection may
+            # return a MultiPolygon; take the largest piece.
+            mid_rect_poly = mid_rect_poly.intersection(s.polygon)
+            if mid_rect_poly.is_empty:
+                new_shapes.append(s)
+                continue
+            if mid_rect_poly.geom_type == "MultiPolygon":
+                mid_rect_poly = max(mid_rect_poly.geoms,
+                                     key=lambda g: g.area)
+            if (mid_rect_poly.geom_type != "Polygon"
+                    or mid_rect_poly.area < SUBDIVIDE_MIN_AREA_M2):
+                new_shapes.append(s)
+                continue
+        except Exception:
+            new_shapes.append(s)
+            continue
+
+        # Build the two flat ends by splitting the original polygon
+        # at each cut line and keeping the side beyond the cut.
+        def _flat_end(cutter, want_proj_side: str):
+            try:
+                parts = _shapely_split(s.polygon, cutter)
+            except Exception:
+                return None
+            best = None
+            for g in getattr(parts, "geoms", [parts]):
+                if (g is None or g.is_empty
+                        or g.geom_type != "Polygon"
+                        or g.area < SUBDIVIDE_MIN_AREA_M2):
+                    continue
+                centroid_proj = ((g.centroid.x - cx) * gx
+                                 + (g.centroid.y - cy) * gy)
+                if want_proj_side == "low" and centroid_proj < cut_low_proj:
+                    if best is None or g.area > best.area:
+                        best = g
+                elif (want_proj_side == "high"
+                        and centroid_proj > cut_high_proj):
+                    if best is None or g.area > best.area:
+                        best = g
+            return best
+
+        low_flat_poly = _flat_end(cut_low_line, "low")
+        high_flat_poly = _flat_end(cut_high_line, "high")
+        if low_flat_poly is None or high_flat_poly is None:
+            new_shapes.append(s)
+            continue
+
+        # ── Flat altitude resolution ────────────────────────────
+        # For each end region, look up pinned altitudes from the
+        # pin map (vertices shared with rect / terminal / runway
+        # neighbours).  When pins exist we MUST use them (1:1
+        # continuity at the connection); when none exist, fall
+        # back to the mean of the end region's vertex elevations
+        # from the original ring.
+        def _flat_altitude(end_poly, vert_indices):
+            ring_p = list(end_poly.exterior.coords)
+            if ring_p and ring_p[0] == ring_p[-1]:
+                ring_p = ring_p[:-1]
+            pins = []
+            for ex, ey in ring_p:
+                b = _corner_elevation_bucket(ex, ey)
+                if b in pin_map:
+                    pins.extend(pin_map[b])
+            if pins:
+                # Median of pins is robust to occasional inconsistent
+                # neighbours; for a single pin source it just returns
+                # that value.
+                pins_sorted = sorted(pins)
+                med = pins_sorted[len(pins_sorted) // 2]
+                return round(float(med), 1)
+            # No pins: use mean of original ring vertex elevations
+            # within the end region.
+            if not vert_indices:
+                return None
+            return round(
+                sum(elevs[k] for k in vert_indices)
+                / len(vert_indices), 1)
+
+        low_idx = [k for k in range(n) if projections[k] < cut_low_proj]
+        high_idx = [k for k in range(n) if projections[k] >= cut_high_proj]
+        low_alt = _flat_altitude(low_flat_poly, low_idx)
+        high_alt = _flat_altitude(high_flat_poly, high_idx)
+        if low_alt is None or high_alt is None:
+            new_shapes.append(s)
+            continue
+        if abs(high_alt - low_alt) < 0.1:
+            # No real slope after pin resolution — would emit a
+            # degenerate sloping rect; skip the slice entirely.
+            new_shapes.append(s)
+            continue
+        # Make sure altitude_high > altitude_low (the gradient
+        # might point either way once pins are resolved).
+        ah = max(high_alt, low_alt)
+        al = min(high_alt, low_alt)
+
+        # ── Emit the three replacement shapes ───────────────────
+        low_shape = BuiltShape(
+            polygon=low_flat_poly, role=ROLE_JUNCTION, ref=s.ref)
+        low_shape.altitude = low_alt
+        new_shapes.append(low_shape)
+
+        high_shape = BuiltShape(
+            polygon=high_flat_poly, role=ROLE_JUNCTION, ref=s.ref)
+        high_shape.altitude = high_alt
+        new_shapes.append(high_shape)
+
+        # Middle: clean 4-corner rect.  source_axis runs from the
+        # midpoint of the LOW cut to the midpoint of the HIGH cut
+        # (gradient direction).  altitude_high / altitude_low come
+        # from the two flat ends — guarantees 1:1 join at each cut
+        # line because the rect's short-end altitude equals the
+        # adjacent flat end's altitude.
+        mid_axis = LineString([cut_low_centre, cut_high_centre])
+        mid_shape = BuiltShape(
+            polygon=mid_rect_poly,
+            role=ROLE_PRIMARY_PARALLEL,
+            ref=s.ref or "",
+            source_axis=mid_axis)
+        mid_shape.altitude_high = ah
+        mid_shape.altitude_low = al
+        new_shapes.append(mid_shape)
+
         n_subdivided += 1
     layout.shapes = new_shapes
     return n_subdivided
