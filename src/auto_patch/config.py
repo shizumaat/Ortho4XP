@@ -122,19 +122,12 @@ RUNWAY_INSIDE_APRON_FRAC = 0.95
 # the segment area to count as an apron.
 RUNWAY_APRON_AREA_RATIO = 3.0
 
-# Per user 2026-04-30: bridge / tunnel emission disabled while we
-# stabilise the core pavement-geometry pipeline.  Recent KPHX work
-# emitted ``tunnel_ramp`` polygons that overlapped junction /
-# groundside_pavement geometry (130 overlap pairs, 75K m^2 total at
-# KPHX, caught by ``test_no_self_overlap``).
-#
-# TODO(bridges): once core geometry is stable + refactored, revisit
-# the four feature emit calls gated by this flag in
-# build_airport_pavement -- _emit_through_airport_depressed_roads,
+# Bridge / tunnel emission flag.  Gates the four feature emit calls
+# in build_airport_pavement: _emit_through_airport_depressed_roads,
 # _emit_tunnel_portals, _emit_taxi_bridges,
-# _emit_underpass_road_approaches.  Each must carve its footprint
-# out of overlapping airside / groundside pavement before emitting,
-# or test_no_self_overlap will fail again.
+# _emit_underpass_road_approaches.  Each carves its footprint out of
+# overlapping airside / groundside pavement before emitting so
+# ``test_no_self_overlap`` stays green.
 EMIT_BRIDGES_AND_TUNNELS = True
 
 # Combine apt.dat with DSF pavement polygons: when True the

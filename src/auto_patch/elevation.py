@@ -74,7 +74,6 @@ from shapely.ops import linemerge, nearest_points, unary_union
 from . import apt_dat_reader as APR
 
 from .config import (
-    EMIT_BRIDGES_AND_TUNNELS,
     RUNWAY_APRON_AREA_RATIO,
     RUNWAY_INSIDE_APRON_FRAC,
 )
@@ -2268,8 +2267,6 @@ def _orient_rect_for_altitude(shape: "BuiltShape",
 # ──────────────────────────────────────────────────────────────────
 from .pavement.junctions import (
     _decompose_polygon_with_holes,
-    _densify_long_boundary_edges,
-    _drop_colinear_boundary_vertices,
     _drop_sliver_corners,
     _merge_thin_decomposed_pieces,
     _polygon_area,

@@ -13,13 +13,10 @@ Five emitters:
 * ``_emit_through_airport_depressed_roads`` — road segments
   depressed below airport surface where they cut through.
 
-**All five are gated off via ``EMIT_BRIDGES_AND_TUNNELS=False`` in
-``O4_Pavement_Config``** pending a future re-enable pass — they
-emit ``tunnel_ramp`` / ``retaining_wall`` polygons that overlap
-junction / groundside_pavement geometry on the post-refactor
-output (KPHX 75 K m² overlap, caught by ``test_no_self_overlap``).
-The module structure is preserved so re-engaging is a single flag
-flip in Config plus per-emitter overlap-clip work.
+**All five are gated by ``EMIT_BRIDGES_AND_TUNNELS`` in
+``O4_Pavement_Config`` (currently True).**  Each emitter carves
+its footprint out of overlapping airside / groundside pavement
+before emitting so ``test_no_self_overlap`` stays green.
 
 Public API (leading-underscore preserved for backward compatibility
 with internal callers in ``O4_Airport_Pavement_Builder``):

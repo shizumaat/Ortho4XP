@@ -8,15 +8,12 @@ Two responsibilities live in this module:
    ``_rect_end_corners``, ``_build_junction_constructive``,
    ``_build_junction_polys_from_corners``.
 
-2. **Decomposition + densification** — turn a residue Polygon
-   (apt.dat pavement minus rect / runway / terminal coverage) into
-   a set of junction-polygon pieces with hole splicing, sliver
-   removal, long-edge densification, and colinear-vertex pruning:
+2. **Decomposition** — turn a residue Polygon (apt.dat pavement
+   minus rect / runway / terminal coverage) into a set of
+   junction-polygon pieces with hole splicing and sliver removal:
    ``_decompose_polygon_with_holes``, ``_polygon_min_thickness``,
    ``_merge_thin_decomposed_pieces``, ``_splice_holes``,
-   ``_polygon_area``, ``_splice_one_hole``,
-   ``_densify_long_boundary_edges``, ``_drop_sliver_corners``,
-   ``_drop_colinear_boundary_vertices``.
+   ``_polygon_area``, ``_splice_one_hole``, ``_drop_sliver_corners``.
 
 Public API (leading-underscore preserved for backward compatibility
 with internal callers in ``O4_Airport_Pavement_Builder``):
@@ -25,8 +22,6 @@ with internal callers in ``O4_Airport_Pavement_Builder``):
     _build_junction_polys_from_corners
     _build_junctions_from_rect_endpoints
     _decompose_polygon_with_holes
-    _densify_long_boundary_edges
-    _drop_colinear_boundary_vertices
     _drop_sliver_corners
     _find_junction_points
     _merge_thin_decomposed_pieces
@@ -39,51 +34,32 @@ with internal callers in ``O4_Airport_Pavement_Builder``):
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
-from shapely.ops import linemerge, nearest_points, unary_union
+from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import unary_union
 
 from ..config import (
     JUNCTION_CLUSTER_DIST_M,
-    MAX_BOUNDARY_EDGE_M,
     SLIVER_ANGLE_THRESHOLD_DEG,
 )
 from ..layout import (
     BuiltShape,
     PavementLayout,
-    ROLE_APRON,
     ROLE_CROSS_CONNECTOR,
     ROLE_JUNCTION,
     ROLE_PRIMARY_PARALLEL,
     ROLE_RUNWAY,
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
-    ROLE_TERMINAL,
-    SHARED_VERTEX_TOL_M,
 )
 
 
-# Max distance from a junction-ring midpoint to a neighbour-edge
-# below which the midpoint sits on a shared boundary and inherits
-# the neighbour's edge-interpolated elevation.
-SHARED_NEIGHBOUR_EDGE_TOL_M = 5.0
-
-# Max perpendicular distance to neighbours below which a colinear
-# boundary vertex may be dropped without breaking shared-vertex
-# alignment.
-COLINEAR_DROP_M = 3.0
-
-
 __all__ = [
-    "COLINEAR_DROP_M",
-    "SHARED_NEIGHBOUR_EDGE_TOL_M",
     "_build_junction_constructive",
     "_build_junction_polys_from_corners",
     "_build_junctions_from_rect_endpoints",
     "_decompose_polygon_with_holes",
-    "_densify_long_boundary_edges",
-    "_drop_colinear_boundary_vertices",
     "_drop_sliver_corners",
     "_find_junction_points",
     "_merge_thin_decomposed_pieces",
@@ -490,272 +466,6 @@ def _splice_one_hole(ring: List[Tuple[float, float]],
     return spliced
 
 
-# ── Ear-clip triangulation ───────────────────────────────────────
-#
-# Pure-Python ear-clipping for simple polygons (no holes).  Returns
-# index triples (i,j,k) into the input vertex list.  For an N-vertex
-# simple polygon, exactly N-2 triangles are produced — the proven
-# minimum count when no Steiner points are added.
-
-
-                             # boundary segment.  Long segments
-                             # (e.g. cuts from hole-decomposition)
-                             # leave Triangle4XP's quality refinement
-                             # unable to fit small triangles between
-                             # the cut endpoints; interior Steiners
-                             # span the full distance and produce
-                             # steep local gradients.  Densifying
-                             # the boundary with linearly-interpolated
-                             # midpoints gives Triangle4XP closer
-                             # boundary anchors to connect to.
-
-
-SHARED_NEIGHBOUR_EDGE_TOL_M = 5.0  # max distance from a midpoint
-                                    # to a neighbour-shape edge to
-                                    # treat the midpoint as on a
-                                    # shared boundary; matches
-                                    # check_grade's edge-step
-                                    # search radius
-
-
-def _densify_long_boundary_edges(
-    ring: List[Tuple[float, float]],
-    vert_elev: List[float],
-    neighbour_edges: List[Tuple[float, float, float, float,
-                                 float, float]],
-    sloping_rect_edges: Optional[List[Tuple[float, float, float, float]]] = None,
-    runway_edges: Optional[List[Tuple[float, float, float, float]]] = None,
-    terminal_edges: Optional[List[Tuple[float, float, float, float]]] = None,
-) -> Tuple[List[Tuple[float, float]], List[float]]:
-    """Insert interpolated midpoints along long ring segments.
-
-    For each candidate midpoint, check distance to the nearest
-    rect/runway/terminal edge.  If within
-    ``SHARED_NEIGHBOUR_EDGE_TOL_M``, the midpoint sits on a
-    shared boundary; use the NEIGHBOUR'S edge-interpolated
-    elevation (matches whatever the neighbour renders at that
-    point — including segmented-runway piecewise profiles).
-    Otherwise use linear interpolation between the segment's
-    endpoint elevations.
-
-    Per Rule 2 (user 2026-05-01) + user 2026-05-04 follow-up: if
-    ``sloping_rect_edges`` is supplied, skip any midpoint within
-    ``SLOPING_EDGE_SNAP_M`` of ANY edge of a sloping rect (both the
-    sloping edges parallel to source_axis AND the cross edges
-    perpendicular to it).  Junctions must share a sloping rect's
-    boundary 1:1 — only the rect's 4 corners are legal shared
-    vertices.  Without this guard, the densification midpoints
-    appear as intermediate nodes on the cross edge between two
-    corner-coincident vertices, then get pushed ~1 m off the edge
-    by Rule 5's outward-push pass.
-
-    Per Rule 1 (user 2026-05-01): if ``runway_edges`` is supplied,
-    skip any midpoint within ``RUNWAY_BOUNDARY_TOL_M`` of a runway
-    boundary edge — junction vertices on the runway must coincide
-    with runway vertices, not float between them.
-
-    Per user 2026-05-04: if ``terminal_edges`` is supplied, skip any
-    midpoint within ``SHARED_VERTEX_TOL_M`` of a terminal edge.
-    Terminals don't yet have an elevation when triangulation runs,
-    so they're absent from ``neighbour_edges`` and the generic
-    ``_point_on_neighbour`` guard misses them — junctions adjacent
-    to a terminal pad would otherwise grow extra mid-edge vertices
-    that the terminal itself doesn't have, breaking the seamless
-    meld between the two surfaces.
-
-    This guarantees no shared-boundary step is introduced and
-    handles both the simple "junction-on-rect-edge" case (linear
-    interp matches) and the "junction-on-segmented-runway-edge"
-    case (use the runway segment's interp).
-    """
-    from ..config import SLOPING_EDGE_SNAP_M, RUNWAY_BOUNDARY_TOL_M
-    from ..elevation import _corner_elevation_bucket
-    n = len(ring)
-    if n < 3 or len(vert_elev) != n:
-        return ring, vert_elev
-
-    def _interp_at(mx: float, my: float, fallback: float) -> float:
-        """Return neighbour-edge interpolation at (mx, my) if a
-        neighbour edge passes within tolerance; else fallback."""
-        best_d2 = SHARED_NEIGHBOUR_EDGE_TOL_M * SHARED_NEIGHBOUR_EDGE_TOL_M
-        best_e: Optional[float] = None
-        for ax, ay, bx, by, ea, eb in neighbour_edges:
-            dx = bx - ax
-            dy = by - ay
-            seg2 = dx * dx + dy * dy
-            if seg2 < 0.04:
-                continue
-            t = ((mx - ax) * dx + (my - ay) * dy) / seg2
-            if t < 0.0:
-                t = 0.0
-            elif t > 1.0:
-                t = 1.0
-            cx = ax + t * dx
-            cy = ay + t * dy
-            d2 = (mx - cx) * (mx - cx) + (my - cy) * (my - cy)
-            if d2 < best_d2:
-                best_d2 = d2
-                best_e = ea + t * (eb - ea)
-        return best_e if best_e is not None else fallback
-
-    def _point_within_of_edge(mx: float, my: float,
-                              edges: List[Tuple[float, float, float, float]],
-                              tol_m: float) -> bool:
-        """True if (mx, my) lies within ``tol_m`` PERPENDICULAR to
-        any edge in the supplied list, AND its projection falls
-        strictly within the edge segment.  Per user 2026-05-01:
-        vertices reaching toward a rect's cross-edge corner (whose
-        projection lies past the sloping edge's endpoint) are
-        allowed, so we exempt projections at or beyond either
-        endpoint."""
-        tol2 = tol_m * tol_m
-        for ax, ay, bx, by in edges:
-            dx = bx - ax
-            dy = by - ay
-            seg2 = dx * dx + dy * dy
-            if seg2 < 0.04:
-                continue
-            t = ((mx - ax) * dx + (my - ay) * dy) / seg2
-            if t <= 0.0 or t >= 1.0:
-                continue
-            cx = ax + t * dx
-            cy = ay + t * dy
-            d2 = (mx - cx) * (mx - cx) + (my - cy) * (my - cy)
-            if d2 <= tol2:
-                return True
-        return False
-
-    def _point_on_neighbour(mx: float, my: float) -> bool:
-        """True if point (mx, my) lies within SHARED_VERTEX_TOL_M of
-        some neighbour edge's interior.
-
-        A densification midpoint that lands this close to a
-        rect/runway/terminal edge will be snapped onto that edge by
-        X-Plane's vector_map encroachment check, creating a T-
-        junction that breaks the neighbour rect's 4-corner slope
-        rendering.  Skip these midpoints — the junction edge stays
-        un-densified at that point, which is the right call because
-        Triangle4XP doesn't need an interior-anchor near a shared
-        boundary anyway (the neighbour rect's own subdivision
-        provides the anchors).
-        """
-        tol2 = SHARED_VERTEX_TOL_M * SHARED_VERTEX_TOL_M
-        for nax, nay, nbx, nby, _, _ in neighbour_edges:
-            ndx = nbx - nax
-            ndy = nby - nay
-            seg2 = ndx * ndx + ndy * ndy
-            if seg2 < 0.04:
-                continue
-            t = ((mx - nax) * ndx + (my - nay) * ndy) / seg2
-            if t < 0.0 or t > 1.0:
-                continue
-            cx = nax + t * ndx
-            cy = nay + t * ndy
-            d2 = (mx - cx) * (mx - cx) + (my - cy) * (my - cy)
-            if d2 < tol2:
-                return True
-        return False
-
-    # Pre-compute the bucket-key of every existing ring vertex so we
-    # can reject midpoints that would collide with one via
-    # ``to_osm``'s SHARED_VERTEX_TOL_M intern.  A midpoint that
-    # collides would emit the same OSM nid as a non-adjacent ring
-    # vertex, producing a polygon that visits the same node twice
-    # — duplicate-consecutive or self-intersection (figure-8) at
-    # OSM-write time.  Either crashes X-Plane's mesh builder.
-    existing_buckets = {
-        _corner_elevation_bucket(x, y) for (x, y) in ring}
-    new_ring: List[Tuple[float, float]] = []
-    new_elev: List[float] = []
-    for i in range(n):
-        a = ring[i]
-        b = ring[(i + 1) % n]
-        ea = vert_elev[i]
-        eb = vert_elev[(i + 1) % n]
-        new_ring.append(a)
-        new_elev.append(ea)
-        d = math.hypot(b[0] - a[0], b[1] - a[1])
-        if d <= MAX_BOUNDARY_EDGE_M:
-            continue
-        n_subs = int(math.ceil(d / MAX_BOUNDARY_EDGE_M))
-        # Per-arc cap of 4 — at most 3 inserted midpoints per ring
-        # edge.  Without this, the long apt.dat boundary edges that
-        # bound a residue junction (CYXY's -10070 had 200+ m edges)
-        # add 6-8 midpoints each and total junction-vertex count
-        # explodes past Triangle4XP's safe ceiling.  4 anchors per
-        # arc is enough for the elevation solver to fit a smooth
-        # plane; more just adds free vertices that the solver pushes
-        # around until they create cliffs.
-        if n_subs > 4:
-            n_subs = 4
-        for k in range(1, n_subs):
-            t = k / n_subs
-            mx = a[0] + t * (b[0] - a[0])
-            my = a[1] + t * (b[1] - a[1])
-            mb = _corner_elevation_bucket(mx, my)
-            if mb in existing_buckets:
-                continue  # would collide with an existing ring nid
-            # Skip midpoints that would land near a neighbour edge
-            # — X-Plane's vector_map would snap them onto the
-            # neighbour, creating a T-junction that breaks the
-            # neighbour rect's 4-corner slope rendering.
-            if _point_on_neighbour(mx, my):
-                continue
-            # Per Rule 2 (user 2026-05-01) + 1:1-corner-sharing rule
-            # (user 2026-05-04): no junction midpoint near a sloping
-            # rect edge — junctions share corners only.  Tightened
-            # from SLOPING_EDGE_SNAP_M (20 m) to 10 m on 2026-05-05
-            # so densification can place ring anchors on long edges
-            # that pass within the 10–20 m corridor of an adjacent
-            # F-taxi rect (otherwise large junctions retain unanchored
-            # 200 m+ stretches that let DEM spikes through).
-            DENSIFY_SLOPING_RECT_TOL_M = 10.0
-            if sloping_rect_edges and _point_within_of_edge(
-                    mx, my, sloping_rect_edges,
-                    DENSIFY_SLOPING_RECT_TOL_M):
-                continue
-            # Per Rule 1 (user 2026-05-01): no junction vertex within
-            # ``RUNWAY_BOUNDARY_TOL_M`` of a runway boundary edge.
-            if runway_edges and _point_within_of_edge(
-                    mx, my, runway_edges, RUNWAY_BOUNDARY_TOL_M):
-                continue
-            # Per user 2026-05-04: no junction vertex on a terminal
-            # edge interior — terminals lack altitude at triangulation
-            # time and thus don't appear in ``neighbour_edges``.
-            if terminal_edges and _point_within_of_edge(
-                    mx, my, terminal_edges, SHARED_VERTEX_TOL_M):
-                continue
-            linear_me = ea + t * (eb - ea)
-            me = _interp_at(mx, my, linear_me)
-            new_ring.append((mx, my))
-            new_elev.append(me)
-            existing_buckets.add(mb)
-    return new_ring, new_elev
-
-
-COLINEAR_DROP_M = 0.5  # max perpendicular distance to neighbours
-                        # for a non-anchor vertex to be removed.
-                        # Originally 0.5 m; bumped to 3.0 m on
-                        # 2026-04-25 to thin apt.dat curves; reverted
-                        # to 0.5 m on 2026-05-05 once the geometry
-                        # baseline produced precise pavement curves
-                        # the user wants preserved.  Still strips
-                        # near-duplicate vertices (sub-metre noise)
-                        # without flattening genuine curve detail.
-
-
-                             # ring vertex to a non-adjacent edge
-                             # of the same polygon for the vertex
-                             # to count as a "spike" — the ring
-                             # ventured out and returned to (or
-                             # very near) itself.  Sub-mm spikes
-                             # are valid in shapely's eyes but
-                             # become hard self-intersections
-                             # after .11f OSM-format truncation,
-                             # which would crash X-Plane.
-
-
-
 def _drop_sliver_corners(
     ring: List[Tuple[float, float]],
 ) -> List[Tuple[float, float]]:
@@ -804,54 +514,6 @@ def _drop_sliver_corners(
                 # Angle = acos(cos) is below threshold.
                 keep[i] = False
         new_ring = [r for r, k in zip(ring, keep) if k]
-        if len(new_ring) == n:
-            break
-        ring = new_ring
-    return ring
-
-
-def _drop_colinear_boundary_vertices(
-    ring: List[Tuple[float, float]],
-    corner_elev: Dict[Tuple[int, int], float],
-    shared_junction_buckets: set,
-) -> List[Tuple[float, float]]:
-    """Remove vertices whose perpendicular distance to the line
-    through their immediate neighbours is below COLINEAR_DROP_M,
-    EXCEPT vertices that are shared corners (rect/runway/terminal
-    or cross-junction shared buckets) — those carry topological
-    meaning and must not be dropped.
-
-    Eliminates the "ear-clip can only emit a sliver here" geometry
-    that produces visible step artefacts on long thin apron strips.
-    """
-    from ..elevation import _corner_elevation_bucket
-    if len(ring) < 4:
-        return ring
-    # Iterate to fixed point: dropping one vertex may make a
-    # neighbour droppable too.
-    for _ in range(8):
-        n = len(ring)
-        if n < 4:
-            break
-        keep = [True] * n
-        for i in range(n):
-            bucket = _corner_elevation_bucket(*ring[i])
-            if bucket in corner_elev or bucket in shared_junction_buckets:
-                continue  # anchor — keep no matter what
-            ax, ay = ring[(i - 1) % n]
-            bx, by = ring[(i + 1) % n]
-            cx, cy = ring[i]
-            # Perpendicular distance from C to line AB.
-            dx = bx - ax
-            dy = by - ay
-            seg_len = math.hypot(dx, dy)
-            if seg_len < 0.1:
-                continue
-            # Cross-product / line-length = perpendicular distance.
-            perp = abs((cx - ax) * dy - (cy - ay) * dx) / seg_len
-            if perp < COLINEAR_DROP_M:
-                keep[i] = False
-        new_ring = [c for c, k in zip(ring, keep) if k]
         if len(new_ring) == n:
             break
         ring = new_ring

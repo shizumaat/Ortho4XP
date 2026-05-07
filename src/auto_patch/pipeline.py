@@ -28,7 +28,6 @@ from __future__ import annotations
 import math
 import os
 import re
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
@@ -39,7 +38,6 @@ import O4_File_Names as FNAMES
 import O4_UI_Utils as UI
 
 from . import apt_dat_reader as APR
-from .pavement import classifier as PC
 from .pavement import strips as PS
 
 
@@ -48,7 +46,6 @@ from .pavement import strips as PS
 # ──────────────────────────────────────────────────────────────────
 from .config import (
     MIN_SEGMENT_LEN_M,
-    EMIT_BRIDGES_AND_TUNNELS,
     LOAD_DSF_PAVEMENT,
     RUNWAY_APRON_AREA_RATIO,
 )
@@ -1818,7 +1815,6 @@ def build_airport_pavement(icao: str, xplane_root: str,
         from .junction_rules import (
             _align_rect_slope_to_axis,
             _enforce_runway_1to1_sharing,
-            _push_junction_vertices_outside_pavement,
             _snap_to_sloping_edge_corners,
             widen_junctions_to_runway_corners,
         )
@@ -1836,10 +1832,6 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # because the cascade with Rule 4 + segmentation re-run
         # over-grew junctions past the 4-node cap.
         widen_junctions_to_runway_corners(layout)
-        # Per user 2026-05-05: disabled — see junction_rules.py for
-        # rationale.  The push pass introduces 1 m flat-edge mid-edge
-        # nodes on every adjacent rect.
-        # _push_junction_vertices_outside_pavement(layout)
 
         # Per user 2026-05-03: per-surface solver runs AS THE LAST
         # STEP of the pipeline, after every junction rule and
@@ -1861,56 +1853,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                dem=dem,
                                tile_lat=tile_lat, tile_lon=tile_lon)
 
-            # Per user 2026-05-05: subdivide passes on the per-
-            # surface path.  Two complementary triggers:
-            #
-            # 1. DEM-spike-based (``_subdivide_dem_spike_junctions``)
-            #    — catches large polygons whose footprint contains
-            #    a DEM region significantly above the ring-anchor
-            #    elevations (e.g. SPJC -10135).  Triangle4XP's
-            #    interior Steiners would otherwise inherit the raw
-            #    DEM values, producing visible bumps the ring
-            #    audit can't see.  Cuts the polygon into four
-            #    approximately equal pieces with two orthogonal
-            #    lines aligned with the longest runway axis.
-            #    Single pass — one 4-way split per flagged polygon.
-            # 2. Grade-based (``_subdivide_violating_junctions``,
-            #    threshold 2 %) — catches residual within-shape
-            #    grade violations the solver alone can't relax.
-            #    Iterates up to 4 rounds.
-            #
-            # Re-run the solver once after if any cuts happened, to
-            # integrate the new geometry.
-            from .junction_repair import (
-                _subdivide_dem_spike_junctions,
-                _subdivide_violating_junctions,
-            )
-            from .junction_rules import longest_runway_axis_deg
-            runway_axis_deg = longest_runway_axis_deg(layout)
-            # Spike detection always uses the RAW DEM, NOT the
-            # smoothed ``tile_dem`` Ortho4XP supplies for elevation
-            # seeding.  Smoothing is precisely what masks the
-            # spikes we're trying to detect — sampling the smoothed
-            # DEM in Ortho4XP's run path would silently disable this
-            # pass.  ``_load_airport_dem`` caches per tile, so this
-            # is a dict lookup when called twice in the same run.
-            # DEM-spike 3-way slice disabled for testing
-            # (user 2026-05-06): isolating the effect of the
-            # raw-DEM switch on elevation behaviour.
-            n_dem_spike = 0
+            # Grade-based subdivide (``_subdivide_violating_junctions``,
+            # threshold 2 %) — catches residual within-shape grade
+            # violations the solver alone can't relax.  Iterates up
+            # to 4 rounds, then re-runs the solver to integrate the
+            # new geometry.
+            from .junction_repair import _subdivide_violating_junctions
             n_grade = 0
             for _ in range(4):
                 n = _subdivide_violating_junctions(layout)
                 if n == 0:
                     break
                 n_grade += n
-            # Re-run the solver only when the GRADE-based subdivide
-            # fired — the DEM-spike slice already computes pin-
-            # correct altitudes during the cut (flat ends locked
-            # to neighbour pin altitudes, middle rect's
-            # altitude_high/low taken from those flats).  Re-solving
-            # would let the unified graph drift the flats away from
-            # those pinned values, defeating the slice's purpose.
             if n_grade > 0:
                 per_surface_solve(layout, icao,
                                    dem=dem,

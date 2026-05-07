@@ -8,13 +8,12 @@ multi-directional slopes.  This module owns that work.
 For every junction:
   1. Collect HARD anchors (rect corners, runway segments, terminals)
      touching the junction's boundary.
-  2. Densify long boundary edges with interpolated midpoints.
-  3. Drop sliver corners + colinear boundary vertices that would
-     produce near-degenerate triangles.
-  4. Assign each ring vertex an altitude: planar fit when anchors
+  2. Drop sliver corners + spike vertices that would produce
+     near-degenerate triangles.
+  3. Assign each ring vertex an altitude: planar fit when anchors
      are co-planar enough, otherwise 2D-Euclidean smoothing
      (``_smooth_polygon_grid``).
-  5. Stash the per-vertex altitudes on the BuiltShape's
+  4. Stash the per-vertex altitudes on the BuiltShape's
      ``node_altitudes``.
 
 Public API:
@@ -29,7 +28,6 @@ from shapely.geometry import Polygon
 
 import O4_UI_Utils as UI
 
-from .config import MAX_BOUNDARY_EDGE_M
 from .elevation import (
     NEIGHBOUR_CLAMP_RADIUS_M,
     SHARED_AGREE_TOL_M,
@@ -55,8 +53,6 @@ from .layout import (
     SHARED_VERTEX_TOL_M,
 )
 from .pavement.junctions import (
-    _densify_long_boundary_edges,
-    _drop_colinear_boundary_vertices,
     _drop_sliver_corners,
     _splice_holes,
 )
@@ -494,10 +490,6 @@ def _triangulate_junctions(
                 continue
         if len(ring) < 3:
             continue
-        # Colinear-vertex pruning disabled (user 2026-05-05): the
-        # geometry-baseline pav_union no longer produces near-colinear
-        # ear-clip slivers that this pass was added to mop up.  Keep
-        # apt.dat curve detail intact.
         ring = _drop_spike_vertices(ring)
         if len(ring) < 3:
             continue
@@ -641,14 +633,8 @@ def _triangulate_junctions(
     for shape in junction_dropped_shapes:
         new_shapes.append(shape)
     # Emit each cleaned junction with its post-iteration vert_elev
-    # passed through the existing densify + FLAT/PLANAR/COMPOUND
-    # classifier.
+    # passed through the FLAT/PLANAR/COMPOUND classifier.
     for (shape, ring, vert_elev) in iter_results:
-        # Long-edge densification disabled (user 2026-05-05):
-        # the area-gated re-enable for >50k m² junctions did not
-        # measurably reduce the visible DEM-spike bumps in X-Plane,
-        # so the synthetic midpoints aren't paying for themselves.
-
         # ── Surface-complexity classification ───────────────────
         # User 2026-04-25: only triangulate where the surface has
         # a compound slope.  Flat or planar regions can stay as a
