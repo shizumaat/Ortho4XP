@@ -1035,14 +1035,54 @@ def smooth_raster_over_airports(tile, dico_airports, preserve_boundary=True):
     return
 
 ################################################################################
+def _airport_subsumed_by_patches(apt, patches_area, threshold=0.3):
+    # An airport whose footprint substantially overlaps the union of active
+    # patches should not be encoded again — the patch already describes that
+    # region with consistent altitudes, and re-encoding the airport's
+    # runway/taxiway/apron polygons (with DEM-derived altitudes) injects
+    # conflicting constraint edges into the patch's region.  This catches
+    # airports whose ``patches_list`` membership is missed because they are
+    # keyed by name or ``repr_node`` rather than ICAO (the only key form
+    # added to ``patches_list``).
+    #
+    # Threshold tuning (2026-05-07): SPJC tile contains "Base de Aviacion
+    # Naval", a name-keyed airport whose footprint sits 49% inside SPJC's
+    # patch area; its taxiway constraints were polluting SPJC's apron
+    # interior with ~38m altitudes from DEM-driven least-squares fits.
+    # 0.3 catches that case with comfortable margin while still leaving
+    # genuinely separate airports near a patched one (e.g., a small
+    # airfield 200m away with <10% overlap) untouched.
+    if patches_area is None or patches_area.is_empty:
+        return False
+    boundary = apt.get("boundary")
+    if boundary is None or boundary.is_empty:
+        return False
+    boundary_area = boundary.area
+    if boundary_area <= 0:
+        return False
+    overlap_area = boundary.intersection(patches_area).area
+    return (overlap_area / boundary_area) >= threshold
+
+
 def encode_runways_taxiways_and_aprons(
-    tile, airport_layer, dico_airports, vector_map, patches_list
+    tile, airport_layer, dico_airports, vector_map, patches_list,
+    patches_area=None,
 ):
     seeds = {"RUNWAY": [], "TAXIWAY": [], "APRON": []}
     total_rwy = 0
     total_taxi = 0
     for airport in dico_airports:
         if airport in patches_list:
+            continue
+        if _airport_subsumed_by_patches(
+            dico_airports[airport], patches_area
+        ):
+            UI.vprint(
+                1,
+                "   Skipping airport",
+                repr(airport),
+                "(footprint subsumed by active patches).",
+            )
             continue
         apt = dico_airports[airport]
         total_rwy += len(apt["runway"][1] + apt["runway"][2])
@@ -1341,10 +1381,15 @@ def encode_runways_taxiways_and_aprons(
     )
 
 ################################################################################
-def encode_hangars(tile, dico_airports, vector_map, patches_list):
+def encode_hangars(tile, dico_airports, vector_map, patches_list,
+                   patches_area=None):
     seeds = []
     for airport in dico_airports:
         if airport in patches_list:
+            continue
+        if _airport_subsumed_by_patches(
+            dico_airports[airport], patches_area
+        ):
             continue
         for pol in VECT.ensure_MultiPolygon(
             VECT.cut_to_tile(dico_airports[airport]["hangar"])

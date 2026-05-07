@@ -280,10 +280,12 @@ def include_airports(vector_map, tile):
             )
     (patches_area, patches_list) = include_patches(vector_map, tile)
     runway_taxiway_apron_area = APT.encode_runways_taxiways_and_aprons(
-        tile, airport_layer, dico_airports, vector_map, patches_list
+        tile, airport_layer, dico_airports, vector_map, patches_list,
+        patches_area=patches_area,
     )
     treated_area = ops.unary_union([patches_area, runway_taxiway_apron_area])
-    APT.encode_hangars(tile, dico_airports, vector_map, patches_list)
+    APT.encode_hangars(tile, dico_airports, vector_map, patches_list,
+                       patches_area=patches_area)
     APT.flatten_helipads(airport_layer, vector_map, tile, treated_area)
     # APT.encode_aprons(tile,dico_airports,vector_map)
     apt_array = APT.build_airport_array(tile, dico_airports)

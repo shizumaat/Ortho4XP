@@ -1,4 +1,106 @@
-# Auto-Patch Status — PHASE-2 RE-ENABLED + ELEVATION POLISH 2026-05-07
+# Auto-Patch Status — SPJC APRON FIX + NEW BASELINE 2026-05-07
+
+## TL;DR
+
+The SPJC apron rough-spot is **resolved**.  Root cause was upstream
+of ``auto_patch``: the SPJC tile contains three airports — SPJC
+(ICAO), SPLP (ICAO), and "Base de Aviacion Naval" (NAME-keyed,
+no ICAO).  The naval base's footprint sits 49% inside SPJC's
+patch area, but the
+``encode_runways_taxiways_and_aprons`` skip check (line 1045)
+only matched ICAO-form keys in ``patches_list``.  The naval base's
+taxiways were therefore re-encoded with DEM-driven ``weighted_alt``
+altitudes (TAXIWAY marker, ~37–38 m), landing inside SPJC's
+auto-patch apron polygon as constraint edges.  Triangle4XP's
+barycentric Steiner interpolation then mixed those high-z nodes
+with SPJC's apron ring nodes (32–34 m), producing the
+1.5–4 m bumps seen in X-Plane.
+
+**Fix (Option A):** add a spatial-overlap skip to
+``encode_runways_taxiways_and_aprons`` and ``encode_hangars``.
+Any airport whose ``apt["boundary"]`` is ≥30% inside the active
+``patches_area`` is skipped, regardless of its key form.  See
+[O4_Airport_Utils.py:1038](src/O4_Airport_Utils.py:1038)
+``_airport_subsumed_by_patches`` and the call-site updates at
+[O4_Vector_Map.py:284,288](src/O4_Vector_Map.py:284).
+
+**Verified empirically:** apron-interior mesh vertices now have
+z range [32.80, 35.60] m, exactly within the polygon's ring
+[32.6, 35.6] (was [32.6, 37.89] before).  Zero TAXIWAY edges
+in the .poly file (was 58).  100% of apron-interior vertices
+within ring range (was 61.7%).
+
+The previously-disabled DEM-spike subdivide infrastructure in
+``junction_repair.py`` is **no longer needed** for SPJC — the
+real fix was upstream, not a junction-side post-process.
+
+## New baseline established 2026-05-07
+
+``tests/fixtures/SPJC_target.osm`` was regenerated to equal the
+current canonical SPJC build output (post-fix).  Per user:
+**every code change going forward must continue to reproduce
+this output for SPJC.**  The compare-target gate floors are
+tightened accordingly:
+
+| role               | floor | target |
+|--------------------|-------|--------|
+| boundary           | 1     | 1      |
+| cross_connector    | 6     | 6      |
+| junction           | 36    | 36     |
+| primary_parallel   | 27    | 27     |
+| retaining_wall     | 66    | 68     |
+| runway             | 80    | 80     |
+| secondary_parallel | 1     | 1      |
+| stub               | 16    | 16     |
+| terminal           | 2     | 2      |
+| tunnel_ramp        | 34    | 35     |
+
+Total floor: 269 of 272 target shapes (~99% match).  The 3-shape
+gap is run-to-run non-determinism in node-ID assignment / sliver
+ordering — a pre-existing variance, not a regression from this
+fix.  Future work: stabilize the build to enable strict equality
+floors.
+
+## What's not in this change (intentionally)
+
+* **Per-shape clip** for partial-overlap airports.  Naval Base
+  has 51% of its footprint *outside* SPJC's patch area (a
+  separate naval pavement region).  With per-airport skip, that
+  area is no longer encoded — it will render as DEM terrain in
+  X-Plane rather than airport pavement.  If anyone reports a
+  visible regression at the naval base, the next iteration
+  would be per-shape clipping: subtract ``patches_area`` from
+  each runway/taxiway/apron polygon before encoding, keeping
+  the unpatched portions.
+* **DEM-spike subdivide** machinery.  Still preserved in
+  ``junction_repair.py`` but the call site stays disabled.
+  The fix above eliminates the spike's effect at the source.
+
+## SPJC measurements (this session, post-fix)
+
+```
+total OSM ways            : 272 (vs 276 in pre-fix v17 — 4 fewer
+                                 due to absorbed orphan strip,
+                                 sliver drops, etc.)
+rect corners on pav       : 200 / 200  (worst d = 0.000 m)
+within-shape grade        : 0 WARN
+per-surface solver        : 217 iters / ~6 s
+compare-target test       : PASS  (with new tighter floors)
+mesh vertices in apron    : 10  (was 47 with manual-baseline mesh)
+apron z range             : [32.80, 35.60]m (matches ring exactly)
+TAXIWAY edges in .poly    : 0   (was 58, ~22 inside apron region)
+INTERP_ALT edges          : 107,038 (69% of total — patch coverage)
+```
+
+# Previous status — Phase-2 re-enabled and elevation polish
+
+The remainder of this file describes the state immediately before
+today's apron fix, when the bumps were still unresolved.  Kept
+verbatim as historical context.
+
+---
+
+# Auto-Patch Status — PHASE-2 RE-ENABLED + ELEVATION POLISH 2026-05-07 (pre-apron-fix)
 
 ## TL;DR
 

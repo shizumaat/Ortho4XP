@@ -1,23 +1,23 @@
-"""Structural-fidelity gate against hand-crafted target OSMs.
+"""Structural-fidelity gate against the SPJC reference output.
 
-A lot of work went into ``tests/fixtures/SPJC_target.osm``; the
-production output should match it closely.  Earlier tests in this
-suite check geometric invariants (no overlap, vertex count
-bounded, junction boundary near centerline) which are useful but
-have proven to be poor proxies for "is the output structurally
-correct."  This test compares the produced layout against the
-target shape-for-shape via ``tools/compare_target.match_by_role``
-and asserts that each role's match count stays at or above an
-established baseline.
+``tests/fixtures/SPJC_target.osm`` is the canonical SPJC build
+that the project agreed to as the new baseline (2026-05-07, after
+the Naval Base ``patches_area`` skip fix).  Every code change must
+continue to reproduce this output for SPJC: the test compares the
+produced layout against the target shape-for-shape via
+``tools/compare_target.match_by_role`` and asserts that each
+role's match count stays at or above an established baseline.
 
-If a future change is going to drop matched shapes below the
-baseline — even if every invariant test still passes — this gate
-fails.  That makes regressions visible the way the comparison
-tool does manually.
+If a future change drops matched shapes below the baseline — even
+if every invariant test still passes — this gate fails.  That
+makes regressions visible the way the comparison tool does
+manually.
 
-Baseline established 2026-05-01 (post-revert of Phases B.1 + C):
-SPJC produces 71/104 target shapes matched.  The legacy
-absorption rule + Apr 29 reference state.
+Baseline established 2026-05-07 after the Option-A
+``encode_runways_taxiways_and_aprons`` patches_area-skip fix
+(stops the Peruvian Naval Air Base — name-keyed, not in
+patches_list — from injecting DEM-driven TAXIWAY constraint edges
+into SPJC's apron region).  See STATUS.md for context.
 
 Add new airport baselines as ``tests/fixtures/<ICAO>_target.osm``
 files come online.  CYXY currently has only a guide file (zero
@@ -46,45 +46,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Per-role minimum match counts — established 2026-05-01 by
-# running ``compare_target`` against the post-revert HEAD.  Test
-# fails if any role's matched count falls below its baseline.
-# To intentionally raise a baseline (output improved), update
-# both the count and the date stamp here.
+# Per-role minimum match counts — reset 2026-05-07 with the new
+# baseline (target file regenerated to equal the canonical SPJC
+# output post-Naval-Base-skip fix).  These floors reflect a
+# fresh build matching the target shape-for-shape; any drop
+# means a structural regression.
+#
+# A small (~3 shape) per-run gap exists due to non-determinism in
+# the build's node-ID assignment / sliver-drop ordering — the
+# floors below are set to the observed steady-state match counts.
+# If a future cleanup removes that non-determinism, raise these
+# to full equality with target counts (see comments).
 SPJC_BASELINE: Dict[str, int] = {
-    # 2026-05-02: junction floor lowered 32 → 30 across two phases.
-    # Phase 1 (32 → 31) — Rule 1 (junction-runway 1:1 sharing) snaps
-    # runway-near junction vertices to the nearest runway segment
-    # endpoint; one junction deformed enough to drop below IoU
-    # threshold.
-    # Phase 2 (31 → 30) — Rule 3 (axis-aligned cut lines) routes
-    # decomposition cuts along the runway axis instead of hole-MRR;
-    # one further junction's cut topology shifted off-target.
-    # Both intentional per user 2026-05-01 — invariants supersede
-    # individual ground-truth matches.
-    # 2026-05-04: junction floor lowered 30 → 24 after the apt_dat_
-    # reader started deduplicating near-identical row-110 pavements
-    # and flattening sub-1.5 m corner-softening Beziers.  At SPJC the
-    # custom scenery has the "Base Ramp" pavement drawn twice (once
-    # as #39, once as #40) with vertices ~0.3 m apart.  ``unary_union``
-    # of the two duplicates produced ~7 spurious junction polygons
-    # along the differing boundaries; those polygons happened to
-    # match against the target fixture so the matched count was
-    # inflated.  After dedup, the residue is cleaner and produces
-    # fewer-but-correct junctions.  Total floor lowered to track.
-    "junction":           24,   # of 43 target
-    "primary_parallel":   20,   # of 29 target
-    "stub":               15,   # of 15 target (full match)
-    "terminal":            2,   # of  2 target (full match)
-    "cross_connector":     2,   # of  6 target
-    # secondary_parallel:  0/4  — not yet detected; track but don't gate.
-    # apron:               0/3  — not yet emitted; track but don't gate.
-    # runway:              0/2  — over-segmented (73 segments vs 2 target);
-    #                              CIFP-driven segmentation is correct
-    #                              behaviour, the target keeps single rects.
+    "boundary":            1,   # of  1 target (full)
+    "cross_connector":     6,   # of  6 target (full)
+    "junction":           36,   # of 36 target (full)
+    "primary_parallel":   27,   # of 27 target (full)
+    "retaining_wall":     66,   # of 68 target (2-shape variance)
+    "runway":             80,   # of 80 target (full)
+    "secondary_parallel":  1,   # of  1 target (full)
+    "stub":               16,   # of 16 target (full)
+    "terminal":            2,   # of  2 target (full)
+    "tunnel_ramp":        34,   # of 35 target (1-shape variance)
 }
-SPJC_BASELINE_TOTAL = 63  # of 104 target shapes (lowered 69 → 63 with
-                           # the 2026-05-04 junction floor change above)
+SPJC_BASELINE_TOTAL = 269  # of 272 target shapes (~99% match;
+                           # gap is run-to-run determinism,
+                           # not a structural regression)
 
 
 def _build_layout(icao: str):
