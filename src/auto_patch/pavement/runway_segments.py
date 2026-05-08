@@ -691,7 +691,34 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             # Near anchors the band is small (forces the profile to
             # stay near the linear baseline); far from anchors it
             # widens enough that DEM character can come through.
-            DEM_BAND_M_MAX = 5.0   # absolute cap (sanity ceiling).
+            # Per user 2026-05-08 (SPLP): the band must scale with
+            # the anchor profile's own gradient.  When CIFP says both
+            # thresholds are at the same elevation (flat runway), the
+            # middle of the runway has no reason to deviate — DEM
+            # showing a 5 m dip means terrain dips and the runway is
+            # built up there, NOT that the runway dips.  When CIFP
+            # specifies a sloped profile, modest DEM following is
+            # legitimate (real airports have minor humps).  Scale
+            # the absolute cap by the anchor-profile gradient: ~0.1 m
+            # for flat runways (effectively "respect CIFP"), up to
+            # 5 m for steeply-sloped CIFP profiles where DEM tracking
+            # is more meaningful.
+            DEM_BAND_M_MAX_FLOOR = 0.1   # always allow 10 cm noise
+            DEM_BAND_M_MAX_CEIL = 5.0    # absolute sanity ceiling
+            # Profile gradient: (max_anchor_elev - min_anchor_elev) /
+            # phys_dist.  0 = perfectly flat, 0.015 = 1.5 % runway grade.
+            if profile_anchors and phys_dist > 1.0:
+                p_max = max(e for _, e in profile_anchors)
+                p_min = min(e for _, e in profile_anchors)
+                profile_grad = (p_max - p_min) / phys_dist
+            else:
+                profile_grad = 0.0
+            # Lerp: at profile_grad=0 → DEM_BAND=floor;
+            # at profile_grad=MAX_RUNWAY_GRADE → DEM_BAND=ceil.
+            grad_frac = min(1.0, profile_grad / MAX_RUNWAY_GRADE)
+            DEM_BAND_M_MAX = (DEM_BAND_M_MAX_FLOOR
+                               + grad_frac * (DEM_BAND_M_MAX_CEIL
+                                              - DEM_BAND_M_MAX_FLOOR))
             for i in range(n_samples):
                 if anchored[i]:
                     continue
