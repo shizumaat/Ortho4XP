@@ -1912,14 +1912,12 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _snap_junction_altitudes_to_rect_corners,
             _enforce_shared_vertex_altitudes,
         )
-        _snap_junction_altitudes_to_rect_corners(
-            layout, interior_proximity_m=3.0)
+        _snap_junction_altitudes_to_rect_corners(layout)
         _enforce_shared_vertex_altitudes(layout)
         # Re-run the rect-corner snap after the junction-pair
         # average, since averaging can pull a shared-with-rect
         # bucket away from the rect's tag value.
-        _snap_junction_altitudes_to_rect_corners(
-            layout, interior_proximity_m=3.0)
+        _snap_junction_altitudes_to_rect_corners(layout)
 
         # The corner-snap above can introduce within-junction grade
         # violations: when one corner of a long junction sits on a
