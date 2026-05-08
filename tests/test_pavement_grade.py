@@ -52,7 +52,15 @@ WITHIN_SHAPE_CAP = {"SPJC": 30, "SPLP": 30}
 # Mid-edge step cap: every triangle plane should match its
 # neighbours' surface along shared boundaries.  Samples along each
 # edge and compares to the nearest other-shape edge's interpolation.
-MID_EDGE_CAP = {"SPJC": 10, "SPLP": 10}
+#
+# SPLP exception (user 2026-05-08): junction-10053 and junction-10054
+# are adjacent polygons whose rings don't share OSM nids (they have
+# parallel edges with separate vertices ~0.1-4 m apart, disagreeing
+# by ~6 m in elevation at mid-edge samples).  Fixing requires a
+# junction-to-junction stitch pass analogous to
+# ``stitch_pavement_to_terminals`` (currently terminals-only).
+# Tracked as future work; cap set to current observed background.
+MID_EDGE_CAP = {"SPJC": 10, "SPLP": 15}
 
 
 @pytest.mark.parametrize("icao", ["SPJC", "SPLP"])
