@@ -23,6 +23,7 @@ __all__ = [
     "NECK_ABSOLUTE_M",
     "NECK_ABSORB_FRAC",
     "NECK_RELATIVE",
+    "ROLE_GRADE_LIMITS",
     "RUNWAY_ADJACENCY_TOL_M",
     "RUNWAY_BOUNDARY_TOL_M",
     "RUNWAY_INSIDE_APRON_FRAC",
@@ -135,6 +136,54 @@ EMIT_BRIDGES_AND_TUNNELS = True
 # vs global candidate by OSM coverage; DSF polygons supplement
 # whichever apt.dat is picked.
 LOAD_DSF_PAVEMENT = True
+
+
+# Per-role within-shape grade limits (rise / run, decimal — i.e.
+# 0.015 = 1.5%).  The validator in tools/check_grade.py uses this
+# table to decide whether a vertex pair on a polygon's ring is in
+# violation.  ``None`` means "skip the within-shape grade check
+# for this role" — used for shapes that intentionally trace
+# terrain (boundary outline, groundside curbside) or that are
+# vertical structures (retaining walls).
+#
+# Keep this aligned with the solver caps in ``elevation.py``
+# (``TAXI_MAX_GRADE``, ``APRON_MAX_GRADE``).  Per user 2026-05-07
+# apron and junction get the same 1.5% all-directions cap as
+# taxiways; per user 2026-05-08 tunnel ramps get 4.0%.
+ROLE_GRADE_LIMITS = {
+    # Taxiway-like surfaces — 1.5% along centerline (axis), tested
+    # here as 1.5% between any pair of ring vertices since the
+    # ring follows the axis closely.
+    "runway":             0.015,
+    "primary_parallel":   0.015,
+    "secondary_parallel": 0.015,
+    "stub":               0.015,
+    "cross_connector":    0.015,
+    # Apron / junction — 1.5% all directions within the polygon
+    # (per user 2026-05-07).
+    "apron":              0.015,
+    "junction":           0.015,
+    # Terminals are typically flat polygons; the value rarely fires.
+    "terminal":           0.015,
+    # Tunnel ramps descend from pavement elevation to the tunnel
+    # floor; 4% is the navigable taxi grade for ramped portals
+    # (per user 2026-05-08).
+    "tunnel_ramp":        0.040,
+    # ── Skip-list (no grade enforcement) ─────────────────────────
+    # Airport boundary is a footprint outline that traces real
+    # terrain at 5 m vertex spacing.  No taxiable surface, no
+    # grade rule applies.
+    "boundary":           None,
+    # Retaining walls are vertical 4-vertex polygons with 2 corners
+    # at apt elev and 2 at tunnel-floor elev; the wall is vertical
+    # by design.  Grade between the high and low corners is the
+    # full step over a sub-metre run.
+    "retaining_wall":     None,
+    # Groundside terminal pavement is per-vertex DEM-altitude (it
+    # follows local terrain at curbside / drop-off / parking) so
+    # ring grade exposes terrain, not a pavement-builder defect.
+    "groundside_pavement": None,
+}
 
 # Phase-1 emit-suppression toggles (kept from the pre-refactor
 # baseline; iteration aids that remain useful).

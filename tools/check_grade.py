@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 import sys
 from collections import defaultdict
@@ -47,6 +48,22 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 R_EARTH = 6_378_137.0
+
+
+# Import per-role grade limits from the auto_patch package (the
+# single source of truth).  ``ROLE_GRADE_LIMITS`` maps role-tag to
+# decimal grade (e.g. 0.015 for 1.5 %); a value of ``None`` means
+# "skip the within-shape grade check for this role".  Roles
+# missing from the dict fall back to ``max_grade`` (the function
+# argument, default 1.5 %).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SRC_DIR = os.path.join(os.path.dirname(_THIS_DIR), "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+try:
+    from auto_patch.config import ROLE_GRADE_LIMITS
+except Exception:
+    ROLE_GRADE_LIMITS: Dict[str, Optional[float]] = {}
 
 
 # ── OSM parsing ─────────────────────────────────────────────────
@@ -296,6 +313,9 @@ def _check_plane_gradient(ways: List[Way],
     """
     out: List[Violation] = []
     for w in ways:
+        grade_cap = _role_grade_limit(w, max_grade)
+        if grade_cap is None:
+            continue
         pts: List[Tuple[float, float, float]] = []
         for k, nid in enumerate(w.nids[:-1] if (len(w.nids) > 1
                                 and w.nids[0] == w.nids[-1])
@@ -323,7 +343,7 @@ def _check_plane_gradient(ways: List[Way],
         gx = -nx / nz
         gy = -ny / nz
         grad = math.hypot(gx, gy)
-        if grad > max_grade + 1e-5:
+        if grad > grade_cap + 1e-5:
             # Pick two vertices along the gradient direction for
             # the report: project all three onto the gradient axis,
             # take the max/min-elevation pair.
@@ -339,7 +359,7 @@ def _check_plane_gradient(ways: List[Way],
             dist_along_grad = hi_p - lo_p
             out.append(Violation(
                 grade_pct=grad * 100,
-                excess_pct=(grad - max_grade) * 100,
+                excess_pct=(grad - grade_cap) * 100,
                 distance_m=dist_along_grad if dist_along_grad > 0.5
                            else 1.0,
                 de_m=abs(hi_z - lo_z),
@@ -364,11 +384,39 @@ WITHIN_SHAPE_MAX_PAIR_DIST_M = 60.0   # max distance between two
                                         # plus margin.
 
 
+def _role_grade_limit(way: "Way",
+                      default_grade: float) -> Optional[float]:
+    """Resolve the within-shape grade limit for a way.
+
+    Looks up the way's ``role`` tag in ``ROLE_GRADE_LIMITS`` (the
+    single source of truth in ``auto_patch.config``):
+
+    * Returns the role-specific limit (decimal, e.g. 0.015) if
+      the role is present.
+    * Returns ``None`` if the role is explicitly mapped to ``None``
+      (skip the check — vertical structures, terrain-following
+      outlines).
+    * Falls back to ``default_grade`` when the role is absent
+      from the dict (unknown role; use the function-argument
+      cap so behaviour stays compatible with un-tagged input).
+    """
+    role = way.tags.get("role")
+    if role in ROLE_GRADE_LIMITS:
+        return ROLE_GRADE_LIMITS[role]
+    return default_grade
+
+
 def _check_within_shape(ways: List[Way],
                         nodes: Dict[str, Tuple[float, float]],
                         ll_to_m,
                         max_grade: float) -> List[Violation]:
     """Grade check between vertex pairs on the same way.
+
+    The grade limit per way is resolved from
+    ``ROLE_GRADE_LIMITS`` (auto_patch.config) — taxiway-class
+    surfaces use 1.5 %, tunnel ramps use 4 %, and roles whose
+    limit is ``None`` (boundary, retaining_wall,
+    groundside_pavement) are skipped entirely.
 
     For 3-vertex polygons (triangles), every pair IS a triangle
     edge X-Plane will render — check all 3 pairs.
@@ -390,6 +438,9 @@ def _check_within_shape(ways: List[Way],
     """
     out: List[Violation] = []
     for w in ways:
+        grade_cap = _role_grade_limit(w, max_grade)
+        if grade_cap is None:
+            continue  # skip ROLE_GRADE_LIMITS[role] is None
         pts: List[Tuple[float, float, float]] = []
         for k, nid in enumerate(w.nids[:-1] if (len(w.nids) > 1
                                 and w.nids[0] == w.nids[-1])
@@ -426,13 +477,13 @@ def _check_within_shape(ways: List[Way],
             if d < 0.5:
                 continue
             de = abs(ei - ej)
-            allowance = max_grade * d + ELEV_ROUNDING_NOISE_M
+            allowance = grade_cap * d + ELEV_ROUNDING_NOISE_M
             if de <= allowance:
                 continue
             grade = de / d
             out.append(Violation(
                 grade_pct=grade * 100,
-                excess_pct=(grade - max_grade) * 100,
+                excess_pct=(grade - grade_cap) * 100,
                 distance_m=d,
                 de_m=de,
                 way_a=w, way_b=w,
