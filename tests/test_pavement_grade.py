@@ -53,13 +53,20 @@ WITHIN_SHAPE_CAP = {"SPJC": 30, "SPLP": 30}
 # neighbours' surface along shared boundaries.  Samples along each
 # edge and compares to the nearest other-shape edge's interpolation.
 #
-# SPLP exception (user 2026-05-08): junction-10053 and junction-10054
-# are adjacent polygons whose rings don't share OSM nids (they have
-# parallel edges with separate vertices ~0.1-4 m apart, disagreeing
-# by ~6 m in elevation at mid-edge samples).  Fixing requires a
-# junction-to-junction stitch pass analogous to
-# ``stitch_pavement_to_terminals`` (currently terminals-only).
-# Tracked as future work; cap set to current observed background.
+# SPLP exception (user 2026-05-08): junction-10053 has an intrinsic
+# 7 m elevation range across its ring (corners 0-3 at z=70 anchored
+# to lower pavement; corners 4-5 at z=77 anchored to runway).  The
+# polygon wraps around two terrain regions at different elevations
+# and topologically can't be cleanly bisected — perpendicular cuts
+# through the worst-pair midpoint produce one tiny triangle (the
+# high-z corners + cut endpoints) whose own worst-pair grade isn't
+# better than the parent's, so subdivide rejects.  ``stitch_pavement
+# _polygons`` (junction-to-junction stitch, added 2026-05-08) is in
+# place but doesn't help here — the issue is upstream geometry.
+# Future work: a smarter subdivide that recognises wrap-around
+# residual junctions and cuts along the iso-elevation contour
+# rather than perpendicular to the worst pair.  Cap set to current
+# observed background.
 MID_EDGE_CAP = {"SPJC": 10, "SPLP": 15}
 
 

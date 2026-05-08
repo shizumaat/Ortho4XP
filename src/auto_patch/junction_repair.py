@@ -638,8 +638,24 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
                 (snapped_poly, snapped_pts, sub_elevs))
 
         if not cut_was_useful or len(validated_subs) < 2:
-            new_shapes.append(s)
-            continue
+            # Fallback: iso-elevation cut.  When the perpendicular
+            # cut through the worst-pair midpoint can't be validated
+            # (typically because it produces a tiny sliver containing
+            # the high-z corners + cut endpoints, whose own worst
+            # pair isn't measurably better), try cutting along the
+            # MEDIAN-elevation contour instead.  Walk ring edges; an
+            # edge "crosses" the median when its endpoints straddle
+            # it.  For a polygon that wraps two distinct elevation
+            # regions (SPLP junction-10053: 4 corners at z=70, 2 at
+            # z=77), exactly two edges cross — a clean cut between
+            # the crossing midpoints separates the two regions.
+            iso_subs = _try_iso_elevation_cut(
+                s, ring, elevs, worst_grade)
+            if iso_subs is not None and len(iso_subs) >= 2:
+                validated_subs = iso_subs
+            else:
+                new_shapes.append(s)
+                continue
 
         for sp, sub_pts, sub_elevs in validated_subs:
             sub_shape = BuiltShape(
@@ -655,6 +671,181 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
         n_subdivided += 1
     layout.shapes = new_shapes
     return n_subdivided
+
+
+def _try_iso_elevation_cut(
+    s: "BuiltShape",
+    ring: List[Tuple[float, float]],
+    elevs: List[float],
+    parent_worst_grade: float,
+) -> Optional[List[Tuple["Polygon", List[Tuple[float, float]],
+                         List[float]]]]:
+    """Cut a junction polygon along its median-elevation contour.
+
+    Returns a list of validated sub-polygons (each
+    ``(polygon, snapped_pts, sub_elevs)``) or ``None`` if the cut
+    isn't applicable.
+
+    Rationale: when the polygon wraps two distinct elevation regions
+    (e.g. corners 0-3 at z=70, corners 4-5 at z=77), the
+    perpendicular-cut subdivide produces a tiny corner-sliver that
+    fails validation.  An iso-elevation cut walks ring edges,
+    finds the two edges where elevation crosses the median (between
+    z_min and z_max), and cuts from one crossing point to the other.
+    Each resulting sub-polygon has elevation range half the parent's.
+    """
+    n = len(ring)
+    if n < 4:
+        return None
+    z_min = min(elevs)
+    z_max = max(elevs)
+    if z_max - z_min < 0.5:
+        return None
+    median = 0.5 * (z_min + z_max)
+    crossings: List[Tuple[float, float, int]] = []
+    for k in range(n):
+        z_a = elevs[k]
+        z_b = elevs[(k + 1) % n]
+        if (z_a < median) == (z_b < median):
+            continue  # both on same side
+        if abs(z_b - z_a) < 1e-6:
+            continue  # too flat to interpolate
+        t = (median - z_a) / (z_b - z_a)
+        if t <= 0.001 or t >= 0.999:
+            continue
+        ax, ay = ring[k]
+        bx, by = ring[(k + 1) % n]
+        cx = ax + t * (bx - ax)
+        cy = ay + t * (by - ay)
+        crossings.append((cx, cy, k))
+    if len(crossings) != 2:
+        return None
+    from shapely.geometry import LineString
+    from shapely.ops import split as _shapely_split
+    cx0, cy0, _ = crossings[0]
+    cx1, cy1, _ = crossings[1]
+    cut = LineString([(cx0, cy0), (cx1, cy1)])
+    try:
+        parts = _shapely_split(s.polygon, cut)
+    except Exception:
+        return None
+    sub_polys: List[Polygon] = []
+    for g in getattr(parts, "geoms", [parts]):
+        if (g is None or g.is_empty
+                or g.geom_type != "Polygon"
+                or g.area < SUBDIVIDE_MIN_AREA_M2):
+            continue
+        sub_polys.append(g)
+    if len(sub_polys) < 2:
+        return None
+    snap_r2 = SUBDIVIDE_SNAP_RADIUS_M ** 2
+
+    def _snap_to_ring(qx: float, qy: float
+                      ) -> Tuple[float, float, int]:
+        best_k = -1
+        best_d2 = snap_r2
+        for k in range(n):
+            rx, ry = ring[k]
+            d2 = (rx - qx) ** 2 + (ry - qy) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_k = k
+        if best_k >= 0:
+            rx, ry = ring[best_k]
+            return rx, ry, best_k
+        return qx, qy, -1
+
+    def _lookup_elev(qx: float, qy: float, hint_idx: int) -> float:
+        if hint_idx >= 0:
+            return elevs[hint_idx]
+        best_d2 = float("inf")
+        best_e = elevs[0]
+        for k in range(n):
+            ax, ay = ring[k]
+            bx, by = ring[(k + 1) % n]
+            edx = bx - ax
+            edy = by - ay
+            seg2 = edx * edx + edy * edy
+            if seg2 < 1e-9:
+                continue
+            t = ((qx - ax) * edx + (qy - ay) * edy) / seg2
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+            ccx = ax + t * edx
+            ccy = ay + t * edy
+            d2 = (qx - ccx) ** 2 + (qy - ccy) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                ea = elevs[k]
+                eb = elevs[(k + 1) % n]
+                best_e = ea + t * (eb - ea)
+        return round(float(best_e), 1)
+
+    validated_subs: List[Tuple[Polygon, List[Tuple[float, float]],
+                                List[float]]] = []
+    for sp in sub_polys:
+        sub_ring_raw = list(sp.exterior.coords)
+        if sub_ring_raw and sub_ring_raw[0] == sub_ring_raw[-1]:
+            sub_ring_raw = sub_ring_raw[:-1]
+        snapped_pts: List[Tuple[float, float]] = []
+        snapped_hints: List[int] = []
+        for (qx, qy) in sub_ring_raw:
+            sx, sy, hint = _snap_to_ring(qx, qy)
+            if (snapped_pts
+                    and abs(snapped_pts[-1][0] - sx) < 1e-9
+                    and abs(snapped_pts[-1][1] - sy) < 1e-9):
+                continue
+            snapped_pts.append((sx, sy))
+            snapped_hints.append(hint)
+        while (len(snapped_pts) >= 2
+               and abs(snapped_pts[0][0] - snapped_pts[-1][0]) < 1e-9
+               and abs(snapped_pts[0][1] - snapped_pts[-1][1]) < 1e-9):
+            snapped_pts.pop()
+            snapped_hints.pop()
+        if len(snapped_pts) < 3:
+            return None
+        try:
+            snapped_poly = Polygon(snapped_pts)
+            if not snapped_poly.is_valid:
+                snapped_poly = snapped_poly.buffer(0)
+            if (snapped_poly.is_empty
+                    or snapped_poly.geom_type != "Polygon"
+                    or snapped_poly.area < SUBDIVIDE_MIN_AREA_M2):
+                return None
+        except Exception:
+            return None
+        sub_elevs = [_lookup_elev(qx, qy, h)
+                     for (qx, qy), h
+                     in zip(snapped_pts, snapped_hints)]
+        # Compute this sub's worst-pair grade
+        sub_worst = 0.0
+        sm = len(snapped_pts)
+        radius2 = SUBDIVIDE_MAX_PAIR_DIST_M ** 2
+        for a in range(sm):
+            xa, ya = snapped_pts[a]
+            ea = sub_elevs[a]
+            for b in range(a + 1, sm):
+                xb, yb = snapped_pts[b]
+                d2 = (xa - xb) ** 2 + (ya - yb) ** 2
+                if d2 < 0.25 or d2 > radius2:
+                    continue
+                d_ = math.sqrt(d2)
+                de_ = abs(ea - sub_elevs[b])
+                if de_ <= TAXI_MAX_GRADE * d_ + 0.10:
+                    continue
+                g_ = de_ / d_
+                if g_ > sub_worst:
+                    sub_worst = g_
+        # Iso cut should produce sub-polygons that are MEASURABLY
+        # better; if not, this cut isn't useful either.
+        if sub_worst >= parent_worst_grade - 0.005:
+            return None
+        validated_subs.append((snapped_poly, snapped_pts, sub_elevs))
+    if len(validated_subs) < 2:
+        return None
+    return validated_subs
 
 
 def _merge_sliver_junctions_into_neighbours(

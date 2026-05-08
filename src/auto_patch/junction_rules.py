@@ -51,6 +51,7 @@ from .layout import (
 __all__ = [
     "apply_junction_rules",
     "longest_runway_axis_deg",
+    "stitch_pavement_polygons",
     "stitch_pavement_to_terminals",
     "widen_junctions_to_runway_corners",
 ]
@@ -1848,6 +1849,166 @@ def stitch_pavement_to_terminals(
         term.polygon = new_poly
         # Terminals carry a single ``s.altitude`` (uniform plane); no
         # ``node_altitudes`` to update.
+
+
+def stitch_pavement_polygons(
+    layout: PavementLayout,
+    edge_tol_m: float = 0.5,
+    snap_corner_m: float = 1.0,
+) -> int:
+    """Make adjacent pavement polygons share an identical vertex set
+    on every shared boundary segment (user 2026-05-08).
+
+    Two pavement polygons (junction / apron) are "adjacent" when one
+    polygon's ring vertex lies within ``edge_tol_m`` of another's
+    edge interior.  Without this pass, neighbouring junction
+    polygons can have parallel edges that don't share OSM nids; the
+    grade validator finds 6 m elevation gaps at mid-edge samples
+    along those edges (SPLP junction-10053 ↔ junction-10054).
+
+    For each pair where polygon A's vertex V lies on polygon B's
+    edge E:
+      * If V is within ``snap_corner_m`` of one of E's endpoints, no
+        action — the vertex is effectively at a B corner already
+        (and ``_enforce_shared_vertex_altitudes`` will average the
+        two polygons' z at that bucket).
+      * Otherwise insert a new vertex at V's exact (x, y) into B's
+        ring with z linearly interpolated from E's endpoints.  After
+        insertion, V and the new vertex are at the same XY → same
+        OSM-emit bucket → ``_enforce_shared_vertex_altitudes``
+        averages their elevations so the rendered surface meets at
+        a single z at every shared point.
+
+    Companion to ``stitch_pavement_to_terminals``; runs before the
+    final altitude reconciliation chain at the end of
+    ``build_airport_pavement``.
+
+    Returns the total number of vertices inserted across all
+    polygons.
+    """
+    PAVEMENT_LIKE = (ROLE_JUNCTION, ROLE_APRON)
+    pavements = [
+        (i, s) for i, s in enumerate(layout.shapes)
+        if s.role in PAVEMENT_LIKE
+        and s.polygon is not None
+        and not s.polygon.is_empty
+        and s.polygon.geom_type == "Polygon"
+        and s.node_altitudes
+    ]
+    if len(pavements) < 2:
+        return 0
+
+    edge_tol2 = edge_tol_m * edge_tol_m
+    snap_tol2 = snap_corner_m * snap_corner_m
+
+    # Cache per-shape open-ring + altitude views.
+    cache: Dict[int, Tuple[
+        List[Tuple[float, float]], List[float]]] = {}
+    for idx, s in pavements:
+        coords = list(s.polygon.exterior.coords)
+        ring_closed = (
+            len(coords) > 1 and coords[0] == coords[-1])
+        coords_open = coords[:-1] if ring_closed else list(coords)
+        alts = list(s.node_altitudes)
+        alts_open = (alts[:-1] if (
+            ring_closed and len(alts) == len(coords)) else alts)
+        if len(alts_open) != len(coords_open):
+            continue
+        cache[idx] = (coords_open, alts_open)
+
+    # Pending inserts per polygon: {b_idx: {edge_idx: [(t, x, y, z), ...]}}
+    pending: Dict[int, Dict[int, List[
+        Tuple[float, float, float, float]]]] = {}
+
+    for a_idx, A in pavements:
+        if a_idx not in cache:
+            continue
+        a_coords, _ = cache[a_idx]
+        for vi, (vx, vy) in enumerate(a_coords):
+            for b_idx, B in pavements:
+                if b_idx == a_idx or b_idx not in cache:
+                    continue
+                b_coords, b_alts = cache[b_idx]
+                m = len(b_coords)
+                if m < 3:
+                    continue
+                # Skip if V is already at any B corner.
+                already_corner = False
+                for (cx, cy) in b_coords:
+                    if (vx - cx) * (vx - cx) \
+                            + (vy - cy) * (vy - cy) <= snap_tol2:
+                        already_corner = True
+                        break
+                if already_corner:
+                    continue
+                # Find B edge that V projects onto within edge_tol.
+                for ei in range(m):
+                    ax, ay = b_coords[ei]
+                    bx, by = b_coords[(ei + 1) % m]
+                    dx = bx - ax
+                    dy = by - ay
+                    seg2 = dx * dx + dy * dy
+                    if seg2 < 1.0:
+                        continue
+                    t = ((vx - ax) * dx + (vy - ay) * dy) / seg2
+                    if t <= 0.001 or t >= 0.999:
+                        continue
+                    cx = ax + t * dx
+                    cy = ay + t * dy
+                    d2 = (vx - cx) * (vx - cx) \
+                        + (vy - cy) * (vy - cy)
+                    if d2 > edge_tol2:
+                        continue
+                    # Found.  Compute interpolated z along B's edge
+                    # at fraction t.
+                    z_a = b_alts[ei]
+                    z_b = b_alts[(ei + 1) % m]
+                    interp_z = z_a * (1.0 - t) + z_b * t
+                    # Use V's exact (x, y) so A's vertex and B's new
+                    # vertex hash to the same OSM-emit bucket.
+                    pending.setdefault(b_idx, {}).setdefault(
+                        ei, []).append((t, vx, vy, interp_z))
+                    break  # done with this A vertex
+
+    if not pending:
+        return 0
+
+    n_inserts = 0
+    for b_idx, edge_inserts in pending.items():
+        if b_idx not in cache:
+            continue
+        B = layout.shapes[b_idx]
+        b_coords, b_alts = cache[b_idx]
+        m = len(b_coords)
+        new_coords: List[Tuple[float, float]] = []
+        new_alts: List[float] = []
+        for ei in range(m):
+            new_coords.append(b_coords[ei])
+            new_alts.append(b_alts[ei])
+            if ei in edge_inserts:
+                pts = sorted(edge_inserts[ei], key=lambda x: x[0])
+                last_t = -1.0
+                for t, ix, iy, iz in pts:
+                    if t - last_t < 1e-3:
+                        continue
+                    new_coords.append((ix, iy))
+                    new_alts.append(iz)
+                    n_inserts += 1
+                    last_t = t
+        if len(new_coords) < 3:
+            continue
+        try:
+            new_poly = Polygon(new_coords + [new_coords[0]])
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if (new_poly.is_empty
+                    or new_poly.geom_type != "Polygon"):
+                continue
+        except Exception:
+            continue
+        B.polygon = new_poly
+        B.node_altitudes = new_alts + [new_alts[0]]
+    return n_inserts
 
 
 def _vertex_on_any_anchor_edge(

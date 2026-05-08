@@ -1876,8 +1876,21 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # vertices in the edge interior get inserted into the
         # terminal polygon.  Eliminates the 4 sub-metre "step"
         # artefacts that survived the densify-skip guard.
-        from .junction_rules import stitch_pavement_to_terminals
+        from .junction_rules import (
+            stitch_pavement_polygons,
+            stitch_pavement_to_terminals,
+        )
         stitch_pavement_to_terminals(layout)
+        # Adjacent junction polygons whose rings have parallel-but-
+        # near-coincident edges should share OSM nids on every shared
+        # boundary segment.  Inserts vertices into the other polygon's
+        # ring at the projected point with z linearly interpolated
+        # along the host edge.  Companion to
+        # ``stitch_pavement_to_terminals`` for junction-junction
+        # adjacency.  Runs before the corner-snap reconciliation so
+        # ``_enforce_shared_vertex_altitudes`` can average shared-
+        # bucket altitudes the stitch makes coincident.
+        stitch_pavement_polygons(layout)
 
         # Final cross-shape reconciliation pass (user 2026-05-08):
         # snap each junction vertex whose bucket coincides with a
@@ -1907,6 +1920,30 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # bucket away from the rect's tag value.
         _snap_junction_altitudes_to_rect_corners(
             layout, interior_proximity_m=3.0)
+
+        # The corner-snap above can introduce within-junction grade
+        # violations: when one corner of a long junction sits on a
+        # runway (snapped to z=77) while another corner is anchored
+        # to lower-elevation pavement (z=70), the junction's ring
+        # spans 7 m of elevation over ~10 m of distance — 60 %+
+        # grade.  Re-run the grade-based subdivide loop to split
+        # those polygons into shorter pieces with consistent
+        # altitudes, then re-snap so the new sub-polygon corners
+        # adopt their respective rect/runway anchor values.
+        # SPLP junction-10053 is the canonical case (user 2026-05-08).
+        from .junction_repair import _subdivide_violating_junctions
+        n_post_snap = 0
+        for _ in range(4):
+            n = _subdivide_violating_junctions(layout)
+            if n == 0:
+                break
+            n_post_snap += n
+        if n_post_snap > 0:
+            _snap_junction_altitudes_to_rect_corners(
+                layout, interior_proximity_m=3.0)
+            _enforce_shared_vertex_altitudes(layout)
+            _snap_junction_altitudes_to_rect_corners(
+                layout, interior_proximity_m=3.0)
 
         # Final within-shape grade WARN reflects the absolute
         # final state — junction / apron / terminal Euclidean caps
