@@ -406,6 +406,32 @@ def _role_grade_limit(way: "Way",
     return default_grade
 
 
+def _pair_grade_limit(way_a: "Way", way_b: "Way",
+                      default_grade: float) -> Optional[float]:
+    """Resolve the cross-shape grade limit between two ways.
+
+    Returns ``None`` (= skip the pair) when either way's role is
+    on the skip-list (boundary, retaining_wall,
+    groundside_pavement) — these are intentionally at terrain
+    elevations or stacked at different vertical layers (a
+    retaining_wall sitting at apt_elev above a tunnel_ramp at
+    apt_elev−8m at the same XY is not an elevation
+    "disagreement"; the wall and the ramp are different terrain
+    layers by design).
+
+    Otherwise returns the more restrictive of the two role's
+    grade caps so close-but-not-shared vertices satisfy both
+    surfaces' grade rules.
+    """
+    a = _role_grade_limit(way_a, default_grade)
+    if a is None:
+        return None
+    b = _role_grade_limit(way_b, default_grade)
+    if b is None:
+        return None
+    return min(a, b)
+
+
 def _check_within_shape(ways: List[Way],
                         nodes: Dict[str, Tuple[float, float]],
                         ll_to_m,
@@ -536,6 +562,12 @@ def _check_cross_shape_proximity(
                     d = math.hypot(v.x - u.x, v.y - u.y)
                     if d > proximity_m:
                         continue
+                    way_v = ways[v.way_idx]
+                    way_u = ways[u.way_idx]
+                    grade_cap = _pair_grade_limit(
+                        way_v, way_u, max_grade)
+                    if grade_cap is None:
+                        continue
                     de = abs(v.elev - u.elev)
                     # Same OSM node referenced by two ways: the
                     # only valid step is rounding noise.  Don't
@@ -548,22 +580,22 @@ def _check_cross_shape_proximity(
                             excess_pct=float("inf"),
                             distance_m=d,
                             de_m=de,
-                            way_a=ways[v.way_idx],
-                            way_b=ways[u.way_idx],
+                            way_a=way_v,
+                            way_b=way_u,
                             pt_a=(v.x, v.y), pt_b=(u.x, u.y),
                             elev_a=v.elev, elev_b=u.elev))
                         continue
-                    allowance = max_grade * d + ELEV_ROUNDING_NOISE_M
+                    allowance = grade_cap * d + ELEV_ROUNDING_NOISE_M
                     if de <= allowance:
                         continue
                     grade = de / d
                     out.append(Violation(
                         grade_pct=grade * 100,
-                        excess_pct=(grade - max_grade) * 100,
+                        excess_pct=(grade - grade_cap) * 100,
                         distance_m=d,
                         de_m=de,
-                        way_a=ways[v.way_idx],
-                        way_b=ways[u.way_idx],
+                        way_a=way_v,
+                        way_b=way_u,
                         pt_a=(v.x, v.y), pt_b=(u.x, u.y),
                         elev_a=v.elev, elev_b=u.elev))
     return out
@@ -587,6 +619,9 @@ def _check_vertex_to_edge_step(
     for v in vertices:
         if v.elev is None:
             continue
+        way_v = ways[v.way_idx]
+        if _role_grade_limit(way_v, 1.0) is None:
+            continue  # vertex's role is on the skip-list
         cx = int(math.floor(v.x / cell))
         cy = int(math.floor(v.y / cell))
         best_d2 = edge_search_m * edge_search_m
@@ -600,6 +635,9 @@ def _check_vertex_to_edge_step(
                     e = edges[e_idx]
                     if e.way_idx == v.way_idx:
                         continue
+                    way_e = ways[e.way_idx]
+                    if _role_grade_limit(way_e, 1.0) is None:
+                        continue  # edge's role is on the skip-list
                     ax, ay = e.a
                     bx, by = e.b
                     dx = bx - ax
@@ -661,6 +699,9 @@ def _check_edge_midpoint_step(
     cell = max(edge_search_m, 1.0)
     edge_grid = _bucket_edges(edges, cell)
     for e1 in edges:
+        way_e1 = ways[e1.way_idx]
+        if _role_grade_limit(way_e1, 1.0) is None:
+            continue  # this edge's role is on the skip-list
         ax, ay = e1.a
         bx, by = e1.b
         dx = bx - ax
@@ -688,6 +729,9 @@ def _check_edge_midpoint_step(
                         e2 = edges[e2_idx]
                         if e2.way_idx == e1.way_idx:
                             continue
+                        way_e2 = ways[e2.way_idx]
+                        if _role_grade_limit(way_e2, 1.0) is None:
+                            continue  # other edge's role on skip-list
                         e2ax, e2ay = e2.a
                         e2bx, e2by = e2.b
                         e2dx = e2bx - e2ax
