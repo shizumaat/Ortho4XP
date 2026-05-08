@@ -169,12 +169,20 @@ def test_neither_side_keeps_rect():
 def test_partial_adjacency_splits_not_drops():
     """Apron covering ONLY the first 50 m of the long edge should
     absorb that portion and KEEP the remaining 50 m as a shorter
-    rect — not drop the whole rect."""
+    rect — not drop the whole rect.
+
+    ``apt_pav_union`` is the FULL apt.dat ∪ DSF pavement (per the
+    real pipeline at pipeline.py:1710), so the kept fragment's
+    corners land on/near pav.boundary and snap cleanly.  Tests
+    that pass only the apron here will fail the snap's degenerate-
+    rect check because corners collapse onto the apron's edge.
+    """
     # Apron on north side, x=0..50.  Rect length 100.
     apron = _apron(-10.0, 50.0, +5.0, +50.0)
     poly, axis = _rect(length=100.0, half_w=10.0)
+    pav_union = apron.union(poly)
     result = _drop_primary_parallels_embedded_in_pavement(
-        [(poly, axis, ROLE_PRIMARY_PARALLEL, "F")], apron)
+        [(poly, axis, ROLE_PRIMARY_PARALLEL, "F")], pav_union)
     assert len(result) == 1, (
         "Partial-absorption rule violated: half-covered rect must "
         "produce one shorter rect, not drop the whole thing")
@@ -187,14 +195,20 @@ def test_partial_adjacency_splits_not_drops():
 
 def test_two_separate_adjacencies_split_into_three():
     """Apron at x=0..30 and x=70..100 (with a clear gap in the
-    middle) should leave the middle 30..70 chunk as a rect."""
+    middle) should leave the middle 30..70 chunk as a rect.
+
+    See ``test_partial_adjacency_splits_not_drops`` for the
+    ``pav_union`` shape — apron(s) ∪ rect mirrors the real
+    pipeline.
+    """
     # Two apron strips on the north side.
     a1 = _apron(-10.0, 30.0, +5.0, +50.0)
     a2 = _apron(70.0, 110.0, +5.0, +50.0)
     apron = a1.union(a2)
     poly, axis = _rect(length=100.0, half_w=10.0)
+    pav_union = apron.union(poly)
     result = _drop_primary_parallels_embedded_in_pavement(
-        [(poly, axis, ROLE_PRIMARY_PARALLEL, "F")], apron)
+        [(poly, axis, ROLE_PRIMARY_PARALLEL, "F")], pav_union)
     # The middle (~30..70 = 40 m) survives as one rect.
     assert len(result) == 1
     spans = _kept_axes(result)
