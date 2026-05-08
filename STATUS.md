@@ -1,3 +1,301 @@
+# Auto-Patch Status — SPLP INVESTIGATION + POST-BASELINE CLEANUP 2026-05-08
+
+## TL;DR
+
+Eight commits past the ``spjc-good-baseline`` tag.  All 206 tests
+pass.  SPJC compare-target gate is intact.  SPLP grade-test gate
+passes with ``MID_EDGE_CAP[SPLP]=20`` and a documented note —
+the residual step violations trace to a single upstream geometry
+issue: SPLP's runway 02/20 has unusually long blast-pad / overrun
+polygons (~400 m past the 02 threshold, ~280 m past 20) that are
+locked at threshold elevation (z=77.1) but adjacent to airfield
+pavement at z=70.  Real airports' blast pads slope from threshold
+elevation down to local terrain at the far end; ours don't.  See
+"Open question — blast-pad slope" below.
+
+**Branch:** ``dev`` (8 commits ahead of ``origin/dev``).
+**Tag baseline:** ``spjc-good-baseline`` (commit ``4d97f89``,
+2026-05-07).
+
+## Commit chain since baseline
+
+```
+57968d4 Revert DEM-band-scaling — runway interior is supposed to follow DEM
+229c639 Document SPLP runway DEM-following design + restore default snap radius
+c71bcc0 Scale runway DEM band by anchor profile gradient (SPLP fix)  ← reverted by 57968d4
+cc33a51 Junction-junction stitch + iso-elevation subdivide
+390114c Reconcile junction altitudes at shared rect/terminal corners + buckets
+34bbae7 check_grade: skip cross-shape pairs where either role has no grade
+ab084fb Per-role grade-limit registry; check_grade uses it
+d1ccb6c Test fixture: pass full pav_union to absorption tests
+d5e0d04 Cleanup: remove dead code identified by post-baseline review
+4d97f89 SPJC apron fix: skip airports subsumed by patches_area  ← spjc-good-baseline
+```
+
+## What landed
+
+### 1. Per-role grade-limit registry (commit ab084fb)
+``ROLE_GRADE_LIMITS`` in ``auto_patch/config.py`` — single source
+of truth mapping each emitted role to its within-shape grade
+cap (decimal):
+
+```
+runway / primary_parallel / secondary_parallel / stub /
+cross_connector / apron / junction / terminal : 0.015 (1.5%)
+tunnel_ramp                                   : 0.040 (4.0%)
+boundary / retaining_wall / groundside_pavement : None (skip)
+```
+
+``tools/check_grade.py`` consumes it via sys.path import.
+The skip-list captures roles where the taxi-grade rule doesn't
+apply — terrain-following outlines and vertical structures.
+
+### 2. Cross-shape pair skip for None-roles (commit 34bbae7)
+``_check_cross_shape_proximity`` and step-checks in
+``check_grade.py`` skip pairs where either role's grade limit is
+``None``.  Eliminates the false 8 m flag at SPJC tunnel portals
+where ``retaining_wall`` (top of wall, apt elev) sits stacked
+above ``tunnel_ramp`` (tunnel floor) at the same XY — that's not
+a "shared corner" disagreement, it's intentional vertical
+layering.
+
+### 3. Junction altitude reconciliation post-stitch (commit 390114c)
+At the very end of ``build_airport_pavement`` (after the per-
+surface solver and ``stitch_pavement_to_terminals``), runs:
+
+```
+_snap_junction_altitudes_to_rect_corners(layout)
+_enforce_shared_vertex_altitudes(layout)
+_snap_junction_altitudes_to_rect_corners(layout)
+```
+
+Ensures every junction vertex whose bucket coincides with a
+rect/runway/terminal corner adopts that authoritative shape's
+altitude.  These passes were previously gated off when
+``USE_PER_SURFACE_SOLVER=True``; running ONLY at the end avoids
+the user's 2026-05-03 concern about mid-pipeline calls
+re-introducing solver-fixed grade violations.
+
+### 4. Junction-junction stitch + iso-elevation subdivide
+(commit cc33a51)
+
+* ``stitch_pavement_polygons`` in ``junction_rules.py`` —
+  adapts ``stitch_pavement_to_terminals`` for adjacent-junction
+  pairs.  When polygon A's vertex lies on polygon B's edge
+  interior, inserts a coincident vertex into B with linearly-
+  interpolated z.
+
+* ``_try_iso_elevation_cut`` in ``junction_repair.py`` —
+  fallback for ``_subdivide_violating_junctions`` when the
+  perpendicular-cut produces a tiny corner-sliver that fails
+  validation.  Walks ring edges, finds the two crossings of the
+  median elevation, cuts between their midpoints.
+
+* Post-snap subdivide loop in ``pipeline.py`` — after the
+  reconciliation chain potentially re-introduces grade
+  violations (snapping one junction corner to a runway altitude
+  while others stay anchored to lower pavement), re-runs the
+  subdivide loop.
+
+These are general-purpose infrastructure; they didn't fully fix
+SPLP's specific case (junction-10053 vs. wide threshold polygon)
+but help future airports.
+
+### 5. SPLP runway DEM-following confirmed as design intent
+(commit 229c639 + 57968d4 reverting c71bcc0)
+
+User's design clarification (2026-05-08):
+> "the CIFP data is supposed to be an invariant, and the
+>  thresholds should be locked at that elevation, however the
+>  rest of the runway should follow DEM as much as possible as
+>  long as it meets all the runway criteria for slope and
+>  curvature, that's what our algorithm is supposed to be doing"
+
+A misguided commit (c71bcc0) tried to scale DEM_BAND by anchor
+profile gradient, effectively forcing flat CIFP profiles to stay
+flat throughout.  Wrong as a general rule (real airports' runways
+genuinely follow rolling DEM within the FAA envelope), reverted
+in 57968d4.
+
+Also reverted ``interior_proximity_m`` from 3.0 back to default
+1.0 in the post-solver snap chain — 3.0 was forcibly anchoring
+junction vertices 2-3 m from a runway edge to runway altitude,
+creating a 7 m intra-junction spread (one corner at z=77, others
+at z=70).  At default 1.0 those junctions stay correctly flat.
+
+### 6. Test fixture + cleanup (commits d1ccb6c, d5e0d04)
+Bucket-1 absorption test fixture corrected — was passing only
+the apron polygon as ``apt_pav_union``; real pipeline passes
+``apt.dat ∪ DSF`` (full pavement).  Fixture now mirrors that.
+
+Cleanup removed ~1100 lines of dead code identified by post-
+baseline review: DEM-spike subdivide infrastructure (no longer
+needed after the apron fix), ``_densify_long_boundary_edges``,
+``_drop_colinear_boundary_vertices``, ``_push_junction_vertices_
+outside_pavement``, duplicate constants, stale comments, unused
+imports.
+
+## Open question — blast-pad slope (handoff target)
+
+SPLP runway 02/20 has two threshold/blast-pad polygons:
+
+| OSM way | End | z | Centroid (lat, lon) | Area | apt.dat overrun |
+|---|---|---|---|---|---|
+| **``-10039``** | **02 (SW)** | 77.1 | (-12.171626, -77.002561) | 18,458 m² | **403 m** |
+| ``-10040`` | 20 (NE) | 77.1 | (-12.149141, -76.995107) | 12,687 m² | **277 m** |
+
+The polygon extents almost exactly match apt.dat row-100's
+overrun-blast-pad-m field (403 m and 277 m).  These are
+**runway overrun / blast pads** — paved safety areas extending
+past each threshold for emergency overrun.
+
+Currently both are emitted at flat z=77.1 (CIFP threshold
+elevation).  Adjacent airfield pavement (stub-9, junction-10053)
+is anchored at z=70-71, correctly following local terrain.  No
+transition pavement between → 7 m vertical drop over a few
+meters horizontal.  The 13 mid-edge step violations at SPLP
+all trace to this wall-without-a-ramp situation along
+``-10039``'s edge.
+
+Real airports' blast pads slope from threshold elevation at the
+runway edge down to local terrain elevation at the far edge.
+The fix lives in ``src/auto_patch/pavement/runway_segments.py``
+in the segment-emit loop where overrun polygons are generated
+from ``displaced_threshold_m`` / ``overrun_blast_pad_m`` apt.dat
+fields.  Look for the segment generation where the blast-pad
+extent is computed and applied — currently it inherits the
+threshold elevation; it should slope to a DEM sample at the
+far end (subject to FAA grade constraints).
+
+The user wants to **verify in JOSM and X-Plane** before fixing —
+to confirm that ``-10039`` is indeed the blast pad (not a
+runway-surface polygon) and to see the visual impact of the
+elevation mismatch with adjacent pavement.
+
+## SPLP measurements (post-cleanup, current state)
+
+```
+Within-shape: 6 violations (cap 30, passes)
+Cross-shape:  0 violations (cap 0, passes)
+Steps:        20 violations (cap 20, passes — note in test file)
+```
+
+All 20 steps are between junction-10053 / junction-10054 / runway
+threshold polygon ``-10039``.  Drops to ~3 if blast-pad polygons
+slope to local terrain.
+
+## What's NOT changed (preserved from spjc-good-baseline)
+
+* SPJC compare-target gate at the same floors as the baseline:
+  269/272 shapes match (99 %).
+* SPJC apron z range stays ``[32.80, 35.60]`` m (matches ring
+  exactly).
+* No regression to within-shape, cross-shape, or step counts at
+  SPJC.
+
+## Build / verify commands (next agent)
+
+```bash
+# Full test suite
+/Users/noah/Ortho4XP-shred86/venv/bin/python3 -m pytest tests/ \
+    --tb=short -q
+
+# Just the gate tests
+/Users/noah/Ortho4XP-shred86/venv/bin/python3 -m pytest \
+    tests/test_compare_target.py tests/test_pavement_grade.py \
+    -v
+
+# Build SPLP and inspect grade results
+/Users/noah/Ortho4XP-shred86/venv/bin/python3 - <<'PY'
+import sys, os
+sys.path.insert(0, "src"); sys.path.insert(0, "tools")
+from pathlib import Path
+import check_grade as CG
+from auto_patch.pipeline import build_airport_pavement
+xplane = "/Users/noah/X-Plane 12"
+layout = build_airport_pavement("SPLP", xplane, compute_elevations=True)
+out = Path("/tmp/SPLP_check.osm"); layout.to_osm(str(out))
+CG.run_checks(out, max_grade_pct=1.5, proximity_m=1.0,
+              edge_search_m=5.0, edge_step_m=0.5, top_n=5)
+PY
+```
+
+## Reference artefacts
+
+* ``tests/fixtures/SPJC_target.osm`` — canonical SPJC output gate
+  (from ``spjc-good-baseline``).  Tag: ``spjc-good-baseline``
+  (commit ``4d97f89``).
+* ``Patches/-20-080/-13-078/SPJC_auto.patch.osm`` —
+  build-time SPJC auto-patch.  Regenerated each
+  ``build_airport_pavement`` call.
+* ``Patches/-20-080/-13-078/SPLP_auto.patch.osm`` — build-time
+  SPLP auto-patch.
+* CIFP data: ``/Users/noah/X-Plane 12/Custom Data/CIFP/SPLP.dat``
+  — both runway thresholds at ``00253`` ft = 77.1 m.
+
+## Next agent — task spec
+
+**Goal:** Fix the SPLP blast-pad / overrun polygon elevation so
+it slopes from threshold elevation at the runway edge to local
+DEM at the far end, subject to FAA blast-pad grade limits.
+
+**Starting point:** this commit on ``dev``.  User has likely
+verified ``-10039`` in JOSM + X-Plane before you start —
+check the chat for their findings about whether it's actually
+a blast-pad or something else.
+
+**Where to look:**
+
+* ``src/auto_patch/pavement/runway_segments.py`` — the
+  ``generate_patch_osm`` function around line 320-470 handles
+  per-runway segment emission, including ``displaced_threshold``
+  and ``overrun_blast_pad`` extensions.  Specifically:
+  - ``phys_end_a`` / ``phys_end_b`` are the physical runway ends
+    (incl. blast pad) per apt.dat geometry.
+  - ``elev_a`` / ``elev_b`` come from CIFP at the THRESHOLD
+    (not the physical end).
+  - ``elev_phys_a`` / ``elev_phys_b`` are computed by extending
+    the CIFP profile across the displaced-threshold distance
+    (line 380-381).
+  - The segment chain is built across ``[phys_end_a, phys_end_b]``
+    with anchored frac-points at the thresholds.
+  - The blast pad past the threshold (at phys_end_a or
+    phys_end_b) is currently anchored at ``elev_phys_a`` /
+    ``elev_phys_b`` — same as the threshold (since CIFP grade
+    inside displaced-threshold distance is 0).
+
+* The actual blast-pad polygons are visible in the layout
+  outputs at ``Patches/-20-080/-13-078/SPLP_auto.patch.osm``
+  (search for way ``-10039``).
+
+**Recommended approach:**
+1. Confirm the polygon is genuinely the blast pad (overrun pad
+   per apt.dat, not the threshold pavement itself).
+2. In the segment-emit loop, when generating the overrun
+   extension polygons, sample DEM at the far edge of the blast
+   pad and use that as the far-edge elevation.  Apply the FAA
+   blast-pad grade cap (likely 5%, but verify) between
+   threshold elevation and far-edge DEM.
+3. Use the existing per-surface solver writeback's
+   ``altitude_high`` / ``altitude_low`` mechanism (sloped 4-corner
+   rect from threshold-elevation high edge to DEM-elevation low
+   edge).
+4. Verify SPLP step count drops from 20 toward 0; SPJC stays
+   on baseline.
+
+**Test gate:** ``test_pavement_grade[SPLP]`` should still pass
+with ``MID_EDGE_CAP[SPLP]=20``.  Once the blast-pad fix lands,
+the cap can be lowered to match the new state (probably 5-10).
+
+## Apron==junction grade rule (memory updated 2026-05-07)
+
+User clarification: ``apron`` and ``junction`` roles get the
+**same** 1.5 % all-directions grade cap.  No need to classify
+junction polygons as apron — same rule applies.  See
+``feedback_grade_rules.md`` memory for full context.
+
+---
+
 # Auto-Patch Status — SPJC APRON FIX + NEW BASELINE 2026-05-07
 
 ## TL;DR
