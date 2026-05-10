@@ -484,14 +484,19 @@ def _emit_boundary_dem_bridge(
         if s.role in (ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
                        ROLE_SECONDARY_PARALLEL, ROLE_STUB,
                        ROLE_CROSS_CONNECTOR):
-            if len(coords) != 4:
-                continue
             if (s.altitude_high is not None
                     and s.altitude_low is not None):
+                # Sloped 4-corner rect — strict convention.
+                if len(coords) != 4:
+                    continue
                 per = [s.altitude_high, s.altitude_low,
                        s.altitude_low, s.altitude_high]
             elif s.altitude is not None:
-                per = [float(s.altitude)] * 4
+                # Flat shape: any number of corners (multi-node flat
+                # runway shapes from the segmenter).
+                if len(coords) < 4:
+                    continue
+                per = [float(s.altitude)] * len(coords)
             else:
                 continue
             for (x, y), a in zip(coords, per):

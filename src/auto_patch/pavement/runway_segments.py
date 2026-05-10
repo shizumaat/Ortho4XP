@@ -198,6 +198,41 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             tags = {"altitude": "{:.1f}".format(avg)}
         add_way([n0, n1, n2, n3, n0], tags)
 
+    def add_flat_multi_rect(samples_ll, elev, width):
+        """Helper: add a multi-node FLAT runway polygon.
+
+        ``samples_ll`` is the centerline sample list ordered start to
+        end; the polygon is built by extending each sample
+        perpendicular by ±width/2.  Used when consecutive sloped/flat
+        segments collapse into a single flat run — intermediate
+        samples are kept only at pav_intersection positions where
+        adjacent junctions need to snap.
+
+        Per user 2026-05-09: flat shapes use single ``altitude=`` tag
+        and may carry an arbitrary number of corners.
+        """
+        if len(samples_ll) < 2:
+            return
+        lat_a, lon_a = samples_ll[0]
+        lat_b, lon_b = samples_ll[-1]
+        bcorners = runway_corners(lat_a, lon_a, lat_b, lon_b, width)
+        if bcorners is None:
+            return
+        # ``runway_corners`` returns [a-left, b-left, b-right, a-right]
+        # — perpendicular offset is (corner[0] - sample[0]).
+        perp_dlat = bcorners[0][0] - lat_a
+        perp_dlon = bcorners[0][1] - lon_a
+        # Build ring: A→B on left side, then B→A on right side.
+        ring: List[Tuple[float, float]] = []
+        for s_lat, s_lon in samples_ll:
+            ring.append((s_lat + perp_dlat, s_lon + perp_dlon))
+        for s_lat, s_lon in reversed(samples_ll):
+            ring.append((s_lat - perp_dlat, s_lon - perp_dlon))
+        node_ids = [add_node(la, lo) for la, lo in ring]
+        node_ids.append(node_ids[0])
+        tags = {"altitude": "{:.1f}".format(round(float(elev), 1))}
+        add_way(node_ids, tags)
+
     def _sample_dem(lat, lon):
         """Sample DEM elevation at a lat/lon, returning 0 on failure."""
         if tile is None or not hasattr(tile, "dem") or tile.dem is None:
@@ -404,6 +439,14 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                             anchored_t.append(t)
                 fractions.sort()
 
+            # ``pav_int_t_vals`` accumulates the t-values of every
+            # pav_intersection that survives dedup into ``fractions``.
+            # Used downstream to identify which sample positions are
+            # legitimate junction-snap points so they get retained as
+            # intermediate corners when consecutive flat segments are
+            # consolidated into a single multi-node flat polygon
+            # (user 2026-05-09).
+            pav_int_t_vals: List[float] = []
             # Per user 2026-05-05: inject pav_intersection breakpoints
             # so segment seam corners align with apt.dat-pavement
             # boundary points where the apron / taxiway meets the
@@ -466,6 +509,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                         fractions[closest_idx] = pt
                     else:
                         fractions.append(pt)
+                    pav_int_t_vals.append(pt)
                 fractions.sort()
 
             # For each sample point, compute lat/lon and seed elevation
@@ -984,20 +1028,62 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 if max(abs(a - b) for a, b in zip(elevs, prev_elevs)) < 0.005:
                     break
 
+            # Identify which sample indices correspond to pav_inter-
+            # section breakpoints (junction-snap points).  These are
+            # the only intermediate vertices retained when consecutive
+            # flat segments are consolidated.
+            pav_int_indices = set()
+            for k, frac in enumerate(fractions):
+                for pt in pav_int_t_vals:
+                    if abs(frac - pt) < 1e-6:
+                        pav_int_indices.add(k)
+                        break
+
             # ── Emit segmented rectangles ────────────────────────────────
-            for idx in range(len(sample_pts) - 1):
-                s_a = sample_pts[idx]
-                s_b = sample_pts[idx + 1]
-                add_rect_patch(
-                    s_a[0], s_a[1], elevs[idx],
-                    s_b[0], s_b[1], elevs[idx + 1],
-                    patch_width,
-                )
-                runway_chain.append((
-                    s_a[0], s_a[1], elevs[idx],
-                    s_b[0], s_b[1], elevs[idx + 1],
-                    patch_width,
-                ))
+            # Per user 2026-05-09: consolidate consecutive flat
+            # segments into a single multi-node flat polygon.  Outer
+            # corners at the run's start / end samples; intermediate
+            # corners at any pav_intersection sample positions inside
+            # the run (so adjacent junctions still get their snap
+            # points).  Sloped pairs and single-segment flats keep
+            # the legacy 4-corner emit.
+            FLAT_TOL = 0.05
+            n_samples = len(sample_pts)
+            idx = 0
+            while idx < n_samples - 1:
+                end_idx = idx
+                while (end_idx < n_samples - 1
+                        and abs(elevs[end_idx + 1] - elevs[end_idx])
+                        < FLAT_TOL):
+                    end_idx += 1
+                if end_idx > idx + 1:
+                    intermediate: List[Tuple[float, float, float, bool]] = []
+                    for k in range(idx + 1, end_idx):
+                        if k in pav_int_indices:
+                            intermediate.append(sample_pts[k])
+                    flat_pts = [sample_pts[idx]] + intermediate \
+                        + [sample_pts[end_idx]]
+                    samples_ll = [(s[0], s[1]) for s in flat_pts]
+                    flat_elev = float(elevs[idx])
+                    add_flat_multi_rect(samples_ll, flat_elev, patch_width)
+                    runway_chain.append((
+                        "MULTI_FLAT", samples_ll, flat_elev, patch_width,
+                    ))
+                    idx = end_idx
+                else:
+                    s_a = sample_pts[idx]
+                    s_b = sample_pts[idx + 1]
+                    add_rect_patch(
+                        s_a[0], s_a[1], elevs[idx],
+                        s_b[0], s_b[1], elevs[idx + 1],
+                        patch_width,
+                    )
+                    runway_chain.append((
+                        s_a[0], s_a[1], elevs[idx],
+                        s_b[0], s_b[1], elevs[idx + 1],
+                        patch_width,
+                    ))
+                    idx += 1
 
             # ── Flat blast-pad / overrun rectangles beyond ends ─────────
             # Length comes from apt.dat row-100 blast_a/blast_b when

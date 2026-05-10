@@ -399,6 +399,47 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         # post-elevation layout overlap-free.
         _LEGACY_RUNWAY_MARGIN = 3.0
         for i, seg in enumerate(runway_segment_chain):
+            # Multi-node flat segment (user 2026-05-09): a single
+            # consolidated polygon covering N centerline samples at
+            # uniform elevation, with intermediate corners at pav_
+            # intersection positions.  Tagged tuple shape:
+            #   ("MULTI_FLAT", [(lat, lon), ...], elev, width)
+            if len(seg) == 4 and seg[0] == "MULTI_FLAT":
+                _, samples_ll, elev_flat, width_m = seg
+                width_m = max(1.0,
+                               width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
+                samples_xy = [
+                    _latlon_to_m_local(la, lo, lat0, lon0, cos0)
+                    for la, lo in samples_ll]
+                if len(samples_xy) < 2:
+                    continue
+                ax, ay = samples_xy[0]
+                bx, by = samples_xy[-1]
+                length = math.hypot(bx - ax, by - ay)
+                if length < 1.0:
+                    continue
+                ux = (bx - ax) / length
+                uy = (by - ay) / length
+                px = -uy * width_m / 2.0
+                py = ux * width_m / 2.0
+                # Build ring: left side A→B, right side B→A.
+                ring = []
+                for x, y in samples_xy:
+                    ring.append((x + px, y + py))
+                for x, y in reversed(samples_xy):
+                    ring.append((x - px, y - py))
+                poly = Polygon(ring)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_empty or poly.geom_type != "Polygon":
+                    continue
+                shape = BuiltShape(
+                    polygon=poly, role=ROLE_RUNWAY, ref=ref_fallback)
+                shape.altitude = round(float(elev_flat), 1)
+                layout.shapes.append(shape)
+                new_runway_polys.append(poly)
+                continue
+            # Legacy 4-corner (sloped or flat).
             lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m = seg
             width_m = max(1.0, width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
             ax, ay = _latlon_to_m_local(lat_a, lon_a, lat0, lon0, cos0)

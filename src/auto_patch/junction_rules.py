@@ -554,10 +554,13 @@ def _build_runway_corner_altitudes(
         coords = list(s.polygon.exterior.coords)
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
-        if len(coords) != 4:
+        if len(coords) < 4:
             continue
         if (s.altitude_high is not None
                 and s.altitude_low is not None):
+            # Sloped 4-corner rect — strict convention.
+            if len(coords) != 4:
+                continue
             corner_alts = (
                 (coords[0], float(s.altitude_high)),
                 (coords[1], float(s.altitude_low)),
@@ -565,6 +568,9 @@ def _build_runway_corner_altitudes(
                 (coords[3], float(s.altitude_high)),
             )
         elif s.altitude is not None:
+            # Flat shape: any number of corners (multi-node flat
+            # runways carry intermediate snap corners along the long
+            # sides).
             a = float(s.altitude)
             corner_alts = tuple((c, a) for c in coords)
         else:
