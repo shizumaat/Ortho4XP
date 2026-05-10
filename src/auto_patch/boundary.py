@@ -22,8 +22,27 @@ import math
 import os
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
+
+# Narrow exception tuple for shapely / geometry ops that signal
+# degenerate input rather than a programming error.  Replaces the
+# blanket ``except Exception`` blocks that previously silently
+# swallowed ``NameError`` from a missing import (user 2026-05-10
+# — boundary runway-elevation clamp had been broken since the
+# slice-5 refactor because the import dance masked a NameError).
+#
+# Programming errors (``NameError``, ``ImportError``,
+# ``AttributeError`` from typos / ``None``-leaks) intentionally
+# propagate so they surface immediately during testing rather than
+# being silently masked at runtime.  Real shapely degeneracy
+# surfaces as ``GEOSException`` / ``TopologicalError`` /
+# ``ValueError``; out-of-bounds DEM indexing surfaces as
+# ``IndexError``.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
+
 
 from .layout import (
     AEROWAY_FOR_ROLE,
@@ -126,7 +145,7 @@ def _emit_airport_boundary_shape(
         try:
             lat, lon = m_to_ll(x, y)
             dem_e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-        except Exception:
+        except _GEOM_EXC:
             dem_e = None
         # Find nearest runway and its elevation at the nearest point.
         best_d = float('inf')
@@ -135,7 +154,7 @@ def _emit_airport_boundary_shape(
         for s in runway_shapes:
             try:
                 d = s.polygon.distance(pt)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if d >= best_d:
                 continue
@@ -146,7 +165,7 @@ def _emit_airport_boundary_shape(
                     np = _nearest_points(s.polygon, pt)[0]
                     np_x, np_y = np.x, np.y
                 e = _sample_runway_segment_elev(s, np_x, np_y)
-            except Exception:
+            except _GEOM_EXC:
                 e = None
             if e is None:
                 continue
@@ -216,7 +235,7 @@ def _emit_airport_boundary_shape(
     if pavement_polys:
         try:
             pavement_union = unary_union(pavement_polys)
-        except Exception:
+        except _GEOM_EXC:
             pavement_union = None
     n_emitted = 0
     for ring in ext_rings:
@@ -227,14 +246,14 @@ def _emit_airport_boundary_shape(
                                 cap_style=2, join_style=2)
             if not strip.is_valid:
                 strip = strip.buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if strip.is_empty:
             continue
         if pavement_union is not None and not pavement_union.is_empty:
             try:
                 strip = strip.difference(pavement_union)
-            except Exception:
+            except _GEOM_EXC:
                 pass
             if strip.is_empty:
                 continue
@@ -252,7 +271,7 @@ def _emit_airport_boundary_shape(
             try:
                 pieces = _decompose_polygon_with_holes(
                     sp, min_area_m2=10.0, max_depth=8)
-            except Exception:
+            except _GEOM_EXC:
                 pieces = [sp]
             for p in pieces:
                 if p.is_empty or p.geom_type != "Polygon":
@@ -262,7 +281,7 @@ def _emit_airport_boundary_shape(
         for piece in all_pieces:
             try:
                 exterior = list(piece.exterior.coords)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             dense = _densify_ring(exterior)
             if len(dense) < 4:
@@ -274,7 +293,7 @@ def _emit_airport_boundary_shape(
                 if (new_poly.is_empty
                         or new_poly.geom_type != "Polygon"):
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 continue
             # Re-extract the (post-buffer-cleanup) exterior so the
             # node_altitudes count matches polygon.exterior.coords.
@@ -370,7 +389,7 @@ def _emit_boundary_dem_bridge(
         try:
             lat, lon = m_to_ll(x, y)
             dem_e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-        except Exception:
+        except _GEOM_EXC:
             dem_e = None
         best_d = float('inf')
         best_e = None
@@ -379,7 +398,7 @@ def _emit_boundary_dem_bridge(
         for s in runway_shapes:
             try:
                 d = s.polygon.distance(pt)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if d >= best_d:
                 continue
@@ -390,7 +409,7 @@ def _emit_boundary_dem_bridge(
                     np = _np(s.polygon, pt)[0]
                     np_x, np_y = np.x, np.y
                 e = _sample_runway_segment_elev(s, np_x, np_y)
-            except Exception:
+            except _GEOM_EXC:
                 e = None
             if e is None:
                 continue
@@ -415,7 +434,7 @@ def _emit_boundary_dem_bridge(
         try:
             lat, lon = m_to_ll(x, y)
             return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-        except Exception:
+        except _GEOM_EXC:
             return None
 
     boundary_geom = layout.airport_boundary
@@ -442,7 +461,7 @@ def _emit_boundary_dem_bridge(
     if pavement_polys:
         try:
             pavement_union = unary_union(pavement_polys)
-        except Exception:
+        except _GEOM_EXC:
             pavement_union = None
     # Separately track the boundary ribbon — its centerline matches
     # the boundary line, so the bridge polygon overlaps the ribbon
@@ -459,7 +478,7 @@ def _emit_boundary_dem_bridge(
     if ribbon_polys:
         try:
             ribbon_union = unary_union(ribbon_polys)
-        except Exception:
+        except _GEOM_EXC:
             ribbon_union = None
 
     # Pre-collect pavement EDGE points with altitudes — used for
@@ -476,7 +495,7 @@ def _emit_boundary_dem_bridge(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -532,7 +551,7 @@ def _emit_boundary_dem_bridge(
     for boundary_poly in rings:
         try:
             ext_coords = list(boundary_poly.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if len(ext_coords) < 4:
             continue
@@ -585,7 +604,7 @@ def _emit_boundary_dem_bridge(
                     if pavement_union.distance(
                             _P2(v[0], v[1])) < 5.0:
                         continue
-                except Exception:
+                except _GEOM_EXC:
                     pass
             marked.append((i, v))
         if not marked:
@@ -626,7 +645,7 @@ def _emit_boundary_dem_bridge(
                 continue
             try:
                 outer_line = _LS(outer_pts)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if outer_line.is_empty or outer_line.length < 1.0:
                 continue
@@ -637,7 +656,7 @@ def _emit_boundary_dem_bridge(
                 try:
                     off = outer_line.parallel_offset(
                         bridge_depth_m, side=side, join_style=2)
-                except Exception:
+                except _GEOM_EXC:
                     off = None
                 if off is None or off.is_empty:
                     continue
@@ -648,7 +667,7 @@ def _emit_boundary_dem_bridge(
                     if boundary_poly.contains(mid):
                         inner_line = off
                         break
-                except Exception:
+                except _GEOM_EXC:
                     continue
             if inner_line is None or inner_line.is_empty:
                 continue
@@ -672,7 +691,7 @@ def _emit_boundary_dem_bridge(
                             and p.area > 100.0):
                         bridge_poly = p
                         break
-                except Exception:
+                except _GEOM_EXC:
                     continue
             if bridge_poly is None:
                 continue
@@ -691,7 +710,7 @@ def _emit_boundary_dem_bridge(
                 if runway_union is not None and not runway_union.is_empty:
                     bridge_poly = bridge_poly.difference(
                         runway_union.buffer(5.0))
-            except Exception:
+            except _GEOM_EXC:
                 pass
             if (bridge_poly.is_empty
                     or bridge_poly.geom_type
@@ -711,7 +730,7 @@ def _emit_boundary_dem_bridge(
             for sub_geom in non_sloping_pav_polys:
                 try:
                     bridge_poly = bridge_poly.difference(sub_geom)
-                except Exception:
+                except _GEOM_EXC:
                     pass
                 if bridge_poly.is_empty:
                     break
@@ -737,7 +756,7 @@ def _emit_boundary_dem_bridge(
                     and not ribbon_union.is_empty):
                 try:
                     bridge_poly = bridge_poly.difference(ribbon_union)
-                except Exception:
+                except _GEOM_EXC:
                     pass
                 if bridge_poly.is_empty:
                     continue
@@ -771,7 +790,7 @@ def _emit_boundary_dem_bridge(
                     if (bridge_poly.intersection(r).area > 1.0):
                         overlaps_rect = True
                         break
-                except Exception:
+                except _GEOM_EXC:
                     continue
             if overlaps_rect:
                 # Trim the bridge against the sloping-rect union
@@ -786,7 +805,7 @@ def _emit_boundary_dem_bridge(
                     # outside that proximity band.
                     bridge_poly = bridge_poly.difference(
                         rect_union.buffer(1.0))
-                except Exception:
+                except _GEOM_EXC:
                     bridge_poly = None
                 if (bridge_poly is None
                         or bridge_poly.is_empty):
@@ -805,7 +824,7 @@ def _emit_boundary_dem_bridge(
                             bridge_poly,
                             sloping_rect_polys,
                             snap_tol_m=5.0))
-                except Exception:
+                except _GEOM_EXC:
                     pass
                 if (bridge_poly is None
                         or bridge_poly.is_empty
