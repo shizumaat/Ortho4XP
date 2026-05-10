@@ -394,6 +394,36 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 else:
                     phys_end_b = (lat_b, lon_b)
 
+            # Per user 2026-05-09: treat blast-pad / overrun
+            # extensions as displaced-threshold continuations.
+            # Extending phys_end_a/b outward by ``blast_a/b`` and
+            # absorbing those distances into ``displaced_a/b`` makes
+            # the existing chain cover the full physical extent
+            # (blast pad → runway proper → blast pad) in one pass.
+            # CIFP threshold elevations stay anchored at the
+            # displaced-threshold positions (now interior to the
+            # extended chain), and the blast-pad area gets DEM-
+            # sampled + grade-limited just like the runway interior.
+            # No separate flat-rect emit is needed for blast pads.
+            if blast_a > 0.1:
+                ext_a = extend_point(
+                    phys_end_b[0], phys_end_b[1],
+                    phys_end_a[0], phys_end_a[1],
+                    blast_a,
+                )
+                phys_end_a = ext_a
+                displaced_a += blast_a
+                blast_a = 0.0
+            if blast_b > 0.1:
+                ext_b = extend_point(
+                    phys_end_a[0], phys_end_a[1],
+                    phys_end_b[0], phys_end_b[1],
+                    blast_b,
+                )
+                phys_end_b = ext_b
+                displaced_b += blast_b
+                blast_b = 0.0
+
             # Full physical runway length (phys_end to phys_end).
             dx_phys = (phys_end_b[1] - phys_end_a[1]) * cos_lat_v * DEG_TO_M
             dy_phys = (phys_end_b[0] - phys_end_a[0]) * DEG_TO_M

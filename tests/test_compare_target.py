@@ -63,14 +63,14 @@ SPJC_BASELINE: Dict[str, int] = {
     "junction":           36,   # of 36 target (full)
     "primary_parallel":   27,   # of 27 target (full)
     "retaining_wall":     66,   # of 66 target (full)
-    "runway":             78,   # of 78 target (full — flat-zone
-                                # consolidation reduced 80→78)
+    "runway":             85,   # of 85 target (full — blast pads
+                                # now part of the segment chain)
     "secondary_parallel":  1,   # of  1 target (full)
     "stub":               16,   # of 16 target (full)
     "terminal":            2,   # of  2 target (full)
     "tunnel_ramp":        34,   # of 36 target (2-shape variance)
 }
-SPJC_BASELINE_TOTAL = 267  # of 269 target shapes (~99% match;
+SPJC_BASELINE_TOTAL = 274  # of 276 target shapes (~99% match;
                            # gap is run-to-run determinism,
                            # not a structural regression)
 
