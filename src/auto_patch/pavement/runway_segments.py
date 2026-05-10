@@ -1097,10 +1097,23 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                         < FLAT_TOL):
                     end_idx += 1
                 if end_idx > idx + 1:
-                    intermediate: List[Tuple[float, float, float, bool]] = []
-                    for k in range(idx + 1, end_idx):
-                        if k in pav_int_indices:
-                            intermediate.append(sample_pts[k])
+                    # Per user 2026-05-12: keep ALL intermediate
+                    # samples as corners (both pav_intersection
+                    # breakpoints and uniform 100 m seams).  Pre-
+                    # Task-1 the runway emitted as separate per-100m
+                    # rects whose corners served as junction-snap
+                    # points via ``widen_junctions_to_runway_corners``.
+                    # Task 1 consolidates consecutive flat segments
+                    # into one multi-node polygon — but dropping the
+                    # uniform-seam samples broke that snap chain;
+                    # junctions in the middle of the flat zone had
+                    # no nearby runway corners to share.  Keeping
+                    # every sample as a corner preserves the
+                    # per-segment granularity inside a single
+                    # polygon.
+                    intermediate: List[Tuple[float, float, float, bool]] = [
+                        sample_pts[k] for k in range(idx + 1, end_idx)
+                    ]
                     flat_pts = [sample_pts[idx]] + intermediate \
                         + [sample_pts[end_idx]]
                     samples_ll = [(s[0], s[1]) for s in flat_pts]
