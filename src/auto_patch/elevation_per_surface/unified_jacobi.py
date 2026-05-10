@@ -194,7 +194,16 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
     is_hard: List[bool] = [False] * n
     have_initial: List[bool] = [False] * n
 
-    # CIFP runway corners.
+    # Runway corners — HARD-anchor every runway segment, sloped or
+    # flat.  The runway's elevation profile is authoritative truth
+    # for adjacent pavement: when a junction shares a vertex with a
+    # runway corner, that vertex must adopt the runway's elevation
+    # so cap projection can pull the rest of the junction (and its
+    # downstream chain of stubs / aprons) up toward it.  The
+    # original gate required both altitude_high and altitude_low,
+    # which silently dropped flat segments (single ``altitude=``)
+    # — leaving long stretches of runway interior with no HARD
+    # anchors and adjacent taxiways stuck at terrain.
     for s in layout.shapes:
         if s.role != ROLE_RUNWAY:
             continue
@@ -203,10 +212,13 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
         coords = _open_ring(list(s.polygon.exterior.coords))
         if len(coords) != 4:
             continue
-        if s.altitude_high is None or s.altitude_low is None:
+        if s.altitude_high is not None and s.altitude_low is not None:
+            per = [s.altitude_high, s.altitude_low,
+                   s.altitude_low, s.altitude_high]
+        elif s.altitude is not None:
+            per = [float(s.altitude)] * 4
+        else:
             continue
-        per = [s.altitude_high, s.altitude_low,
-               s.altitude_low, s.altitude_high]
         for (x, y), a in zip(coords, per):
             b = _corner_elevation_bucket(x, y)
             idx = bucket_to_idx.get(b)
