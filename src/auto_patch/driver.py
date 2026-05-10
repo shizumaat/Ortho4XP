@@ -283,6 +283,15 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                 tile_dem=getattr(tile, "dem", None),
                 airport_boundary=dico_apt_entry.get("boundary")
                                   if dico_apt_entry else None,
+                # Per user 2026-05-12: pass the CURRENT tile being
+                # processed by Ortho4XP (not the airport's anchor
+                # tile) so ``tile_cut`` drops the right shape
+                # pieces.  Cross-tile airports (e.g. SPLP at
+                # lon ~ -77.0) get processed multiple times — once
+                # per tile they touch — and each pass should
+                # produce only the in-tile shapes.
+                current_tile_lat=tile_lat,
+                current_tile_lon=tile_lon,
             )
         except Exception as _e:
             UI.vprint(

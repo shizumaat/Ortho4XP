@@ -126,6 +126,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
                             taxiway_data=None,
                             tile_dem=None,
                             airport_boundary=None,
+                            current_tile_lat=None,
+                            current_tile_lon=None,
                             ) -> PavementLayout:
     """Build the complete role-classified layout for ``icao``.
 
@@ -1961,7 +1963,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # line that passes through the airport's pavement footprint;
         # Ortho4XP + X-Plane stitch the seam at render time.
         from .tile_cut import cut_layout_at_tile_boundaries
-        n_tile_delta = cut_layout_at_tile_boundaries(layout)
+        n_tile_delta = cut_layout_at_tile_boundaries(
+            layout,
+            current_tile_lat=current_tile_lat,
+            current_tile_lon=current_tile_lon,
+        )
         if n_tile_delta != 0:
             UI.vprint(1,
                 f"  [pav-builder] {icao}: tile-boundary cut "

@@ -43,9 +43,25 @@ __all__ = ["cut_layout_at_tile_boundaries"]
 def cut_layout_at_tile_boundaries(
         layout: PavementLayout,
         half_width_m: float = 5.0,
-        min_piece_area_m2: float = 1.0) -> int:
+        min_piece_area_m2: float = 1.0,
+        current_tile_lat: Optional[int] = None,
+        current_tile_lon: Optional[int] = None) -> int:
     """Cut every shape crossing an integer lat or lon tile boundary,
     leaving a ``2 * half_width_m`` wide gap (default 10 m).
+
+    Then DROP every shape piece whose representative point falls
+    outside the current tile.  The neighbour-tile auto_patch run
+    will generate the patch covering its portion.
+
+    ``current_tile_lat`` / ``current_tile_lon`` identify the tile
+    being processed by the driver — these can differ from the
+    airport's anchor tile when a cross-tile airport is being
+    processed during a NEIGHBOUR-tile build (e.g. Ortho4XP
+    generates tile -13/-78, which includes SPLP because the
+    airport extends into it, but SPLP's anchor is in -13/-77).
+    When None, fall back to ``floor(layout.anchor)`` (the
+    airport-anchor tile) — backward-compatible default for tests
+    and direct ``build_airport_pavement`` calls.
 
     Mutates ``layout.shapes`` in place.  Returns the net change in
     shape count (positive when shapes split, negative when slivers
@@ -121,8 +137,10 @@ def cut_layout_at_tile_boundaries(
     # would try to sample the neighbour-tile DEM (which isn't
     # loaded) and substitute 0 m, producing altitude-0 boundary
     # rects in X-Plane.
-    cur_tile_lat = int(math.floor(lat0))
-    cur_tile_lon = int(math.floor(lon0))
+    cur_tile_lat = (current_tile_lat if current_tile_lat is not None
+                    else int(math.floor(lat0)))
+    cur_tile_lon = (current_tile_lon if current_tile_lon is not None
+                    else int(math.floor(lon0)))
 
     def _in_current_tile(poly: Polygon) -> bool:
         try:
