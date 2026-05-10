@@ -58,10 +58,11 @@ pytestmark = pytest.mark.skipif(
 # If a future cleanup removes that non-determinism, raise these
 # to full equality with target counts (see comments).
 SPJC_BASELINE: Dict[str, int] = {
-    "boundary":          620,   # of 630 target (boundary now emits
-                                # as a chain of ~25 m rects so JOSM
-                                # shows altitude profile per segment;
-                                # small variance from sliver drops)
+    "boundary":          595,   # of 603 target (boundary emits as
+                                # a chain of ~25 m rects; shapes
+                                # outside the current tile are
+                                # dropped — only the airport's
+                                # in-tile portion is in this patch)
     "cross_connector":     6,   # of  6 target (full)
     "junction":           36,   # of 36 target (full)
     "primary_parallel":   27,   # of 27 target (full)
@@ -73,7 +74,7 @@ SPJC_BASELINE: Dict[str, int] = {
     "terminal":            2,   # of  2 target (full)
     "tunnel_ramp":        34,   # of 36 target (2-shape variance)
 }
-SPJC_BASELINE_TOTAL = 893  # of 905 target shapes (~99% match;
+SPJC_BASELINE_TOTAL = 866  # of 878 target shapes (~99% match;
                            # gap is run-to-run determinism,
                            # not a structural regression)
 

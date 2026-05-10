@@ -151,7 +151,7 @@ def _emit_airport_boundary_shape(
         boundary follows DEM so Ortho4XP's
         ``smooth_raster_over_airports`` doesn't drag the rendered
         terrain down into a 20 m canyon around the airport
-        perimeter (the SPLP north-end issue user reported).
+        perimeter.
         """
         try:
             lat, lon = m_to_ll(x, y)

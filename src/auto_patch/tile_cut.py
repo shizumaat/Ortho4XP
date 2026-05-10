@@ -112,6 +112,50 @@ def cut_layout_at_tile_boundaries(
             if ab_cut.geom_type in ("Polygon", "MultiPolygon"):
                 layout.airport_boundary = ab_cut
 
+    # The CURRENT tile (the one this auto_patch run is generating)
+    # is the airport-anchor tile.  Per user 2026-05-12: after the
+    # cut, drop any shape (or shape piece) that's not inside the
+    # current tile — when the neighbour tile is processed in its own
+    # auto_patch run, IT generates the patch covering its portion of
+    # the airport.  Without this drop, ``_runway_clamped_alt`` etc.
+    # would try to sample the neighbour-tile DEM (which isn't
+    # loaded) and substitute 0 m, producing altitude-0 boundary
+    # rects in X-Plane.
+    cur_tile_lat = int(math.floor(lat0))
+    cur_tile_lon = int(math.floor(lon0))
+
+    def _in_current_tile(poly: Polygon) -> bool:
+        try:
+            c = poly.representative_point()
+        except _GEOM_EXC:
+            try:
+                c = poly.centroid
+            except _GEOM_EXC:
+                return True  # fail open
+        lat = lat0 + math.degrees(c.y / R_EARTH)
+        lon = lon0 + math.degrees(c.x / (R_EARTH * cos0))
+        return (cur_tile_lat <= lat < cur_tile_lat + 1
+                and cur_tile_lon <= lon < cur_tile_lon + 1)
+
+    # Also clip ``layout.airport_boundary`` to the current tile.
+    if (layout.airport_boundary is not None
+            and not layout.airport_boundary.is_empty):
+        ab = layout.airport_boundary
+        if ab.geom_type == "MultiPolygon":
+            kept = [g for g in ab.geoms
+                    if g.geom_type == "Polygon" and not g.is_empty
+                    and _in_current_tile(g)]
+            if not kept:
+                layout.airport_boundary = None
+            elif len(kept) == 1:
+                layout.airport_boundary = kept[0]
+            else:
+                from shapely.geometry import MultiPolygon
+                layout.airport_boundary = MultiPolygon(kept)
+        elif ab.geom_type == "Polygon":
+            if not _in_current_tile(ab):
+                layout.airport_boundary = None
+
     n_before = len(layout.shapes)
     new_shapes: List[BuiltShape] = []
     for s in layout.shapes:
@@ -120,7 +164,9 @@ def cut_layout_at_tile_boundaries(
             continue
         try:
             if not s.polygon.intersects(cut_union):
-                new_shapes.append(s)
+                # No cut — keep iff the shape is in the current tile.
+                if _in_current_tile(s.polygon):
+                    new_shapes.append(s)
                 continue
             diff = s.polygon.difference(cut_union)
         except _GEOM_EXC:
@@ -135,9 +181,12 @@ def cut_layout_at_tile_boundaries(
                       if g.geom_type == "Polygon" and not g.is_empty]
         else:
             # Unexpected result (e.g. GeometryCollection); keep original.
-            new_shapes.append(s)
+            if _in_current_tile(s.polygon):
+                new_shapes.append(s)
             continue
         pieces = [p for p in pieces if p.area >= min_piece_area_m2]
+        # Drop pieces outside the current tile.
+        pieces = [p for p in pieces if _in_current_tile(p)]
         if not pieces:
             continue
 
