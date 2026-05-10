@@ -199,24 +199,29 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
     # for adjacent pavement: when a junction shares a vertex with a
     # runway corner, that vertex must adopt the runway's elevation
     # so cap projection can pull the rest of the junction (and its
-    # downstream chain of stubs / aprons) up toward it.  The
-    # original gate required both altitude_high and altitude_low,
-    # which silently dropped flat segments (single ``altitude=``)
-    # — leaving long stretches of runway interior with no HARD
-    # anchors and adjacent taxiways stuck at terrain.
+    # downstream chain of stubs / aprons) up toward it.
+    #
+    # Sloped segments are 4-corner rects with altitude_high/low.
+    # Flat segments use a single ``altitude=`` tag and may carry an
+    # arbitrary number of corners — junctions touching the edge
+    # interior get inserted as new shared vertices upstream so the
+    # solver gets denser HARD anchors along long flat runs (blast
+    # pads, runway-interior flats).
     for s in layout.shapes:
         if s.role != ROLE_RUNWAY:
             continue
         if s.polygon is None or s.polygon.is_empty:
             continue
         coords = _open_ring(list(s.polygon.exterior.coords))
-        if len(coords) != 4:
+        if len(coords) < 3:
             continue
         if s.altitude_high is not None and s.altitude_low is not None:
+            if len(coords) != 4:
+                continue
             per = [s.altitude_high, s.altitude_low,
                    s.altitude_low, s.altitude_high]
         elif s.altitude is not None:
-            per = [float(s.altitude)] * 4
+            per = [float(s.altitude)] * len(coords)
         else:
             continue
         for (x, y), a in zip(coords, per):

@@ -52,6 +52,7 @@ __all__ = [
     "apply_junction_rules",
     "longest_runway_axis_deg",
     "stitch_pavement_polygons",
+    "stitch_pavement_to_flat_runways",
     "stitch_pavement_to_terminals",
     "widen_junctions_to_runway_corners",
 ]
@@ -1849,6 +1850,343 @@ def stitch_pavement_to_terminals(
         term.polygon = new_poly
         # Terminals carry a single ``s.altitude`` (uniform plane); no
         # ``node_altitudes`` to update.
+
+
+def stitch_pavement_to_flat_runways(
+    layout: PavementLayout,
+    corner_tol_m: float = SHARED_VERTEX_TOL_M,
+    near_edge_snap_m: float = 2.5,
+) -> None:
+    """For each junction polygon whose boundary contains an edge
+    coincident with a flat runway shape's boundary edge, insert
+    shared vertices along that edge at the perpendicular foot of
+    every other junction vertex.  Both polygons gain matching
+    bucket-shared vertices on the shared edge (user 2026-05-09).
+
+    Why: cap-projection in the per-surface solver propagates HARD
+    anchors at the role's grade × Euclidean distance.  A junction
+    adjacent to a 400 m blast pad currently shares only the 2 edge
+    endpoints with the runway — interior junction vertices 22 m
+    perpendicular to the edge end up 200+ m diagonal from the
+    nearest HARD anchor, allowing a 3 m drop within cap.  Inserting
+    perpendicular-foot vertices on the shared edge at every interior
+    vertex's projection cuts the cap-distance to its perpendicular
+    component, so junction interiors lift to within ~0.3 m of the
+    runway elevation instead of stalling at terrain.
+
+    A pav edge is "coincident" with a runway edge when both
+    endpoints land within ``corner_tol_m`` of two adjacent runway
+    corners (in either direction).  Only flat runway shapes
+    (``role=runway``, single ``altitude=`` tag, no
+    ``altitude_high``/``altitude_low``) are targeted — sloped 4-
+    corner segments must keep their canonical [high, low, low,
+    high] vertex order for OSM emit.
+
+    Run BEFORE the per-surface solver so the new shared vertices
+    feed HARD anchors.
+    """
+    flat_runways = [s for s in layout.shapes
+                    if s.role == ROLE_RUNWAY
+                    and s.polygon is not None
+                    and not s.polygon.is_empty
+                    and s.polygon.geom_type == "Polygon"
+                    and s.altitude is not None
+                    and s.altitude_high is None
+                    and s.altitude_low is None]
+    if not flat_runways:
+        return
+    pavements = [s for s in layout.shapes
+                 if s.role in STITCH_PAVEMENT_ROLES]
+    if not pavements:
+        return
+
+    corner_tol2 = corner_tol_m * corner_tol_m
+    near_snap2 = near_edge_snap_m * near_edge_snap_m
+
+    # rwy id → ei → list of (t_along_edge, x, y) inserts
+    rwy_inserts: dict = {id(r): {} for r in flat_runways}
+
+    def _open_ring(coords):
+        if coords and coords[0] == coords[-1]:
+            return list(coords[:-1])
+        return list(coords)
+
+    # ── Phase A: near-edge snap ──────────────────────────────────
+    # For each pav vertex within ``near_edge_snap_m`` of a flat
+    # runway edge interior, snap it onto the projection AND
+    # schedule a runway-side insert at the same point.  Captures
+    # cases where a junction's boundary runs nearly-parallel to a
+    # runway edge with a small geometric gap (e.g. SPLP -10053
+    # vertices at across=24.8 m next to runway edge at across=22.8
+    # m).  After snap, the pav and runway share the bucket; the
+    # solver HARD-anchors the pav vertex at the runway altitude.
+    for pav in pavements:
+        poly = pav.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        try:
+            pav_coords = _open_ring(list(poly.exterior.coords))
+        except Exception:
+            continue
+        n_pav = len(pav_coords)
+        if n_pav < 3:
+            continue
+        node_alts = pav.node_altitudes
+        ring_closed_alts = (
+            node_alts is not None
+            and len(node_alts) == n_pav + 1
+            and node_alts[0] == node_alts[-1])
+        pav_alts: Optional[List[float]] = None
+        if node_alts is not None and (
+                len(node_alts) == n_pav or ring_closed_alts):
+            pav_alts = list(node_alts[:-1] if ring_closed_alts
+                             else node_alts)
+        snapped = [False] * n_pav
+        new_coords: List[Tuple[float, float]] = list(pav_coords)
+        for vi, (vx, vy) in enumerate(pav_coords):
+            best_d2 = near_snap2
+            best: Optional[Tuple[object, int, float, float, float]] = None
+            for rwy in flat_runways:
+                try:
+                    rcoords = _open_ring(list(
+                        rwy.polygon.exterior.coords))
+                except Exception:
+                    continue
+                m = len(rcoords)
+                if m < 3:
+                    continue
+                # Skip if vertex is already at a runway corner.
+                already_corner = False
+                for (cx, cy) in rcoords:
+                    if (vx - cx) * (vx - cx) + (vy - cy) * (vy - cy) \
+                            <= corner_tol2:
+                        already_corner = True
+                        break
+                if already_corner:
+                    break
+                for ei in range(m):
+                    ax, ay = rcoords[ei]
+                    bx, by = rcoords[(ei + 1) % m]
+                    dx = bx - ax
+                    dy = by - ay
+                    seg2 = dx * dx + dy * dy
+                    if seg2 < 1.0:
+                        continue
+                    t = ((vx - ax) * dx + (vy - ay) * dy) / seg2
+                    if t <= 0.001 or t >= 0.999:
+                        continue
+                    cx = ax + t * dx
+                    cy = ay + t * dy
+                    d2 = (vx - cx) * (vx - cx) + (vy - cy) * (vy - cy)
+                    if d2 >= best_d2:
+                        continue
+                    best_d2 = d2
+                    best = (rwy, ei, t, cx, cy)
+            if best is not None:
+                rwy, ei, t, cx, cy = best
+                new_coords[vi] = (cx, cy)
+                snapped[vi] = True
+                rwy_inserts[id(rwy)].setdefault(
+                    ei, []).append((t, cx, cy))
+        if any(snapped):
+            try:
+                new_poly = Polygon(new_coords + [new_coords[0]])
+                if not new_poly.is_valid:
+                    new_poly = new_poly.buffer(0)
+                if (not new_poly.is_empty
+                        and new_poly.geom_type == "Polygon"):
+                    pav.polygon = new_poly
+                    if pav_alts is not None:
+                        pav.node_altitudes = pav_alts + [pav_alts[0]]
+            except Exception:
+                pass
+
+    # ── Phase B: coincident-edge perpendicular projection ────────
+    for pav in pavements:
+        poly = pav.polygon
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        try:
+            pav_coords = _open_ring(list(poly.exterior.coords))
+        except Exception:
+            continue
+        n_pav = len(pav_coords)
+        if n_pav < 3:
+            continue
+
+        node_alts = pav.node_altitudes
+        ring_closed_alts = (
+            node_alts is not None
+            and len(node_alts) == n_pav + 1
+            and node_alts[0] == node_alts[-1])
+        if node_alts is not None and (
+                len(node_alts) == n_pav
+                or ring_closed_alts):
+            pav_alts: Optional[List[float]] = list(
+                node_alts[:-1] if ring_closed_alts
+                else node_alts)
+        else:
+            pav_alts = None
+
+        # Inserts to apply to THIS pav polygon: pi -> [(t, x, y)].
+        pav_local_inserts: dict = {}
+
+        for rwy in flat_runways:
+            try:
+                rwy_coords = _open_ring(list(
+                    rwy.polygon.exterior.coords))
+            except Exception:
+                continue
+            n_rwy = len(rwy_coords)
+            if n_rwy < 3:
+                continue
+
+            # Find pav edges coincident with rwy edges.
+            for pi in range(n_pav):
+                pj = (pi + 1) % n_pav
+                p1x, p1y = pav_coords[pi]
+                p2x, p2y = pav_coords[pj]
+                seg_dx = p2x - p1x
+                seg_dy = p2y - p1y
+                seg2 = seg_dx * seg_dx + seg_dy * seg_dy
+                if seg2 < 1.0:
+                    continue
+                for ri in range(n_rwy):
+                    rj = (ri + 1) % n_rwy
+                    r1x, r1y = rwy_coords[ri]
+                    r2x, r2y = rwy_coords[rj]
+                    # Same direction: p1≈r1 and p2≈r2.
+                    same_dir = (
+                        (p1x - r1x) ** 2 + (p1y - r1y) ** 2
+                        <= corner_tol2
+                        and (p2x - r2x) ** 2 + (p2y - r2y) ** 2
+                        <= corner_tol2)
+                    # Reverse: p1≈r2 and p2≈r1.
+                    rev_dir = (not same_dir) and (
+                        (p1x - r2x) ** 2 + (p1y - r2y) ** 2
+                        <= corner_tol2
+                        and (p2x - r1x) ** 2 + (p2y - r1y) ** 2
+                        <= corner_tol2)
+                    if not same_dir and not rev_dir:
+                        continue
+                    # Shared edge found.  Project every pav vertex
+                    # NOT on this edge onto the runway edge segment.
+                    rseg_dx = r2x - r1x
+                    rseg_dy = r2y - r1y
+                    rseg2 = rseg_dx * rseg_dx + rseg_dy * rseg_dy
+                    if rseg2 < 1.0:
+                        continue
+                    for vi, (vx, vy) in enumerate(pav_coords):
+                        if vi == pi or vi == pj:
+                            continue
+                        # Project onto runway edge.
+                        tr = (
+                            (vx - r1x) * rseg_dx
+                            + (vy - r1y) * rseg_dy) / rseg2
+                        if tr <= 0.001 or tr >= 0.999:
+                            continue
+                        cx = r1x + tr * rseg_dx
+                        cy = r1y + tr * rseg_dy
+                        # Schedule insert on the runway edge at tr.
+                        rwy_inserts[id(rwy)].setdefault(
+                            ri, []).append((tr, cx, cy))
+                        # Schedule insert on the pav edge at the
+                        # corresponding fraction tp.  same_dir →
+                        # tp = tr; reversed → tp = 1 - tr.
+                        tp = tr if same_dir else (1.0 - tr)
+                        pav_local_inserts.setdefault(
+                            pi, []).append((tp, cx, cy))
+                    break  # one shared rwy edge per pav edge
+
+        # Apply pav-side inserts (after walking all rwy pairs for
+        # this pav).
+        if not pav_local_inserts:
+            continue
+        new_coords: List[Tuple[float, float]] = []
+        new_alts: Optional[List[float]] = (
+            [] if pav_alts is not None else None)
+        for pi in range(n_pav):
+            new_coords.append(pav_coords[pi])
+            if new_alts is not None:
+                new_alts.append(pav_alts[pi])
+            if pi in pav_local_inserts:
+                pts = sorted(pav_local_inserts[pi],
+                             key=lambda x: x[0])
+                last_t: float = -1.0
+                # Edge endpoint altitudes for linear interp on the
+                # pav side.  These are PAV's existing values (will
+                # be overwritten by solver via bucket-share, but
+                # initialise to something sensible).
+                pj = (pi + 1) % n_pav
+                a_alt = pav_alts[pi] if pav_alts is not None else None
+                b_alt = pav_alts[pj] if pav_alts is not None else None
+                for tp, cx, cy in pts:
+                    if tp - last_t < 1e-4:
+                        continue
+                    new_coords.append((cx, cy))
+                    if new_alts is not None:
+                        if a_alt is not None and b_alt is not None:
+                            new_alts.append(
+                                a_alt + tp * (b_alt - a_alt))
+                        else:
+                            new_alts.append(
+                                a_alt if a_alt is not None
+                                else (b_alt if b_alt is not None
+                                       else 0.0))
+                    last_t = tp
+        if len(new_coords) < 3:
+            continue
+        try:
+            new_poly = Polygon(new_coords + [new_coords[0]])
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if (new_poly.is_empty
+                    or new_poly.geom_type != "Polygon"):
+                continue
+        except Exception:
+            continue
+        pav.polygon = new_poly
+        if new_alts is not None:
+            pav.node_altitudes = new_alts + [new_alts[0]]
+
+    # Apply runway-side inserts.
+    for rwy in flat_runways:
+        inserts = rwy_inserts.get(id(rwy))
+        if not inserts:
+            continue
+        try:
+            rcoords_open = _open_ring(list(
+                rwy.polygon.exterior.coords))
+        except Exception:
+            continue
+        m = len(rcoords_open)
+        if m < 3:
+            continue
+        out: List[Tuple[float, float]] = []
+        for ei in range(m):
+            out.append(rcoords_open[ei])
+            if ei in inserts:
+                pts = sorted(inserts[ei], key=lambda x: x[0])
+                last_t: float = -1.0
+                for t, cx, cy in pts:
+                    if t - last_t < 1e-4:
+                        continue
+                    out.append((cx, cy))
+                    last_t = t
+        if len(out) < 3:
+            continue
+        try:
+            new_poly = Polygon(out + [out[0]])
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if (new_poly.is_empty
+                    or new_poly.geom_type != "Polygon"):
+                continue
+        except Exception:
+            continue
+        rwy.polygon = new_poly
+        # Flat runway carries a single ``s.altitude`` — uniform
+        # plane, no per-vertex node_altitudes to update.
 
 
 def stitch_pavement_polygons(

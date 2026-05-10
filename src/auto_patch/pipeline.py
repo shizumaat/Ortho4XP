@@ -1816,6 +1816,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _align_rect_slope_to_axis,
             _enforce_runway_1to1_sharing,
             _snap_to_sloping_edge_corners,
+            stitch_pavement_to_flat_runways,
             widen_junctions_to_runway_corners,
         )
         # Slope alignment runs FIRST post-elevation: rects whose
@@ -1832,6 +1833,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # because the cascade with Rule 4 + segmentation re-run
         # over-grew junctions past the 4-node cap.
         widen_junctions_to_runway_corners(layout)
+        # Stitch pavement to flat runway shapes (user 2026-05-09):
+        # for blast pads / flat-interior runway segments, insert a
+        # shared vertex on the runway boundary at the projection of
+        # every adjacent pavement vertex that sits within edge
+        # tolerance.  These new shared vertices become HARD anchors
+        # at the runway altitude when the per-surface solver runs,
+        # cutting cap-projection distance from the runway corners
+        # (often 100s of m apart on long blast pads) down to tens
+        # of metres — adjacent junctions / stubs lift toward the
+        # runway elevation instead of stalling at terrain.
+        stitch_pavement_to_flat_runways(layout)
 
         # Per user 2026-05-03: per-surface solver runs AS THE LAST
         # STEP of the pipeline, after every junction rule and
