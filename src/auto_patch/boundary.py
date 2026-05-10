@@ -139,9 +139,20 @@ def _emit_airport_boundary_shape(
         return 0
 
     def _runway_clamped_alt(x: float, y: float) -> Optional[float]:
-        """Return DEM at (x, y) clamped to ``[runway_e - g·d,
-        runway_e + g·d]`` when within ``runway_clamp_radius_m`` of
-        any runway, else raw DEM, else None."""
+        """Return DEM at (x, y) clamped UP toward the nearest runway
+        when within ``runway_clamp_radius_m`` and DEM dips below
+        ``runway_e - g·d``, else raw DEM, else None.
+
+        Per user 2026-05-11: the clamp is ASYMMETRIC.  We only ever
+        pull the boundary UP toward the runway (the original
+        "graded up to runway elevation" rule for low terrain near
+        the runway).  We never pull the boundary DOWN — if the
+        surrounding terrain is higher than the runway-band, the
+        boundary follows DEM so Ortho4XP's
+        ``smooth_raster_over_airports`` doesn't drag the rendered
+        terrain down into a 20 m canyon around the airport
+        perimeter (the SPLP north-end issue user reported).
+        """
         try:
             lat, lon = m_to_ll(x, y)
             dem_e = _sample_dem(dem, tile_lat, tile_lon, lat, lon)
@@ -177,13 +188,15 @@ def _emit_airport_boundary_shape(
             return dem_e
         band = best_d * runway_clamp_grade
         lo = best_e - band
-        hi = best_e + band
         if dem_e is None:
-            return 0.5 * (lo + hi)
+            # No DEM available — fall back to the floor (the
+            # closest the boundary can be to the runway at this
+            # distance without violating the grade cap).
+            return lo
+        # Asymmetric clamp: only pull UP toward runway.  If DEM is
+        # below the floor, lift it; otherwise follow DEM.
         if dem_e < lo:
             return lo
-        if dem_e > hi:
-            return hi
         return dem_e
 
     def _densify_ring(coords: List[Tuple[float, float]]
@@ -421,13 +434,14 @@ def _emit_boundary_dem_bridge(
             return dem_e
         band = best_d * runway_clamp_grade
         lo = best_e - band
-        hi = best_e + band
         if dem_e is None:
-            return 0.5 * (lo + hi)
+            return lo
+        # Asymmetric clamp (user 2026-05-11): only pull UP toward
+        # runway when DEM is below the floor; never pull DOWN.
+        # See ``_runway_clamped_alt`` in ``_emit_airport_boundary_shape``
+        # for the full rationale.
         if dem_e < lo:
             return lo
-        if dem_e > hi:
-            return hi
         return dem_e
 
     def _dem_alt(x: float, y: float) -> Optional[float]:
