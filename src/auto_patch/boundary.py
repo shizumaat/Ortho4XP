@@ -223,8 +223,13 @@ def _emit_airport_boundary_shape(
         out.append(out[0])
         return out
 
-    # 1. Boundary line → 5 m strip polygon (with inner ring if the
-    #    airport is large enough that 2.5 m × 2 < interior radius).
+    # Per user 2026-05-12: emit the boundary as a CHAIN OF 4-corner
+    # rectangles (one per densified boundary segment) instead of a
+    # single buffered strip polygon.  Each rect is either flat
+    # (single ``altitude=`` tag) or sloped (``altitude_high`` /
+    # ``altitude_low`` with the [high, low, low, high] corner
+    # convention), so debug tools like JOSM can read the altitude
+    # profile along the perimeter directly off each rect's tags.
     boundary_geom = layout.airport_boundary
     if boundary_geom.geom_type == "Polygon":
         ext_rings = [boundary_geom.exterior]
@@ -232,13 +237,6 @@ def _emit_airport_boundary_shape(
         ext_rings = [g.exterior for g in boundary_geom.geoms]
     else:
         return 0
-    # Build a union of all existing pavement shapes — the boundary
-    # ribbon is meant to control elevations OUTSIDE the pavement
-    # (grass / approach lights / ramp).  Subtract pavement from the
-    # strip so the boundary doesn't overlap runway / taxi rects /
-    # apron junctions etc. (would otherwise fail the no-self-
-    # overlap regression test and double-up elevation tags at the
-    # airport perimeter).
     pavement_polys = [
         s.polygon for s in layout.shapes
         if s.polygon is not None
@@ -250,78 +248,121 @@ def _emit_airport_boundary_shape(
             pavement_union = unary_union(pavement_polys)
         except _GEOM_EXC:
             pavement_union = None
+
+    def _rect_for_segment(
+            p0: Tuple[float, float],
+            p1: Tuple[float, float],
+            alt0: float, alt1: float,
+            ) -> Optional[Tuple[Polygon, Optional[float], float]]:
+        """Build a 4-corner rect spanning the boundary segment
+        p0 → p1 with strip half-width.  Convention: corners 0, 3 at
+        the HIGH-altitude end, corners 1, 2 at the LOW end (matches
+        runway segment emit).  Returns
+        ``(polygon, altitude_high, altitude_low)`` with
+        ``altitude_high=None`` for flat segments (``altitude_low``
+        carries the single flat value in that case).
+        """
+        # Order so p0 is the HIGH end (alt0 >= alt1).
+        if abs(alt0 - alt1) < 0.1:
+            eh: Optional[float] = None
+            el = round((alt0 + alt1) / 2.0, 1)
+        elif alt0 >= alt1:
+            eh = round(alt0, 1)
+            el = round(alt1, 1)
+        else:
+            p0, p1 = p1, p0
+            alt0, alt1 = alt1, alt0
+            eh = round(alt0, 1)
+            el = round(alt1, 1)
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        L = math.hypot(dx, dy)
+        if L < 0.5:
+            return None
+        # Perpendicular unit vector × half-width.  Sign matches
+        # ``pavement.runway_geometry.runway_corners`` so adjacent
+        # rects don't accidentally flip ring orientation.
+        perp_x = -dy / L * strip_half_width_m
+        perp_y = dx / L * strip_half_width_m
+        corners = [
+            (p0[0] + perp_x, p0[1] + perp_y),  # 0 high-left
+            (p1[0] + perp_x, p1[1] + perp_y),  # 1 low-left
+            (p1[0] - perp_x, p1[1] - perp_y),  # 2 low-right
+            (p0[0] - perp_x, p0[1] - perp_y),  # 3 high-right
+        ]
+        try:
+            poly = _Polygon(corners)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty or poly.geom_type != "Polygon":
+                return None
+        except _GEOM_EXC:
+            return None
+        return poly, eh, el
+
     n_emitted = 0
     for ring in ext_rings:
         ring_coords = list(ring.coords)
-        try:
-            line = _LS(ring_coords)
-            strip = line.buffer(strip_half_width_m,
-                                cap_style=2, join_style=2)
-            if not strip.is_valid:
-                strip = strip.buffer(0)
-        except _GEOM_EXC:
+        if ring_coords and ring_coords[0] == ring_coords[-1]:
+            ring_coords = ring_coords[:-1]
+        if len(ring_coords) < 3:
             continue
-        if strip.is_empty:
+        # Densify to ``densify_step_m`` along the ring.  The closing
+        # duplicate is added back at the end of ``_densify_ring``.
+        dense = _densify_ring(ring_coords)
+        if len(dense) < 4:
             continue
-        if pavement_union is not None and not pavement_union.is_empty:
-            try:
-                strip = strip.difference(pavement_union)
-            except _GEOM_EXC:
-                pass
-            if strip.is_empty:
+        # Walk consecutive pairs; emit a rect per pair.
+        n_pairs = len(dense) - 1
+        for i in range(n_pairs):
+            p0 = dense[i]
+            p1 = dense[i + 1]
+            a0 = _runway_clamped_alt(p0[0], p0[1])
+            a1 = _runway_clamped_alt(p1[0], p1[1])
+            if a0 is None:
+                a0 = 0.0
+            if a1 is None:
+                a1 = 0.0
+            built = _rect_for_segment(p0, p1, float(a0), float(a1))
+            if built is None:
                 continue
-            if not strip.is_valid:
-                strip = strip.buffer(0)
-        if strip.geom_type == "MultiPolygon":
-            strip_polys = list(strip.geoms)
-        elif strip.geom_type == "Polygon":
-            strip_polys = [strip]
-        else:
-            continue
-        # 2. Decompose any holes.
-        all_pieces: List[Polygon] = []
-        for sp in strip_polys:
-            try:
-                pieces = _decompose_polygon_with_holes(
-                    sp, min_area_m2=10.0, max_depth=8)
-            except _GEOM_EXC:
-                pieces = [sp]
-            for p in pieces:
-                if p.is_empty or p.geom_type != "Polygon":
-                    continue
-                all_pieces.append(p)
-        # 3-5. Densify, compute altitudes, emit.
-        for piece in all_pieces:
-            try:
-                exterior = list(piece.exterior.coords)
-            except _GEOM_EXC:
-                continue
-            dense = _densify_ring(exterior)
-            if len(dense) < 4:
-                continue
-            try:
-                new_poly = _Polygon(dense)
-                if not new_poly.is_valid:
-                    new_poly = new_poly.buffer(0)
-                if (new_poly.is_empty
-                        or new_poly.geom_type != "Polygon"):
-                    continue
-            except _GEOM_EXC:
-                continue
-            # Re-extract the (post-buffer-cleanup) exterior so the
-            # node_altitudes count matches polygon.exterior.coords.
-            new_coords = list(new_poly.exterior.coords)
-            alts: List[float] = []
-            for (cx, cy) in new_coords:
-                e = _runway_clamped_alt(cx, cy)
-                if e is None:
-                    e = 0.0
-                alts.append(round(float(e), 1))
-            layout.shapes.append(BuiltShape(
-                polygon=new_poly,
+            poly, eh, el = built
+            # Skip rects entirely buried inside pavement — they
+            # would just shadow runway / taxi / apron geometry and
+            # fail the no-self-overlap test.  Partial overlaps are
+            # OK; X-Plane resolves at render time and the rect
+            # still labels its segment.
+            if (pavement_union is not None
+                    and not pavement_union.is_empty):
+                try:
+                    if pavement_union.contains(poly):
+                        continue
+                    # If pavement covers >80 % of the rect, skip too
+                    # — keeps the chain coherent with what's
+                    # actually visible.
+                    inter = pavement_union.intersection(poly)
+                    if (not inter.is_empty
+                            and inter.area > 0.8 * poly.area):
+                        continue
+                    # Otherwise trim against pavement; if the
+                    # trimmed result is still a Polygon, replace.
+                    trimmed = poly.difference(pavement_union)
+                    if (not trimmed.is_empty
+                            and trimmed.geom_type == "Polygon"):
+                        poly = trimmed
+                except _GEOM_EXC:
+                    pass
+            shape = BuiltShape(
+                polygon=poly,
                 role=ROLE_BOUNDARY,
                 ref="airport_boundary",
-                node_altitudes=alts))
+            )
+            if eh is None:
+                shape.altitude = el
+            else:
+                shape.altitude_high = eh
+                shape.altitude_low = el
+            layout.shapes.append(shape)
             n_emitted += 1
     return n_emitted
 
