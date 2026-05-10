@@ -70,7 +70,7 @@ SPJC_BASELINE: Dict[str, int] = {
     "terminal":            2,   # of  2 target (full)
     "tunnel_ramp":        34,   # of 36 target (2-shape variance)
 }
-SPJC_BASELINE_TOTAL = 274  # of 276 target shapes (~99% match;
+SPJC_BASELINE_TOTAL = 276  # of 278 target shapes (~99% match;
                            # gap is run-to-run determinism,
                            # not a structural regression)
 

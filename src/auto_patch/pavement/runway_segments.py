@@ -17,7 +17,7 @@ Public API:
 """
 from __future__ import annotations
 
-from math import cos, pi, sqrt
+from math import ceil, cos, floor, pi, sqrt
 
 import O4_UI_Utils as UI
 
@@ -541,6 +541,57 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                         fractions.append(pt)
                     pav_int_t_vals.append(pt)
                 fractions.sort()
+
+            # ── Tile-boundary cut intervals (user 2026-05-10) ────────────
+            # X-Plane / Ortho4XP renders each 1°×1° tile separately —
+            # no shape may cross a tile boundary.  For each integer
+            # lat / lon line the chain crosses, mark a ±5 m interval
+            # in t along the chain; the emit loop skips any segment
+            # whose midpoint falls inside the interval and the flat-
+            # run consolidator refuses to extend across it.  The
+            # interval edges are appended to ``anchored_t`` /
+            # ``fractions`` so segment seams align with the gap.
+            TILE_CUT_HALF_M = 5.0
+            tile_cut_intervals: List[Tuple[float, float]] = []
+            if phys_dist > 1.0:
+                a_lat, a_lon = phys_end_a
+                b_lat, b_lon = phys_end_b
+                crossings_t: List[float] = []
+                if abs(b_lat - a_lat) > 1e-12:
+                    lat_min = min(a_lat, b_lat)
+                    lat_max = max(a_lat, b_lat)
+                    for L in range(int(ceil(lat_min)),
+                                    int(floor(lat_max)) + 1):
+                        if lat_min < L < lat_max:
+                            t = (L - a_lat) / (b_lat - a_lat)
+                            if 0.0 < t < 1.0:
+                                crossings_t.append(t)
+                if abs(b_lon - a_lon) > 1e-12:
+                    lon_min = min(a_lon, b_lon)
+                    lon_max = max(a_lon, b_lon)
+                    for L in range(int(ceil(lon_min)),
+                                    int(floor(lon_max)) + 1):
+                        if lon_min < L < lon_max:
+                            t = (L - a_lon) / (b_lon - a_lon)
+                            if 0.0 < t < 1.0:
+                                crossings_t.append(t)
+                if crossings_t:
+                    half_t = TILE_CUT_HALF_M / phys_dist
+                    for t_cross in crossings_t:
+                        t_lo = max(0.0, t_cross - half_t)
+                        t_hi = min(1.0, t_cross + half_t)
+                        if t_hi - t_lo <= 0:
+                            continue
+                        tile_cut_intervals.append((t_lo, t_hi))
+                        for edge_t in (t_lo, t_hi):
+                            if 0.001 < edge_t < 0.999:
+                                if not any(abs(f - edge_t) < 1e-6
+                                            for f in fractions):
+                                    fractions.append(edge_t)
+                                if not any(abs(a - edge_t) < 1e-6
+                                            for a in anchored_t):
+                                    anchored_t.append(edge_t)
+                    fractions.sort()
 
             # For each sample point, compute lat/lon and seed elevation
             sample_pts = []  # [(lat, lon, seeded_elev, is_anchored), ...]
@@ -1079,12 +1130,27 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             # the legacy 4-corner emit.
             FLAT_TOL = 0.05
             n_samples = len(sample_pts)
+
+            def _pair_in_tile_gap(i: int) -> bool:
+                """Segment (i, i+1) midpoint inside any tile-cut gap."""
+                if not tile_cut_intervals:
+                    return False
+                mid = 0.5 * (fractions[i] + fractions[i + 1])
+                return any(t_lo < mid < t_hi
+                            for (t_lo, t_hi) in tile_cut_intervals)
+
             idx = 0
             while idx < n_samples - 1:
                 end_idx = idx
                 while (end_idx < n_samples - 1
                         and abs(elevs[end_idx + 1] - elevs[end_idx])
                         < FLAT_TOL):
+                    # Don't extend the flat run across a tile-cut
+                    # gap — the next pair is the gap segment and
+                    # would consolidate left+right halves into one
+                    # polygon spanning the seam.
+                    if _pair_in_tile_gap(end_idx):
+                        break
                     end_idx += 1
                 if end_idx > idx + 1:
                     intermediate: List[Tuple[float, float, float, bool]] = []
@@ -1101,18 +1167,21 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     ))
                     idx = end_idx
                 else:
-                    s_a = sample_pts[idx]
-                    s_b = sample_pts[idx + 1]
-                    add_rect_patch(
-                        s_a[0], s_a[1], elevs[idx],
-                        s_b[0], s_b[1], elevs[idx + 1],
-                        patch_width,
-                    )
-                    runway_chain.append((
-                        s_a[0], s_a[1], elevs[idx],
-                        s_b[0], s_b[1], elevs[idx + 1],
-                        patch_width,
-                    ))
+                    # Skip single segments that fall inside a
+                    # tile-cut gap.
+                    if not _pair_in_tile_gap(idx):
+                        s_a = sample_pts[idx]
+                        s_b = sample_pts[idx + 1]
+                        add_rect_patch(
+                            s_a[0], s_a[1], elevs[idx],
+                            s_b[0], s_b[1], elevs[idx + 1],
+                            patch_width,
+                        )
+                        runway_chain.append((
+                            s_a[0], s_a[1], elevs[idx],
+                            s_b[0], s_b[1], elevs[idx + 1],
+                            patch_width,
+                        ))
                     idx += 1
 
             # ── Flat blast-pad / overrun rectangles beyond ends ─────────

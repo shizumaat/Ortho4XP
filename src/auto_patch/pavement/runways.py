@@ -101,6 +101,26 @@ def _sample_runway_segment_elev(
     """
     if shape.altitude is not None:
         return float(shape.altitude)
+    # Per-vertex node_altitudes (e.g. a sloped runway segment that
+    # was cut along a tile boundary — see ``tile_cut.py``).
+    # Nearest-neighbour vertex sample.
+    if shape.node_altitudes and shape.polygon is not None:
+        try:
+            coords = list(shape.polygon.exterior.coords)
+        except Exception:
+            coords = []
+        n = min(len(coords), len(shape.node_altitudes))
+        if n >= 1:
+            best_d2 = float("inf")
+            best_alt: Optional[float] = None
+            for i in range(n):
+                cx, cy = coords[i]
+                d2 = (x - cx) ** 2 + (y - cy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_alt = shape.node_altitudes[i]
+            if best_alt is not None:
+                return float(best_alt)
     if (shape.altitude_high is None
             or shape.altitude_low is None
             or shape.polygon is None):

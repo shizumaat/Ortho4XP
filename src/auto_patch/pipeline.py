@@ -1955,6 +1955,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _snap_junction_altitudes_to_rect_corners(
                 layout, interior_proximity_m=3.0)
 
+        # Per user 2026-05-10: shapes cannot cross integer lat/lon
+        # tile boundaries (X-Plane / Ortho4XP render each 1°x1° tile
+        # separately).  Cut a 10 m gap along every tile boundary
+        # line that passes through the airport's pavement footprint;
+        # Ortho4XP + X-Plane stitch the seam at render time.
+        from .tile_cut import cut_layout_at_tile_boundaries
+        n_tile_delta = cut_layout_at_tile_boundaries(layout)
+        if n_tile_delta != 0:
+            UI.vprint(1,
+                f"  [pav-builder] {icao}: tile-boundary cut "
+                f"adjusted shape count by {n_tile_delta:+d}.")
+
         # Final within-shape grade WARN reflects the absolute
         # final state — junction / apron / terminal Euclidean caps
         # post-final-solver.  Per user 2026-05-03 the WARN was
