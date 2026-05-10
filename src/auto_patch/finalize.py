@@ -63,7 +63,8 @@ __all__ = ["run_phase2"]
 
 def run_phase2(layout, icao, xplane_root, apt, *,
                nodes, ways, to_m, apron_candidates,
-               tile_dem=None):
+               tile_dem=None,
+               current_tile_lat=None, current_tile_lon=None):
     """Phase-2 elevation solve + feature emit.  Mutates layout.
 
     ``tile_dem`` (when supplied by the tile-pipeline driver) is the
@@ -72,6 +73,13 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     Phase-2 elevation solver and the boundary-shape emit consume
     the SAME smoothed DEM that drives Ortho4XP's flattening,
     without each per-airport pass loading DEM tiles independently.
+
+    ``current_tile_lat`` / ``current_tile_lon`` identify the tile
+    being processed by the driver — used to provide correct
+    ``(tile_lat, tile_lon)`` context for DEM sampling on cross-tile
+    airports (the airport's anchor tile may differ from the tile
+    Ortho4XP is currently generating).  Default ``None`` falls back
+    to ``floor(layout.anchor)`` for direct test runs.
     """
     _compute_elevations(
         layout, icao, xplane_root, apt,
@@ -166,8 +174,17 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     # airport pavement and surrounding terrain.
     try:
         _lat0, _lon0 = layout.anchor
-        _tile_lat = int(math.floor(_lat0))
-        _tile_lon = int(math.floor(_lon0))
+        # Use the current tile being processed (from the driver)
+        # for DEM sampling context.  When ``tile_dem`` is the DEM
+        # for the current tile (-13/-78 for SPLP when generating
+        # that tile), ``_sample_dem`` needs ``tile_lat=-13,
+        # tile_lon=-78`` to convert lat/lon → DEM local coords
+        # correctly.  Anchor-derived tile coords would be wrong
+        # for cross-tile airports.
+        _tile_lat = (current_tile_lat if current_tile_lat is not None
+                     else int(math.floor(_lat0)))
+        _tile_lon = (current_tile_lon if current_tile_lon is not None
+                     else int(math.floor(_lon0)))
         _dem = _load_airport_dem(_lat0, _lon0, override_dem=tile_dem)
         n_b = _emit_airport_boundary_shape(
             layout, _dem, _tile_lat, _tile_lon)

@@ -1803,7 +1803,9 @@ def build_airport_pavement(icao: str, xplane_root: str,
             layout, icao, xplane_root, apt,
             nodes=nodes, ways=ways, to_m=to_m,
             apron_candidates=apron_candidates,
-            tile_dem=tile_dem)
+            tile_dem=tile_dem,
+            current_tile_lat=current_tile_lat,
+            current_tile_lon=current_tile_lon)
 
         # Final Rule 2 enforcement (user 2026-05-01).  Triangulation
         # densification and Laplacian-solver vertex insertions can
