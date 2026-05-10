@@ -45,6 +45,7 @@ from .layout import (
 )
 from .pavement.vertices import _snap_polygon_vertices_to_rect_corners
 from .pavement.junctions import _decompose_polygon_with_holes
+from .pavement.runways import _sample_runway_segment_elev
 from .elevation import _resample_node_altitudes_nn, _sample_dem
 
 
