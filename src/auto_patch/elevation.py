@@ -271,13 +271,10 @@ def _load_airport_dem(lat0: float, lon0: float, override_dem=None):
             except _GEOM_EXC:
                 pass
             dem = _DEM.DEM(tile_lat, tile_lon)
-    except Exception as exc:
-        try:
-            UI.vprint(1,
-                f"  [pav-builder] WARN: DEM load/download failed for "
-                f"{fname}: {exc}")
-        except _GEOM_EXC:
-            pass
+    except _GEOM_EXC as exc:
+        UI.vprint(1,
+            f"  [pav-builder] WARN: DEM load/download failed for "
+            f"{fname}: {exc}")
         _DEM_CACHE[key] = None
         return None
     _DEM_CACHE[key] = dem
