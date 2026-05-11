@@ -35,11 +35,17 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Polygon
 from shapely.ops import substring, unary_union
 from shapely.validation import make_valid
 
 from . import taxiway_skeleton as TS
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -184,7 +190,7 @@ def _mrr_midline_and_width(polygon: Polygon) -> Tuple[Optional[LineString],
         return (None, 0.0)
     try:
         mrr = polygon.minimum_rotated_rectangle
-    except Exception:
+    except _GEOM_EXC:
         return (None, 0.0)
     if mrr is None or mrr.is_empty or not hasattr(mrr, "exterior"):
         return (None, 0.0)
@@ -218,7 +224,7 @@ def _mrr_aspect_short(polygon: Polygon) -> Tuple[float, float]:
         return (0.0, 0.0)
     try:
         mrr = polygon.minimum_rotated_rectangle
-    except Exception:
+    except _GEOM_EXC:
         return (0.0, 0.0)
     if mrr is None or mrr.is_empty or not hasattr(mrr, "exterior"):
         return (0.0, 0.0)
@@ -266,7 +272,7 @@ def _extend_axis_to_polygon_boundary(
         probe = LineString([(ex, ey), target])
         try:
             inside_seg = probe.intersection(polygon)
-        except Exception:
+        except _GEOM_EXC:
             return None
         if inside_seg.is_empty:
             return None
@@ -295,7 +301,7 @@ def _extend_axis_to_polygon_boundary(
         out[-1] = newN
     try:
         return LineString(out)
-    except Exception:
+    except _GEOM_EXC:
         return axis
 
 
@@ -385,10 +391,10 @@ def _validate_polygon(polygon: Polygon) -> Optional[Polygon]:
         return polygon
     try:
         fixed = make_valid(polygon)
-    except Exception:
+    except _GEOM_EXC:
         try:
             fixed = polygon.buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             return None
     return _largest_polygon_part(fixed)
 
@@ -607,7 +613,7 @@ def _extract_trunks(
             continue
         try:
             trunks.append(LineString(e.coords))
-        except Exception:
+        except _GEOM_EXC:
             continue
     trunks.sort(key=lambda ls: -ls.length)
     return trunks
@@ -698,7 +704,7 @@ def _split_trunk_by_local_width(
             continue
         try:
             sub = substring(trunk, t0, t1)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if sub is None or sub.is_empty or sub.length < min_run_length_m:
             continue
@@ -747,7 +753,7 @@ def _decompose_mega_polygon(
             simplify_tol=5.0,  # keep junction geometry intact so
                                # trunk stitching finds the T-nodes
         )
-    except Exception:
+    except _GEOM_EXC:
         raw_centerlines = []
 
     # Merge sub-branches into trunks along the straightest paths
@@ -818,14 +824,14 @@ def _decompose_mega_polygon(
         half_w = max(w / 2.0, 5.0) + TAXI_BUFFER_PAD_M
         try:
             buf = cl.buffer(half_w, cap_style=3, join_style=2)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if buf.is_empty:
             continue
         # Clip to source polygon.
         try:
             region = buf.intersection(polygon)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if region.is_empty:
             continue
@@ -833,7 +839,7 @@ def _decompose_mega_polygon(
         if claimed is not None and not claimed.is_empty:
             try:
                 region = region.difference(claimed)
-            except Exception:
+            except _GEOM_EXC:
                 pass
         if region.is_empty:
             continue
@@ -855,7 +861,7 @@ def _decompose_mega_polygon(
         else:
             try:
                 claimed = unary_union([claimed, taxi_poly])
-            except Exception:
+            except _GEOM_EXC:
                 pass
 
     # Apron residual = source minus all claimed taxi polygons.
@@ -865,11 +871,11 @@ def _decompose_mega_polygon(
     if claimed is not None and not claimed.is_empty:
         try:
             claimed_fat = claimed.buffer(0.1, join_style=2)
-        except Exception:
+        except _GEOM_EXC:
             claimed_fat = claimed
         try:
             residual = polygon.difference(claimed_fat)
-        except Exception:
+        except _GEOM_EXC:
             residual = polygon
         if not residual.is_empty:
             if residual.geom_type == "Polygon":
@@ -966,12 +972,12 @@ def decompose_pavement(
     try:
         taxi_union_geom = (unary_union(taxi_valid) if taxi_valid
                            else None)
-    except Exception:
+    except _GEOM_EXC:
         taxi_union_geom = None
     try:
         apron_union_geom = (unary_union(apron_valid) if apron_valid
                             else None)
-    except Exception:
+    except _GEOM_EXC:
         apron_union_geom = None
 
     taxi_components = _poly_components(taxi_union_geom)
@@ -1018,7 +1024,7 @@ def decompose_pavement(
                 for a in apron_sources:
                     try:
                         diff = a.difference(taxi_u_fat)
-                    except Exception:
+                    except _GEOM_EXC:
                         diff = a
                     if diff.is_empty:
                         continue
@@ -1030,12 +1036,12 @@ def decompose_pavement(
                                     and not g.is_empty):
                                 trimmed_sources.append(g)
                 apron_sources = trimmed_sources
-            except Exception:
+            except _GEOM_EXC:
                 pass
         try:
             apron_union = unary_union(apron_sources) \
                 if apron_sources else None
-        except Exception:
+        except _GEOM_EXC:
             apron_union = None
         if apron_union is not None and not apron_union.is_empty:
             parts = _poly_components(apron_union)
@@ -1119,7 +1125,7 @@ def build_adjacency_graph(
                 continue
             try:
                 inter = boundary_i.intersection(inflated[j])
-            except Exception:
+            except _GEOM_EXC:
                 continue
             parts = _boundary_line_parts(inter)
             if not parts:
@@ -1218,7 +1224,7 @@ def classify_shape_roles(
                 continue
             try:
                 dist = s.polygon.distance(rw_line)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if dist > primary_max_distance_m:
                 continue

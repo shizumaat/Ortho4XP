@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
@@ -24,6 +25,11 @@ from .rects import (
     _natural_half_width,
     _rect_from_axis_extended,
 )
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -124,7 +130,7 @@ def _emit_primary_parallel_runway_stubs(
         if len(pts) >= 2:
             try:
                 by_ref.setdefault(ref, []).append(LineString(pts))
-            except Exception:
+            except _GEOM_EXC:
                 pass
 
     # Pre-compute existing rect union for overlap detection
@@ -133,7 +139,7 @@ def _emit_primary_parallel_runway_stubs(
         try:
             existing_rects_union = unary_union(
                 [r for r, _, _, _ in existing_taxi_rects])
-        except Exception:
+        except _GEOM_EXC:
             existing_rects_union = None
 
     new_stubs: List[Tuple[Polygon, LineString, str, str]] = []
@@ -258,7 +264,7 @@ def _emit_primary_parallel_runway_stubs(
                           cy + uy * STUB_LEN_M / 2)
                 try:
                     probe_axis = LineString([ax_start, ax_end])
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 _nat, _p90, narrow = _natural_half_width(
                     probe_axis, pav_union)
@@ -336,7 +342,7 @@ def _emit_primary_parallel_runway_stubs(
                                     cc[-1][1] - coords[last_in][1])
                                 cross_pt = (cc[0] if d0 < d1
                                             else cc[-1])
-                        except Exception:
+                        except _GEOM_EXC:
                             pass
                         pull_path.append(
                             (cross_pt[0], cross_pt[1]))
@@ -354,7 +360,7 @@ def _emit_primary_parallel_runway_stubs(
                         try:
                             gap_curve = LineString(pull_path)
                             gap = gap_curve.length
-                        except Exception:
+                        except _GEOM_EXC:
                             gap = 0.0
                         if gap > 30.0:
                             # New centre at (1 - PULL_BACK_FRAC)
@@ -381,7 +387,7 @@ def _emit_primary_parallel_runway_stubs(
                           cy + uy * target_len / 2)
                 try:
                     stub_axis = LineString([ax_start, ax_end])
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 rect = _rect_from_axis_extended(
                     stub_axis, width, pav_union,
@@ -391,7 +397,7 @@ def _emit_primary_parallel_runway_stubs(
                 if not rect.is_valid:
                     try:
                         rect = rect.buffer(0)
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
                     if (rect.is_empty
                             or rect.geom_type != "Polygon"):
@@ -420,7 +426,7 @@ def _emit_primary_parallel_runway_stubs(
                             existing_rects_union).area
                         if overlap > rect.area * 0.2:
                             skip = True
-                    except Exception:
+                    except _GEOM_EXC:
                         pass
                 if not skip and ref:
                     # Same-ref near-duplicate guard: applies only
@@ -434,7 +440,7 @@ def _emit_primary_parallel_runway_stubs(
                             if er.buffer(30.0).intersects(rect):
                                 skip = True
                                 break
-                        except Exception:
+                        except _GEOM_EXC:
                             pass
                 if skip:
                     continue
@@ -487,7 +493,7 @@ def _clip_residue_at_stub_sloping_edges(
             continue
         try:
             rc = list(rect.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if rc and rc[0] == rc[-1]:
             rc = rc[:-1]
@@ -518,7 +524,7 @@ def _clip_residue_at_stub_sloping_edges(
                 strip = Polygon([e0, e1, o1, o0])
                 if strip.is_valid and not strip.is_empty:
                     residue = residue.difference(strip)
-            except Exception:
+            except _GEOM_EXC:
                 continue
     return residue
 
@@ -557,7 +563,7 @@ def _add_stub_to_runway_bridges(
             continue
         try:
             rc = list(rect.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if rc and rc[0] == rc[-1]:
             rc = rc[:-1]
@@ -574,7 +580,7 @@ def _add_stub_to_runway_bridges(
                         0.5 * (e0[1] + e1[1]))
             try:
                 d = mid.distance(rwy_boundary)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if d < best_d:
                 best_d = d
@@ -590,7 +596,7 @@ def _add_stub_to_runway_bridges(
         try:
             n0, _ = nearest_points(rwy_boundary, Point(e0))
             n1, _ = nearest_points(rwy_boundary, Point(e1))
-        except Exception:
+        except _GEOM_EXC:
             continue
         # Build the bridge quadrilateral: stub edge → runway edge.
         # Order: e0, e1, n1, n0 so the bridge closes properly.
@@ -611,11 +617,11 @@ def _add_stub_to_runway_bridges(
                     and bridge.geom_type == "Polygon"
                     and bridge.area >= 1.0):
                 additions.append(bridge)
-        except Exception:
+        except _GEOM_EXC:
             continue
     if additions:
         try:
             residue = unary_union([residue] + additions)
-        except Exception:
+        except _GEOM_EXC:
             pass
     return residue
