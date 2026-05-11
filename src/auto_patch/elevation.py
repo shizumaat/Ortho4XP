@@ -661,23 +661,25 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 #   the runway while keeping the 4-corner rect
                 #   shape intact.
                 #
-                #   `junction_clip` — 2.0 m outward buffer.  For
-                #   junction polygons, shrinks them away from the
-                #   runway edge by 2 m (user 2026-04-24: "taxiway
-                #   shapes should stop just short of the runway").
-                #   Prevents junction boundary vertices from
-                #   landing mid-edge on a runway short edge, which
-                #   X-Plane's mesh builder would interpret as
-                #   splitting the runway's 4-corner slope rect
-                #   and break the altitude_high/low rendering.
+                #   `junction_clip` — exact runway shape, no
+                #   outward buffer.  Per user 2026-05-11: a 2 m
+                #   outward buffer (used here previously) pushed
+                #   every adjacent junction polygon 2 m off the
+                #   runway boundary, creating a visible sliver gap
+                #   at every taxi-junction-to-runway interface (the
+                #   -10178 / V1-throat issue at SPJC).  The original
+                #   2026-04-24 rationale ("junction vertices can't
+                #   land mid-edge on a runway short edge") is
+                #   handled downstream by
+                #   ``_snap_polygon_vertices_to_rect_corners`` +
+                #   ``widen_junctions_to_runway_corners`` /
+                #   ``stitch_pavement_to_flat_runways``; the buffer
+                #   was double-protection that broke the seam.
                 try:
                     taxi_clip = new_rwy_union.buffer(0.05)
                 except _GEOM_EXC:
                     taxi_clip = new_rwy_union
-                try:
-                    junction_clip = new_rwy_union.buffer(2.0)
-                except _GEOM_EXC:
-                    junction_clip = new_rwy_union
+                junction_clip = new_rwy_union
                 # Rebuild layout.shapes in-place: when the clip
                 # produces a MultiPolygon (e.g. a junction that
                 # straddled the old runway ends up as two pieces
@@ -736,10 +738,10 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
 
                 # Per user 2026-04-28: junction polygon vertices
                 # cannot land on a sloping rect's edge interior —
-                # only on corners.  The 2 m runway-shrink difference
-                # above can produce boundary intersection points 2 m
-                # along a runway rect's edge; snap them to the
-                # nearest corner.  Same helper used in
+                # only on corners.  Boundary intersection points
+                # from the runway difference can land along a
+                # runway rect's edge; snap them to the nearest
+                # corner.  Same helper used in
                 # ``_resolve_runway_crossings``.
                 sloping_rect_polys_for_snap = [
                     s.polygon for s in layout.shapes
@@ -756,11 +758,12 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     if (shape.polygon is None
                             or shape.polygon.is_empty):
                         continue
-                    # Exclude this junction's own polygon from snap
-                    # candidates (it isn't a sloping rect anyway,
-                    # but be defensive).  Snap tolerance 5 m matches
-                    # the runway-clip's 2 m buffer plus a small
-                    # cushion for Shapely overlay precision.
+                    # 5 m tolerance is enough to catch overlay-
+                    # precision drift after the (no-buffer)
+                    # runway difference; tighter than the legacy
+                    # 2 m buffer's 5 m margin in cases where the
+                    # junction's exact boundary should remain
+                    # flush with the runway side.
                     snapped = _snap_polygon_vertices_to_rect_corners(
                         shape.polygon,
                         sloping_rect_polys_for_snap,

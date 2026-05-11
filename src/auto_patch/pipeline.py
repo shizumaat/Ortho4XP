@@ -359,7 +359,24 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # unnecessary.  Per user direction: dedup intersections within
     # 2 m centerline distance (a junction can span a 2 m gap
     # without needing a node there).
-    INTERSECTION_PROX_M = 0.5
+    #
+    # Per user 2026-05-11: tolerance widened from 0.5 m to 3.0 m so
+    # apt.dat pavement boundaries drawn slightly INSIDE the row-100
+    # runway rect (1-2 m offsets are common — SPJC's row-110 stops
+    # 1.75 m short of 16R/34L at the V1 throat) still register as
+    # runway intersection points.  Without this, the segmenter
+    # doesn't insert a seam corner at the chart-level pavement
+    # transition, and the downstream junction-widening pass can't
+    # share a vertex with the runway there — leaving a visible
+    # 1-2 m sliver gap between every taxi-junction and the runway
+    # boundary.  The runway segmenter projects each kept point onto
+    # the centerline and emits the seam corner there; the actual
+    # corner sits on the runway boundary (rect-perpendicular at
+    # half-width) regardless of how far the source pavement vertex
+    # was off-edge, so widening the tolerance just unlocks more
+    # near-runway pavement landmarks as segmentation breakpoints
+    # without distorting the segmenter's output geometry.
+    INTERSECTION_PROX_M = 3.0
     INTERSECTION_DEDUP_M = 2.0
     pav_runway_intersections: dict = {}
     for ridx, r in enumerate(apt.runways):
