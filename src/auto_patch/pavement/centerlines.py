@@ -63,6 +63,7 @@ __all__ = [
     "_split_by_width_profile",
     "_split_centerlines_at_points",
     "_sub_ref_narrow_corridor",
+    "split_merged_centerline",
 ]
 
 
@@ -117,6 +118,215 @@ def _bridge_same_ref_polylines(lines: List[LineString]
     return merged_lines
 
 
+def split_merged_centerline(
+        ls: LineString,
+        ref: str,
+        rwy_centerlines: Optional[List[LineString]] = None,
+) -> List[Tuple[LineString, str]]:
+    """Split a single merged taxi-name polyline into rect-axis
+    segments via RDP simplification + bend-split.
+
+    Public helper so both the OSM extractor and apt.dat taxi-
+    network builder feed merged polylines through the same
+    splitting machinery.  Without it apt.dat-derived polylines
+    (whose nodes follow real bends in the taxi route) emit as
+    single straight rects spanning curves, producing rects that
+    visibly drift off the actual pavement at every bend.
+
+    Returns a list of ``(LineString, ref)`` segments — typically
+    1-N pieces depending on how many significant bends survive
+    RDP simplification.
+    """
+    out: List[Tuple[LineString, str]] = []
+    try:
+        simp = ls.simplify(RDP_SIMPLIFY_TOL_M,
+                           preserve_topology=False)
+    except _GEOM_EXC:
+        return out
+    scoords = list(simp.coords)
+    if len(scoords) < 2:
+        return out
+    # Geometrically-straight-enough centerlines emit as ONE
+    # rect rather than being bend-split.  This catches
+    # continuous diagonal taxis at any airport (e.g. SPJC's
+    # B/C/E/G, CYXY's E parallel) where the simplified
+    # polyline has small bends that would otherwise get
+    # bend-split into too-short fragments.  Sub-refs are
+    # excluded because they're typically already short
+    # connector spurs that benefit from bend-splitting at
+    # their natural curve points.
+    #
+    # The chord/path-only test is INSUFFICIENT for taxis like
+    # SPJC's L that have a long mostly-straight middle plus
+    # tight curves at the ends (chord/path = 0.955 even though
+    # L bends 23° at one end and 14-22° at the other).  A
+    # post-pass STRAIGHT-ENOUGH check requires chord/path
+    # close to 1 AND every interior bend below
+    # ``MAX_INTERIOR_BEND_DEG``.  L's max bend is 23° → fails;
+    # B/C/E/G/CYXY-E's max wobble is ~5° → still passes.
+    MAX_INTERIOR_BEND_DEG = 15.0
+    has_digit = bool(ref) and any(c.isdigit() for c in ref)
+    if not has_digit:
+        path_len = ls.length
+        sc = list(simp.coords)
+        if len(sc) >= 2 and path_len > 1e-6:
+            chord = math.hypot(sc[-1][0] - sc[0][0],
+                               sc[-1][1] - sc[0][1])
+            chord_ratio = chord / path_len
+            max_interior_bend = 0.0
+            for k in range(1, len(sc) - 1):
+                ax, ay = sc[k - 1]
+                bx, by = sc[k]
+                cx, cy = sc[k + 1]
+                v1x, v1y = bx - ax, by - ay
+                v2x, v2y = cx - bx, cy - by
+                m1 = math.hypot(v1x, v1y)
+                m2 = math.hypot(v2x, v2y)
+                if m1 < 1e-6 or m2 < 1e-6:
+                    continue
+                d = (v1x * v2x + v1y * v2y) / (m1 * m2)
+                if d > 1.0:
+                    d = 1.0
+                elif d < -1.0:
+                    d = -1.0
+                ang = math.degrees(math.acos(d))
+                if ang > max_interior_bend:
+                    max_interior_bend = ang
+            if (chord_ratio > 0.95
+                    and max_interior_bend
+                    < MAX_INTERIOR_BEND_DEG):
+                out.append((simp, ref))
+                return out
+    # SHORT UNREFED runway-connecting stubs: SPLP has short
+    # curvy unrefed taxis (e.g. way -696731, 165 m chord
+    # 144 m) that link runway to apron/primary.  Target
+    # emits a single rect in the middle of each.  Bend-
+    # splitting fragments them into pieces too small to
+    # survive the 40 m floor in `_split_centerlines_at_points`.
+    # Emit atomically when: ref="" (unrefed) AND path < 300 m
+    # AND one endpoint is inside the runway polygon.
+    if (not ref
+            and ls.length < 300.0
+            and rwy_centerlines):
+        try:
+            sc = list(simp.coords)
+            if len(sc) >= 2:
+                ep0 = Point(sc[0])
+                ep1 = Point(sc[-1])
+                ep0_near = any(
+                    ep0.distance(r) < 30.0 for r in rwy_centerlines)
+                ep1_near = any(
+                    ep1.distance(r) < 30.0 for r in rwy_centerlines)
+                if ep0_near or ep1_near:
+                    out.append((simp, ref))
+                    return out
+        except _GEOM_EXC:
+            pass
+    # All refs (including sub-refs) split at significant
+    # bends.  Per user (2026-04-20 refined): intersections
+    # + sharp curves define rect break points; there's no
+    # reason sub-refs should be exempt from curve detection.
+    # Split at INTERNAL bends with angle change ≥
+    # SIGNIFICANT_BEND_DEG, but cluster consecutive
+    # bends within BEND_CLUSTER_M together.  A curve
+    # (many tiny bends adding up to a big turn) counts
+    # as ONE break point at its midpoint — matching
+    # how the target treats a curve as a single logical
+    # transition between rects.
+    candidate_bends: List[int] = []
+    for i in range(1, len(scoords) - 1):
+        a = scoords[i - 1]
+        b = scoords[i]
+        c = scoords[i + 1]
+        v1 = (b[0] - a[0], b[1] - a[1])
+        v2 = (c[0] - b[0], c[1] - b[1])
+        m1 = math.hypot(*v1)
+        m2 = math.hypot(*v2)
+        if m1 < 1e-6 or m2 < 1e-6:
+            continue
+        dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2)
+        dot = max(-1.0, min(1.0, dot))
+        angle_change = math.degrees(math.acos(dot))
+        if angle_change >= SIGNIFICANT_BEND_DEG:
+            candidate_bends.append(i)
+    # Cluster consecutive bends within BEND_CLUSTER_M of
+    # each other.  Per user rule (2026-04-20): when a
+    # primary taxi curves at the runway, emit the straight
+    # portions as rects and leave the curve itself as
+    # junction territory (no rect emitted for the curve).
+    # → Each cluster yields TWO break indices
+    #   (cluster start, cluster end) with the curve
+    #   interval between them skipped.
+    # A single isolated bend (cluster of 1) gives only
+    # ONE break at itself.
+    # Sub-refs (letter+digit: V3, V5, L1, …) are usually
+    # short stub taxis whose straight portion is much
+    # less than the primary's junction-bend-transition
+    # span.  Using the primary's 100 m cluster distance
+    # swallows a true 90°-corner stub's straight middle
+    # run (e.g. V5 indices [13..15] are a 97 m straight
+    # between two tight curves).  For sub-refs we cluster
+    # bends far more conservatively so the straight run
+    # between two curves can survive as its own segment.
+    cluster_m = BEND_CLUSTER_M
+    if ref and any(c.isdigit() for c in ref):
+        cluster_m = 30.0
+    clusters: List[List[int]] = []
+    for bi in candidate_bends:
+        if clusters and (scoords[bi][0] - scoords[clusters[-1][-1]][0])**2 + \
+                (scoords[bi][1] - scoords[clusters[-1][-1]][1])**2 \
+                <= cluster_m * cluster_m:
+            clusters[-1].append(bi)
+        else:
+            clusters.append([bi])
+    # Build an ordered list of (break_index, kind) where
+    # kind='point' (single bend) or 'interval_start' /
+    # 'interval_end' (curve boundaries).
+    events: List[Tuple[int, str]] = [(0, "point")]
+    for cl in clusters:
+        if len(cl) == 1:
+            events.append((cl[0], "point"))
+        else:
+            # Only treat curve as junction interval if
+            # NEAR A RUNWAY (per user rule 3: "primary
+            # taxiway curves and intersects the runway"
+            # → straight rect, curve = junction, perp =
+            # stub).  Curves in the middle of the
+            # airport (e.g. A's gentle bend) stay as
+            # single break points.
+            near_rwy = False
+            if rwy_centerlines:
+                cluster_mid = scoords[cl[len(cl) // 2]]
+                cp = Point(cluster_mid)
+                for r in rwy_centerlines:
+                    if cp.distance(r) < 200.0:
+                        near_rwy = True
+                        break
+            if near_rwy:
+                events.append((cl[0], "interval_start"))
+                events.append((cl[-1], "interval_end"))
+            else:
+                events.append((cl[len(cl) // 2], "point"))
+    events.append((len(scoords) - 1, "point"))
+    events.sort()
+    # Walk events pair-wise; skip intervals between
+    # interval_start and interval_end (that's the curve).
+    for k in range(len(events) - 1):
+        i0, k0 = events[k]
+        i1, k1 = events[k + 1]
+        # Skip the curve interval itself.
+        if k0 == "interval_start" and k1 == "interval_end":
+            continue
+        if i0 == i1:
+            continue
+        try:
+            seg = LineString(scoords[i0:i1 + 1])
+        except _GEOM_EXC:
+            continue
+        if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
+            continue
+        out.append((seg, ref))
+    return out
 
 
 def _extract_osm_taxi_centerlines(
@@ -205,196 +415,7 @@ def _extract_osm_taxi_centerlines(
             merged_lines = _bridge_same_ref_polylines(merged_lines)
 
         for ls in merged_lines:
-            try:
-                simp = ls.simplify(RDP_SIMPLIFY_TOL_M,
-                                   preserve_topology=False)
-            except _GEOM_EXC:
-                continue
-            scoords = list(simp.coords)
-            if len(scoords) < 2:
-                continue
-            # Geometrically-straight-enough centerlines emit as ONE
-            # rect rather than being bend-split.  This catches
-            # continuous diagonal taxis at any airport (e.g. SPJC's
-            # B/C/E/G, CYXY's E parallel) where the simplified
-            # polyline has small bends that would otherwise get
-            # bend-split into too-short fragments.  Sub-refs are
-            # excluded because they're typically already short
-            # connector spurs that benefit from bend-splitting at
-            # their natural curve points.
-            #
-            # The chord/path-only test is INSUFFICIENT for taxis like
-            # SPJC's L that have a long mostly-straight middle plus
-            # tight curves at the ends (chord/path = 0.955 even though
-            # L bends 23° at one end and 14-22° at the other).  A
-            # post-pass STRAIGHT-ENOUGH check requires chord/path
-            # close to 1 AND every interior bend below
-            # ``MAX_INTERIOR_BEND_DEG``.  L's max bend is 23° → fails;
-            # B/C/E/G/CYXY-E's max wobble is ~5° → still passes.
-            MAX_INTERIOR_BEND_DEG = 15.0
-            has_digit = bool(ref) and any(c.isdigit() for c in ref)
-            if not has_digit:
-                path_len = ls.length
-                sc = list(simp.coords)
-                if len(sc) >= 2 and path_len > 1e-6:
-                    chord = math.hypot(sc[-1][0] - sc[0][0],
-                                       sc[-1][1] - sc[0][1])
-                    chord_ratio = chord / path_len
-                    max_interior_bend = 0.0
-                    for k in range(1, len(sc) - 1):
-                        ax, ay = sc[k - 1]
-                        bx, by = sc[k]
-                        cx, cy = sc[k + 1]
-                        v1x, v1y = bx - ax, by - ay
-                        v2x, v2y = cx - bx, cy - by
-                        m1 = math.hypot(v1x, v1y)
-                        m2 = math.hypot(v2x, v2y)
-                        if m1 < 1e-6 or m2 < 1e-6:
-                            continue
-                        d = (v1x * v2x + v1y * v2y) / (m1 * m2)
-                        if d > 1.0:
-                            d = 1.0
-                        elif d < -1.0:
-                            d = -1.0
-                        ang = math.degrees(math.acos(d))
-                        if ang > max_interior_bend:
-                            max_interior_bend = ang
-                    if (chord_ratio > 0.95
-                            and max_interior_bend
-                            < MAX_INTERIOR_BEND_DEG):
-                        out.append((simp, ref))
-                        continue
-            # SHORT UNREFED runway-connecting stubs: SPLP has short
-            # curvy unrefed taxis (e.g. way -696731, 165 m chord
-            # 144 m) that link runway to apron/primary.  Target
-            # emits a single rect in the middle of each.  Bend-
-            # splitting fragments them into pieces too small to
-            # survive the 40 m floor in `_split_centerlines_at_points`.
-            # Emit atomically when: ref="" (unrefed) AND path < 300 m
-            # AND one endpoint is inside the runway polygon.
-            if (not ref
-                    and ls.length < 300.0
-                    and rwy_centerlines):
-                try:
-                    sc = list(simp.coords)
-                    if len(sc) >= 2:
-                        ep0 = Point(sc[0])
-                        ep1 = Point(sc[-1])
-                        ep0_near = any(
-                            ep0.distance(r) < 30.0 for r in rwy_centerlines)
-                        ep1_near = any(
-                            ep1.distance(r) < 30.0 for r in rwy_centerlines)
-                        if ep0_near or ep1_near:
-                            out.append((simp, ref))
-                            continue
-                except _GEOM_EXC:
-                    pass
-            # All refs (including sub-refs) split at significant
-            # bends.  Per user (2026-04-20 refined): intersections
-            # + sharp curves define rect break points; there's no
-            # reason sub-refs should be exempt from curve detection.
-            is_parallel = True  # unified: all refs use bend-split
-            if is_parallel:
-                # Split at INTERNAL bends with angle change ≥
-                # SIGNIFICANT_BEND_DEG, but cluster consecutive
-                # bends within BEND_CLUSTER_M together.  A curve
-                # (many tiny bends adding up to a big turn) counts
-                # as ONE break point at its midpoint — matching
-                # how the target treats a curve as a single logical
-                # transition between rects.
-                candidate_bends: List[int] = []
-                for i in range(1, len(scoords) - 1):
-                    a = scoords[i - 1]
-                    b = scoords[i]
-                    c = scoords[i + 1]
-                    v1 = (b[0] - a[0], b[1] - a[1])
-                    v2 = (c[0] - b[0], c[1] - b[1])
-                    m1 = math.hypot(*v1)
-                    m2 = math.hypot(*v2)
-                    if m1 < 1e-6 or m2 < 1e-6:
-                        continue
-                    dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (m1 * m2)
-                    dot = max(-1.0, min(1.0, dot))
-                    angle_change = math.degrees(math.acos(dot))
-                    if angle_change >= SIGNIFICANT_BEND_DEG:
-                        candidate_bends.append(i)
-                # Cluster consecutive bends within BEND_CLUSTER_M of
-                # each other.  Per user rule (2026-04-20): when a
-                # primary taxi curves at the runway, emit the straight
-                # portions as rects and leave the curve itself as
-                # junction territory (no rect emitted for the curve).
-                # → Each cluster yields TWO break indices
-                #   (cluster start, cluster end) with the curve
-                #   interval between them skipped.
-                # A single isolated bend (cluster of 1) gives only
-                # ONE break at itself.
-                # Sub-refs (letter+digit: V3, V5, L1, …) are usually
-                # short stub taxis whose straight portion is much
-                # less than the primary's junction-bend-transition
-                # span.  Using the primary's 100 m cluster distance
-                # swallows a true 90°-corner stub's straight middle
-                # run (e.g. V5 indices [13..15] are a 97 m straight
-                # between two tight curves).  For sub-refs we cluster
-                # bends far more conservatively so the straight run
-                # between two curves can survive as its own segment.
-                cluster_m = BEND_CLUSTER_M
-                if ref and any(c.isdigit() for c in ref):
-                    cluster_m = 30.0
-                clusters: List[List[int]] = []
-                for bi in candidate_bends:
-                    if clusters and (scoords[bi][0] - scoords[clusters[-1][-1]][0])**2 + \
-                            (scoords[bi][1] - scoords[clusters[-1][-1]][1])**2 \
-                            <= cluster_m * cluster_m:
-                        clusters[-1].append(bi)
-                    else:
-                        clusters.append([bi])
-                # Build an ordered list of (break_index, kind) where
-                # kind='point' (single bend) or 'interval_start' /
-                # 'interval_end' (curve boundaries).
-                events: List[Tuple[int, str]] = [(0, "point")]
-                for cl in clusters:
-                    if len(cl) == 1:
-                        events.append((cl[0], "point"))
-                    else:
-                        # Only treat curve as junction interval if
-                        # NEAR A RUNWAY (per user rule 3: "primary
-                        # taxiway curves and intersects the runway"
-                        # → straight rect, curve = junction, perp =
-                        # stub).  Curves in the middle of the
-                        # airport (e.g. A's gentle bend) stay as
-                        # single break points.
-                        near_rwy = False
-                        if rwy_centerlines:
-                            cluster_mid = scoords[cl[len(cl) // 2]]
-                            cp = Point(cluster_mid)
-                            for r in rwy_centerlines:
-                                if cp.distance(r) < 200.0:
-                                    near_rwy = True
-                                    break
-                        if near_rwy:
-                            events.append((cl[0], "interval_start"))
-                            events.append((cl[-1], "interval_end"))
-                        else:
-                            events.append((cl[len(cl) // 2], "point"))
-                events.append((len(scoords) - 1, "point"))
-                events.sort()
-                # Walk events pair-wise; skip intervals between
-                # interval_start and interval_end (that's the curve).
-                for k in range(len(events) - 1):
-                    i0, k0 = events[k]
-                    i1, k1 = events[k + 1]
-                    # Skip the curve interval itself.
-                    if k0 == "interval_start" and k1 == "interval_end":
-                        continue
-                    if i0 == i1:
-                        continue
-                    try:
-                        seg = LineString(scoords[i0:i1 + 1])
-                    except _GEOM_EXC:
-                        continue
-                    if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
-                        continue
-                    out.append((seg, ref))
+            out.extend(split_merged_centerline(ls, ref, rwy_centerlines))
 
     # Drop unrefed centerlines AT AIRPORTS THAT HAVE ANY REFED
     # CENTERLINES (per user 2026-04-27).  At SPJC etc. the OSM data

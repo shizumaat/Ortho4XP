@@ -833,7 +833,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # "taxiways turning into big junctions" report).  Fall back to
     # OSM only when the apt.dat block has no taxi-network at all
     # (some custom packs omit rows 1201/1202).
-    apt_centerlines = APR.taxi_centerlines(apt, to_m)
+    apt_centerlines = APR.taxi_centerlines(
+        apt, to_m, rwy_centerlines=rwy_centerlines)
     if apt_centerlines:
         osm_centerlines = apt_centerlines
         UI.vprint(1,

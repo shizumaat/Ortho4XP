@@ -1068,6 +1068,7 @@ def taxi_junction_points(
 def taxi_centerlines(
         airport: Airport,
         to_m,
+        rwy_centerlines: "Optional[List]" = None,
 ) -> List[Tuple["LineString", str]]:
     """Build taxi centerlines from apt.dat 1201/1202 rows.
 
@@ -1084,15 +1085,17 @@ def taxi_centerlines(
       3. Build one ``LineString`` per edge, then ``linemerge`` per
          name group so consecutive edges along the same taxiway
          collapse into a single polyline.
-      4. Return one ``(LineString, name)`` per merged path.
-
-    Unnamed connector edges (empty ``name``) are included as
-    ``(LineString, "")`` so downstream callers can decide whether
-    to keep or drop them.  Per-taxi (named) edges are linemerged
-    independently; unnamed edges are merged as one group.
+      4. Run each merged polyline through
+         :func:`pavement.centerlines.split_merged_centerline` so
+         significant bends become separate rect-axis segments.
+         Without this step apt.dat taxi-network polylines (whose
+         nodes track every chart-level vertex) emit as single
+         straight rects spanning curves, visibly drifting off the
+         actual pavement at every bend.
     """
     from shapely.geometry import LineString, MultiLineString
     from shapely.ops import linemerge
+    from .pavement.centerlines import split_merged_centerline
 
     nodes = airport.taxi_nodes
     edges = airport.taxi_edges
@@ -1124,22 +1127,26 @@ def taxi_centerlines(
 
     out: List[Tuple[LineString, str]] = []
     for name, segments in by_name.items():
+        # Linemerge per name into one (or a few) connected polylines.
+        merged_lines: List[LineString] = []
         if len(segments) == 1:
-            out.append((segments[0], name))
-            continue
-        try:
-            merged = linemerge(MultiLineString(segments))
-        except (ValueError, TypeError):
-            # Geometry-merge failure: fall back to per-segment emit.
-            for seg in segments:
-                out.append((seg, name))
-            continue
-        if merged.is_empty:
-            continue
-        if merged.geom_type == "LineString":
-            out.append((merged, name))
-        elif merged.geom_type == "MultiLineString":
-            for ls in merged.geoms:
-                if not ls.is_empty:
-                    out.append((ls, name))
+            merged_lines = [segments[0]]
+        else:
+            try:
+                merged = linemerge(MultiLineString(segments))
+            except (ValueError, TypeError):
+                merged_lines = list(segments)
+            else:
+                if merged.is_empty:
+                    continue
+                elif merged.geom_type == "LineString":
+                    merged_lines = [merged]
+                elif merged.geom_type == "MultiLineString":
+                    merged_lines = [ls for ls in merged.geoms
+                                    if not ls.is_empty]
+        # Apply the same RDP + bend-split as OSM-derived centerlines
+        # so curves become break points and adjacent straight
+        # sections emit as separate rect axes.
+        for ls in merged_lines:
+            out.extend(split_merged_centerline(ls, name, rwy_centerlines))
     return out
