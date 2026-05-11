@@ -52,7 +52,13 @@ import math
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -148,7 +154,7 @@ def _long_axis(polygon: Polygon
         return None
     try:
         mrr = polygon.minimum_rotated_rectangle
-    except Exception:
+    except _GEOM_EXC:
         return None
     if mrr is None or mrr.is_empty or not hasattr(mrr, "exterior"):
         return None
@@ -401,13 +407,13 @@ def build_taxiway_rects(
 
     try:
         mrr = polygon.minimum_rotated_rectangle
-    except Exception:
+    except _GEOM_EXC:
         return None
     if mrr is None or mrr.is_empty:
         return None
     try:
         fit_ratio = (polygon.area / mrr.area) if mrr.area > 0 else 0.0
-    except Exception:
+    except _GEOM_EXC:
         fit_ratio = 0.0
 
     ax = _long_axis(polygon)
@@ -508,7 +514,7 @@ def build_taxiway_rects(
                 if rz is not None:
                     zs[0] = float(rz)
                     anchored[0] = True
-        except Exception:
+        except _GEOM_EXC:
             pass
         try:
             last = n_samples - 1
@@ -519,7 +525,7 @@ def build_taxiway_rects(
                 if rz is not None:
                     zs[last] = float(rz)
                     anchored[last] = True
-        except Exception:
+        except _GEOM_EXC:
             pass
 
     if any(anchored):
@@ -705,7 +711,7 @@ def build_rects_along_centerline(
             if p_end.distance(runway_polygon) <= ANCHOR_MAX_DIST_M:
                 anchor_at_end = runway_elev_lookup(
                     base_coords[-1][0], base_coords[-1][1])
-        except Exception:
+        except _GEOM_EXC:
             pass
 
     # 3. For each vertex-to-vertex segment: sample DEM along the
@@ -853,7 +859,7 @@ def _local_half_width(polygon: Polygon,
     try:
         if not polygon.contains(Point(cx, cy)):
             return 0.0
-    except Exception:
+    except _GEOM_EXC:
         return 0.0
 
     left_end = (cx + px * max_reach, cy + py * max_reach)
@@ -863,7 +869,7 @@ def _local_half_width(polygon: Polygon,
             [(cx, cy), left_end]).intersection(polygon)
         right_seg = LineString(
             [(cx, cy), right_end]).intersection(polygon)
-    except Exception:
+    except _GEOM_EXC:
         return 0.0
 
     def _len(seg):
@@ -871,7 +877,7 @@ def _local_half_width(polygon: Polygon,
             return 0.0
         try:
             return float(seg.length)
-        except Exception:
+        except _GEOM_EXC:
             return 0.0
 
     left_d = _len(left_seg)

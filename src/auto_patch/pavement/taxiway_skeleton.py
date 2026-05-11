@@ -55,10 +55,16 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import (
     LineString, MultiLineString, MultiPoint, Point, Polygon,
 )
 from shapely.ops import linemerge, voronoi_diagram
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 # Tunables
@@ -153,7 +159,7 @@ def extract_centerlines(
 
     try:
         vd = voronoi_diagram(MultiPoint(dense_pts), edges=True)
-    except Exception:
+    except _GEOM_EXC:
         return []
 
     edges = _iter_voronoi_edges(vd)
@@ -166,7 +172,7 @@ def extract_centerlines(
     # shrink absorbs edges that merely touch the boundary.
     try:
         interior_test = polygon.buffer(-_INTERIOR_SHRINK_M)
-    except Exception:
+    except _GEOM_EXC:
         interior_test = polygon
     if interior_test.is_empty or not hasattr(interior_test, "contains"):
         interior_test = polygon
@@ -182,7 +188,7 @@ def extract_centerlines(
             if (interior_test.contains(p0)
                     and interior_test.contains(p1)):
                 interior_edges.append(e)
-        except Exception:
+        except _GEOM_EXC:
             continue
 
     if not interior_edges:
@@ -190,7 +196,7 @@ def extract_centerlines(
 
     try:
         merged = linemerge(MultiLineString(interior_edges))
-    except Exception:
+    except _GEOM_EXC:
         merged = None
     if merged is None or merged.is_empty:
         return []
@@ -209,7 +215,7 @@ def extract_centerlines(
             continue
         try:
             simp = p.simplify(simplify_tol, preserve_topology=False)
-        except Exception:
+        except _GEOM_EXC:
             simp = p
         if simp.is_empty or simp.length < min_path_length:
             continue
@@ -237,7 +243,7 @@ def local_half_width(
     try:
         if not polygon.contains(center):
             return 0.0
-    except Exception:
+    except _GEOM_EXC:
         return 0.0
 
     tx, ty = tangent
@@ -257,7 +263,7 @@ def local_half_width(
         right_line = LineString([(center.x, center.y), right_end])
         left_seg = left_line.intersection(polygon)
         right_seg = right_line.intersection(polygon)
-    except Exception:
+    except _GEOM_EXC:
         return 0.0
 
     def _seg_length(seg):
