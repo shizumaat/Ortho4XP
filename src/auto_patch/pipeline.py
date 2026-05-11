@@ -821,12 +821,33 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _rc = _rc[:-1]
         apt_pav_vertices.extend(_rc)
 
-    # ── OSM centerlines from already-loaded OSM ──────────────────
-    # ``nodes`` / ``ways`` / ``relations`` were loaded earlier so
-    # the DSF-loading loop could compare apt.dat coverage against
-    # the OSM-aeroway footprint.
-    osm_centerlines = _extract_osm_taxi_centerlines(
-        nodes, ways, to_m, rwy_centerlines=rwy_centerlines)
+    # ── Taxi centerlines (apt.dat primary, OSM fallback) ─────────
+    # Per user 2026-05-12: apt.dat row 1201/1202 taxi-network is
+    # the authoritative source for the taxi graph at airports that
+    # have it.  Since the pavement footprint is also drawn from
+    # apt.dat row-110 polygons, the taxi-network endpoints align
+    # exactly with the pavement boundary — eliminating the OSM-vs-
+    # apt.dat boundary mismatch where OSM centerlines clipped
+    # against ``pav_union`` produced empty / too-short intersections
+    # (CYXY's long E parallel, all of F and G — the user's
+    # "taxiways turning into big junctions" report).  Fall back to
+    # OSM only when the apt.dat block has no taxi-network at all
+    # (some custom packs omit rows 1201/1202).
+    apt_centerlines = APR.taxi_centerlines(apt, to_m)
+    if apt_centerlines:
+        osm_centerlines = apt_centerlines
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: using {len(apt_centerlines)} "
+            f"apt.dat taxi-network centerline(s) "
+            f"({len(apt.taxi_nodes)} nodes, "
+            f"{len(apt.taxi_edges)} edges).")
+    else:
+        osm_centerlines = _extract_osm_taxi_centerlines(
+            nodes, ways, to_m, rwy_centerlines=rwy_centerlines)
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: apt.dat has no taxi network; "
+            f"using {len(osm_centerlines)} OSM aeroway-taxiway "
+            f"centerline(s).")
 
     # ── Terminal groundside-pavement subtraction (user 2026-04-29):
     # remove curbside / drop-off / parking pavement from pav_union
@@ -1139,13 +1160,50 @@ def build_airport_pavement(icao: str, xplane_root: str,
         layout.shapes.append(BuiltShape(
             polygon=tp, role=ROLE_TERMINAL, ref=f"terminal{i+1}"))
 
-    # ── Identify junction node CLUSTERS from OSM topology ───────
-    # Any OSM node referenced by ≥2 taxi ways is a potential junction
-    # point.  Nodes within JUNCTION_CLUSTER_DIST of each other are
-    # merged into one cluster (target junctions often span a whole
-    # multi-way intersection, not just a single OSM node).
-    junction_points = _find_junction_points(
-        nodes, ways, to_m, osm_centerlines=osm_centerlines)
+    # ── Identify junction node CLUSTERS ──────────────────────────
+    # Per user 2026-05-12: when the taxi graph comes from apt.dat
+    # row 1201/1202, the junction nodes ARE explicit in the data —
+    # any taxi node referenced by edges of ≥ 2 distinct names, or
+    # by a runway-cross edge, is a chart-level junction.  Use
+    # those points so ``_split_centerlines_at_points`` trims the
+    # apt.dat centerlines at the right places (otherwise long
+    # parallel taxis terminate deep inside apron polygons and
+    # ``_snap_corners_to_pavement`` rejects them as
+    # apron-interior).  Fall back to OSM topology when apt.dat
+    # has no taxi network.
+    if apt_centerlines:
+        junction_points = APR.taxi_junction_points(apt, to_m)
+        # Also add geometric crossing points between centerlines of
+        # different names — covers the case where a taxi node was
+        # tagged with one name but the connecting edge has another.
+        # Same behaviour ``_find_junction_points`` provides for OSM.
+        for i in range(len(osm_centerlines)):
+            ls1, ref1 = osm_centerlines[i]
+            for j in range(i + 1, len(osm_centerlines)):
+                ls2, ref2 = osm_centerlines[j]
+                if ref1 and ref2 and ref1 == ref2:
+                    continue
+                try:
+                    if not ls1.intersects(ls2):
+                        continue
+                    inter = ls1.intersection(ls2)
+                except _GEOM_EXC:
+                    continue
+                if inter.is_empty:
+                    continue
+                if inter.geom_type == "Point":
+                    junction_points.append((inter.x, inter.y))
+                elif inter.geom_type == "MultiPoint":
+                    for p in inter.geoms:
+                        junction_points.append((p.x, p.y))
+    else:
+        # Any OSM node referenced by ≥2 taxi ways is a potential
+        # junction point.  Nodes within JUNCTION_CLUSTER_DIST of
+        # each other are merged into one cluster (target junctions
+        # often span a whole multi-way intersection, not just a
+        # single OSM node).
+        junction_points = _find_junction_points(
+            nodes, ways, to_m, osm_centerlines=osm_centerlines)
 
     # ── Diagonal-stub trim at primary-parallel SPINES ────────────
     # Per user 2026-04-27: a diagonal stub (B/C/D/E/G overall db
@@ -1552,22 +1610,34 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # the runway: target stub-rect corners are 22–66 m from the
     # runway edge (measured from the actual target), so 80 m gives
     # a small margin for freehand drift.
+    #
+    # Per user 2026-05-11: SKIP this filter when the taxi graph
+    # comes from apt.dat (rows 1201/1202).  apt.dat doesn't carry
+    # OSM-noise sub-refs; every row-1202 edge is a canonical taxi
+    # path.  CYXY's G runs apron-to-apron without ever touching
+    # a runway — under OSM-only filtering it gets dropped here as
+    # "apron-internal" even though apt.dat declares it a real
+    # taxiway.  The downstream absorption pass
+    # (``_drop_primary_parallels_embedded_in_pavement``) is the
+    # authoritative place to decide whether an apron-running taxi
+    # rect should be partially absorbed or kept intact.
     RUNWAY_ENDPOINT_DIST_M = 80.0
     raw_endpoints_by_ref: Dict[str, List[Tuple[float, float]]] = {}
-    for wid, nds, tags in ways:
-        if tags.get("aeroway") != "taxiway":
-            continue
-        ref = tags.get("ref", "")
-        pts = []
-        for n in nds:
-            if n in nodes:
-                lat, lon = nodes[n]
-                pts.append(to_m(lon, lat))
-        if len(pts) >= 2:
-            raw_endpoints_by_ref.setdefault(ref, []).append(pts[0])
-            raw_endpoints_by_ref.setdefault(ref, []).append(pts[-1])
+    if not apt_centerlines:
+        for wid, nds, tags in ways:
+            if tags.get("aeroway") != "taxiway":
+                continue
+            ref = tags.get("ref", "")
+            pts = []
+            for n in nds:
+                if n in nodes:
+                    lat, lon = nodes[n]
+                    pts.append(to_m(lon, lat))
+            if len(pts) >= 2:
+                raw_endpoints_by_ref.setdefault(ref, []).append(pts[0])
+                raw_endpoints_by_ref.setdefault(ref, []).append(pts[-1])
 
-    if layout.runway_union is not None:
+    if not apt_centerlines and layout.runway_union is not None:
         rwy_boundary = layout.runway_union.boundary
         filtered: List[Tuple[Polygon, LineString, str, str]] = []
         for rect, axis, role, ref in taxi_rects:

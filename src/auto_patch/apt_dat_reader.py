@@ -36,7 +36,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
@@ -83,6 +83,8 @@ ROW_NODE_BEZIER = 112
 ROW_CLOSE = 113
 ROW_CLOSE_BEZIER = 114
 ROW_BOUNDARY_HEADER = 130
+ROW_TAXI_NODE = 1201
+ROW_TAXI_EDGE = 1202
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -116,6 +118,44 @@ class Pavement:
 
 
 @dataclass
+class TaxiNode:
+    """One taxi-network node (apt.dat row 1201).
+
+    Format: ``1201 lat lon usage id [label]``
+
+    ``usage`` is one of ``"init"``, ``"dest"``, ``"both"``, or
+    ``"judge"`` — describes whether the node is a route endpoint.
+    Not used for centerline construction but kept for completeness.
+    """
+    id: int
+    lat: float
+    lon: float
+    usage: str = ""
+    label: str = ""
+
+
+@dataclass
+class TaxiEdge:
+    """One taxi-network edge (apt.dat row 1202).
+
+    Format: ``1202 node_from node_to direction kind [name]``
+
+    * ``direction`` is ``"oneway"`` or ``"twoway"``.
+    * ``kind`` is an ICAO width category (``"taxiway_A"`` …
+      ``"taxiway_F"``) or the literal ``"runway"`` for taxi paths
+      crossing a runway.
+    * ``name`` is the taxiway designator (``"G"``, ``"A1"``, …) or
+      the runway designator (``"02/20"``) when ``kind == "runway"``.
+      May be empty for unnamed connector edges.
+    """
+    node_from: int
+    node_to: int
+    direction: str
+    kind: str
+    name: str = ""
+
+
+@dataclass
 class Airport:
     """Parsed airport geometry from one apt.dat block."""
     icao: str
@@ -123,6 +163,8 @@ class Airport:
     reference_elev_ft: int      # row 1 elevation, in feet (0 if absent)
     runways: List[Runway] = field(default_factory=list)
     pavements: List[Pavement] = field(default_factory=list)
+    taxi_nodes: "Dict[int, TaxiNode]" = field(default_factory=dict)
+    taxi_edges: List[TaxiEdge] = field(default_factory=list)
     boundary: Optional[Polygon] = None
     source_path: str = ""
 
@@ -329,6 +371,14 @@ def load_airport(
             rwy = _parse_runway(toks)
             if rwy is not None:
                 airport.runways.append(rwy)
+        elif row_type == ROW_TAXI_NODE:
+            tn = _parse_taxi_node(toks)
+            if tn is not None:
+                airport.taxi_nodes[tn.id] = tn
+        elif row_type == ROW_TAXI_EDGE:
+            te = _parse_taxi_edge(toks)
+            if te is not None:
+                airport.taxi_edges.append(te)
 
     # Final flush in case the block ends mid-pavement.
     flush_pavement()
@@ -607,6 +657,50 @@ def _parse_runway(toks: List[str]) -> Optional[Runway]:
         displaced_a_m=displaced_a_m, displaced_b_m=displaced_b_m,
         blast_a_m=blast_a_m, blast_b_m=blast_b_m,
     )
+
+
+def _parse_taxi_node(toks: List[str]) -> Optional[TaxiNode]:
+    """Parse an apt.dat row 1201 into a TaxiNode.
+
+    Format: ``1201 lat lon usage id [label]``
+
+    The label can contain spaces (e.g. ``"Props fuel truck_stop"``) —
+    join all remaining tokens for it.
+    """
+    if len(toks) < 5:
+        return None
+    try:
+        lat = float(toks[1])
+        lon = float(toks[2])
+        usage = toks[3]
+        nid = int(toks[4])
+    except (ValueError, IndexError):
+        return None
+    label = " ".join(toks[5:]) if len(toks) > 5 else ""
+    return TaxiNode(id=nid, lat=lat, lon=lon, usage=usage, label=label)
+
+
+def _parse_taxi_edge(toks: List[str]) -> Optional[TaxiEdge]:
+    """Parse an apt.dat row 1202 into a TaxiEdge.
+
+    Format: ``1202 node_from node_to direction kind [name]``
+
+    The taxiway/runway name field may be empty (the unnamed-connector
+    case at CYXY — 9 of 65 edges).  The name can also contain
+    spaces; join remaining tokens.
+    """
+    if len(toks) < 5:
+        return None
+    try:
+        nf = int(toks[1])
+        nt = int(toks[2])
+    except (ValueError, IndexError):
+        return None
+    direction = toks[3]
+    kind = toks[4]
+    name = " ".join(toks[5:]) if len(toks) > 5 else ""
+    return TaxiEdge(node_from=nf, node_to=nt,
+                    direction=direction, kind=kind, name=name)
 
 
 def _parse_pavement(rows: List[List[str]],
@@ -906,9 +1000,146 @@ def airport_pavement_summary(airport: Airport) -> str:
         "  source:   {}".format(airport.source_path),
         "  runways:  {}".format(len(airport.runways)),
         "  pavements: {}".format(len(airport.pavements)),
+        "  taxi:     {} nodes, {} edges".format(
+            len(airport.taxi_nodes), len(airport.taxi_edges)),
         "  boundary: {}".format(
             "yes ({:.0f} m² in lat-lon space)".format(
                 airport.boundary.area * 12_345_679_000.0)
             if airport.boundary is not None else "no"),
     ]
     return "\n".join(lines)
+
+
+def taxi_junction_points(
+        airport: Airport,
+        to_m,
+) -> List[Tuple[float, float]]:
+    """Return apt.dat taxi-network junction node positions.
+
+    A node is a "junction" when at least one of these holds:
+
+      * Referenced by edges with ≥ 2 distinct taxiway names (e.g.
+        the node where E meets G).
+      * Referenced by ≥ 3 edges of the same name (a 3-way branch
+        within one taxiway — the apex of an apron loop).
+      * Touches a runway-crossing edge (kind == "runway") — the
+        taxi transitions onto the runway here, so rect axes
+        must terminate.
+
+    Names equal to ``""`` (unnamed connectors) are treated as the
+    sentinel ``"_conn"`` so a connector + a named taxi counts as
+    two distinct names.
+
+    Result is in meter coordinates (caller-supplied ``to_m``).
+    """
+    from collections import defaultdict
+    if not airport.taxi_nodes or not airport.taxi_edges:
+        return []
+
+    names_at_node: Dict[int, set] = defaultdict(set)
+    degree_per_name: Dict[Tuple[int, str], int] = defaultdict(int)
+    runway_touch: set = set()
+    for edge in airport.taxi_edges:
+        if edge.kind == "runway":
+            runway_touch.add(edge.node_from)
+            runway_touch.add(edge.node_to)
+            continue
+        key = edge.name if edge.name else "_conn"
+        names_at_node[edge.node_from].add(key)
+        names_at_node[edge.node_to].add(key)
+        degree_per_name[(edge.node_from, key)] += 1
+        degree_per_name[(edge.node_to, key)] += 1
+
+    out: List[Tuple[float, float]] = []
+    for nid, names in names_at_node.items():
+        is_junction = (
+            len(names) >= 2
+            or any(degree_per_name[(nid, n)] >= 3 for n in names)
+            or nid in runway_touch)
+        if not is_junction:
+            continue
+        if nid not in airport.taxi_nodes:
+            continue
+        node = airport.taxi_nodes[nid]
+        out.append(to_m(node.lon, node.lat))
+    return out
+
+
+def taxi_centerlines(
+        airport: Airport,
+        to_m,
+) -> List[Tuple["LineString", str]]:
+    """Build taxi centerlines from apt.dat 1201/1202 rows.
+
+    Returns a list of ``(LineString_in_meter_space, taxiway_name)``
+    pairs — the same shape as
+    :func:`pavement.centerlines._extract_osm_taxi_centerlines` so the
+    rect builder can consume either source interchangeably.
+
+    Steps:
+      1. Group taxi edges by ``name``.  Drop ``kind == "runway"``
+         edges (taxi paths crossing a runway — not pavement we emit).
+      2. Convert each edge's endpoints (node_from / node_to) to meter
+         coords via the caller-supplied ``to_m(lon, lat)``.
+      3. Build one ``LineString`` per edge, then ``linemerge`` per
+         name group so consecutive edges along the same taxiway
+         collapse into a single polyline.
+      4. Return one ``(LineString, name)`` per merged path.
+
+    Unnamed connector edges (empty ``name``) are included as
+    ``(LineString, "")`` so downstream callers can decide whether
+    to keep or drop them.  Per-taxi (named) edges are linemerged
+    independently; unnamed edges are merged as one group.
+    """
+    from shapely.geometry import LineString, MultiLineString
+    from shapely.ops import linemerge
+
+    nodes = airport.taxi_nodes
+    edges = airport.taxi_edges
+    if not nodes or not edges:
+        return []
+
+    by_name: Dict[str, List[LineString]] = {}
+    for edge in edges:
+        # Drop taxi paths crossing a runway — those exist only to
+        # define the taxi route for ATC purposes; no pavement is
+        # emitted from them (the runway emit covers that footprint).
+        if edge.kind == "runway":
+            continue
+        if (edge.node_from not in nodes
+                or edge.node_to not in nodes):
+            continue
+        na = nodes[edge.node_from]
+        nb = nodes[edge.node_to]
+        ax, ay = to_m(na.lon, na.lat)
+        bx, by = to_m(nb.lon, nb.lat)
+        if (ax - bx) ** 2 + (ay - by) ** 2 < 0.01:
+            # Collapsed edge (both ends at the same node within 0.1 m).
+            continue
+        try:
+            seg = LineString([(ax, ay), (bx, by)])
+        except (ValueError, TypeError):
+            continue
+        by_name.setdefault(edge.name, []).append(seg)
+
+    out: List[Tuple[LineString, str]] = []
+    for name, segments in by_name.items():
+        if len(segments) == 1:
+            out.append((segments[0], name))
+            continue
+        try:
+            merged = linemerge(MultiLineString(segments))
+        except (ValueError, TypeError):
+            # Geometry-merge failure: fall back to per-segment emit.
+            for seg in segments:
+                out.append((seg, name))
+            continue
+        if merged.is_empty:
+            continue
+        if merged.geom_type == "LineString":
+            out.append((merged, name))
+        elif merged.geom_type == "MultiLineString":
+            for ls in merged.geoms:
+                if not ls.is_empty:
+                    out.append((ls, name))
+    return out
