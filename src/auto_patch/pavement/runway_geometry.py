@@ -107,7 +107,7 @@ def parse_aptdat_runway_widths(aptdat_path, icao):
                         desig2 = "RW" + rwy2_name if not rwy2_name.startswith("RW") else rwy2_name
                         widths[desig2] = width_m
 
-    except Exception as e:
+    except OSError as e:
         UI.vprint(
             2,
             "   Auto-patch: Could not read apt.dat runway widths:",
