@@ -24,6 +24,14 @@ from __future__ import annotations
 import math
 
 import O4_UI_Utils as UI
+from shapely.errors import GEOSException, TopologicalError
+
+# Narrow exception tuple for feature-emit failures (shapely +
+# OSM/DEM file I/O).  Programming errors propagate so they surface
+# immediately rather than being silently masked at runtime.
+_GEOM_EXC = (OSError, ValueError, TypeError, KeyError,
+             IndexError, RuntimeError,
+             GEOSException, TopologicalError)
 
 from .boundary import (
     _emit_airport_boundary_shape,
@@ -207,7 +215,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                     f"  [pav-builder] emitted "
                     f"{n_gs} groundside pavement "
                     f"polygon(s) with DEM altitudes.")
-        except Exception:
+        except _GEOM_EXC:
             pass
         # Per user 2026-04-29 (CYXY -10111 / -10115): drop
         # junction polygons that are connected ONLY to non-
@@ -228,7 +236,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                     f"  [pav-builder] dropped {n_orph} "
                     f"junction(s) sharing vertices with "
                     f"groundside pavement.")
-        except Exception:
+        except _GEOM_EXC:
             pass
         # Then emit DEM-bridge polygons inside the boundary
         # wherever the clamped boundary altitude differs from
@@ -241,7 +249,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                     f"  [pav-builder] emitted "
                     f"{n_br} boundary→DEM bridge "
                     f"polygon(s).")
-        except Exception:
+        except _GEOM_EXC:
             pass
         # TODO(bridges): re-enable bridge / tunnel emission
         # after core pavement geometry is stable + refactored.
@@ -268,7 +276,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                         f"  [pav-builder] emitted "
                         f"{n_dep} through-airport depressed "
                         f"road segment(s).")
-            except Exception:
+            except _GEOM_EXC:
                 _depressed_way_ids = set()
             # Per user 2026-04-29: re-enable tunnel-portal
             # emission.  For each big-roads tunnel crossing the
@@ -290,7 +298,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                         f"  [pav-builder] emitted "
                         f"{n_tun} tunnel-portal cluster(s) "
                         f"(ramp + walls along approach).")
-            except Exception:
+            except _GEOM_EXC:
                 pass
             # Per user 2026-04-29: emit retaining walls along
             # taxi bridges (KBNA Taxiway A, KPHX taxis over
@@ -306,7 +314,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
             # bridge edge — emit walls + skip under-bridge.
             try:
                 _scn_bridge = _scenery_has_bridge_objects(layout)
-            except Exception:
+            except _GEOM_EXC:
                 _scn_bridge = False
             try:
                 n_brg = _emit_taxi_bridges(
@@ -321,7 +329,7 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                         f"  [pav-builder] {icao}: scenery has "
                         f"3D bridge OBJ(s); skipping wall "
                         f"emission.")
-            except Exception:
+            except _GEOM_EXC:
                 pass
             try:
                 n_app = _emit_underpass_road_approaches(
@@ -333,9 +341,9 @@ def run_phase2(layout, icao, xplane_root, apt, *,
                         f"road approaches for {n_app} "
                         f"surface(s)"
                         f"{' (cut through under bridge OBJ)' if _scn_bridge else ' (ramp up to bridge edge)'}.")
-            except Exception:
+            except _GEOM_EXC:
                 pass
-    except Exception:
+    except _GEOM_EXC:
         pass
 
     # The per-surface solver final pass moved to pipeline.py — it

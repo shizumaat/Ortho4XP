@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
 
@@ -41,6 +42,11 @@ from .layout import (
 )
 from .pavement.vertices import _snap_polygon_vertices_to_rect_corners
 from .elevation import _sample_dem, _resample_node_altitudes_nn
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -107,7 +113,7 @@ def _emit_groundside_pavement_dem(
                 [tp.buffer(terminal_gap_m) for tp in _t_polys])
             if _term_buf.is_empty:
                 _term_buf = None
-    except Exception:
+    except _GEOM_EXC:
         _term_buf = None
     # Also subtract every other pavement-bearing layout shape so
     # the groundside pavement never overlaps a rect / junction /
@@ -128,7 +134,7 @@ def _emit_groundside_pavement_dem(
             _other_buf = unary_union(_other_polys)
             if _other_buf.is_empty:
                 _other_buf = None
-    except Exception:
+    except _GEOM_EXC:
         _other_buf = None
     cuts = []
     if _term_buf is not None:
@@ -138,14 +144,14 @@ def _emit_groundside_pavement_dem(
     if cuts:
         try:
             cut_union = unary_union(cuts) if len(cuts) > 1 else cuts[0]
-        except Exception:
+        except _GEOM_EXC:
             cut_union = None
         if cut_union is not None and not cut_union.is_empty:
             clipped: List[Polygon] = []
             for p in polys:
                 try:
                     q = p.difference(cut_union)
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 if q is None or q.is_empty:
                     continue
@@ -173,7 +179,7 @@ def _emit_groundside_pavement_dem(
         try:
             lat, lon = _m_to_ll(x, y)
             return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-        except Exception:
+        except _GEOM_EXC:
             return None
     n_emitted = 0
     for p in polys:
@@ -181,7 +187,7 @@ def _emit_groundside_pavement_dem(
             continue
         try:
             ring = list(p.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if not ring:
             continue
@@ -245,7 +251,7 @@ def _emit_groundside_pavement_dem(
             if (new_poly.geom_type != "Polygon"
                     or new_poly.is_empty):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         # The buffer(0) cleanup may rebuild the ring; re-extract
         # coords and re-sample DEM if the vertex count changed.
@@ -324,7 +330,7 @@ def _drop_groundside_orphan_junctions(
             return []
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             return []
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]

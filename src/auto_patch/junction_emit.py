@@ -19,6 +19,7 @@ import math
 from typing import List, Optional, Tuple
 
 import O4_UI_Utils as UI
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points, unary_union
 
@@ -42,6 +43,11 @@ from .pavement.vertices import (
     _enforce_shared_vertices,
     _validate_shared_vertex_invariant,
 )
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = ["emit_junctions_and_finalize"]
@@ -76,7 +82,7 @@ def _drop_orphan_strips(pieces, fixed_shape_polys, min_other_perim_m=10.0):
         for fs in fixed_shape_polys:
             try:
                 inter = p.boundary.intersection(fs.boundary)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if inter.is_empty:
                 continue
@@ -86,7 +92,7 @@ def _drop_orphan_strips(pieces, fixed_shape_polys, min_other_perim_m=10.0):
                 total_shared += L
         try:
             total_perim = p.boundary.length
-        except Exception:
+        except _GEOM_EXC:
             total_perim = 0.0
         non_shared = max(0.0, total_perim - total_shared)
         if (len(shared_lens) <= 1
@@ -96,12 +102,9 @@ def _drop_orphan_strips(pieces, fixed_shape_polys, min_other_perim_m=10.0):
             continue
         out.append(p)
     if n_dropped:
-        try:
-            UI.vprint(1,
-                f"  [pav-builder] dropped {n_dropped} orphan strip(s) "
-                f"alongside a single fixed shape.")
-        except Exception:
-            pass
+        UI.vprint(1,
+            f"  [pav-builder] dropped {n_dropped} orphan strip(s) "
+            f"alongside a single fixed shape.")
     return out
 
 
@@ -227,7 +230,7 @@ def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
                         if cleaned.geom_type == "MultiPolygon":
                             cleaned = max(cleaned.geoms,
                                           key=lambda g: g.area)
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 if (cleaned.geom_type != "Polygon"
                         or cleaned.is_empty
