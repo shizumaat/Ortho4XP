@@ -23,6 +23,7 @@ import math
 import sys
 from typing import Dict, List, Optional, Set, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
@@ -45,6 +46,13 @@ from ..config import (
     JUNCTION_CLUSTER_DIST_M,
     SLIVER_ANGLE_THRESHOLD_DEG,
 )
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors (``NameError``, ``AttributeError``-on-
+# typo, ``ImportError``) propagate so they surface immediately
+# during testing rather than being silently masked at runtime.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 
@@ -100,7 +108,7 @@ def _snap_polygon_vertices_to_rect_corners(
     """
     try:
         coords = list(poly.exterior.coords)
-    except Exception:
+    except _GEOM_EXC:
         return poly
     if coords and coords[0] == coords[-1]:
         coords = coords[:-1]
@@ -113,7 +121,7 @@ def _snap_polygon_vertices_to_rect_corners(
             continue
         try:
             rc = list(r.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if rc and rc[0] == rc[-1]:
             rc = rc[:-1]
@@ -158,7 +166,7 @@ def _snap_polygon_vertices_to_rect_corners(
                 or new_poly.geom_type != "Polygon"):
             return poly
         return new_poly
-    except Exception:
+    except _GEOM_EXC:
         return poly
 
 
@@ -219,7 +227,7 @@ def _push_junction_vertices_off_taxi_rect_edges(
             coords = list(s.polygon.exterior.coords)
             if coords and coords[0] == coords[-1]:
                 coords = coords[:-1]
-        except Exception:
+        except _GEOM_EXC:
             continue
         if len(coords) != 4:
             continue
@@ -300,7 +308,7 @@ def _push_junction_vertices_off_taxi_rect_edges(
             continue
         try:
             ring = list(shape.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         # Drop closing repeat for ring traversal.
         if ring and ring[0] == ring[-1]:
@@ -473,7 +481,7 @@ def _push_junction_vertices_off_taxi_rect_edges(
                     shape.node_altitudes = (
                         new_alts + [new_alts[0]])
                 n_modified += 1
-        except Exception:
+        except _GEOM_EXC:
             pass
     return n_modified
 
@@ -680,12 +688,12 @@ def _enforce_shared_vertices(layout: "PavementLayout",
                                 and fixed.is_valid
                                 and not fixed.is_empty):
                             new_poly = fixed
-                except Exception:
+                except _GEOM_EXC:
                     pass
             if (new_poly.geom_type == "Polygon"
                     and not new_poly.is_empty):
                 shape.polygon = new_poly
-        except Exception:
+        except _GEOM_EXC:
             pass
 
 
