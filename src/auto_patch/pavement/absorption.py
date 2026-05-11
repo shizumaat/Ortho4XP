@@ -194,6 +194,31 @@ def _drop_primary_parallels_embedded_in_pavement(
     sloping_rect_roles = {ROLE_PRIMARY_PARALLEL,
                           ROLE_SECONDARY_PARALLEL,
                           ROLE_STUB, ROLE_CROSS_CONNECTOR}
+    # CORRIDOR HEURISTIC (user 2026-04-30, reinstated 2026-05-11):
+    # preserve rects whose short edge connects to a runway.  These
+    # are runway-anchored corridors — long parallel taxis running
+    # alongside the runway (SPJC's L) or stubs running apron→runway
+    # (CYXY's F).  The rect's slope follows the runway's grade
+    # along its long axis, so even when one long edge has apron
+    # alongside it the seam is between the apron's natural slope
+    # and the runway-anchored taxi slope — that's the expected
+    # taxi-to-apron transition and shouldn't be absorbed.
+    #
+    # The "either long edge adjacent → absorb" rule applies only
+    # to ``alongside`` rects whose BOTH short edges are far from
+    # any runway (SPJC E, CYXY E / G — apron-internal parallels
+    # with no runway anchor).
+    CORRIDOR_TO_RUNWAY_M = 160.0
+    runway_union_for_corridor = None
+    if runway_polys:
+        try:
+            runway_union_for_corridor = unary_union(
+                [r for r in runway_polys
+                 if r is not None and not r.is_empty])
+            if runway_union_for_corridor.is_empty:
+                runway_union_for_corridor = None
+        except _GEOM_EXC:
+            runway_union_for_corridor = None
     # Per user 2026-04-30: absorb wherever EITHER long edge has
     # junction-class pavement running alongside it.  Sloping
     # rects cannot share a long edge with an apron/junction
@@ -299,6 +324,22 @@ def _drop_primary_parallels_embedded_in_pavement(
         if half_w < 1.0:
             kept.append(entry)
             continue
+        # Corridor preservation: if at least one short-edge midpoint
+        # is within ``CORRIDOR_TO_RUNWAY_M`` of any runway, this rect
+        # is a runway-anchored corridor.  Skip the absorption probe
+        # — the apron seam along one long edge is the expected
+        # apron-to-corridor transition, not a slope conflict.
+        if runway_union_for_corridor is not None:
+            try:
+                d_a = Point(a_mid[0], a_mid[1]).distance(
+                    runway_union_for_corridor)
+                d_b = Point(b_mid[0], b_mid[1]).distance(
+                    runway_union_for_corridor)
+            except _GEOM_EXC:
+                d_a = d_b = float("inf")
+            if min(d_a, d_b) <= CORRIDOR_TO_RUNWAY_M:
+                kept.append(entry)
+                continue
 
         n_steps = max(2, int(L / SAMPLE_STEP_M) + 1)
         either_adj = [False] * n_steps
