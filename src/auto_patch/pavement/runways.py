@@ -28,6 +28,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
@@ -42,6 +43,11 @@ from ..layout import (
     ROLE_STUB,
 )
 from .vertices import _snap_polygon_vertices_to_rect_corners
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -107,7 +113,7 @@ def _sample_runway_segment_elev(
     if shape.node_altitudes and shape.polygon is not None:
         try:
             coords = list(shape.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             coords = []
         n = min(len(coords), len(shape.node_altitudes))
         if n >= 1:
@@ -127,7 +133,7 @@ def _sample_runway_segment_elev(
         return None
     try:
         coords = list(shape.polygon.exterior.coords)
-    except Exception:
+    except _GEOM_EXC:
         return None
     if coords and coords[0] == coords[-1]:
         coords = coords[:-1]
@@ -190,7 +196,7 @@ def _resolve_runway_crossings(
     from shapely.strtree import STRtree
     try:
         tree = STRtree(rwy_polys)
-    except Exception:
+    except _GEOM_EXC:
         return 0
 
     # Union-find for transitive grouping.
@@ -212,7 +218,7 @@ def _resolve_runway_crossings(
         pa = rwy_polys[ai]
         try:
             cands = tree.query(pa)
-        except Exception:
+        except _GEOM_EXC:
             continue
         for ci in cands:
             bi = int(ci)
@@ -224,7 +230,7 @@ def _resolve_runway_crossings(
                 if inter.is_empty or inter.area < min_overlap_m2:
                     continue
                 union_uf(ai, bi)
-            except Exception:
+            except _GEOM_EXC:
                 continue
 
     # Group by root; ignore singleton groups.
@@ -258,7 +264,7 @@ def _resolve_runway_crossings(
             union_poly = unary_union(seg_polys)
             if not union_poly.is_valid:
                 union_poly = union_poly.buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if union_poly.is_empty:
             continue
@@ -282,7 +288,7 @@ def _resolve_runway_crossings(
             union_poly, other_sloping_polys, snap_tol_m=5.0)
         try:
             coords = list(union_poly.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -315,7 +321,7 @@ def _resolve_runway_crossings(
                     continue
                 try:
                     d = s.polygon.distance(pt)
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 # ε floor so a vertex exactly on a segment edge
                 # still has a finite weight (just very large).
@@ -409,7 +415,7 @@ def _insert_runway_chain_bridges(
     try:
         from shapely.strtree import STRtree as _STRtree
         rwy_tree = _STRtree(other_rwy_polys)
-    except Exception:
+    except _GEOM_EXC:
         rwy_tree = None
     new_shapes: List[BuiltShape] = []
     for ref, segs in by_ref.items():
@@ -421,7 +427,7 @@ def _insert_runway_chain_bridges(
         s0 = segs[0]
         try:
             c0 = list(s0.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if c0 and c0[0] == c0[-1]:
             c0 = c0[:-1]
@@ -449,7 +455,7 @@ def _insert_runway_chain_bridges(
             try:
                 ca = list(a.polygon.exterior.coords)
                 cb = list(b.polygon.exterior.coords)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if ca and ca[0] == ca[-1]:
                 ca = ca[:-1]
@@ -538,7 +544,7 @@ def _insert_runway_chain_bridges(
                     poly = poly.buffer(0)
                 if poly.is_empty or poly.geom_type != "Polygon":
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 continue
             # Reject if the bridge polygon overlaps any OTHER
             # runway segment (we'd be bridging across an active
@@ -560,9 +566,9 @@ def _insert_runway_chain_bridges(
                                     and inter.area > 1.0):
                                 overlap_with_other = True
                                 break
-                        except Exception:
+                        except _GEOM_EXC:
                             continue
-                except Exception:
+                except _GEOM_EXC:
                     pass
             if overlap_with_other:
                 continue
@@ -665,7 +671,7 @@ def _detect_runway_shoulders(
             continue
         try:
             coords = list(pav.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if not coords:
             continue
