@@ -24,9 +24,15 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
 
 import O4_UI_Utils as UI
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 from .elevation import (
     NEIGHBOUR_CLAMP_RADIUS_M,
@@ -96,7 +102,7 @@ def _triangulate_junctions(
             continue
         try:
             ring = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if ring and ring[0] == ring[-1]:
             ring = ring[:-1]
@@ -152,7 +158,7 @@ def _triangulate_junctions(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -204,7 +210,7 @@ def _triangulate_junctions(
             continue
         try:
             rc = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if rc and rc[0] == rc[-1]:
             rc = rc[:-1]
@@ -227,7 +233,7 @@ def _triangulate_junctions(
             continue
         try:
             rc = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if rc and rc[0] == rc[-1]:
             rc = rc[:-1]
@@ -249,7 +255,7 @@ def _triangulate_junctions(
             continue
         try:
             rc = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if rc and rc[0] == rc[-1]:
             rc = rc[:-1]
@@ -478,12 +484,12 @@ def _triangulate_junctions(
             continue
         try:
             ring = _splice_holes(shape.polygon)
-        except Exception:
+        except _GEOM_EXC:
             try:
                 ring = list(shape.polygon.exterior.coords)
                 if ring and ring[0] == ring[-1]:
                     ring = ring[:-1]
-            except Exception:
+            except _GEOM_EXC:
                 # Couldn't extract a ring at all — preserve the
                 # original shape unchanged downstream.
                 junction_dropped_shapes.append(shape)
@@ -503,7 +509,7 @@ def _triangulate_junctions(
             if (poly.is_empty or poly.geom_type != "Polygon"
                     or poly.area < 0.5):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         junction_cleaned.append((shape, ring, poly))
 
@@ -556,7 +562,7 @@ def _triangulate_junctions(
                         e_b = sampler_b(rx, ry)
                         if e_b is not None:
                             vert_elev[k] = float(e_b)
-            except Exception:
+            except _GEOM_EXC:
                 pass
         # Junction-local 1D boundary smoothing — pull free vertices
         # into anchor-band compliance with the polygon's hard
@@ -700,7 +706,7 @@ def _triangulate_junctions(
                         sum(vert_elev) / len(vert_elev), 1)
                     new_shapes.append(new_shape)
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 pass  # fall through to triangulation
         # Best-fit plane: solve ax + by + c = z via 3×3 normal eqns.
         # Classify as PLANAR only when the fit's residuals are tight
@@ -742,7 +748,7 @@ def _triangulate_junctions(
                     new_shape.node_altitudes = closed_elev
                     new_shapes.append(new_shape)
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 pass  # fall through to triangulation
 
         # ── Compound-slope: emit as a single polygon with per-
@@ -771,7 +777,7 @@ def _triangulate_junctions(
                     or poly_for_emit.geom_type != "Polygon"
                     or poly_for_emit.area < 0.5):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         # node_altitudes spans the closed ring (one value per
         # vertex including the closing-repeat).  Build it from the
@@ -810,7 +816,7 @@ def _triangulate_junctions(
             UI.vprint(1,
                 f"  [pav-builder] WARN: {grade_violations} junction "
                 f"triangle(s) exceed {TAXI_MAX_GRADE * 100:.1f}% grade.")
-        except Exception:
+        except _GEOM_EXC:
             pass
     return triangle_count
 

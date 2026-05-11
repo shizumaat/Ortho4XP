@@ -28,10 +28,16 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 import O4_UI_Utils as UI
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 from .elevation import (
     NEIGHBOUR_CLAMP_RADIUS_M,
@@ -104,7 +110,7 @@ def _build_clamp_geom_state(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -181,7 +187,7 @@ def _clamp_junction_free_vertices(
                 == s.polygon.exterior.coords[-1]
             ):
                 coords_n -= 1
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords_n <= 0:
             continue
@@ -227,7 +233,7 @@ def _clamp_junction_free_vertices(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -421,7 +427,7 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
             continue
         try:
             ring = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             new_shapes.append(s)
             continue
         if ring and ring[0] == ring[-1]:
@@ -507,7 +513,7 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
         ])
         try:
             parts = _shapely_split(s.polygon, cut)
-        except Exception:
+        except _GEOM_EXC:
             new_shapes.append(s)
             continue
         sub_polys: List[Polygon] = []
@@ -518,7 +524,7 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
                         or g.area < SUBDIVIDE_MIN_AREA_M2):
                     continue
                 sub_polys.append(g)
-        except Exception:
+        except _GEOM_EXC:
             new_shapes.append(s)
             continue
         if len(sub_polys) < 2:
@@ -624,7 +630,7 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
                         or snapped_poly.area < SUBDIVIDE_MIN_AREA_M2):
                     cut_was_useful = False
                     break
-            except Exception:
+            except _GEOM_EXC:
                 cut_was_useful = False
                 break
             sub_elevs = [_lookup_elev(qx, qy, h)
@@ -727,7 +733,7 @@ def _try_iso_elevation_cut(
     cut = LineString([(cx0, cy0), (cx1, cy1)])
     try:
         parts = _shapely_split(s.polygon, cut)
-    except Exception:
+    except _GEOM_EXC:
         return None
     sub_polys: List[Polygon] = []
     for g in getattr(parts, "geoms", [parts]):
@@ -814,7 +820,7 @@ def _try_iso_elevation_cut(
                     or snapped_poly.geom_type != "Polygon"
                     or snapped_poly.area < SUBDIVIDE_MIN_AREA_M2):
                 return None
-        except Exception:
+        except _GEOM_EXC:
             return None
         sub_elevs = [_lookup_elev(qx, qy, h)
                      for (qx, qy), h
@@ -883,7 +889,7 @@ def _merge_sliver_junctions_into_neighbours(
     for i in junction_idxs:
         try:
             coords = list(layout.shapes[i].polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             j_verts[i] = []
             continue
         if coords and coords[0] == coords[-1]:
@@ -955,7 +961,7 @@ def _merge_sliver_junctions_into_neighbours(
                         try:
                             sc = list(
                                 src_shape.polygon.exterior.coords)
-                        except Exception:
+                        except _GEOM_EXC:
                             continue
                         if sc and sc[0] == sc[-1]:
                             sc = sc[:-1]
@@ -965,7 +971,7 @@ def _merge_sliver_junctions_into_neighbours(
                     src_alts = list(src_shape.node_altitudes)
                     try:
                         sc = list(src_shape.polygon.exterior.coords)
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
                     if sc and sc[0] == sc[-1]:
                         sc = sc[:-1]
@@ -1002,7 +1008,7 @@ def _merge_sliver_junctions_into_neighbours(
                     new_alts.append(new_alts[0])
                 target_shape.polygon = merged
                 target_shape.node_altitudes = new_alts
-        except Exception:
+        except _GEOM_EXC:
             continue
     sliver_set = set(merge_into.keys())
     layout.shapes = [
@@ -1013,7 +1019,7 @@ def _merge_sliver_junctions_into_neighbours(
             f"  [pav-builder] {icao}: merged "
             f"{len(merge_into)} sliver junction(s) into "
             f"adjacent larger junctions.")
-    except Exception:
+    except _GEOM_EXC:
         pass
     return len(merge_into)
 

@@ -18,8 +18,14 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -128,7 +134,7 @@ def _build_osm_aeroway_footprint(
                         if (g.geom_type == "Polygon"
                                 and not g.is_empty):
                             pieces.append(g)
-        except Exception:
+        except _GEOM_EXC:
             continue
     if not pieces:
         return None
@@ -137,7 +143,7 @@ def _build_osm_aeroway_footprint(
         if merged.is_empty:
             return None
         return merged
-    except Exception:
+    except _GEOM_EXC:
         return None
 
 
@@ -234,7 +240,7 @@ def _terminal_groundside_zone(
                 g = LineString(pts)
             if g.is_empty:
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         if is_airside:
             airside_geoms.append(g)
@@ -265,7 +271,7 @@ def _terminal_groundside_zone(
             try:
                 from shapely.strtree import STRtree as _STRtree
                 pav_tree = _STRtree(apt_pavement_polys)
-            except Exception:
+            except _GEOM_EXC:
                 pav_tree = None
             seed_buf_polys = [
                 s.buffer(TOUCH_TOL_M)
@@ -294,7 +300,7 @@ def _terminal_groundside_zone(
                         if cand.intersects(sb):
                             airside_idxs.add(pi)
                             queue.append(pi)
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
             # BFS: a poly is airside-reachable if its boundary is
             # within TOUCH_TOL_M of an already-airside poly's
@@ -321,7 +327,7 @@ def _terminal_groundside_zone(
                         if cand.intersects(src_buf):
                             airside_idxs.add(qi)
                             queue.append(qi)
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
             # Use EXTERIOR rings only (drop interior holes).  Per
             # user 2026-04-30 (CYXY -10123): apt.dat row-110
@@ -344,7 +350,7 @@ def _terminal_groundside_zone(
                     if (ext_only.geom_type == "Polygon"
                             and not ext_only.is_empty):
                         airside_apt_polys.append(ext_only)
-                except Exception:
+                except _GEOM_EXC:
                     airside_apt_polys.append(src)
             # Always include the seeds themselves so the probe
             # also fires when the building edge faces directly
@@ -361,7 +367,7 @@ def _terminal_groundside_zone(
     # STRtree indexes for fast spatial query.
     try:
         from shapely.strtree import STRtree
-    except Exception:
+    except _GEOM_EXC:
         STRtree = None
     air_tree = (STRtree(airside_geoms)
                 if STRtree and airside_geoms else None)
@@ -375,7 +381,7 @@ def _terminal_groundside_zone(
             continue
         try:
             coords = list(bldg.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -431,7 +437,7 @@ def _terminal_groundside_zone(
                     probe = probe.buffer(0)
                 if probe.is_empty:
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 continue
             airside = False
             groundside = False
@@ -526,7 +532,7 @@ def _terminal_groundside_zone(
                 if (zone.geom_type == "Polygon"
                         and not zone.is_empty):
                     zones.append(zone)
-            except Exception:
+            except _GEOM_EXC:
                 continue
     if not zones:
         return None
@@ -535,7 +541,7 @@ def _terminal_groundside_zone(
         if merged.is_empty:
             return None
         return merged
-    except Exception:
+    except _GEOM_EXC:
         return None
 
 
@@ -591,7 +597,7 @@ def _extract_osm_terminals(
             return None
         try:
             p = Polygon(pts).buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             return None
         if p.is_empty:
             return None
@@ -663,7 +669,7 @@ def _extract_osm_terminals(
         # simplified polygon spanning the full footprint.
         try:
             hull = unary_union(components).convex_hull
-        except Exception:
+        except _GEOM_EXC:
             out.append(components[0])
             continue
         if hull.geom_type == "Polygon" and hull.area >= 100.0:
