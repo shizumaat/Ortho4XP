@@ -861,7 +861,11 @@ def _rect_from_axis_extended(axis: LineString, width: float,
         snapped = _snap_corners_to_pavement(
             corners, pav, apt_vertices)
         if snapped is None:
-            # apron-interior or degenerate rect — reject
+            # Degenerate rect (≥2 corners collapsed within 1 m of
+            # each other after snap) — reject.  Per user 2026-05-11:
+            # do NOT reject apron-interior rects here; let the
+            # absorption pass split them per the long-edge-adjacent
+            # ruleset.
             return None
 
         # Symmetry check: equal widths (end1 vs end2) AND equal
@@ -973,30 +977,34 @@ def _snap_corners_to_pavement(
         if a vertex is close, use it instead so the corner shares
         an exact node with pav.
 
-    Returns ``None`` when the rect is sitting inside an apron —
-    detected as ≥2 of 4 natural corners further than
-    ``APRON_INTERIOR_DEPTH_M`` from the pav boundary.  In that case
-    the centerline runs through wide apron pavement, not a real
-    corridor, and shouldn't generate a rect (the apron stays as
-    residue → junction).
+    Per user 2026-05-11: this function does NOT decide whether a
+    rect "should be emitted at all" — that's the absorption pass's
+    job (``_drop_primary_parallels_embedded_in_pavement``), which
+    applies the authoritative long-edge-adjacent ruleset (probe
+    each long edge at 5 m steps, absorb runs ≥ 10 % of axial
+    length, keep ≥ 30 m surviving fragments).  An earlier
+    apron-interior reject here short-circuited the absorption
+    ruleset before it ran — every centerline whose natural corners
+    sat deep inside pavement got dropped, even legitimate taxi
+    corridors running through wide apron pavement (e.g. CYXY's G
+    parallel).  Always snap.  Apron-interior fragments are
+    discarded downstream by the kept-fragment guard inside
+    absorption (``n_off == 4 and max_off > 5.0``) once the
+    splitting rule has decided what survives.
 
-    Also returns ``None`` when the snap collapses two corners onto
-    near-identical points (degenerate rect).
+    Returns ``None`` only for genuine geometric degeneracy: when
+    the snap collapses two corners onto near-identical points
+    (within 1 m), producing a degenerate quadrilateral.
     """
     boundary = pav.boundary
     pav_nodes = _pav_boundary_nodes(pav)
-    deep_count = 0
     snapped: List[Tuple[float, float]] = []
     for (cx, cy) in corners:
         p = Point(cx, cy)
-        if p.distance(boundary) > APRON_INTERIOR_DEPTH_M:
-            deep_count += 1
         near, _ = nearest_points(boundary, p)
         boundary_pt = (float(near.x), float(near.y))
         prefered = _prefer_pav_node(boundary_pt, pav_nodes)
         snapped.append(prefered)
-    if deep_count >= 2:
-        return None
     # Reject degenerate rects where two corners collapsed onto the
     # same point (within 1 m).
     for i in range(4):
