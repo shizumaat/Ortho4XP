@@ -68,8 +68,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import O4_UI_Utils as UI
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes + DEM/file I/O.  Programming errors propagate so they
+# surface immediately rather than being silently masked at runtime.
+_GEOM_EXC = (OSError, ValueError, TypeError, KeyError,
+             IndexError, RuntimeError,
+             GEOSException, TopologicalError)
 
 from . import apt_dat_reader as APR
 
@@ -260,7 +268,7 @@ def _load_airport_dem(lat0: float, lon0: float, override_dem=None):
                 UI.vprint(1,
                     f"  [pav-builder] {fname} missing; downloading "
                     f"DEM tile via Ortho4XP elevation provider...")
-            except Exception:
+            except _GEOM_EXC:
                 pass
             dem = _DEM.DEM(tile_lat, tile_lon)
     except Exception as exc:
@@ -268,7 +276,7 @@ def _load_airport_dem(lat0: float, lon0: float, override_dem=None):
             UI.vprint(1,
                 f"  [pav-builder] WARN: DEM load/download failed for "
                 f"{fname}: {exc}")
-        except Exception:
+        except _GEOM_EXC:
             pass
         _DEM_CACHE[key] = None
         return None
@@ -284,7 +292,7 @@ def _sample_dem(dem, tile_lat: int, tile_lon: int,
         return None
     try:
         return float(dem.alt((lon - tile_lon, lat - tile_lat)))
-    except Exception:
+    except _GEOM_EXC:
         return None
 
 
@@ -382,7 +390,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     icao, pairs, runway_widths=runway_widths,
                     tile=tile, apt_runways=apt_runway_geom,
                     pav_intersections=pav_intersections)
-        except Exception:
+        except _GEOM_EXC:
             runway_segment_chain = []
 
     new_runway_polys: List[Polygon] = []
@@ -516,7 +524,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             from shapely.strtree import STRtree
             try:
                 index = STRtree(apron_candidates_m)
-            except Exception:
+            except _GEOM_EXC:
                 index = None
             kept_shapes: List[BuiltShape] = []
             kept_polys: List[Polygon] = []
@@ -550,7 +558,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                                 drop = True
                                 drop_apron = cand
                                 break
-                        except Exception:
+                        except _GEOM_EXC:
                             continue
                 if drop:
                     n_dropped += 1
@@ -588,7 +596,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                         f"  [pav-builder] {icao}: dropped "
                         f"{n_dropped} runway segment(s) "
                         f"apron-merged.")
-                except Exception:
+                except _GEOM_EXC:
                     pass
                 layout.shapes = kept_shapes
                 new_runway_polys = kept_polys
@@ -619,7 +627,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     f"  [pav-builder] {icao}: resolved "
                     f"{n_crossings} runway crossing(s) into "
                     f"junction polygon(s).")
-            except Exception:
+            except _GEOM_EXC:
                 pass
             new_runway_polys = [
                 s.polygon for s in layout.shapes
@@ -646,7 +654,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 new_rwy_union = unary_union(
                     [p.buffer(0) for p in new_runway_polys]
                 ).buffer(0)
-            except Exception:
+            except _GEOM_EXC:
                 new_rwy_union = None
             if new_rwy_union is not None and not new_rwy_union.is_empty:
                 # Two clip regions:
@@ -667,11 +675,11 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 #   and break the altitude_high/low rendering.
                 try:
                     taxi_clip = new_rwy_union.buffer(0.05)
-                except Exception:
+                except _GEOM_EXC:
                     taxi_clip = new_rwy_union
                 try:
                     junction_clip = new_rwy_union.buffer(2.0)
-                except Exception:
+                except _GEOM_EXC:
                     junction_clip = new_rwy_union
                 # Rebuild layout.shapes in-place: when the clip
                 # produces a MultiPolygon (e.g. a junction that
@@ -694,16 +702,16 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                     src = shape.polygon
                     if not src.is_valid:
                         try: src = src.buffer(0)
-                        except Exception: pass
+                        except _GEOM_EXC: pass
                     clip_region = (junction_clip
                                    if shape.role == ROLE_JUNCTION
                                    else taxi_clip)
                     try:
                         clipped = src.difference(clip_region)
-                    except Exception:
+                    except _GEOM_EXC:
                         try:
                             clipped = src.buffer(0).difference(clip_region)
-                        except Exception:
+                        except _GEOM_EXC:
                             new_shapes.append(shape)
                             continue
                     if clipped.is_empty:
@@ -810,7 +818,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             continue
         try:
             r_coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if r_coords and r_coords[0] == r_coords[-1]:
             r_coords = r_coords[:-1]
@@ -843,7 +851,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             t_corners = list(shape.polygon.exterior.coords)
             if t_corners and t_corners[0] == t_corners[-1]:
                 t_corners = t_corners[:-1]
-        except Exception:
+        except _GEOM_EXC:
             t_corners = []
         for x, y in [(shape.polygon.centroid.x,
                       shape.polygon.centroid.y)] + t_corners:
@@ -914,7 +922,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 f"runway corners within "
                 f"{TERMINAL_NEIGHBOUR_RADIUS_M:.0f} m, "
                 f"DEM-median ceiling = {dem_str}).")
-        except Exception:
+        except _GEOM_EXC:
             pass
 
     # ── Phase D: Geometric refinement + unified elevation solve ─
@@ -975,7 +983,7 @@ def _resample_node_altitudes_nn(
         return None
     try:
         new_open = list(new_poly.exterior.coords)
-    except Exception:
+    except _GEOM_EXC:
         return None
     if new_open and new_open[0] == new_open[-1]:
         new_open = new_open[:-1]
@@ -1171,7 +1179,7 @@ def _solve_pavement_elevations_unified(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1197,7 +1205,7 @@ def _solve_pavement_elevations_unified(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1233,7 +1241,7 @@ def _solve_pavement_elevations_unified(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1319,7 +1327,7 @@ def _solve_pavement_elevations_unified(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1402,7 +1410,7 @@ def _solve_pavement_elevations_unified(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1510,7 +1518,7 @@ def _solve_pavement_elevations_unified(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         ring_closed = (coords and coords[0] == coords[-1])
         coords_open = coords[:-1] if ring_closed else coords
@@ -1567,7 +1575,7 @@ def _solve_pavement_elevations_unified(
             f"({elapsed:.2f} s); applied to "
             f"{n_terms} terminal(s), {n_rects} rect(s), "
             f"{n_junctions} junction(s).")
-    except Exception:
+    except _GEOM_EXC:
         pass
 
 
@@ -1630,7 +1638,7 @@ def _smooth_within_junction_adjacent_pair_grade(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1645,7 +1653,7 @@ def _smooth_within_junction_adjacent_pair_grade(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1790,7 +1798,7 @@ def _rederive_terminal_altitude_from_apron_neighbours(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1818,7 +1826,7 @@ def _rederive_terminal_altitude_from_apron_neighbours(
             continue
         try:
             t_boundary = s.polygon.boundary
-        except Exception:
+        except _GEOM_EXC:
             t_boundary = None
         from shapely.geometry import Point as _P
         nearby: List[Tuple[float, float]] = []  # (distance, elev)
@@ -1830,7 +1838,7 @@ def _rederive_terminal_altitude_from_apron_neighbours(
                     d = math.hypot(
                         px - s.polygon.centroid.x,
                         py - s.polygon.centroid.y)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if d * d > radius2:
                 continue
@@ -1860,7 +1868,7 @@ def _rederive_terminal_altitude_from_apron_neighbours(
                     f"(median of {len(closest)} closest hard "
                     f"anchors within {sample_radius_m:.0f} m; "
                     f"replaces DEM-median).")
-            except Exception:
+            except _GEOM_EXC:
                 pass
             s.altitude = new_alt
             n_changed += 1
@@ -1898,7 +1906,7 @@ def _enforce_shared_vertex_altitudes(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -1979,7 +1987,7 @@ def _snap_junction_altitudes_to_rect_corners(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -2015,7 +2023,7 @@ def _snap_junction_altitudes_to_rect_corners(
                 [s.polygon for s in rect_shapes_for_interior])
         else:
             interior_tree = None
-    except Exception:
+    except _GEOM_EXC:
         interior_tree = None
     n_changed = 0
     for s in layout.shapes:
@@ -2025,7 +2033,7 @@ def _snap_junction_altitudes_to_rect_corners(
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         # node_altitudes spans the closed ring; coords from
         # ``polygon.exterior.coords`` is also closed.  Walk the open
@@ -2058,7 +2066,7 @@ def _snap_junction_altitudes_to_rect_corners(
                 _Point = Point  # local alias
                 pt = _Point(cx, cy)
                 cands = interior_tree.query(pt)
-            except Exception:
+            except _GEOM_EXC:
                 cands = []
             best_e: Optional[float] = None
             best_d2 = float("inf")
@@ -2070,7 +2078,7 @@ def _snap_junction_altitudes_to_rect_corners(
                 try:
                     if rs.polygon.distance(pt) > interior_proximity_m:
                         continue
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 e = _sample_runway_segment_elev(rs, cx, cy)
                 if e is None:
@@ -2082,7 +2090,7 @@ def _snap_junction_altitudes_to_rect_corners(
                     rcx = rs.polygon.centroid.x
                     rcy = rs.polygon.centroid.y
                     d2 = (rcx - cx) ** 2 + (rcy - cy) ** 2
-                except Exception:
+                except _GEOM_EXC:
                     d2 = 0.0
                 if d2 < best_d2:
                     best_d2 = d2
@@ -2148,7 +2156,7 @@ def _re_emit_apron_merged_runway_segments(
                                for i in jct_idxs])
         else:
             index = None
-    except Exception:
+    except _GEOM_EXC:
         index = None
         jct_idxs = []
     n_emitted = 0
@@ -2161,7 +2169,7 @@ def _re_emit_apron_merged_runway_segments(
         if index is not None:
             try:
                 cands = index.query(seg.polygon)
-            except Exception:
+            except _GEOM_EXC:
                 cands = []
             for hit in cands:
                 ji = int(hit) if hasattr(hit, "__int__") else hit
@@ -2175,7 +2183,7 @@ def _re_emit_apron_merged_runway_segments(
                 try:
                     inter_area = target.polygon.intersection(
                         seg.polygon).area
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 if inter_area < 1.0:
                     continue
@@ -2183,7 +2191,7 @@ def _re_emit_apron_merged_runway_segments(
                 try:
                     _old_ring = list(
                         target.polygon.exterior.coords)
-                except Exception:
+                except _GEOM_EXC:
                     _old_ring = []
                 if _old_ring and _old_ring[0] == _old_ring[-1]:
                     _old_ring = _old_ring[:-1]
@@ -2192,7 +2200,7 @@ def _re_emit_apron_merged_runway_segments(
                 try:
                     new_poly = target.polygon.difference(
                         seg.polygon)
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 if (new_poly.is_empty
                         or new_poly.geom_type
@@ -2250,7 +2258,7 @@ def _orient_rect_for_altitude(shape: "BuiltShape",
     """
     try:
         coords = list(shape.polygon.exterior.coords)
-    except Exception:
+    except _GEOM_EXC:
         return
     if coords and coords[0] == coords[-1]:
         coords = coords[:-1]
@@ -2297,7 +2305,7 @@ def _orient_rect_for_altitude(shape: "BuiltShape",
         if (new_poly.geom_type == "Polygon"
                 and not new_poly.is_empty):
             shape.polygon = new_poly
-    except Exception:
+    except _GEOM_EXC:
         pass
 
 
@@ -2490,7 +2498,7 @@ def _corner_elev_map(layout: "PavementLayout"
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -2587,7 +2595,7 @@ def _report_within_shape_violations(
         cap_pct = TAXI_MAX_GRADE if s.role == ROLE_JUNCTION else APRON_MAX_GRADE
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]
@@ -2650,7 +2658,7 @@ def _report_within_shape_violations(
                         f"d={d:.1f}m, de={de:.1f}m)")
             msg += "."
             UI.vprint(1, msg)
-        except Exception:
+        except _GEOM_EXC:
             pass
 
 
@@ -2713,7 +2721,7 @@ def _drop_overlap_against_fixed_shapes(
         if not p.is_valid:
             try:
                 p = p.buffer(0)
-            except Exception:
+            except _GEOM_EXC:
                 return None
             if p.is_empty or p.geom_type != "Polygon":
                 return None
@@ -2726,7 +2734,7 @@ def _drop_overlap_against_fixed_shapes(
         result is empty / below MIN_KEEP_AREA_M2."""
         try:
             d = p.difference(c)
-        except Exception:
+        except _GEOM_EXC:
             return p
         if d.is_empty:
             return None
@@ -2811,7 +2819,7 @@ def _drop_overlap_against_fixed_shapes(
                             layout.shapes[j].polygon = clipped
                             n_clipped += 1
                         any_change = True
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
             if not any_change:
                 break
@@ -2890,7 +2898,7 @@ def _drop_overlap_against_fixed_shapes(
                             new_p = clipped
                             any_change = True
                             n_clipped += 1
-                        except Exception:
+                        except _GEOM_EXC:
                             continue
                 if (new_p is not None
                         and tier_roles == {ROLE_JUNCTION}):
@@ -2915,7 +2923,7 @@ def _drop_overlap_against_fixed_shapes(
                             new_p = clipped
                             any_change = True
                             n_clipped += 1
-                        except Exception:
+                        except _GEOM_EXC:
                             continue
                 if new_p is None:
                     layout.shapes[i].polygon = None
@@ -2935,5 +2943,5 @@ def _drop_overlap_against_fixed_shapes(
                 f"  [pav-builder] {icao}: overlap-clip pass — "
                 f"{n_clipped} clip operation(s), "
                 f"{n_dropped} shape(s) dropped.")
-        except Exception:
+        except _GEOM_EXC:
             pass
