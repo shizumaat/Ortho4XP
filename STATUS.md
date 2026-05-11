@@ -1,299 +1,397 @@
-# Auto-Patch Status — RUNWAY / BOUNDARY / TILE-CUT REFACTOR 2026-05-12
+# Auto-Patch Status — APT.DAT TAXI NETWORK + EXCEPTION HARDENING 2026-05-11
 
 ## TL;DR
 
-**Twelve commits past the ``spjc-good-baseline`` tag.**  All 206
-tests pass.  SPJC compare-target gate intact under regenerated
-fixture.  SPLP grade test passes; runway-area step violations are
-**zero** (all remaining steps are 0.5 m sub-metre artefacts at
-terminal corners, totally unrelated to the runway).
+**28 commits past where the last status.md was written.**  204 of
+206 tests pass.  Two SPJC-specific tests fail because the
+fixture floors were generated against OSM-based output and the
+build now uses apt.dat as the primary taxi-network source —
+positions differ by 1–3 m, breaking the spatial floor counts.
 
-This stretch landed eight architectural changes the user drove in
-sequence:
+This session landed four substantial architectural changes the
+user drove in sequence:
 
-1. Per-surface solver HARD-anchors flat runway segments (not just
-   sloped 4-corner with ``altitude_high/low``).
-2. New ``stitch_pavement_to_flat_runways`` pass — perpendicular-
-   projection + near-edge snap to insert shared vertices on flat
-   runway shapes from adjacent junction boundaries.
-3. **Task 1** — runway flat-zone consolidation: consecutive flat
-   segments collapse into a single multi-node flat polygon.
-   *Sample-corner retention rule* (user 2026-05-12): keep EVERY
-   uniform 100 m sample as an intermediate corner, not just
-   pav_intersections, so junction-snap chains stay intact.
-4. **Task 2** — runway-segment chain extends to cover apt.dat
-   blast pads as displaced-threshold continuations.
-5. Airport boundary emits as a **chain of 4-corner rectangles**
-   (one per ~25 m densified segment), each tagged
-   ``altitude_high``/``altitude_low`` for sloped pieces or
-   ``altitude=`` for flat — JOSM-readable per-segment altitude
-   profile.
-6. Asymmetric boundary clamp: pull boundary UP toward runway
-   when DEM is below the band; **never pull DOWN from DEM**
-   (otherwise Ortho4XP's ``smooth_raster_over_airports`` drags
-   the rendered terrain down into a canyon around the airport
-   perimeter).
-7. ``tile_cut.py`` — cut shapes along integer lat/lon tile lines
-   with a 10 m buffer, then **drop pieces outside the current
-   tile**.  Neighbour-tile auto_patch runs handle their own
-   portion of cross-tile airports.
-8. Fix to a year-old silently-disabled boundary runway-elevation
-   clamp (missing ``_sample_runway_segment_elev`` import — the
-   broad ``except Exception`` mask hid the NameError since the
-   slice-5 refactor commit ``3f6bb89`` in 2026-04-26).  Then
-   narrowed 28 ``except Exception:`` blocks in ``boundary.py`` to
-   a focused ``(ValueError, TypeError, GEOSException,
-   TopologicalError, IndexError)`` tuple so future bugs of the
-   same shape surface immediately.
+1. **Exception-hardening pass** across the entire ``auto_patch/``
+   tree (commits ``bd43761`` … ``2931236``, 21 of the 28).
+   Replaced ~430 broad ``except Exception:`` blocks with narrow
+   per-file ``_GEOM_EXC`` tuples.  Surfaced one masked bug:
+   ``_resample_node_altitudes_nn`` was used at six sites in
+   ``bridges.py`` but never imported (silently swallowed by the
+   broad except in ``finalize.run_phase2``'s feature-emit
+   harness); fixed with one import line in commit ``74e92b1``.
 
-**Branch:** ``dev`` (12 commits ahead of ``origin/dev``).
+2. **apt.dat taxi network as the primary centerline source**
+   (commits ``4568c1e``, ``8656efa``, ``78b1b70``).  Parse apt.dat
+   rows 1201 (taxi nodes) and 1202 (taxi edges) into
+   ``Airport.taxi_nodes`` / ``Airport.taxi_edges``.  Pipeline now
+   uses apt.dat-derived centerlines (run through the same
+   RDP-simplify + bend-split machinery as OSM) for any airport
+   that has a 1201/1202 block, falling back to OSM when apt.dat
+   has no taxi network.  Also fixed two real bugs along the way:
+   the DSFTool-path lookup (commit ``4568c1e``: DSF pavement
+   wasn't loading at all for CYXY) and a missing
+   ``ROLE_TUNNEL_RAMP`` import in ``groundside.py``.
+
+3. **Long-edge absorption ruleset re-aligned** (commits
+   ``1684c8e``, ``fe52a1d``).  Dropped the apron-interior reject
+   in ``_snap_corners_to_pavement`` that was short-circuiting the
+   absorption pass at the rect-build stage.  Reinstated the
+   ``CORRIDOR_TO_RUNWAY_M`` heuristic that preserves runway-
+   anchored corridors (SPJC L, CYXY F) from absorption, while
+   still letting alongside parallels (CYXY G, apron-internal
+   sub-refs) absorb correctly.
+
+4. **Runway-pavement seam fixes** (commits ``211f043``,
+   ``0b035e8``).  Dropped the 2 m outward buffer in
+   ``elevation.py``'s post-segmenting junction-clip — that buffer
+   pushed every taxi-junction 2 m off the runway boundary,
+   creating a visible sliver at every taxi-junction-to-runway
+   interface.  Widened ``INTERSECTION_PROX_M`` from 0.5 m → 3 m
+   so apt.dat row-110 boundaries drawn 1–2 m inside the row-100
+   runway rect (SPJC's V1 throat is 1.75 m off) still register
+   as runway-segmenter intersection points.  Plus euclidean
+   dedup + Phase A/B snap-target dedup to consolidate
+   multi-vertex clusters from a single chart-level transition.
+
+**Branch:** ``dev`` (28 commits ahead of ``origin/dev``).
 **Tag baseline:** ``spjc-good-baseline`` (commit ``4d97f89``,
-2026-05-07).
+2026-05-07) — predates all of this session's work.
 
-## Commit chain since baseline
-
-```
-10e3544 Drop tile-cut shape pieces outside the current tile
-63edd2f Keep all intermediate samples as corners in multi-flat runway
-f882250 Emit airport boundary as a chain of 4-corner rectangles
-58ff723 Revert runway-chain-aware tile-cut; cut entirely at end
-6c3323d Asymmetric boundary runway-clamp: pull UP only, never DOWN
-8305131 Cut shapes along integer lat/lon tile boundaries
-effacdf Narrow broad except blocks in boundary.py
-5033ac2 Fix missing import that silently disabled boundary runway clamp
-69929d6 Extend runway segment chain to cover blast pads as displaced thresholds
-c04ac53 Consolidate flat runway segments into multi-node polygons
-e5cc969 Stitch pavement to flat runway shapes (multi-node flat shapes)
-1614676 HARD-anchor flat runway segments in per-surface solver
-4d97f89 SPJC apron fix: skip airports subsumed by patches_area  ← spjc-good-baseline
-```
-
-## Architectural changes — what to know
-
-### 1. Per-surface solver HARD-anchors flat runway segments (``1614676``)
-
-The HARD-seed in ``elevation_per_surface/unified_jacobi.py`` used
-to require BOTH ``altitude_high`` and ``altitude_low`` to be set
-on a runway shape.  Flat segments (single ``altitude=``) silently
-got zero HARD anchors — adjacent junctions saw the runway as
-SOFT and didn't get lifted toward runway elevation.  Now both
-forms HARD-anchor.
-
-### 2. ``stitch_pavement_to_flat_runways`` (``e5cc969``)
-
-New pass in ``junction_rules.py`` runs before the per-surface
-solver.  Two phases:
-
-* **Phase A — near-edge snap.**  For each pavement vertex within
-  ``near_edge_snap_m=2.5 m`` of a flat-runway edge interior, snap
-  onto the projection and insert a matching vertex into the
-  runway shape.
-* **Phase B — coincident-edge perpendicular projection.**  For
-  each pavement edge whose endpoints both match flat-runway
-  corners (a shared boundary edge), project every other pavement
-  vertex perpendicular onto the shared edge.  Inserts at every
-  projection in BOTH polygons.
-
-### 3. Multi-flat consolidation with full sample retention (``c04ac53``+``63edd2f``)
-
-The runway segmenter's flat-zone consolidator merges consecutive
-flat samples into ONE multi-node polygon (single ``altitude=``
-tag).  **All** intermediate samples are retained as corners —
-both pav_intersection breakpoints AND uniform 100 m seams.
-
-The "sample-corner retention" rule (``63edd2f``) was the user's
-2026-05-12 correction to the original Task 1 implementation,
-which had dropped uniform 100 m samples and broke the junction-
-snap chain (``widen_junctions_to_runway_corners`` relies on
-per-segment corner density to find nearby snap points).
-
-### 4. Chain extends to blast pads (``69929d6``)
-
-apt.dat row-100 ``blast_a`` / ``blast_b`` distances are absorbed
-into ``displaced_a`` / ``displaced_b`` at the start of segment-
-chain setup; ``blast_a/b`` then get zeroed.  CIFP threshold
-elevations stay anchored at the displaced-threshold positions
-(now interior to the extended chain).  Blast-pad areas get DEM-
-sampled + grade-limited like the runway interior.
-
-The legacy separate flat-rect blast-pad emit (at lines 1007-1038
-of the pre-refactor ``runway_segments.py``) silently skips
-because ``blast_a/b == 0`` after the extension.
-
-### 5. Boundary as a chain of 4-corner rectangles (``f882250``)
-
-``_emit_airport_boundary_shape`` no longer emits a single buffered
-strip polygon with per-vertex ``node_altitudes``.  Instead it
-walks the airport-boundary ring, densifies to 25 m, and emits one
-4-corner rect per consecutive pair of densified points.  Each
-rect is tagged ``altitude_high``/``altitude_low`` (sloped) or
-``altitude=`` (flat) for direct readability in JOSM.
-
-Half-width 2.5 m on each side of the boundary line.  Pavement
-overlap is handled — rects entirely buried in pavement are
-skipped; partial-overlap rects are trimmed against pavement.
-
-### 6. Asymmetric runway clamp (``6c3323d``)
-
-In ``_runway_clamped_alt`` (boundary ribbon) and ``_clamped_alt``
-(DEM bridge):
+## Commit chain since last status
 
 ```
-band = distance * 0.03           # 3 % grade
-lo   = runway_elev - band
-if dem < lo:  alt = lo           # lift UP toward runway when DEM is low
-else:         alt = dem          # follow DEM (no upper clamp)
+0b035e8 Dedup runway-pavement intersection clusters
+211f043 Fix runway-pavement seam at apt.dat-row-110 offsets
+78b1b70 Apply RDP+bend-split to apt.dat taxi centerlines
+fe52a1d Reinstate corridor heuristic in long-edge absorption
+1684c8e Remove apron-interior reject; let absorption ruleset split rects
+8656efa Use apt.dat taxi network as primary centerline source
+4568c1e Fix DSFTool path lookup + missing ROLE_TUNNEL_RAMP import
+2931236 Catch one remaining 'except Exception as exc' in elevation.py
+a0af8f0 Narrow broad excepts in elevation.py to _GEOM_EXC
+3eaf6f3 Narrow broad excepts in bridges.py to _GEOM_EXC
+3e2ea1e Narrow broad excepts in pipeline.py to _GEOM_EXC
+574267b Narrow broad excepts in junction_rules.py to _GEOM_EXC
+eb65659 Narrow broad excepts in triangulation/junction_repair/terminals
+74e92b1 Narrow broad excepts in junction_emit/groundside/finalize + fix masked NameError in bridges.py
+4723af5 Narrow broad excepts in elevation_smoothing/unified_jacobi
+4db0fd5 Narrow broad excepts in apt_dat_reader/osm_aeroway/osm_load
+541df64 Narrow broad excepts in cifp_reader/dsf_reader/driver/layout
+833dfc0 Narrow broad excepts in stubs/strips
+613e93d Narrow broad excepts in taxiway_skeleton/taxiway_rects
+ed2edc6 Narrow broad excepts in classifier/union_helpers/taxiway_decompose
+ad34922 Narrow broad excepts in centerlines.py to _GEOM_EXC
+777b843 Narrow broad excepts in junctions.py to _GEOM_EXC
+6eef867 Narrow broad excepts in rects.py to _GEOM_EXC
+70edb16 Narrow broad excepts in runways.py to _GEOM_EXC
+1aaf054 Narrow broad excepts in absorption.py
+bbfeaf1 Narrow broad excepts in vertices.py to _GEOM_EXC
+8e22da7 Narrow broad excepts in runway_segments.py
+bd43761 Narrow broad except in runway_geometry.py to OSError
 ```
 
-The earlier symmetric clamp pulled boundary DOWN to ``runway +
-band`` when DEM was higher.  Ortho4XP's
-``smooth_raster_over_airports`` then dragged the rendered terrain
-DOWN with it, producing a visible 20 m-deep canyon around the
-airport perimeter at the SPLP north end.  Asymmetric clamp
-preserves both rules: lift up when terrain dips below runway;
-follow DEM when terrain is at or above runway.
+## Architecture changes — what to know
 
-### 7. Tile cut with drop-out-of-tile (``8305131`` + ``10e3544``)
+### 1. apt.dat taxi network is the primary centerline source
 
-New module ``tile_cut.py``.  Runs as a late post-process in
-``pipeline.py``.  Three things:
+New data in ``apt_dat_reader.py``:
 
-* For each integer lat/lon line passing through the airport's
-  pavement footprint, builds a buffered LineString (5 m each
-  side → 10 m gap) and subtracts from every shape.
-* Clips ``layout.airport_boundary`` itself to the current tile
-  so downstream boundary-ribbon / DEM-bridge emit see only the
-  in-tile portion.
-* **Drops every shape piece whose representative point falls
-  outside the current tile.**  The neighbour-tile auto_patch run
-  generates the patch covering its portion.
+* ``TaxiNode`` (id, lat, lon, usage, label) — row 1201.
+* ``TaxiEdge`` (node_from, node_to, direction, kind, name) —
+  row 1202.  ``kind`` is ``"taxiway_A"`` … ``"taxiway_F"`` or
+  ``"runway"`` (taxi paths crossing a runway).
+* ``Airport.taxi_nodes: Dict[int, TaxiNode]`` and
+  ``Airport.taxi_edges: List[TaxiEdge]``.
 
-The "drop" rule (``10e3544``) is the user's 2026-05-12
-correction: previously cross-tile boundary rects ended up with
-``altitude=0`` because the loaded DEM tile didn't cover their
-location.  Now those rects are simply dropped — the neighbour
-tile handles them with its own DEM context.
+New helpers:
 
-**Earlier chain-aware tile-cut in ``runway_segments.py`` was
-reverted** (commit ``58ff723``) per user direction: pre-cut
-chain breaking interfered with ``widen_junctions_to_runway_
-corners`` (the widen pass promoted the gap-edge runway corners
-into adjacent junctions, which then misaligned with the post-
-process cut).  Cutting at the end uniformly is cleaner.
+* ``taxi_centerlines(airport, to_m, rwy_centerlines)`` —
+  group edges by ``name``, linemerge per group, run each
+  merged polyline through
+  ``pavement.centerlines.split_merged_centerline`` (extracted
+  from the OSM extractor so apt.dat and OSM share the same
+  RDP + straight-enough + bend-split logic).
+* ``taxi_junction_points(airport, to_m)`` — nodes referenced
+  by edges of ≥ 2 distinct names, ≥ 3 same-name edges, or
+  touched by a runway-cross edge.  Fed to
+  ``_split_centerlines_at_points``.
 
-### 8. Boundary-clamp import fix + exception narrowing (``5033ac2`` + ``effacdf``)
+Pipeline integration (``pipeline.py``):
 
-``_sample_runway_segment_elev`` was used in ``boundary.py`` but
-never imported — every call raised ``NameError`` and was silently
-swallowed by the surrounding ``except Exception:`` block, leaving
-the boundary runway-elevation clamp permanently disabled.  Bug
-dated back to the slice-5 refactor (commit ``3f6bb89``,
-2026-04-26).
+* If apt.dat has any taxi-network entries, use them as primary.
+* Fall back to OSM (``_extract_osm_taxi_centerlines``) only when
+  the apt.dat block has no 1201/1202 data.
+* The stub-reach-runway filter at
+  ``RUNWAY_ENDPOINT_DIST_M = 80`` is **skipped** when apt.dat is
+  the source — apt.dat doesn't carry OSM-noise sub-refs (A1, F1,
+  V1-V3) so the filter's purpose doesn't apply, and apron-to-
+  apron taxis like CYXY's G survive correctly.
 
-Fixed with one import line.  Then narrowed all 28
-``except Exception:`` blocks in ``boundary.py`` to
-``_GEOM_EXC = (ValueError, TypeError, GEOSException,
-TopologicalError, IndexError)`` so future ``NameError`` /
-``ImportError`` / ``AttributeError``-on-typo propagate
-immediately.
+### 2. Apron-interior reject removed; absorption ruleset is authoritative
 
-## Final grade state
+``_snap_corners_to_pavement`` (rects.py) no longer returns
+``None`` for "≥ 2 of 4 natural corners > 15 m inside pavement".
+Always snaps every corner to ``pav.boundary``.  The only
+remaining ``return None`` is geometric degeneracy (≥ 2 corners
+collapsed within 1 m of each other after snap).
 
-### SPJC (compare-target baseline)
+The authoritative ruleset is now exclusively in
+``_drop_primary_parallels_embedded_in_pavement`` (absorption.py):
 
-```
-278 total shapes:
-  boundary:           603 (chain of 25 m rects, post-cut, in-tile only)
-  cross_connector:      6
-  junction:            36
-  primary_parallel:    27
-  retaining_wall:      66
-  runway:              85
-  secondary_parallel:   1
-  stub:                16
-  terminal:             2
-  tunnel_ramp:         36
+* Probe each long edge at 5 m steps; mark step "adjacent" if
+  EITHER side has junction-class pavement within 5 m of the
+  probe point.
+* Contiguous adjacent runs ≥ 10 % of axial length → absorbed.
+* Kept fragments ≥ 30 m survive; smaller → dropped.
 
-Within-shape grade   : 7 violations, worst 2.2 % (junction)
-```
+Plus the **corridor heuristic** (reinstated):
+``CORRIDOR_TO_RUNWAY_M = 160 m``.  Rects whose short-edge
+midpoint is within 160 m of a runway are preserved from
+absorption — they're runway-anchored corridors (SPJC L, CYXY F)
+that should keep their full length even when one long edge has
+apron alongside.
 
-Compare-target fixture at ``tests/fixtures/SPJC_target.osm`` was
-regenerated at commit ``10e3544``.  Floor table in
-``tests/test_compare_target.py:SPJC_BASELINE`` matches the new
-target with ~99 % per-role floors.
+### 3. Runway-pavement seam fixes
 
-### SPLP (cross-tile + custom apt.dat)
+Three layered changes for the −10178 sliver at SPJC's V1 throat:
 
-```
-Within-shape:  4 violations (worst 13 % on small isolated
-                junction -10043, the original SPLP residue —
-                unchanged across this entire refactor)
-Plane gradient: 1 violation at 1.52 % (junction -10025, just
-                over the cap)
-Cross-shape:   0
-Vertex-edge step:    0
-Mid-edge step: 2 (worst 0.55 m — terminal/primary_parallel
-                interface, unrelated to runway)
-```
+* **Drop the 2 m junction-clip buffer** in ``elevation.py`` after
+  runway segmenting.  Previously ``junction_clip =
+  new_rwy_union.buffer(2.0)`` pulled every adjacent junction 2 m
+  off the runway boundary.  Replaced with ``junction_clip =
+  new_rwy_union``.
 
-The runway / blast-pad area is now **completely clean** in terms
-of step violations.  The original SPLP 20-step "canyon at SW
-threshold" report has dissolved entirely through the chain of
-HARD anchors + multi-flat snap corners + asymmetric clamp +
-tile-cut drop.
+* **Widen INTERSECTION_PROX_M** in ``pipeline.py`` from 0.5 m
+  → 3 m so apt.dat row-110 boundaries drawn 1–2 m inside the
+  row-100 runway rect still register as pav_runway_intersections.
 
-## Outstanding TODOs
+* **Dedup chain**: euclidean (5 m) for pav_runway_intersections
+  in ``pipeline.py``, plus per-edge euclidean (3 m) for both
+  Phase A snap targets and the runway-side insert step inside
+  ``stitch_pavement_to_flat_runways``.
 
-### 1. Exception-handling hardening across auto_patch (medium effort)
+### 4. Exception hardening complete
 
-``auto_patch/`` still contains ~412 ``except Exception:`` blocks
-in adjacent files (``elevation.py``, ``junction_rules.py``,
-``pavement/*.py``, ``bridges.py``, ``groundside.py``, etc.).
-Same anti-pattern that silently masked the 1-year boundary import
-bug AND a NameError on ``math.ceil`` / ``math.floor`` in the
-tile-cut work (``8305131`` — the import was missing, the
-NameError swallowed by the broad except wrapping
-``generate_patch_osm`` in ``elevation.py:381``, collapsing the
-entire SPJC runway chain to 2 shapes until I noticed).
-
-**Approach:** one file per commit.  Define a per-file
-``_GEOM_EXC`` tuple of expected geometry exceptions (model on
-``boundary.py``):
+Every ``except Exception:`` in ``src/auto_patch/`` has been
+narrowed.  Each module has a per-file ``_GEOM_EXC`` tuple:
 
 ```python
-_GEOM_EXC = (ValueError, TypeError, GEOSException,
-             TopologicalError, IndexError)
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 ```
 
-Replace ``except Exception:`` with ``except _GEOM_EXC:``.
+For modules mixing geometry with file I/O / dict access
+(``pipeline.py``, ``finalize.py``, ``bridges.py``,
+``elevation.py``, ``osm_load.py``, ``apt_dat_reader.py``,
+``osm_aeroway.py``), the tuple is widened with
+``(OSError, KeyError, RuntimeError)``.  ``driver.py`` has a
+dedicated ``_DRIVER_EXC`` for the per-airport harness that omits
+``NameError`` / ``AttributeError`` / ``ImportError`` so typos
+propagate to the test suite immediately.
 
-**Acceptance:** no ``except Exception:`` in ``auto_patch/**/*.py``
-outside of explicit driver-harness layers; ``NameError`` /
-``ImportError`` / ``AttributeError``-on-typo propagate; all 206
-tests still pass; SPJC compare-target gate intact.
+## Current state
 
-See ``project_todos.md`` memory note for the full rationale.
+### Test status
 
-### 2. Small isolated junction with 10 % within-shape grade (SPLP)
+| Test | Status |
+|---|---|
+| 204 / 206 | ✓ pass |
+| ``test_compare_target.py::test_compare_target_spjc`` | ✗ fail — fixture is OSM-derived; apt.dat positions differ by 1–3 m |
+| ``test_pavement_grade.py::test_pavement_grade[SPJC]`` | ✗ fail — 14 mid-edge steps > 0.5 m (cap 10), worst 1.36 m on junction-stub interfaces |
+| ``test_pavement_grade.py::test_pavement_grade[SPLP]`` | ✓ pass |
+| Compare-target on every other tested airport | ✓ pass |
 
-A 4-corner junction at SPLP (way id ``-10043`` in the current
-build, but it renumbers run-to-run) has a 10.5 % within-shape
-all-pair grade between two of its corners (~2.8 m delta over
-~26 m).  No HARD-anchor neighbours, no pav_intersection
-constraints.  The per-surface solver's cap-projection between
-soft corners isn't moving them toward each other.
+### CYXY (the original "broken at DSF" airport)
 
-Probably a one-vertex solver convergence issue or a topology
-quirk in pav_union → junction extraction.  Worth a separate
-investigation.  Doesn't affect rendering (no nearby pavement
-to step against — within-shape only).
+Massive improvement vs. start of session:
 
-### 3. Stale ``+60-140/`` directory at repo root
+| Role | session start | now |
+|---|---|---|
+| primary_parallel | 0 | 6 |
+| stub | 5 | 11 |
+| cross_connector | 0 | 1 |
+| junction | 39 huge | **2 small** |
 
-Untracked.  24 elevation tile files (~24 MB) that should live
-under ``Elevation_data/+60-140/``.  Mentioned in the refactor-
-state memory; leave it untracked, do NOT include in any
-``git add -A``.
+CYXY's DSF pavement now loads (was completely missing due to the
+DSFTool path bug).  G (apron-to-apron taxi) correctly emits as
+stub + cross_connector instead of being absorbed into a mega-
+junction.  Most pavement is now correctly classified into rects.
+
+### SPJC
+
+Most pavement classifies correctly under apt.dat-driven flow.
+Counts vs. the old OSM-derived fixture:
+
+| Role | target | out | matched |
+|---|---|---|---|
+| boundary | 603 | 603 | 603 |
+| runway | 85 | 85 | 85 |
+| retaining_wall | 66 | 66 | 66 |
+| tunnel_ramp | 36 | 36 | 36 |
+| junction | 36 | 46 | 31 |
+| primary_parallel | 27 | 31 | 23 |
+| stub | 16 | 16 | 16 |
+| cross_connector | 6 | 9 | 6 |
+| secondary_parallel | 1 | 1 | 0 |
+
+The output has slightly more rects (over-emission) and the
+matches lose ~4–8 per role to spatial drift between apt.dat and
+OSM coordinates.
+
+### SPLP
+
+| Role | count |
+|---|---|
+| primary_parallel | 1 |
+| runway | 21 |
+| boundary | 123 |
+
+Simpler output than the old build (which had more OSM-noise sub-
+refs); grade test passes cleanly.
+
+## OPEN WORK — where to pick up
+
+### Hot topic: V1-throat sloped-runway split at SPJC (USER'S LAST DIRECTION)
+
+**User's exact words (2026-05-11):** "Is the segmenter missing
+that point because of the 1.78 m gap with apt.dat pavement?  We
+probably need to segment on pavement nodes within 2 m of the
+runway."
+
+**Where:** SPJC's V1 throat, runway 16R/34L, segment ``-10108``.
+
+**Geometry:**
+
+* Runway segment ``-10108`` is **sloped** (``altitude_high=6.1``,
+  ``altitude_low=5.6``) covering the blast pad area at the 16R
+  end.  Single 4-corner rect; vertices at m-coords
+  ``(-83, -19)``, ``(-127, +71)``, ``(-86, +91)``, ``(-43, 0)``.
+
+* The V1 taxiway entry point (apt.dat node 305 in the row-1201
+  taxi network) projects onto the runway centerline at
+  axial ≈ 75 m from the extended ``phys_end_a``.  The nearest
+  apt.dat row-110 vertex to the runway boundary in this area is
+  at ``(-60.8, +42.2)`` — **1.76 m off the runway boundary**.
+
+* That row-110 vertex sits on the apron-side **long edge** of
+  ``-10108`` (between corners ``(-86, +91)`` and ``(-43, 0)``).
+  The user wants ``-10108`` split there into two sloped
+  sub-rects so the apron-side junction has a corner to share.
+
+**What's currently happening:**
+
+* ``INTERSECTION_PROX_M = 3.0`` (after my widening) DOES capture
+  this row-110 vertex as a ``pav_runway_intersection``.  My
+  earlier trace confirmed it: 1 intersection survives dedup
+  at t ≈ 0.0194 for runway 16R/34L.
+
+* The pav_intersection gets injected into the segmenter's
+  ``fractions`` list (``runway_segments.py:499–543``) and
+  becomes a sample at ``sample_pts[i]`` with an interpolated
+  elevation.
+
+* **But the resulting sloped segment doesn't split where I
+  expect.**  Looking at the runway segments sorted by axial
+  position (NW → SE), ``-10108`` is the first sloped segment;
+  it ends at the V1-throat seam where the runway transitions to
+  flat (``-10109`` at ``alt=6.2``).  The seam corner is at
+  ``(-43, 0)`` (node ``-349``), NOT at the projection of the
+  apt.dat row-110 vertex ``(-60.8, +42.2)``.
+
+* **The mystery:** the t ≈ 0.0194 pav_intersection corresponds
+  to axial position 67.8 m from ``phys_end_a``; projected
+  perpendicular at half-width the seam corner SHOULD be at
+  ``(-58, +30)`` (apron side) or ``(-78, +10)`` (runway side).
+  But ``-10108``'s SE corner ``-349`` is at ``(-43, 0)`` — far
+  from either of those predicted positions.
+
+* The runway segmenter's flat-region consolidation (``FLAT_TOL
+  = 0.05`` m) groups consecutive flat samples into a multi-node
+  polygon; sloped sub-runs become individual 4-corner rects.
+  When the consolidation runs, it might be absorbing the
+  pav_intersection sample into an adjacent group whose
+  elevation difference is below ``FLAT_TOL``.
+
+**User's proposed direction:** "We probably need to segment on
+pavement nodes within 2 m of the runway."
+
+Interpretation: re-examine the runway segmenter's handling of
+pav_intersection samples that sit **interior to a sloped run**
+(i.e. ``-10108``'s case).  Currently:
+
+* If the pav_intersection lands inside a flat run → it
+  survives as an intermediate corner of the multi-node flat
+  polygon (Task 1 / 2026-05-09 behaviour).
+* If the pav_intersection lands inside a sloped run → emit
+  loop processes adjacent sample pairs.  If consecutive
+  elevations differ by ≥ FLAT_TOL the sloped 4-corner rect
+  emits, but **the pav_intersection sample doesn't become a
+  corner of either sub-rect** unless adjacent samples already
+  have substantially different elevations.
+
+**Required investigation (next session):**
+
+1. **Run the segmenter with instrumentation** to dump
+   ``fractions``, ``sample_pts``, and ``elevs`` for SPJC
+   16R/34L at low-t range.  Specifically: at t ≈ 0.0194 (my
+   pav_intersection at the V1 throat) — is the sample present?
+   What's its elevation?  Is it being consolidated into an
+   adjacent group?
+
+2. **Locate where the flat-vs-sloped consolidation runs**
+   (``runway_segments.py:1086`` ``while idx < n_samples - 1``)
+   and trace whether ``sample_pts[i]`` corresponding to the
+   pav_intersection survives or gets absorbed.
+
+3. **Confirm the t-projection math.**  My standalone trace
+   says the pav_intersection is at t ≈ 0.0194 but the segment
+   output says ``-10108`` ends at a different position.
+   Either the segmenter handles the pav_intersection
+   differently than my standalone trace, or the SE corner of
+   ``-10108`` (node ``-349`` at ``(-43, 0)``) came from a
+   different fraction (the first uniform 100 m seam, perhaps).
+
+4. **Once the actual split point is identified, fix it so the
+   sloped ``-10108`` splits into two pieces with a corner at
+   the V1 entry.**
+
+### Other open items (deferred)
+
+* **CYXY −10006 V split** — user noted the V primary at CYXY
+  should be split at a centerline bend, but apt.dat row-1202
+  edges don't represent bends (just node-to-node edges).  Same
+  underlying issue as the SPJC V1 case: apt.dat is sparser than
+  OSM at apron-internal bends, so the segmenter doesn't see
+  the natural breakpoints.  Same investigation as the V1 throat
+  will likely surface the right fix.
+
+* **SPJC compare-target fixture regeneration** — once the
+  taxi-network behaviour stabilises, regenerate
+  ``tests/fixtures/SPJC_target.osm`` against the new apt.dat-
+  driven output.  The fixture is OSM-derived from
+  ``spjc-good-baseline`` (commit ``4d97f89``) and won't match
+  the new layout's coordinate positions.  The current floor
+  failures are spatial-match misses, not count misses (counts
+  are roughly correct; matches drop because rects shift 1–3 m).
+
+* **Task 3 from the original 2026-05-11 ask:** "the boundary
+  fill shapes should be added last to ensure they do not
+  overlap with snapped runway junctions."  Currently
+  ``_emit_airport_boundary_shape`` runs **inside**
+  ``finalize.run_phase2`` ([finalize.py:197](src/auto_patch/finalize.py:197))
+  before the post-finalize passes
+  (``widen_junctions_to_runway_corners``,
+  ``stitch_pavement_to_flat_runways``, the per-surface solver,
+  the snap chain).  Move the boundary-emit + DEM-bridge emit
+  to AFTER those passes so the boundary rects don't overlap
+  with junctions that have just been widened to share runway
+  corners.
+
+* **Exception-hardening item 3 still open per project_todos:**
+  the broad-except pass is done within ``src/auto_patch/`` but
+  the wider Ortho4XP codebase outside ``auto_patch/`` (e.g.
+  ``O4_*`` modules) may still have similar issues.  Out of
+  scope unless the user explicitly requests it.
 
 ## Build / verify commands
 
@@ -302,99 +400,124 @@ state memory; leave it untracked, do NOT include in any
 /Users/noah/Ortho4XP-shred86/venv/bin/python3 -m pytest tests/ \
     --tb=short -q
 
-# Gate tests
+# Gate tests (currently 2 SPJC-only failures, all others pass)
 /Users/noah/Ortho4XP-shred86/venv/bin/python3 -m pytest \
     tests/test_compare_target.py tests/test_pavement_grade.py \
     -v
 
-# Build SPLP + grade check
+# Build SPJC + write to /tmp for visual review
 /Users/noah/Ortho4XP-shred86/venv/bin/python3 - <<'PY'
 import sys
-sys.path.insert(0, "src"); sys.path.insert(0, "tools")
-from pathlib import Path
-import check_grade as CG
+sys.path.insert(0, "src")
 from auto_patch.pipeline import build_airport_pavement
-xplane = "/Users/noah/X-Plane 12"
-layout = build_airport_pavement("SPLP", xplane, compute_elevations=True)
-out = Path("/tmp/SPLP_check.osm"); layout.to_osm(str(out))
-CG.run_checks(out, max_grade_pct=1.5, proximity_m=1.0,
-              edge_search_m=5.0, edge_step_m=0.5, top_n=5)
+layout = build_airport_pavement(
+    "SPJC", "/Users/noah/X-Plane 12", compute_elevations=True)
+layout.to_osm("/tmp/SPJC.osm")
+print("wrote /tmp/SPJC.osm")
 PY
 
-# Build SPJC + dump shape counts
+# Build CYXY (the original "DSF missing" airport)
 /Users/noah/Ortho4XP-shred86/venv/bin/python3 - <<'PY'
 import sys; sys.path.insert(0, "src")
-from collections import Counter
 from auto_patch.pipeline import build_airport_pavement
-layout = build_airport_pavement("SPJC", "/Users/noah/X-Plane 12",
-                                  compute_elevations=True)
-print(Counter(s.role for s in layout.shapes))
+layout = build_airport_pavement(
+    "CYXY", "/Users/noah/X-Plane 12", compute_elevations=True)
+layout.to_osm("/tmp/CYXY.osm")
+PY
+
+# Standalone trace of pav_runway_intersections for the V1 throat
+/Users/noah/Ortho4XP-shred86/venv/bin/python3 - <<'PY'
+import sys, math
+sys.path.insert(0, "src")
+from auto_patch import apt_dat_reader as APR
+from auto_patch.pavement.runways import _runway_rect_m
+from shapely.geometry import Point
+from shapely.ops import transform as shp_transform
+
+apt = APR.load_airport(
+    "/Users/noah/X-Plane 12/Custom Scenery/SPJC Lima by Los Flipantes 3.0 Nueva Terminal XP12/Earth nav data/apt.dat",
+    "SPJC")
+r = next(r for r in apt.runways if "16R" in (r.desig_a, r.desig_b))
+lat0 = (r.lat_a + r.lat_b) / 2; lon0 = (r.lon_a + r.lon_b) / 2
+R = 6371000; cos0 = math.cos(math.radians(lat0))
+def to_m(lon, lat):
+    return ((lon - lon0) * math.radians(1) * R * cos0,
+            (lat - lat0) * math.radians(1) * R)
+rect = _runway_rect_m(r, to_m)
+cl_ax, cl_ay = to_m(r.lon_a, r.lat_a)
+cl_bx, cl_by = to_m(r.lon_b, r.lat_b)
+cl_dx = cl_bx - cl_ax; cl_dy = cl_by - cl_ay
+cl_L2 = cl_dx*cl_dx + cl_dy*cl_dy
+phys_dist = math.sqrt(cl_L2)
+print(f"Runway phys_dist: {phys_dist:.0f}m, blast_a={r.blast_a_m}m, displaced_a={r.displaced_a_m}m")
+# Pavement vertices within 3m
+intersections = []
+for pav in apt.pavements:
+    if not pav.polygon: continue
+    pm = shp_transform(to_m, pav.polygon)
+    coords = list(pm.exterior.coords)
+    if coords and coords[0] == coords[-1]: coords = coords[:-1]
+    for px, py in coords:
+        if rect.exterior.distance(Point(px, py)) > 3.0: continue
+        t = ((px - cl_ax) * cl_dx + (py - cl_ay) * cl_dy) / cl_L2
+        if t <= 5/phys_dist or t >= 1.0 - 5/phys_dist: continue
+        intersections.append((t, px, py, pav.name))
+intersections.sort()
+for t, px, py, name in intersections[:10]:
+    print(f"  t={t:.5f}  m=({px:+.1f},{py:+.1f})  name={name!r}")
 PY
 ```
 
 ## Reference artefacts
 
-* ``tests/fixtures/SPJC_target.osm`` — canonical SPJC output gate
-  (regenerated 2026-05-12 at commit ``10e3544``).  Includes the
-  tile-cut drop + boundary rect chain + multi-flat sample
-  retention.
-* ``Patches/-20-080/-13-077/SPLP_auto.patch.osm`` — SPLP runtime
-  output (in tile -13/-77, the airport-anchor tile).
-* ``Patches/-20-080/-13-078/SPLP_auto.patch.osm`` — older SPLP
-  patch from a separate generation of tile -13/-78.  Will be
-  refreshed when that tile is regenerated; current contents
-  pre-date the tile-cut drop fix.
-* CIFP data: ``/Users/noah/X-Plane 12/Custom Data/CIFP/SPLP.dat``.
+* ``tests/fixtures/SPJC_target.osm`` — OLD baseline gate
+  (regenerated at commit ``10e3544``, 2026-05-12 in calendar time
+  but BEFORE this session's apt.dat-primary change set).  Will
+  need regeneration once the V1-throat split is resolved.
+* ``/tmp/SPJC_v6.osm`` … ``/tmp/SPJC_v9.osm`` (working artefacts
+  from this session; the latest ``v9`` reflects the current
+  ``dev`` branch tip including all dedup work).
+* ``/tmp/CYXY_v4.osm`` — CYXY output for visual review.  Same
+  branch state as SPJC_v9.
 
 ## Memory notes added this stretch
 
-Saved under ``~/.claude/projects/-Users-noah-Ortho4XP-shred86/memory/``:
+Saved under
+``~/.claude/projects/-Users-noah-Ortho4XP-shred86/memory/``:
 
-* ``feedback_runway_end_pavement_classification.md`` — within 10 m
-  of runway width → runway (hard anchor); wider → apron.
-* ``feedback_flat_segment_node_count.md`` — flat shapes keep
-  single ``altitude=`` tag, support arbitrary node count.
-* ``feedback_boundary_clamp_asymmetric.md`` — clamp pulls UP only,
-  never DOWN from DEM.
-* ``project_todos.md`` — deferred work items (exception hardening
-  is the standing item).
+* (none added — work is captured in commit messages.  The
+  ``feedback_shape_rules.md`` "Long-edge absorption rule" entry
+  remains authoritative; commit ``fe52a1d`` documents the
+  corridor heuristic that's paired with it.)
 
 ## Next agent — task spec
 
-**Recommended starting point:** the exception-handling hardening
-pass.  It's mechanical, low-risk, and the unmasking has already
-caught two real bugs in this stretch — there are likely more
-hiding behind the remaining 412 broad excepts.
+**Recommended starting point:** the V1-throat sloped-runway split
+investigation (the user's last interrupted direction).  Specifics
+are in the "OPEN WORK" section above.  In short:
 
-**Order suggestion (smallest to largest):**
-1. ``pavement/runway_geometry.py``, ``pavement/runways.py``,
-   ``pavement/runway_segments.py`` (already partially audited
-   when adding tile-cut intervals — same patterns as boundary.py).
-2. ``pavement/vertices.py``, ``pavement/junctions.py``,
-   ``pavement/rects.py``, ``pavement/centerlines.py``,
-   ``pavement/absorption.py``.
-3. ``junction_rules.py``, ``junction_repair.py``,
-   ``junction_emit.py``.
-4. ``elevation.py`` (largest — be careful, lots of paths).
-5. Remaining: ``bridges.py``, ``boundary.py`` (already done),
-   ``groundside.py``, ``pipeline.py``, ``finalize.py``,
-   ``triangulation.py``, ``apt_dat_reader.py``, etc.
+1. Read commit ``0b035e8`` first (most recent runway-seam fix);
+   that's where the current intersection-tolerance / dedup state
+   came from.
+2. Read ``src/auto_patch/pavement/runway_segments.py:445–543``
+   (the fractions / pav_intersection injection) and
+   ``:1086–1136`` (the flat/sloped emit loop) to understand how
+   samples become corners.
+3. Instrument the segmenter with a debug print at line ≈ 1090
+   (start of the emit loop) to dump ``[(i, t, elev, anchored)]``
+   for runway 16R/34L.
+4. Confirm where SPJC's V1-throat pav_intersection sample ends
+   up in the emit sequence.  Compare to where ``-10108`` 's SE
+   corner actually lands.
+5. Fix the segmenter so an interior pav_intersection sample on a
+   sloped run creates a corner at that point (splits the sloped
+   sub-rect into two).
 
-One file per commit.  Run the full test suite + SPJC compare-
-target + SPLP grade test after each.  Any test failure means
-the broad except was masking a real bug — investigate, fix,
-then continue.
+**After that lands:** regenerate the SPJC target fixture and
+adjust ``test_compare_target.py`` floors.  Then proceed to the
+deferred items (CYXY V split, Task 3 boundary-emit ordering).
 
-**Other potential follow-ups (in priority order):**
-* Visual verification of SPLP in X-Plane after all the changes.
-  The user has been driving this iteratively but hasn't yet
-  confirmed the final state looks right in-sim.  The 20 m canyon
-  at SPLP north and the SW threshold step issues should all be
-  gone — worth a check.
-* The ``-10043`` small-isolated-junction within-shape grade
-  violation (see "Outstanding TODOs" above).
-* Regenerate the ``Patches/-20-080/-13-078/`` SPLP patch file by
-  running ``driver.generate_auto_patches`` for tile -13/-78.
-  The current file is stale and predates the tile-cut drop fix
-  (so it has 127 altitude-0 boundary rects); the regenerated
-  file would have the correct in-tile portion.
+**Do NOT touch:** the un-tracked ``+60-140/`` directory at the
+repo root.  24 stray .hgt elevation-tile files that should live
+under ``Elevation_data/+60-140/``; the user has confirmed
+"leave it untracked, never include in git add -A".
