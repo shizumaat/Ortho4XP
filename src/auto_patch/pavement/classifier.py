@@ -35,7 +35,13 @@ import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -129,7 +135,7 @@ def min_rotated_bbox_dims(polygon: Polygon) -> Tuple[float, float]:
         return (0.0, 0.0)
     try:
         mrr = polygon.minimum_rotated_rectangle
-    except Exception:
+    except _GEOM_EXC:
         return (0.0, 0.0)
     if mrr is None or mrr.is_empty:
         return (0.0, 0.0)

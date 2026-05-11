@@ -54,8 +54,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 # Default half-width for the morphological opening.  Taxiways on
 # SPJC range 20-45 m wide.  A 15 m half-width (30 m diameter) is
@@ -112,7 +118,7 @@ def decompose_multi_taxiway(
     try:
         core = polygon.buffer(-half_width_m).buffer(
             +half_width_m, join_style=2)
-    except Exception:
+    except _GEOM_EXC:
         core = None
 
     if core is None or core.is_empty or core.area < min_branch_area_m2:
@@ -124,7 +130,7 @@ def decompose_multi_taxiway(
 
     try:
         branches_geom = polygon.difference(core)
-    except Exception:
+    except _GEOM_EXC:
         branches_geom = None
     if branches_geom is None or branches_geom.is_empty:
         # Whole polygon is the hub — nothing to rectify.  Send it
@@ -155,7 +161,7 @@ def decompose_multi_taxiway(
         try:
             expanded = b.buffer(BRANCH_JUNCTION_OVERLAP_M).intersection(
                 polygon)
-        except Exception:
+        except _GEOM_EXC:
             expanded = b
         if expanded.is_empty:
             continue
@@ -174,7 +180,7 @@ def decompose_multi_taxiway(
         try:
             branch_union = unary_union(trimmed_branches)
             hub = polygon.difference(branch_union)
-        except Exception:
+        except _GEOM_EXC:
             hub = core
     else:
         hub = core

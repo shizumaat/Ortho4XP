@@ -12,7 +12,13 @@ from __future__ import annotations
 
 from typing import Optional
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -115,7 +121,7 @@ def _simplify_pavement_polygon(geom, tol: float = 1.0):
                 and not out.is_empty
                 and out.geom_type == "Polygon"):
             return out
-    except Exception:
+    except _GEOM_EXC:
         pass
     return geom
 
@@ -149,5 +155,5 @@ def _merge_near_touching(geom: Optional[Polygon],
         if merged.geom_type not in ("Polygon", "MultiPolygon"):
             return geom
         return merged
-    except Exception:
+    except _GEOM_EXC:
         return geom
