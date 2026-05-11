@@ -38,6 +38,7 @@ from .layout import (
     ROLE_STUB,
     ROLE_TERMINAL,
     ROLE_RETAINING_WALL,
+    ROLE_TUNNEL_RAMP,
     SHARED_VERTEX_TOL_M,
 )
 from .pavement.vertices import _snap_polygon_vertices_to_rect_corners

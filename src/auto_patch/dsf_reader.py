@@ -31,6 +31,7 @@ import sys
 import tempfile
 from typing import List, Optional, Tuple
 
+import O4_File_Names as FNAMES
 import O4_UI_Utils as UI
 
 
@@ -73,10 +74,7 @@ _PAVEMENT_SKIP = (
 def _dsftool_path() -> Optional[str]:
     """Return the platform's bundled DSFTool binary, or None."""
     # Mirror the layout O4_Mesh_Utils uses for Triangle4XP.
-    base = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "Utils",
-    )
+    base = FNAMES.Utils_dir
     sysname = platform.system().lower()
     if sysname == "darwin":
         cand = os.path.join(base, "mac", "DSFTool")
@@ -129,6 +127,10 @@ def read_dsf_pavements(
         return []
     tool = _dsftool_path()
     if tool is None:
+        UI.vprint(1,
+            "  [dsf-reader] WARN: DSFTool binary not found at "
+            f"{os.path.join(FNAMES.Utils_dir, platform.system().lower())}; "
+            "DSF pavement will not be loaded.")
         return []
 
     # Cache the converted text alongside the DSF (or in cache_dir).
