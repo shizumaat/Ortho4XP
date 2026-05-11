@@ -24,8 +24,14 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 from .config import (
     AXIS_ALIGN_TOL_DEG,
@@ -152,7 +158,7 @@ def longest_runway_axis_deg(layout: PavementLayout) -> Optional[float]:
         # polygon is a long thin segment.
         try:
             mrr = p.minimum_rotated_rectangle
-        except Exception:
+        except _GEOM_EXC:
             continue
         if mrr.is_empty or mrr.geom_type != "Polygon":
             continue
@@ -477,7 +483,7 @@ def _snap_to_sloping_edge_corners(layout: PavementLayout) -> None:
         new_pts = [e[0] for e in deduped]
         try:
             new_poly = Polygon(new_pts).buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if new_poly.is_empty:
             continue
@@ -515,7 +521,7 @@ def _build_runway_union_chain(
         return [], {}
     try:
         union = unary_union(polys)
-    except Exception:
+    except _GEOM_EXC:
         return [], {}
     components: List[Polygon] = []
     if union.geom_type == "Polygon":
@@ -627,7 +633,7 @@ def _widen_runway_shared_corners(
                     and not s.polygon.is_empty]
     try:
         runway_union = unary_union(runway_polys) if runway_polys else None
-    except Exception:
+    except _GEOM_EXC:
         runway_union = None
     pav_union = getattr(layout, "_apt_pav_union", None)
     return _do_widen(
@@ -745,7 +751,7 @@ def _do_widen(
                 return False
             try:
                 trial_poly = Polygon(trial).buffer(0)
-            except Exception:
+            except _GEOM_EXC:
                 return False
             if trial_poly.is_empty:
                 return False
@@ -760,7 +766,7 @@ def _do_widen(
             if runway_union is not None and not runway_union.is_empty:
                 try:
                     ovl = trial_poly.intersection(runway_union).area
-                except Exception:
+                except _GEOM_EXC:
                     ovl = 0.0
                 if ovl > 1.0:
                     return False
@@ -773,7 +779,7 @@ def _do_widen(
                     if trial_poly.intersection(
                             other.polygon).area > 1.0:
                         return False
-                except Exception:
+                except _GEOM_EXC:
                     pass
             # Sliver-corner pre-emption (per user 2026-05-05): the
             # OSM emitter drops any polygon with an interior angle
@@ -802,7 +808,7 @@ def _do_widen(
                         cos = (v1x * v2x + v1y * v2y) / (n1 * n2)
                         if cos > sliver_cos:
                             return False
-            except Exception:
+            except _GEOM_EXC:
                 pass
             # Commit
             current_coords = trial
@@ -1034,7 +1040,7 @@ def _do_widen(
                                    and not runway_union.is_empty
                                    else pav_union)
                 on_pav_boundary_obj = on_pav_combined.boundary
-            except Exception:
+            except _GEOM_EXC:
                 on_pav_boundary_obj = None
         if on_pav_boundary_obj is not None and newly_inserted_keys:
             pruned_coords: List[Tuple[float, float]] = []
@@ -1066,7 +1072,7 @@ def _do_widen(
                 # boundary.
                 try:
                     d = on_pav_boundary_obj.distance(Point(v))
-                except Exception:
+                except _GEOM_EXC:
                     d = 0.0
                 if d > INTERIOR_PRUNE_M:
                     continue  # drop
@@ -1078,7 +1084,7 @@ def _do_widen(
                 # Validate the pruned polygon before committing.
                 try:
                     test_poly = Polygon(pruned_coords).buffer(0)
-                except Exception:
+                except _GEOM_EXC:
                     test_poly = None
                 if (test_poly is not None
                         and not test_poly.is_empty
@@ -1094,7 +1100,7 @@ def _do_widen(
         # piecewise; guaranteed to be a single valid Polygon).
         try:
             new_poly = Polygon(current_coords).buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if new_poly.is_empty:
             continue
@@ -1298,7 +1304,7 @@ def _enforce_runway_1to1_sharing(layout: PavementLayout) -> None:
             continue
         try:
             new_poly = Polygon(new_pts).buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if new_poly.is_empty:
             continue
@@ -1520,7 +1526,7 @@ def _polygon_neck_metrics(
     """
     try:
         mrr = poly.minimum_rotated_rectangle
-    except Exception:
+    except _GEOM_EXC:
         return 0.0, 0.0, (0.0, 0.0, 0.0, 0.0)
     if mrr.is_empty or mrr.geom_type != "Polygon":
         return 0.0, 0.0, (0.0, 0.0, 0.0, 0.0)
@@ -1600,7 +1606,7 @@ def _split_narrow_necks(
         try:
             from shapely.ops import split as _shp_split
             result = _shp_split(poly, cut)
-        except Exception:
+        except _GEOM_EXC:
             continue
         pieces: List[Polygon] = []
         if result.geom_type == "Polygon":
@@ -1697,7 +1703,7 @@ def stitch_pavement_to_terminals(
             continue
         try:
             coords = list(poly.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         ring_closed = (
             len(coords) > 1 and coords[0] == coords[-1])
@@ -1814,7 +1820,7 @@ def stitch_pavement_to_terminals(
             if (new_poly.is_empty
                     or new_poly.geom_type != "Polygon"):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         pav.polygon = new_poly
         if deduped_alts is not None:
@@ -1851,7 +1857,7 @@ def stitch_pavement_to_terminals(
             if (new_poly.is_empty
                     or new_poly.geom_type != "Polygon"):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         term.polygon = new_poly
         # Terminals carry a single ``s.altitude`` (uniform plane); no
@@ -1932,7 +1938,7 @@ def stitch_pavement_to_flat_runways(
             continue
         try:
             pav_coords = _open_ring(list(poly.exterior.coords))
-        except Exception:
+        except _GEOM_EXC:
             continue
         n_pav = len(pav_coords)
         if n_pav < 3:
@@ -1956,7 +1962,7 @@ def stitch_pavement_to_flat_runways(
                 try:
                     rcoords = _open_ring(list(
                         rwy.polygon.exterior.coords))
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 m = len(rcoords)
                 if m < 3:
@@ -2004,7 +2010,7 @@ def stitch_pavement_to_flat_runways(
                     pav.polygon = new_poly
                     if pav_alts is not None:
                         pav.node_altitudes = pav_alts + [pav_alts[0]]
-            except Exception:
+            except _GEOM_EXC:
                 pass
 
     # ── Phase B: coincident-edge perpendicular projection ────────
@@ -2014,7 +2020,7 @@ def stitch_pavement_to_flat_runways(
             continue
         try:
             pav_coords = _open_ring(list(poly.exterior.coords))
-        except Exception:
+        except _GEOM_EXC:
             continue
         n_pav = len(pav_coords)
         if n_pav < 3:
@@ -2041,7 +2047,7 @@ def stitch_pavement_to_flat_runways(
             try:
                 rwy_coords = _open_ring(list(
                     rwy.polygon.exterior.coords))
-            except Exception:
+            except _GEOM_EXC:
                 continue
             n_rwy = len(rwy_coords)
             if n_rwy < 3:
@@ -2149,7 +2155,7 @@ def stitch_pavement_to_flat_runways(
             if (new_poly.is_empty
                     or new_poly.geom_type != "Polygon"):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         pav.polygon = new_poly
         if new_alts is not None:
@@ -2163,7 +2169,7 @@ def stitch_pavement_to_flat_runways(
         try:
             rcoords_open = _open_ring(list(
                 rwy.polygon.exterior.coords))
-        except Exception:
+        except _GEOM_EXC:
             continue
         m = len(rcoords_open)
         if m < 3:
@@ -2188,7 +2194,7 @@ def stitch_pavement_to_flat_runways(
             if (new_poly.is_empty
                     or new_poly.geom_type != "Polygon"):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         rwy.polygon = new_poly
         # Flat runway carries a single ``s.altitude`` — uniform
@@ -2348,7 +2354,7 @@ def stitch_pavement_polygons(
             if (new_poly.is_empty
                     or new_poly.geom_type != "Polygon"):
                 continue
-        except Exception:
+        except _GEOM_EXC:
             continue
         B.polygon = new_poly
         B.node_altitudes = new_alts + [new_alts[0]]
