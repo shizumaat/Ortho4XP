@@ -59,6 +59,7 @@ from typing import List, Optional, Tuple
 
 import O4_UI_Utils as UI
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
@@ -68,6 +69,11 @@ from ..layout import (
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
 )
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 __all__ = [
     "_drop_primary_parallels_embedded_in_pavement",
@@ -164,7 +170,7 @@ def _drop_primary_parallels_embedded_in_pavement(
             for r in runway_polys:
                 if r is not None and not r.is_empty:
                     junction_pav = junction_pav.difference(r)
-        except Exception:
+        except _GEOM_EXC:
             junction_pav = apt_pav_union
     # Subtract every taxi-rect's footprint (including the rect being
     # tested — that's CORRECT, because we want to know whether the
@@ -180,7 +186,7 @@ def _drop_primary_parallels_embedded_in_pavement(
             taxi_union = unary_union(all_taxi_polys)
             if not taxi_union.is_empty:
                 junction_pav = junction_pav.difference(taxi_union)
-    except Exception:
+    except _GEOM_EXC:
         pass
     if junction_pav.is_empty:
         return taxi_rects
@@ -265,7 +271,7 @@ def _drop_primary_parallels_embedded_in_pavement(
             continue
         try:
             rc = list(rect.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             kept.append(entry)
             continue
         if rc and rc[0] == rc[-1]:
@@ -309,7 +315,7 @@ def _drop_primary_parallels_embedded_in_pavement(
                 either_adj[i] = (
                     bool(junction_pav.contains(left_pt))
                     or bool(junction_pav.contains(right_pt)))
-            except Exception:
+            except _GEOM_EXC:
                 continue
 
         # Find contiguous "either-side adjacent" runs ≥ 10 % of axis.
@@ -369,7 +375,7 @@ def _drop_primary_parallels_embedded_in_pavement(
         APRON_INTERIOR_TOL_M = 2.0
         try:
             pav_boundary = apt_pav_union.boundary
-        except Exception:
+        except _GEOM_EXC:
             pav_boundary = None
         n_dropped_interior = 0
         new_rects: List[Tuple[Polygon, LineString, str, str]] = []
@@ -438,7 +444,7 @@ def _drop_primary_parallels_embedded_in_pavement(
                         continue
                 new_axis = LineString([new_a_mid, new_b_mid])
                 new_rects.append((new_rect, new_axis, role, ref))
-            except Exception:
+            except _GEOM_EXC:
                 continue
         kept.extend(new_rects)
         if not new_rects:
@@ -452,14 +458,11 @@ def _drop_primary_parallels_embedded_in_pavement(
             f"{'/int=' + str(n_dropped_interior) if n_dropped_interior else ''}")
 
     if abs_refs:
-        try:
-            UI.vprint(1,
-                f"  [pav-builder] long-edge-adjacent absorption: "
-                f"{n_full} dropped, {n_split} split, "
-                f"{n_clipped} clipped (refs: "
-                f"{', '.join(abs_refs)}).")
-        except Exception:
-            pass
+        UI.vprint(1,
+            f"  [pav-builder] long-edge-adjacent absorption: "
+            f"{n_full} dropped, {n_split} split, "
+            f"{n_clipped} clipped (refs: "
+            f"{', '.join(abs_refs)}).")
     return kept
 
 
@@ -515,7 +518,7 @@ def _split_primary_parallels_at_pavement_boundary(
             continue
         try:
             rc = list(rect.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             out.append(entry)
             continue
         if rc and rc[0] == rc[-1]:
@@ -555,7 +558,7 @@ def _split_primary_parallels_at_pavement_boundary(
                 emb = (pav_union.contains(left)
                        or pav_union.contains(right))
                 embedded.append(emb)
-        except Exception:
+        except _GEOM_EXC:
             out.append(entry)
             continue
         # Find embedded prefix length (in steps).
@@ -604,17 +607,14 @@ def _split_primary_parallels_at_pavement_boundary(
             new_axis = LineString([new_a_mid, new_b_mid])
             out.append((new_rect, new_axis, role, ref))
             n_clipped += 1
-            try:
-                UI.vprint(1,
-                    f"  [pav-builder] clipped primary_parallel "
-                    f"{ref!r}: {L:.0f}m → {(u_hi - u_lo):.0f}m "
-                    f"(dropped "
-                    + ("prefix " if clip_pfx else "")
-                    + ("suffix " if clip_sfx else "")
-                    + "embedded in pavement).")
-            except Exception:
-                pass
-        except Exception:
+            UI.vprint(1,
+                f"  [pav-builder] clipped primary_parallel "
+                f"{ref!r}: {L:.0f}m → {(u_hi - u_lo):.0f}m "
+                f"(dropped "
+                + ("prefix " if clip_pfx else "")
+                + ("suffix " if clip_sfx else "")
+                + "embedded in pavement).")
+        except _GEOM_EXC:
             out.append(entry)
             continue
     return out
