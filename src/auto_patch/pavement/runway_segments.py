@@ -239,7 +239,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             return None
         try:
             return tile.dem.alt((lon - tile.lon, lat - tile.lat))
-        except Exception:
+        except (IndexError, ValueError, TypeError, ZeroDivisionError):
             return None
 
     # ── Auto cross-runway anchor pre-pass ──────────────────────
@@ -727,18 +727,15 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     continue
                 g = abs(e1 - e0) / seg_d
                 if g > MAX_RUNWAY_GRADE + 1e-6:
-                    try:
-                        UI.vprint(1,
-                            f"  [auto-patch] {icao} runway "
-                            f"{desig_a}/{desig_b}: anchor pair grade "
-                            f"{g * 100:.2f}% > "
-                            f"{MAX_RUNWAY_GRADE * 100:.1f}% between "
-                            f"fractions {f0:.3f} and {f1:.3f} "
-                            f"({seg_d:.0f} m apart, ΔE={e1 - e0:+.2f} m) "
-                            f"— profile will be infeasible at FAA "
-                            f"runway max grade.")
-                    except Exception:
-                        pass
+                    UI.vprint(1,
+                        f"  [auto-patch] {icao} runway "
+                        f"{desig_a}/{desig_b}: anchor pair grade "
+                        f"{g * 100:.2f}% > "
+                        f"{MAX_RUNWAY_GRADE * 100:.1f}% between "
+                        f"fractions {f0:.3f} and {f1:.3f} "
+                        f"({seg_d:.0f} m apart, ΔE={e1 - e0:+.2f} m) "
+                        f"— profile will be infeasible at FAA "
+                        f"runway max grade.")
 
             # 3. Linear-interpolation anchor profile.
             def _anchor_profile(frac: float):
