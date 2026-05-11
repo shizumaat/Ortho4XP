@@ -47,12 +47,19 @@ import math
 import time as _time
 from typing import Dict, List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
+
 from auto_patch.elevation import APRON_MAX_GRADE, TAXI_MAX_GRADE
 from auto_patch.layout import (
     ROLE_APRON, ROLE_BOUNDARY, ROLE_CROSS_CONNECTOR, ROLE_JUNCTION,
     ROLE_PRIMARY_PARALLEL, ROLE_RUNWAY, ROLE_SECONDARY_PARALLEL,
     ROLE_STUB, ROLE_TERMINAL,
 )
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 SLOPING_RECT_ROLES = (
@@ -155,7 +162,7 @@ def _build_node_list(layout):
             continue
         try:
             coords = _open_ring(list(s.polygon.exterior.coords))
-        except Exception:
+        except _GEOM_EXC:
             continue
         for x, y in coords:
             b = _corner_elevation_bucket(x, y)
@@ -578,7 +585,7 @@ def _writeback(layout, elev, bucket_to_idx):
             continue
         try:
             coords = list(s.polygon.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             continue
         ring_closed = coords and coords[0] == coords[-1]
         coords_open = coords[:-1] if ring_closed else coords
@@ -673,12 +680,9 @@ def _rotation_for_high_pair(high_pair) -> int:
 
 def _report(icao, iters_used, max_iters, elapsed,
              n_terms, n_rects, n_juncs):
-    try:
-        import O4_UI_Utils as UI
-        UI.vprint(1,
-            f"  [pav-builder] {icao}: per-surface Jacobi solver "
-            f"converged in {iters_used}/{max_iters} iters "
-            f"({elapsed:.2f} s); applied to {n_terms} terminal/apron(s), "
-            f"{n_rects} rect(s), {n_juncs} junction(s).")
-    except Exception:
-        pass
+    import O4_UI_Utils as UI
+    UI.vprint(1,
+        f"  [pav-builder] {icao}: per-surface Jacobi solver "
+        f"converged in {iters_used}/{max_iters} iters "
+        f"({elapsed:.2f} s); applied to {n_terms} terminal/apron(s), "
+        f"{n_rects} rect(s), {n_juncs} junction(s).")

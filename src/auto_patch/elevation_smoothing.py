@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from typing import List, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
 
 from .elevation import (
@@ -28,6 +29,11 @@ from .elevation import (
     _sample_dem,
 )
 from .layout import R_EARTH
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = ["_smooth_polygon_grid"]
@@ -105,7 +111,7 @@ def _smooth_polygon_grid(
                 try:
                     if boundary.distance(pt) < grid_step_m:
                         inside[i, j] = True
-                except Exception:
+                except _GEOM_EXC:
                     pass
 
     if not inside.any():
