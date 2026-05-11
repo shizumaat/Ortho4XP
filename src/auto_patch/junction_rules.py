@@ -1998,8 +1998,27 @@ def stitch_pavement_to_flat_runways(
                 rwy, ei, t, cx, cy = best
                 new_coords[vi] = (cx, cy)
                 snapped[vi] = True
-                rwy_inserts[id(rwy)].setdefault(
-                    ei, []).append((t, cx, cy))
+                # Per user 2026-05-11: dedup snap targets within 3 m
+                # of each other on the same runway edge.  Phase A
+                # processes each pav vertex independently; when
+                # multiple pav vertices project to nearly-identical
+                # points on the runway edge (apron-to-runway throats
+                # with several row-110 vertices in a 3 m span), the
+                # runway ends up with a cluster of near-duplicate
+                # corners that forces the adjacent junction to taper
+                # to a needle.  Keep only the first snap target per
+                # 3 m cluster; subsequent pav vertices in the cluster
+                # snap to the same point so the JUNCTION has merged
+                # vertices too.
+                existing = rwy_inserts[id(rwy)].setdefault(ei, [])
+                duplicate = False
+                for et, ex, ey in existing:
+                    if (cx - ex) ** 2 + (cy - ey) ** 2 < 9.0:  # 3 m
+                        new_coords[vi] = (ex, ey)
+                        duplicate = True
+                        break
+                if not duplicate:
+                    existing.append((t, cx, cy))
         if any(snapped):
             try:
                 new_poly = Polygon(new_coords + [new_coords[0]])
@@ -2174,17 +2193,32 @@ def stitch_pavement_to_flat_runways(
         m = len(rcoords_open)
         if m < 3:
             continue
+        # Dedup inserts that land within DEDUP_INSERT_M of each other
+        # on the same runway edge.  Phase A snaps each near-runway
+        # pav vertex INDIVIDUALLY; when multiple junction vertices
+        # project to nearly-identical points on the runway edge
+        # (common at apron-to-runway throats where several apt.dat
+        # row-110 vertices sit within a 3 m span), the runway ends
+        # up with a cluster of 2-3 near-duplicate corners on its
+        # apron-side edge — which forces the adjacent junction to
+        # taper to a needle at that point.  Per user 2026-05-11:
+        # collapse near-duplicate insertions so the runway gets ONE
+        # corner per chart-level transition.
+        DEDUP_INSERT_M = 3.0
         out: List[Tuple[float, float]] = []
         for ei in range(m):
             out.append(rcoords_open[ei])
             if ei in inserts:
                 pts = sorted(inserts[ei], key=lambda x: x[0])
-                last_t: float = -1.0
+                last_xy: Optional[Tuple[float, float]] = None
                 for t, cx, cy in pts:
-                    if t - last_t < 1e-4:
-                        continue
+                    if last_xy is not None:
+                        ddx = cx - last_xy[0]
+                        ddy = cy - last_xy[1]
+                        if ddx * ddx + ddy * ddy < DEDUP_INSERT_M ** 2:
+                            continue
                     out.append((cx, cy))
-                    last_t = t
+                    last_xy = (cx, cy)
         if len(out) < 3:
             continue
         try:

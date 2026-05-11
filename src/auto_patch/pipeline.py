@@ -377,7 +377,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # near-runway pavement landmarks as segmentation breakpoints
     # without distorting the segmenter's output geometry.
     INTERSECTION_PROX_M = 3.0
-    INTERSECTION_DEDUP_M = 2.0
+    # Dedup proportionally to PROX so multi-vertex clusters of a
+    # single pavement transition (row-110 boundaries drawn with 3-4
+    # vertices within a 3 m span at the runway edge) collapse to one
+    # seam corner instead of fragmenting the runway segment.
+    INTERSECTION_DEDUP_M = 5.0
     pav_runway_intersections: dict = {}
     for ridx, r in enumerate(apt.runways):
         if ridx >= len(runway_polys):
@@ -417,13 +421,29 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 intersections.append((t, px, py))
         if not intersections:
             continue
-        # Sort by centerline t and dedup within INTERSECTION_DEDUP_M.
+        # Sort by centerline t and dedup.  Per user 2026-05-11: dedup
+        # by EUCLIDEAN distance between consecutive candidate points
+        # rather than centerline-t alone.  A row-110 boundary that
+        # approaches the runway with a slight angle puts multiple
+        # close-together apt.dat vertices on the runway edge —
+        # each at a slightly different axial position but only ~3 m
+        # apart in real space.  Centerline-t dedup keeps them all
+        # (their t values differ by ≥ dedup_t_gap); euclidean dedup
+        # merges them into a single seam corner, which is what the
+        # runway segmenter actually needs.  Without this, every
+        # close-together row-110 vertex becomes a runway-segment
+        # seam corner and the downstream junction polygon has to
+        # wrap around all of them (the cluster of -349/-351/-352
+        # corners on -10109's east edge that pinched -10182).
         intersections.sort(key=lambda x: x[0])
-        dedup_t_gap = INTERSECTION_DEDUP_M / phys_dist
+        dedup_m2 = INTERSECTION_DEDUP_M * INTERSECTION_DEDUP_M
         deduped: List[Tuple[float, float, float]] = []
         for t, px, py in intersections:
-            if deduped and (t - deduped[-1][0]) < dedup_t_gap:
-                continue
+            if deduped:
+                dpx = px - deduped[-1][1]
+                dpy = py - deduped[-1][2]
+                if dpx * dpx + dpy * dpy < dedup_m2:
+                    continue
             deduped.append((t, px, py))
         # Convert intersection meter-coords back to lat/lon via the
         # layout's m_to_ll (the segmenter consumes lat/lon).  Store
