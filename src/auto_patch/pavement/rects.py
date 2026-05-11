@@ -29,6 +29,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import nearest_points, unary_union
 
@@ -39,6 +40,11 @@ from ..layout import (
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
 )
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -114,7 +120,7 @@ def _build_taxi_rects(
         # clipping it at the runway boundary and losing most of it.
         try:
             clipped = axis.intersection(pav_union)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if clipped.is_empty:
             continue
@@ -151,7 +157,7 @@ def _build_taxi_rects(
                 inside_len = trimmed.intersection(emitted_union).length
                 if inside_len / trimmed.length > 0.7:
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 pass
 
         width = 2.0 * trim_narrow_hw
@@ -163,7 +169,7 @@ def _build_taxi_rects(
         if not rect.is_valid:
             try:
                 rect = rect.buffer(0)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if (rect.is_empty or rect.geom_type != "Polygon"
                     or not rect.is_valid):
@@ -205,7 +211,7 @@ def _build_taxi_rects(
         try:
             emitted_union = (unary_union([emitted_union, rect])
                              if emitted_union is not None else rect)
-        except Exception:
+        except _GEOM_EXC:
             # Self-intersection of accumulated union — skip update.
             pass
 
@@ -261,7 +267,7 @@ def _build_taxi_rects(
                 try:
                     overlap = ra.intersection(rb).area
                     proximate = ra.distance(rb) < OVERLAP_PROX_M
-                except Exception:
+                except _GEOM_EXC:
                     overlap, proximate = 0.0, False
                 if overlap > 1.0 or proximate:
                     pa, pb = find(a), find(b)
@@ -373,7 +379,7 @@ def _merge_collinear_rects_principled(
                 far_j = coords_j[0] if ej == 1 else coords_j[-1]
                 try:
                     merged_axis = LineString([far_i, far_j])
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 merged_rect = _rect_from_axis_extended(
                     merged_axis, 2.0 * (hwi + hwj) / 2.0, pav,
@@ -470,7 +476,7 @@ def _merge_collinear_rects(
                 far_j = coords_j[0] if ej == 1 else coords_j[-1]
                 try:
                     merged_axis = LineString([far_i, far_j])
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 # Build merged rect from merged axis at average width.
                 avg_width = (wi + wj) / 2.0
@@ -783,7 +789,7 @@ def _extend_rect_corners_perpendicular(
         new_rect = Polygon(new_corners)
         if new_rect.is_valid and not new_rect.is_empty:
             return new_rect
-    except Exception:
+    except _GEOM_EXC:
         pass
     return rect
 
@@ -890,7 +896,7 @@ def _rect_from_axis_extended(axis: LineString, width: float,
             return Polygon(snapped)
         try:
             cur_axis = substring(cur_axis, new_start, new_end)
-        except Exception:
+        except _GEOM_EXC:
             return Polygon(snapped)
     return None
 
@@ -1038,7 +1044,7 @@ def _cap_rect_length_to_width(
     for rect, axis, role, ref in taxi_rects:
         try:
             coords = list(rect.exterior.coords)
-        except Exception:
+        except _GEOM_EXC:
             out.append((rect, axis, role, ref))
             continue
         if coords and coords[0] == coords[-1]:
@@ -1078,7 +1084,7 @@ def _cap_rect_length_to_width(
         try:
             new_axis = substring(
                 axis, margin, axis_len - margin)
-        except Exception:
+        except _GEOM_EXC:
             out.append((rect, axis, role, ref))
             continue
         if (new_axis.is_empty
@@ -1151,7 +1157,7 @@ def _classify_role(axis: LineString, width: float,
     try:
         mid = axis.interpolate(0.5, normalized=True)
         dist_rwy = min(mid.distance(r) for r in rwy_centerlines)
-    except Exception:
+    except _GEOM_EXC:
         dist_rwy = 1e6
     length = axis.length
 
@@ -1195,7 +1201,7 @@ def _classify_role(axis: LineString, width: float,
                 _ref_db = min(_ref_db, 180.0 - _ref_db)
                 if 20.0 <= _ref_db < 45.0:
                     return ROLE_STUB
-        except Exception:
+        except _GEOM_EXC:
             pass
 
     if db > 45.0 and length >= 20.0:
@@ -1371,7 +1377,7 @@ def _try_align_sloping_to_hole(
     try:
         new_rect = Polygon(new_rc)
         new_axis = LineString([new_p1, new_p2])
-    except Exception:
+    except _GEOM_EXC:
         return None, None
     if (not new_rect.is_valid) or new_rect.is_empty:
         return None, None
@@ -1579,7 +1585,7 @@ def _snap_rect_sloping_edges_to_holes(
                             final_rect = candidate
                             final_axis = cur_axis
                             break
-                    except Exception:
+                    except _GEOM_EXC:
                         pass
                 # Polygon invalid — fall through to shorten retry.
 
@@ -1602,7 +1608,7 @@ def _snap_rect_sloping_edges_to_holes(
                     cur_axis,
                     half_shorten,
                     cur_axis.length - half_shorten)
-            except Exception:
+            except _GEOM_EXC:
                 break
             new_rect = _rect_from_axis_extended(
                 cur_axis, original_width, pav_union,
