@@ -34,8 +34,16 @@ import os
 import re
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes + file I/O.  Programming errors propagate so they surface
+# immediately rather than being silently masked at runtime.
+_GEOM_EXC = (OSError, ValueError, TypeError, KeyError,
+             IndexError, RuntimeError,
+             GEOSException, TopologicalError)
 
 from .layout import (
     AEROWAY_FOR_ROLE,
@@ -248,7 +256,7 @@ def _emit_tunnel_portals(
                 continue
             try:
                 rcoords = list(s.polygon.exterior.coords)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if rcoords and rcoords[0] == rcoords[-1]:
                 rcoords = rcoords[:-1]
@@ -265,7 +273,7 @@ def _emit_tunnel_portals(
         try:
             lat, lon = _m_to_ll(cx, cy)
             return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-        except Exception:
+        except _GEOM_EXC:
             return None
     # Helper: orient ``o_nrefs`` so it starts at ``anchor_nid`` and
     # walks AWAY from ``anchor_nid``.  When the anchor is mid-way,
@@ -472,13 +480,13 @@ def _emit_tunnel_portals(
                 continue
             try:
                 rcoords = list(s.polygon.exterior.coords)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if len(rcoords) >= 2:
                 b_lines.append(_LS(rcoords))
         if b_lines:
             boundary_line = _uu(b_lines)
-    except Exception:
+    except _GEOM_EXC:
         boundary_line = None
 
     # Collect portal data: (portal_node_id, tunnel_wid, walk_pts,
@@ -509,7 +517,7 @@ def _emit_tunnel_portals(
                     if boundary_line.distance(
                             Point(px, py)) > max_boundary_dist_m:
                         continue
-                except Exception:
+                except _GEOM_EXC:
                     pass
             walk = _walk_surface(portal_nid, tw_id, arm_walk_max_m)
             if walk is None or len(walk) < 2:
@@ -577,7 +585,7 @@ def _emit_tunnel_portals(
                     plat, plon = _m_to_ll(*walk[i])
                     dem_h = _sample_dem(
                         dem, tile_lat, tile_lon, plat, plon)
-                except Exception:
+                except _GEOM_EXC:
                     dem_h = None
                 if dem_h is None:
                     continue
@@ -597,7 +605,7 @@ def _emit_tunnel_portals(
                 far_lat, far_lon = _m_to_ll(*far_xy)
                 far_dem = _sample_dem(
                     dem, tile_lat, tile_lon, far_lat, far_lon)
-            except Exception:
+            except _GEOM_EXC:
                 far_dem = None
             if far_dem is None:
                 far_dem = apt_elev
@@ -750,7 +758,7 @@ def _emit_tunnel_portals(
                     p = p.buffer(0)
                 if p.geom_type == "Polygon" and not p.is_empty:
                     return p
-            except Exception:
+            except _GEOM_EXC:
                 return None
             return None
         # 1) Cap wall AT the portal cluster's centroid, perpendicular
@@ -785,7 +793,7 @@ def _emit_tunnel_portals(
                     ref="tunnel_cap",
                     altitude=round(apt_elev, 1)))
                 exclusion_zones.append(cap_poly)
-        except Exception:
+        except _GEOM_EXC:
             pass
         # Per user 2026-05-04: the cap + arm walls form a continuous
         # "U" — arms touch the cap on both sides (their inner-front
@@ -933,7 +941,7 @@ def _emit_tunnel_portals(
                                 ref="tunnel_wall",
                                 altitude=round(apt_elev, 1)))
                             exclusion_zones.append(wp)
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
             # Ramp polygon (single segment, sloped).  Corners
             # share with adjacent segments via verts_perp.
@@ -1001,7 +1009,7 @@ def _emit_tunnel_portals(
                             altitude=round(
                                 0.5 * (eh + el), 1)))
                     exclusion_zones.append(rp)
-            except Exception:
+            except _GEOM_EXC:
                 pass
         n_emitted += 1
     # Boundary coordination: clip every ROLE_BOUNDARY shape so
@@ -1018,7 +1026,7 @@ def _emit_tunnel_portals(
     if exclusion_zones:
         try:
             tunnel_union = unary_union(exclusion_zones)
-        except Exception:
+        except _GEOM_EXC:
             tunnel_union = None
         if tunnel_union is None or tunnel_union.is_empty:
             return n_emitted
@@ -1036,7 +1044,7 @@ def _emit_tunnel_portals(
             # without elevation guidance was unrenderable.
             try:
                 _old_ring = list(s.polygon.exterior.coords)
-            except Exception:
+            except _GEOM_EXC:
                 _old_ring = []
             if _old_ring and _old_ring[0] == _old_ring[-1]:
                 _old_ring = _old_ring[:-1]
@@ -1044,7 +1052,7 @@ def _emit_tunnel_portals(
                           if s.node_altitudes else None)
             try:
                 new_poly = s.polygon.difference(excl_union)
-            except Exception:
+            except _GEOM_EXC:
                 kept_shapes.append(s)
                 continue
             if new_poly.is_empty:
@@ -1120,7 +1128,7 @@ def _scenery_has_bridge_objects(
         return False
     try:
         from . import dsf_reader as _DSFR
-    except Exception:
+    except _GEOM_EXC:
         return False
     dsf_path = _DSFR.find_associated_dsf(
         layout.apt_dat_path,
@@ -1140,7 +1148,7 @@ def _scenery_has_bridge_objects(
             _sp.run(
                 [tool, "--dsf2text", dsf_path, text_path],
                 check=True, capture_output=True, timeout=120)
-        except Exception:
+        except _GEOM_EXC:
             return False
     BRIDGE_RE = re.compile(
         r"(?i)bridge|elevated|viaduct|overpass")
@@ -1170,7 +1178,7 @@ def _scenery_has_bridge_objects(
                             placements.append((idx, lon, lat))
                         except ValueError:
                             continue
-    except Exception:
+    except _GEOM_EXC:
         return False
     if not bridge_def_idx or not placements:
         return False
@@ -1188,7 +1196,7 @@ def _scenery_has_bridge_objects(
     try:
         bridge_buf = unary_union(bridge_rects).buffer(
             bridge_proximity_m)
-    except Exception:
+    except _GEOM_EXC:
         return False
     for idx, lon_v, lat_v in placements:
         if idx not in bridge_def_idx:
@@ -1318,7 +1326,7 @@ def _emit_taxi_bridges(
                         ref="bridge_wall",
                         altitude=round(float(deck_elev), 1)))
                     exclusion_zones.append(wall_poly)
-            except Exception:
+            except _GEOM_EXC:
                 continue
         # Track the bridge rect itself so the boundary subtraction
         # below also clears the deck area.
@@ -1330,7 +1338,7 @@ def _emit_taxi_bridges(
     if exclusion_zones:
         try:
             bridge_union = unary_union(exclusion_zones)
-        except Exception:
+        except _GEOM_EXC:
             bridge_union = None
         if bridge_union is not None and not bridge_union.is_empty:
             try:
@@ -1342,7 +1350,7 @@ def _emit_taxi_bridges(
                         continue
                     try:
                         _old_ring = list(s.polygon.exterior.coords)
-                    except Exception:
+                    except _GEOM_EXC:
                         _old_ring = []
                     if (_old_ring
                             and _old_ring[0] == _old_ring[-1]):
@@ -1351,7 +1359,7 @@ def _emit_taxi_bridges(
                                   if s.node_altitudes else None)
                     try:
                         new_poly = s.polygon.difference(excl)
-                    except Exception:
+                    except _GEOM_EXC:
                         kept_shapes.append(s)
                         continue
                     if new_poly.is_empty:
@@ -1379,7 +1387,7 @@ def _emit_taxi_bridges(
                                           else None),
                                 node_altitudes=resampled))
                 layout.shapes = kept_shapes
-            except Exception:
+            except _GEOM_EXC:
                 pass
     return n_emitted
 
@@ -1481,7 +1489,7 @@ def _emit_underpass_road_approaches(
             continue
         try:
             ls = LineString(pts)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if ls.is_empty or ls.length < 5.0:
             continue
@@ -1503,7 +1511,7 @@ def _emit_underpass_road_approaches(
         for road_ls in road_lines:
             try:
                 inside = road_ls.intersection(s.polygon)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if inside.is_empty:
                 continue
@@ -1535,7 +1543,7 @@ def _emit_underpass_road_approaches(
                             role=ROLE_TUNNEL_RAMP,
                             ref="bridge_underpass",
                             altitude=round(low_elev, 1)))
-                except Exception:
+                except _GEOM_EXC:
                     pass
             # Approach + departure ramp chains.  Find the parts
             # of the road OUTSIDE the bridge polygon, then walk
@@ -1543,7 +1551,7 @@ def _emit_underpass_road_approaches(
             # per step.
             try:
                 outside = road_ls.difference(s.polygon)
-            except Exception:
+            except _GEOM_EXC:
                 outside = None
             if outside is None or outside.is_empty:
                 continue
@@ -1611,7 +1619,7 @@ def _emit_underpass_road_approaches(
                         dem1 = _sample_dem(
                             dem, tile_lat, tile_lon,
                             lat1_p, lon1_p)
-                    except Exception:
+                    except _GEOM_EXC:
                         dem0 = dem1 = None
                     if dem0 is None or dem1 is None:
                         break
@@ -1653,7 +1661,7 @@ def _emit_underpass_road_approaches(
                                     ref="bridge_approach",
                                     altitude=round(
                                         0.5 * (e0 + e1), 1)))
-                    except Exception:
+                    except _GEOM_EXC:
                         pass
                     u_prev = u_next
         n_processed += 1
@@ -1741,7 +1749,7 @@ def _emit_through_airport_depressed_roads(
         boundary_strict = boundary.buffer(-0.5)
         if boundary_strict.is_empty:
             boundary_strict = boundary
-    except Exception:
+    except _GEOM_EXC:
         boundary_strict = boundary
 
     # Load OSM airport-layer tile (for aeroway=bridge LineStrings).
@@ -1749,7 +1757,7 @@ def _emit_through_airport_depressed_roads(
         nodes_a, ways_a, _ = _load_osm_airports(
             xplane_root, icao,
             layout.anchor[0], layout.anchor[1])
-    except Exception:
+    except _GEOM_EXC:
         return (0, set())
     if not ways_a:
         return (0, set())
@@ -1791,7 +1799,7 @@ def _emit_through_airport_depressed_roads(
                 continue
             try:
                 rcoords = list(s.polygon.exterior.coords)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if rcoords and rcoords[0] == rcoords[-1]:
                 rcoords = rcoords[:-1]
@@ -1807,7 +1815,7 @@ def _emit_through_airport_depressed_roads(
         try:
             lat, lon = _m_to_ll(cx, cy)
             return _sample_dem(dem, tile_lat, tile_lon, lat, lon)
-        except Exception:
+        except _GEOM_EXC:
             return None
 
     # ── Bridge LineStrings (airport-layer OSM) ─────────────────
@@ -1825,7 +1833,7 @@ def _emit_through_airport_depressed_roads(
             continue
         try:
             ls = LineString(pts)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if ls.is_empty or ls.length < 5.0:
             continue
@@ -1858,7 +1866,7 @@ def _emit_through_airport_depressed_roads(
             continue
         try:
             ls = LineString(pts)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if ls.is_empty or ls.length < 5.0:
             continue
@@ -1873,7 +1881,7 @@ def _emit_through_airport_depressed_roads(
     for wid, ls, _nrefs in way_data:
         try:
             inside = ls.intersection(boundary)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if inside.is_empty:
             continue
@@ -1892,7 +1900,7 @@ def _emit_through_airport_depressed_roads(
                     if seg.distance(bls) < BRIDGE_PROXIMITY_M:
                         seed_depressed.add(wid)
                         break
-                except Exception:
+                except _GEOM_EXC:
                     continue
             if wid in seed_depressed:
                 break
@@ -1923,7 +1931,7 @@ def _emit_through_airport_depressed_roads(
             try:
                 if not boundary_strict.contains(Point(n_xy)):
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 continue
             for other_wid in node_to_ways.get(n, []):
                 if other_wid in depressed_set:
@@ -1935,7 +1943,7 @@ def _emit_through_airport_depressed_roads(
                 try:
                     if _o_ls.intersection(boundary).is_empty:
                         continue
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 depressed_set.add(other_wid)
                 queue.append(other_wid)
@@ -1967,7 +1975,7 @@ def _emit_through_airport_depressed_roads(
         # 1) Inside-boundary flat plate(s).
         try:
             inside = ls.intersection(boundary)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if inside.is_empty:
             continue
@@ -1989,7 +1997,7 @@ def _emit_through_airport_depressed_roads(
                     half_w, cap_style=2, join_style=2)
                 if not flat_poly.is_valid:
                     flat_poly = flat_poly.buffer(0)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if (flat_poly.is_empty
                     or flat_poly.geom_type != "Polygon"):
@@ -2010,7 +2018,7 @@ def _emit_through_airport_depressed_roads(
         #    polygons with bisector vertex sharing at bends.
         try:
             outside = ls.difference(boundary)
-        except Exception:
+        except _GEOM_EXC:
             outside = None
         if outside is None or outside.is_empty:
             continue
@@ -2030,12 +2038,12 @@ def _emit_through_airport_depressed_roads(
             try:
                 d_start = boundary.exterior.distance(
                     Point(coords[0]))
-            except Exception:
+            except _GEOM_EXC:
                 d_start = float('inf')
             try:
                 d_end = boundary.exterior.distance(
                     Point(coords[-1]))
-            except Exception:
+            except _GEOM_EXC:
                 d_end = float('inf')
             if d_end < d_start:
                 coords = list(reversed(coords))
@@ -2064,7 +2072,7 @@ def _emit_through_airport_depressed_roads(
                     plat, plon = _m_to_ll(*walk[i])
                     dem_h = _sample_dem(
                         dem, tile_lat, tile_lon, plat, plon)
-                except Exception:
+                except _GEOM_EXC:
                     dem_h = None
                 if dem_h is None:
                     continue
@@ -2082,7 +2090,7 @@ def _emit_through_airport_depressed_roads(
                 far_lat, far_lon = _m_to_ll(*far_xy)
                 far_dem = _sample_dem(
                     dem, tile_lat, tile_lon, far_lat, far_lon)
-            except Exception:
+            except _GEOM_EXC:
                 far_dem = None
             if far_dem is None:
                 far_dem = apt_elev
@@ -2176,7 +2184,7 @@ def _emit_through_airport_depressed_roads(
                             or rp.is_empty
                             or rp.area < 0.5):
                         continue
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 if abs(eh - el) >= 0.1:
                     layout.shapes.append(BuiltShape(
@@ -2197,7 +2205,7 @@ def _emit_through_airport_depressed_roads(
     if exclusion_zones:
         try:
             depressed_union = unary_union(exclusion_zones)
-        except Exception:
+        except _GEOM_EXC:
             depressed_union = None
         if (depressed_union is None
                 or depressed_union.is_empty):
@@ -2210,7 +2218,7 @@ def _emit_through_airport_depressed_roads(
                 continue
             try:
                 _old_ring = list(s.polygon.exterior.coords)
-            except Exception:
+            except _GEOM_EXC:
                 _old_ring = []
             if _old_ring and _old_ring[0] == _old_ring[-1]:
                 _old_ring = _old_ring[:-1]
@@ -2218,7 +2226,7 @@ def _emit_through_airport_depressed_roads(
                           if s.node_altitudes else None)
             try:
                 new_poly = s.polygon.difference(excl_union)
-            except Exception:
+            except _GEOM_EXC:
                 kept_shapes.append(s)
                 continue
             if new_poly.is_empty:
