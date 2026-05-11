@@ -36,6 +36,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
@@ -53,6 +54,11 @@ from ..layout import (
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
 )
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -110,7 +116,7 @@ def _decompose_polygon_with_holes(polygon: Polygon,
         spliced_coords = _splice_holes(clean)
         try:
             return [Polygon(spliced_coords).buffer(0)]
-        except Exception:
+        except _GEOM_EXC:
             return [Polygon(polygon.exterior.coords)]
     big_interiors.sort(key=lambda h: -Polygon(h).area)
     hole = big_interiors[0]
@@ -132,7 +138,7 @@ def _decompose_polygon_with_holes(polygon: Polygon,
                         (cx + span * ux, cy + span * uy)])
             try:
                 result = _shp_split(polygon, line)
-            except Exception:
+            except _GEOM_EXC:
                 return -1.0
             geoms = (list(getattr(result, "geoms", []))
                      if result.geom_type != "Polygon" else [result])
@@ -156,7 +162,7 @@ def _decompose_polygon_with_holes(polygon: Polygon,
 
     try:
         result = _shp_split(polygon, cut)
-    except Exception:
+    except _GEOM_EXC:
         # Fallback: emit the exterior with holes dropped.  Should
         # not occur for valid simple geometries.
         return [Polygon(polygon.exterior.coords)]
@@ -180,7 +186,7 @@ def _decompose_polygon_with_holes(polygon: Polygon,
     # cut-induced verts on each piece.
     try:
         natural_inter = polygon.exterior.intersection(cut)
-    except Exception:
+    except _GEOM_EXC:
         natural_inter = None
     natural_pts: List[Tuple[float, float]] = []
     if natural_inter is not None and not natural_inter.is_empty:
@@ -269,7 +275,7 @@ def _decompose_polygon_with_holes(polygon: Polygon,
             fixed = new_p.buffer(0)
             if (fixed.geom_type == "Polygon" and not fixed.is_empty):
                 return fixed
-        except Exception:
+        except _GEOM_EXC:
             pass
         return piece
 
@@ -318,7 +324,7 @@ def _polygon_min_thickness(poly: "Polygon") -> float:
             bx, by = coords[i + 1]
             sides.append(math.hypot(bx - ax, by - ay))
         return min(sides)
-    except Exception:
+    except _GEOM_EXC:
         return 0.0
 
 
@@ -361,7 +367,7 @@ def _merge_thin_decomposed_pieces(
             try:
                 shared = thin_boundary.intersection(
                     p.boundary).length
-            except Exception:
+            except _GEOM_EXC:
                 shared = 0.0
             if shared > best_share:
                 best_share = shared
@@ -386,7 +392,7 @@ def _merge_thin_decomposed_pieces(
                 continue
             work[best_j] = merged
             work[thin_idx] = None
-        except Exception:
+        except _GEOM_EXC:
             work[thin_idx] = None
     return [p for p in work if p is not None and not p.is_empty]
 
@@ -593,7 +599,7 @@ def _find_junction_points(
                     continue
                 try:
                     inter = ls1.intersection(ls2)
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 if inter.is_empty:
                     continue
@@ -716,7 +722,7 @@ def _build_junctions_from_rect_endpoints(
         ordered = sorted(uniq, key=lambda p: math.atan2(p[1]-cy, p[0]-cx))
         try:
             poly = Polygon(ordered).buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if poly.is_empty:
             continue
@@ -728,7 +734,7 @@ def _build_junctions_from_rect_endpoints(
         if terminal_union is not None:
             try:
                 poly = poly.difference(terminal_union)
-            except Exception:
+            except _GEOM_EXC:
                 pass
             if poly.is_empty:
                 continue
@@ -796,7 +802,7 @@ def _build_junction_constructive(
         try:
             if terminal_union.contains(cp):
                 return None
-        except Exception:
+        except _GEOM_EXC:
             pass
 
     # Gather rect ends near the cluster centroid.
@@ -825,7 +831,7 @@ def _build_junction_constructive(
     try:
         disc = cp.buffer(local_disc_radius_m)
         local_pav = pav_union.intersection(disc)
-    except Exception:
+    except _GEOM_EXC:
         return None
     if local_pav.is_empty:
         return None
@@ -862,7 +868,7 @@ def _build_junction_constructive(
         for c in (c1, c2):
             try:
                 param = ext_ls.project(Point(c))
-            except Exception:
+            except _GEOM_EXC:
                 continue
             proj_pt = ext_ls.interpolate(param)
             # If the projection is far (corner inside pav interior,
@@ -921,7 +927,7 @@ def _build_junction_constructive(
         return None
     try:
         poly = Polygon(poly_coords).buffer(0)
-    except Exception:
+    except _GEOM_EXC:
         return None
     if poly.is_empty:
         return None
@@ -933,7 +939,7 @@ def _build_junction_constructive(
     # Clip to the local pav (in case rect short-edges extend past it)
     try:
         poly = poly.intersection(local_pav)
-    except Exception:
+    except _GEOM_EXC:
         pass
     if poly.is_empty:
         return None
@@ -946,7 +952,7 @@ def _build_junction_constructive(
     if terminal_union is not None and not terminal_union.is_empty:
         try:
             poly = poly.difference(terminal_union)
-        except Exception:
+        except _GEOM_EXC:
             pass
         if poly.is_empty or poly.geom_type not in ("Polygon", "MultiPolygon"):
             return None
@@ -1022,7 +1028,7 @@ def _build_junction_polys_from_corners(
                          key=lambda p: math.atan2(p[1]-cy, p[0]-cx))
         try:
             poly = Polygon(ordered).buffer(0)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if poly.is_empty:
             continue
