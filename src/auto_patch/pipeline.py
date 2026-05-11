@@ -30,9 +30,17 @@ import os
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import (
     linemerge, nearest_points, transform as shp_transform, unary_union)
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes + file I/O.  Programming errors propagate so they surface
+# immediately rather than being silently masked at runtime.
+_GEOM_EXC = (OSError, ValueError, TypeError, KeyError,
+             IndexError, RuntimeError,
+             GEOSException, TopologicalError)
 
 import O4_File_Names as FNAMES
 import O4_UI_Utils as UI
@@ -193,7 +201,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
             layout.airport_boundary = _shp_transform(
                 lambda lon, lat, z=None: to_m(lon, lat),
                 apt.boundary)
-        except Exception:
+        except _GEOM_EXC:
             layout.airport_boundary = None
 
     # ── Runways ──────────────────────────────────────────────────
@@ -320,7 +328,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 + (f" (centerline shifted {offset:+.1f}m)"
                 if abs(offset) > 0.5 else "")
                 + f" — absorbed {len(absorbed)} shoulder polygon(s).")
-        except Exception:
+        except _GEOM_EXC:
             pass
 
     if absorbed_pav_indices:
@@ -377,7 +385,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         for pav_poly in apt_only_pav_polys:
             try:
                 ring = pav_poly.exterior
-            except Exception:
+            except _GEOM_EXC:
                 continue
             coords = list(ring.coords)
             if coords and coords[0] == coords[-1]:
@@ -471,7 +479,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
     if pav_polys:
         try:
             apt_pav_union = unary_union(pav_polys)
-        except Exception:
+        except _GEOM_EXC:
             apt_pav_union = None
         apt_pav_largest_area = max(
             (p.area for p in pav_polys), default=0.0)
@@ -543,7 +551,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
             gap = osm_aeroway_footprint.difference(apt_pav_union)
             if not gap.is_empty:
                 osm_gap = gap.buffer(DSF_OSM_GAP_BUFFER_M)
-        except Exception:
+        except _GEOM_EXC:
             pass
     # Compute the airport's bounding box from runway corners +
     # apt.dat pavement.  DSF polygons farther than
@@ -559,7 +567,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                by_min - DSF_AIRPORT_RADIUS_M,
                                bx_max + DSF_AIRPORT_RADIUS_M,
                                by_max + DSF_AIRPORT_RADIUS_M)
-        except Exception:
+        except _GEOM_EXC:
             apt_bbox_m = None
     try:
         if not LOAD_DSF_PAVEMENT:
@@ -645,7 +653,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                 n_dsf_dropped_outside_osm_gap += 1
                                 continue
                             pm = clipped_pm
-                        except Exception:
+                        except _GEOM_EXC:
                             pass
                     # Oversized-vs-apt.dat gate: a DSF polygon
                     # dramatically larger than the airport's
@@ -674,11 +682,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                     >= DSF_OVERLAY_FRAC):
                                 n_dsf_dropped_overlay += 1
                                 continue
-                        except Exception:
+                        except _GEOM_EXC:
                             pass
                     pav_polys.append(pm)
                     n_dsf_kept += 1
-                except Exception:
+                except _GEOM_EXC:
                     continue
         if (n_dsf_kept or n_dsf_dropped_overlay
                 or n_dsf_dropped_far or n_dsf_dropped_oversized
@@ -696,7 +704,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                     msg += (f", {n_dsf_dropped_outside_osm_gap} "
                             f"dropped: outside OSM-aeroway gap")
                 UI.vprint(1, msg + ".")
-            except Exception:
+            except _GEOM_EXC:
                 pass
     except StopIteration:
         # DSF read intentionally disabled.
@@ -704,9 +712,9 @@ def build_airport_pavement(icao: str, xplane_root: str,
             UI.vprint(1,
                 f"  [pav-builder] {icao}: DSF pavement read "
                 f"disabled (LOAD_DSF_PAVEMENT=False).")
-        except Exception:
+        except _GEOM_EXC:
             pass
-    except Exception:
+    except _GEOM_EXC:
         pass
     pav_union = unary_union(pav_polys) if pav_polys else None
     # Merge near-touching apt.dat polygons so the union is one big
@@ -763,14 +771,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                 if (g.geom_type == "Polygon"
                                         and not g.is_empty):
                                     apron_merged_regions.append(g)
-                except Exception:
+                except _GEOM_EXC:
                     continue
         if apron_merged_regions:
             try:
                 merged_union = unary_union(apron_merged_regions)
                 effective_runway = layout.runway_union.difference(
                     merged_union)
-            except Exception:
+            except _GEOM_EXC:
                 effective_runway = layout.runway_union
         else:
             effective_runway = layout.runway_union
@@ -875,7 +883,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 # Stash on the layout so the elevation pass can
                 # find them once DEM is loaded.
                 layout._groundside_polys = _gs_polys
-            except Exception:
+            except _GEOM_EXC:
                 layout._groundside_polys = []
             try:
                 pav_union = pav_union.difference(_ground_zone)
@@ -890,7 +898,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 for _p in pav_polys:
                     try:
                         _q = _p.difference(_ground_zone)
-                    except Exception:
+                    except _GEOM_EXC:
                         _new_pav_polys.append(_p)
                         continue
                     if _q.is_empty:
@@ -910,7 +918,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 for _p in apt_only_pav_polys:
                     try:
                         _q = _p.difference(_ground_zone)
-                    except Exception:
+                    except _GEOM_EXC:
                         _new_apt_only.append(_p)
                         continue
                     if _q.is_empty:
@@ -937,7 +945,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 for _p in apron_candidates:
                     try:
                         _q = _p.difference(_ground_zone)
-                    except Exception:
+                    except _GEOM_EXC:
                         _new_apron_cand.append(_p)
                         continue
                     if _q.is_empty:
@@ -957,11 +965,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         f"{_ground_zone.area:,.0f} m² of "
                         f"groundside pavement (terminal "
                         f"curbside / drop-off / parking).")
-                except Exception:
+                except _GEOM_EXC:
                     pass
-            except Exception:
+            except _GEOM_EXC:
                 pass
-    except Exception:
+    except _GEOM_EXC:
         pass
 
     # ── Per-ref OVERALL chord bearings (pre-split) ───────────────
@@ -1077,7 +1085,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                     if (not _corridor.is_empty
                             and _corridor.geom_type == "Polygon"):
                         parallel_corridors.append((_ref, _corridor))
-                except Exception:
+                except _GEOM_EXC:
                     pass
 
     # ── Pavement source-of-truth (user 2026-04-28): apt.dat row-110
@@ -1122,7 +1130,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                     and not simp.is_empty
                     and simp.area >= 100.0):
                 pad = simp
-        except Exception:
+        except _GEOM_EXC:
             pass
         terminal_polys.append(pad)
     terminal_union = (unary_union(terminal_polys)
@@ -1176,7 +1184,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 for _spine in parallel_spines:
                     try:
                         _x = _ls.intersection(_spine)
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
                     if _x.is_empty:
                         # Try extending the centerline ends to reach
@@ -1197,7 +1205,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                 _gd = min(
                                     Point(_gp).distance(_r)
                                     for _r in rwy_centerlines)
-                            except Exception:
+                            except _GEOM_EXC:
                                 _gd = 0.0
                             if _gd > _far:
                                 _far = _gd
@@ -1210,7 +1218,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                     # used to pick the closest spine intersection.
                     try:
                         _proj = _ls.project(Point(_pt))
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
                     _d = abs(_proj - _ls.length / 2)
                     if _d < best_d:
@@ -1250,7 +1258,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         try:
             rwy_buffered = layout.runway_union.buffer(
                 RWY_JUNCTION_BUFFER_M)
-        except Exception:
+        except _GEOM_EXC:
             rwy_buffered = layout.runway_union
         # Nearest-runway bearing for angle check
         def _perp_diff_to_runway(ls: LineString) -> float:
@@ -1295,7 +1303,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _buf = rwy_buffered
             try:
                 diff = ls.difference(_buf)
-            except Exception:
+            except _GEOM_EXC:
                 trimmed_centerlines.append((ls, ref))
                 continue
             if diff.is_empty:
@@ -1368,12 +1376,12 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 try:
                     parallel_polys.append(
                         ls.buffer(PARALLEL_BUFFER_M))
-                except Exception:
+                except _GEOM_EXC:
                     pass
         if parallel_polys:
             try:
                 parallel_union = unary_union(parallel_polys)
-            except Exception:
+            except _GEOM_EXC:
                 parallel_union = None
             if parallel_union is not None and not parallel_union.is_empty:
                 def _perp_diff_to_rwy(ls):
@@ -1415,7 +1423,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         continue
                     try:
                         diff = ls.difference(parallel_union)
-                    except Exception:
+                    except _GEOM_EXC:
                         trimmed_perp.append((ls, ref))
                         continue
                     if diff.is_empty:
@@ -1482,7 +1490,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                     continue
                 try:
                     diff = current.difference(corridor)
-                except Exception:
+                except _GEOM_EXC:
                     continue
                 if diff.is_empty:
                     continue
@@ -1576,7 +1584,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                         rect.intersects(layout.runway_union)
                         or rect.distance(layout.runway_union) < 2.0):
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 pass
             reaches_runway = False
             for (px, py) in raw_endpoints_by_ref.get(ref, []):
@@ -1677,7 +1685,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                             break
                         else:
                             drop_idx.add(j)
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
             if drop_idx:
                 kept = [k for idx, k in enumerate(kept)
@@ -1689,7 +1697,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                     f"  [pav-builder] {icao}: dropped "
                     f"{len(taxi_rects) - len(kept)} taxi rect(s) "
                     f"that overlapped another rect.")
-            except Exception:
+            except _GEOM_EXC:
                 pass
             taxi_rects = kept
 
@@ -1737,7 +1745,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
             continue
         try:
             _ls = LineString(_pts)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if _ls.is_empty or _ls.length < 5.0:
             continue
@@ -1763,7 +1771,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
                             >= 0.5 * _axis.length):
                         bridge_rect_indices.add(ri)
                         break
-                except Exception:
+                except _GEOM_EXC:
                     continue
 
     # ── Hole-aware sloping-edge snap (user 2026-05-04) ────────────
