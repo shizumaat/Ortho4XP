@@ -160,20 +160,17 @@ def read_dsf_pavements(
                     [tool, "--dsf2text", dsf_path, text_path],
                     check=True, capture_output=True, timeout=120,
                 )
-        except Exception as exc:
-            try:
-                UI.vprint(1,
-                    f"  [dsf-reader] WARN: DSFTool failed on "
-                    f"{os.path.basename(dsf_path)}: {exc}")
-            except Exception:
-                pass
+        except (OSError, subprocess.SubprocessError) as exc:
+            UI.vprint(1,
+                f"  [dsf-reader] WARN: DSFTool failed on "
+                f"{os.path.basename(dsf_path)}: {exc}")
             return []
 
     try:
         with open(text_path, "r", encoding="utf-8",
                   errors="replace") as f:
             lines = f.readlines()
-    except Exception:
+    except OSError:
         return []
 
     # Pass 1: collect POLYGON_DEFs in order; track which indices

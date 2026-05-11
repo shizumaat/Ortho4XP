@@ -29,12 +29,18 @@ from typing import Dict, List, Optional, Tuple
 
 import O4_UI_Utils as UI
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, Polygon
 
 from . import apt_dat_reader as APR
 from .pavement import strips as PS
 
 from .config import SLIVER_ANGLE_THRESHOLD_DEG
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 __all__ = [
     "BuiltShape",
@@ -304,7 +310,7 @@ class PavementLayout:
                                 1)
                         s.node_altitudes = None
                     poly = repaired
-                except Exception:
+                except _GEOM_EXC:
                     continue
             # Pass node_altitudes alongside ring coords so dedup of
             # duplicate nids drops the matching elevations too,
@@ -332,14 +338,11 @@ class PavementLayout:
                 check_poly = Polygon(
                     [(lon, lat) for lat, lon in latlon_ring])
                 if not check_poly.is_valid:
-                    try:
-                        UI.vprint(1,
-                            f"  [pav-builder] WARN: dropping "
-                            f"invalid polygon (role={s.role}, "
-                            f"nids={len(ext_nids) - 1}): "
-                            f"X-Plane mesh builder would crash.")
-                    except Exception:
-                        pass
+                    UI.vprint(1,
+                        f"  [pav-builder] WARN: dropping "
+                        f"invalid polygon (role={s.role}, "
+                        f"nids={len(ext_nids) - 1}): "
+                        f"X-Plane mesh builder would crash.")
                     continue
                 # Sliver-corner safety net: if any interior angle is
                 # below SLIVER_ANGLE_THRESHOLD_DEG, drop the polygon.
@@ -370,17 +373,14 @@ class PavementLayout:
                             math.acos(max(-1.0, min(1.0, cos))))
                         break
                 if worst_ang is not None:
-                    try:
-                        UI.vprint(1,
-                            f"  [pav-builder] WARN: dropping "
-                            f"sliver-corner polygon (role={s.role}, "
-                            f"nids={len(ext_nids) - 1}, "
-                            f"min angle {worst_ang:.2f}°): "
-                            f"X-Plane mesh builder would crash.")
-                    except Exception:
-                        pass
+                    UI.vprint(1,
+                        f"  [pav-builder] WARN: dropping "
+                        f"sliver-corner polygon (role={s.role}, "
+                        f"nids={len(ext_nids) - 1}, "
+                        f"min angle {worst_ang:.2f}°): "
+                        f"X-Plane mesh builder would crash.")
                     continue
-            except Exception:
+            except _GEOM_EXC:
                 continue
             tags = {
                 "aeroway": AEROWAY_FOR_ROLE.get(s.role, "taxiway"),

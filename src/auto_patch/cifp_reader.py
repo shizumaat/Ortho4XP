@@ -151,7 +151,7 @@ def parse_cifp_file(filepath):
                     "elevation_m": elevation_m,
                     "displaced_m": displaced_m,
                 }
-    except Exception as e:
+    except (OSError, ValueError, IndexError, KeyError) as e:
         UI.vprint(
             1,
             "   Warning: Could not parse CIFP file",
@@ -231,7 +231,7 @@ def xplane_root_from_cifp_path(cifp_path):
         if (os.path.isdir(os.path.join(root, "Custom Scenery"))
                 or os.path.isdir(os.path.join(root, "Resources"))):
             return root
-    except Exception:
+    except OSError:
         pass
     return None
 

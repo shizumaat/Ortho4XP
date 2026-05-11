@@ -15,6 +15,15 @@ from math import cos, sin, pi, sqrt, floor, atan2, acos
 
 from shapely import geometry as shp_geom
 from shapely import ops as shp_ops
+from shapely.errors import GEOSException, TopologicalError
+
+# Driver harness tuple — covers expected runtime failure modes for a
+# per-airport pass.  Specifically OMITS NameError / AttributeError /
+# ImportError so typos and broken imports propagate immediately
+# rather than being silently logged and skipped.
+_DRIVER_EXC = (OSError, ValueError, TypeError, KeyError,
+               IndexError, RuntimeError,
+               GEOSException, TopologicalError)
 
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
@@ -293,7 +302,7 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                 current_tile_lat=tile_lat,
                 current_tile_lon=tile_lon,
             )
-        except Exception as _e:
+        except _DRIVER_EXC as _e:
             UI.vprint(
                 1, "   Auto-patch: Pavement builder failed for",
                 icao, ":", str(_e))
@@ -318,7 +327,7 @@ def generate_auto_patches(tile, cifp_path, taxiway_data=None,
                 1, "   Auto-patch: Generated", icao,
                 "(" + summary + ")")
             auto_patched.append(icao)
-        except Exception as e:
+        except _DRIVER_EXC as e:
             UI.vprint(
                 1,
                 "   Auto-patch: Failed to write",
