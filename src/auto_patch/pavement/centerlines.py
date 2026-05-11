@@ -26,10 +26,16 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import linemerge
 
 from ..config import MIN_SEGMENT_LEN_M
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 # RDP simplification tolerance applied after per-ref linemerge.
@@ -164,7 +170,7 @@ def _extract_osm_taxi_centerlines(
             continue
         try:
             ls = LineString(pts)
-        except Exception:
+        except _GEOM_EXC:
             continue
         if ls.is_empty or ls.length < 5.0:
             continue
@@ -176,7 +182,7 @@ def _extract_osm_taxi_centerlines(
         if len(lines) > 1:
             try:
                 merged = linemerge(MultiLineString(lines))
-            except Exception:
+            except _GEOM_EXC:
                 merged = None
             if merged is None or merged.is_empty:
                 merged_lines = lines
@@ -202,7 +208,7 @@ def _extract_osm_taxi_centerlines(
             try:
                 simp = ls.simplify(RDP_SIMPLIFY_TOL_M,
                                    preserve_topology=False)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             scoords = list(simp.coords)
             if len(scoords) < 2:
@@ -281,7 +287,7 @@ def _extract_osm_taxi_centerlines(
                         if ep0_near or ep1_near:
                             out.append((simp, ref))
                             continue
-                except Exception:
+                except _GEOM_EXC:
                     pass
             # All refs (including sub-refs) split at significant
             # bends.  Per user (2026-04-20 refined): intersections
@@ -384,7 +390,7 @@ def _extract_osm_taxi_centerlines(
                         continue
                     try:
                         seg = LineString(scoords[i0:i1 + 1])
-                    except Exception:
+                    except _GEOM_EXC:
                         continue
                     if seg.is_empty or seg.length < MIN_SEGMENT_LEN_M:
                         continue
@@ -443,7 +449,7 @@ def _insert_points_on_ring(
         try:
             param = ring.project(p)
             proj = ring.interpolate(param)
-        except Exception:
+        except _GEOM_EXC:
             continue
         inserts.append((param, (proj.x, proj.y)))
     if not inserts:
@@ -499,7 +505,7 @@ def _insert_points_on_boundary(
         if (new_poly.geom_type == "Polygon"
                 and new_poly.is_valid and not new_poly.is_empty):
             return new_poly
-    except Exception:
+    except _GEOM_EXC:
         pass
     return poly
 
@@ -573,7 +579,7 @@ def _split_by_width_profile(
         for (s, e) in intervals:
             try:
                 seg = substring(ls, s, e)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if (seg.geom_type == "LineString"
                     and not seg.is_empty
@@ -688,7 +694,7 @@ def _sub_ref_narrow_corridor(
             return None
         try:
             seg = substring(ls, s_t, e_t)
-        except Exception:
+        except _GEOM_EXC:
             return None
         if (seg.geom_type != "LineString"
                 or seg.is_empty
@@ -773,7 +779,7 @@ def _split_centerlines_at_points(
     if pav_for_probe is not None and rwy_union is not None:
         try:
             pav_for_probe = pav_for_probe.union(rwy_union)
-        except Exception:
+        except _GEOM_EXC:
             pass
 
     # Per user 2026-04-28: at sub-segment endpoints that are SHARED
@@ -796,7 +802,7 @@ def _split_centerlines_at_points(
         try:
             cs = list(ls.coords)
             centerline_endpoints.append((cs[0], cs[-1]))
-        except Exception:
+        except _GEOM_EXC:
             centerline_endpoints.append(((0.0, 0.0), (0.0, 0.0)))
 
     def _is_bend_shared(idx: int, endpoint: Tuple[float, float]) -> bool:
@@ -947,7 +953,7 @@ def _split_centerlines_at_points(
             _ls_cs = list(ls.coords)
             _start_endpoint = _ls_cs[0]
             _end_endpoint = _ls_cs[-1]
-        except Exception:
+        except _GEOM_EXC:
             _start_endpoint = (0.0, 0.0)
             _end_endpoint = (0.0, 0.0)
         start_is_bend = _is_bend_shared(ls_idx, _start_endpoint)
@@ -966,7 +972,7 @@ def _split_centerlines_at_points(
                 continue
             try:
                 param = ls.project(sp)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             if param < endpoint_guard_m:
                 continue
@@ -999,7 +1005,7 @@ def _split_centerlines_at_points(
                     mid_hw = _avg_perp_halfwidth(ls, (prev + p) / 2.0)
                     if mid_hw > narrow_hw * WIDEN_FACTOR:
                         merge = True
-                except Exception:
+                except _GEOM_EXC:
                     pass
             if merge:
                 clusters[-1].append(p)
@@ -1071,7 +1077,7 @@ def _split_centerlines_at_points(
                                 d_to_rwy = mid.distance(rmid)
                                 if d_perp <= 20.0 and d_to_rwy > 250.0:
                                     is_cross = True
-            except Exception:
+            except _GEOM_EXC:
                 pass
         for idx, (p0, p1) in enumerate(candidates):
             gap = p1 - p0
@@ -1112,7 +1118,7 @@ def _split_centerlines_at_points(
                             seg_perp = abs(seg_delta - 90.0)
                             if seg_perp >= 75.0:
                                 is_short_parallel_slice = True
-                except Exception:
+                except _GEOM_EXC:
                     pass
             if is_short_parallel_slice:
                 # Shrink to half length, no bias (it's parallel,
@@ -1198,7 +1204,7 @@ def _split_centerlines_at_points(
                         break
                     try:
                         hw_here = _avg_perp_halfwidth(ls, t)
-                    except Exception:
+                    except _GEOM_EXC:
                         hw_here = 0.0
                     if 0 < hw_here <= target_hw:
                         return u
@@ -1221,7 +1227,7 @@ def _split_centerlines_at_points(
                 continue
             try:
                 piece = substring(ls, rect_p0, rect_p1)
-            except Exception:
+            except _GEOM_EXC:
                 continue
             # Drop short between-junction fragments (< 40 m).  Target
             # cross_connector smallest = 52 m, Q smallest = 59 m,
