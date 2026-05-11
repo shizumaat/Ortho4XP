@@ -38,8 +38,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterator, List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -275,7 +281,7 @@ def load_airport(
                         merged = unary_union([airport.boundary, poly])
                         if isinstance(merged, Polygon):
                             airport.boundary = merged
-                    except Exception:
+                    except _GEOM_EXC:
                         pass
             boundary_rows.clear()
 
@@ -363,7 +369,7 @@ def load_airport(
                     sd = pi.polygon.symmetric_difference(pj.polygon)
                     if sd.area / u.area < 0.01:
                         dropped.add(j)
-                except Exception:
+                except _GEOM_EXC:
                     continue
         if dropped:
             airport.pavements = [
@@ -490,7 +496,7 @@ def _index_apt_dat(aptdat_path: str) -> Tuple[frozenset, frozenset]:
         # Close out the last block at EOF.
         if current is not None and saw_pavement_in_current:
             with_pavement.add(current)
-    except Exception:
+    except OSError:
         # Cache an empty result so we don't re-attempt every call.
         result = (frozenset(), frozenset())
         _APT_DAT_INDEX_CACHE[key] = result
@@ -551,7 +557,7 @@ def _read_airport_block(aptdat_path: str, icao: str) -> Optional[List[str]]:
                             continue
                 if in_block:
                     block.append(line)
-    except Exception:
+    except OSError:
         return None
     return block if in_block else None
 
@@ -638,7 +644,7 @@ def _parse_pavement(rows: List[List[str]],
 
     try:
         polygon = Polygon(rings[0], rings[1:] if len(rings) > 1 else None)
-    except Exception:
+    except _GEOM_EXC:
         return None
     if not polygon.is_valid:
         polygon = polygon.buffer(0)
@@ -653,7 +659,7 @@ def _parse_pavement(rows: List[List[str]],
         if hasattr(polygon, "geoms"):
             try:
                 polygon = max(polygon.geoms, key=lambda g: g.area)
-            except Exception:
+            except _GEOM_EXC:
                 return None
         else:
             return None
@@ -693,7 +699,7 @@ def _parse_boundary(rows: List[List[str]],
         return None
     try:
         poly = Polygon(rings[0], rings[1:] if len(rings) > 1 else None)
-    except Exception:
+    except _GEOM_EXC:
         return None
     if not poly.is_valid:
         poly = poly.buffer(0)

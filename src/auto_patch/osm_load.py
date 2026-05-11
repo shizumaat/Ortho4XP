@@ -27,6 +27,7 @@ import math
 import os
 from typing import Dict, List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiPolygon, Polygon
 from shapely.ops import unary_union
 
@@ -36,6 +37,13 @@ import O4_UI_Utils as UI
 from . import apt_dat_reader as APR
 from .layout import R_EARTH
 from .pavement.runways import _runway_rect_m
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+# Includes ``OSError`` because osm_load mixes shapely ops with file
+# I/O (apt.dat / OSM cache reads, Overpass downloads).
+_GEOM_EXC = (OSError, ValueError, TypeError, KeyError,
+             GEOSException, TopologicalError, IndexError)
 
 
 __all__ = [
@@ -135,7 +143,7 @@ def _load_osm_airports(xplane_root: str, icao: str,
                     f"  [pav-builder] WARN: Overpass download failed "
                     f"for airports tile +{base_lat}{base_lon:+04d}; "
                     f"junctions/rects will be empty.")
-        except Exception as exc:
+        except _GEOM_EXC as exc:
             UI.vprint(1,
                 f"  [pav-builder] WARN: airport OSM download error: "
                 f"{exc}")
@@ -275,7 +283,7 @@ def _score_apt_dat_against_osm(
     """
     try:
         apt = APR.load_airport(apt_path, icao)
-    except Exception:
+    except _GEOM_EXC:
         return (0.0, 0.0)
     if apt is None:
         return (0.0, 0.0)
@@ -317,7 +325,7 @@ def _score_apt_dat_against_osm(
                     if (g.geom_type == "Polygon"
                             and not g.is_empty):
                         pav_polys_m.append(g)
-        except Exception:
+        except _GEOM_EXC:
             continue
     # Also include runway rects so a taxi centerline that ends on
     # the runway counts as covered.
@@ -326,13 +334,13 @@ def _score_apt_dat_against_osm(
             rect = _runway_rect_m(rwy, to_m)
             if rect is not None and not rect.is_empty:
                 pav_polys_m.append(rect)
-        except Exception:
+        except _GEOM_EXC:
             continue
     if not pav_polys_m:
         return (0.0, 0.0)
     try:
         pav_union = unary_union(pav_polys_m)
-    except Exception:
+    except _GEOM_EXC:
         return (0.0, 0.0)
     if pav_union.is_empty:
         return (0.0, 0.0)
@@ -365,7 +373,7 @@ def _score_apt_dat_against_osm(
                     inter = poly.intersection(pav_union)
                     if not inter.is_empty:
                         apron_inside += inter.area
-                except Exception:
+                except _GEOM_EXC:
                     continue
         elif ay == "taxiway":
             # Open ways (centerlines).  Closed taxi polygons are
@@ -391,7 +399,7 @@ def _score_apt_dat_against_osm(
                         for g in inter.geoms:
                             if hasattr(g, "length"):
                                 taxi_inside += g.length
-            except Exception:
+            except _GEOM_EXC:
                 continue
     apron_cov = (apron_inside / apron_total
                   if apron_total > 0 else 1.0)
@@ -440,7 +448,7 @@ def _pick_best_apt_dat_against_osm(
             if (anchor_apt is not None
                     and anchor_apt.runways):
                 break
-        except Exception:
+        except _GEOM_EXC:
             continue
     if anchor_apt is None or not anchor_apt.runways:
         return APR.find_airport_apt_dat(xplane_root, icao)
@@ -448,7 +456,7 @@ def _pick_best_apt_dat_against_osm(
     try:
         nodes_o, ways_o, _ = _load_osm_airports(
             xplane_root, icao, r0.lat_a, r0.lon_a)
-    except Exception:
+    except _GEOM_EXC:
         return APR.find_airport_apt_dat(xplane_root, icao)
     if not ways_o:
         return APR.find_airport_apt_dat(xplane_root, icao)
@@ -464,31 +472,25 @@ def _pick_best_apt_dat_against_osm(
         passed = ac >= apron_threshold and tc >= taxi_threshold
         if passed and chosen is None:
             chosen = cand
-        try:
-            import sys as _sys
-            label = "PICK" if (passed and cand == chosen) else (
-                "ok" if passed else "skip")
-            UI.vprint(1,
-                f"  [pav-builder] {icao}: apt.dat candidate "
-                f"[{label}] apron={ac:.0%} taxi={tc:.0%}  "
-                f"{cand}")
-        except Exception:
-            pass
+        import sys as _sys
+        label = "PICK" if (passed and cand == chosen) else (
+            "ok" if passed else "skip")
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: apt.dat candidate "
+            f"[{label}] apron={ac:.0%} taxi={tc:.0%}  "
+            f"{cand}")
     if chosen is not None:
         return chosen
     # Nothing qualified — pick whichever has the highest
     # combined coverage to avoid emitting nothing.
     if scores:
         scores.sort(key=lambda s: -(s[1] + s[2]))
-        try:
-            UI.vprint(1,
-                f"  [pav-builder] {icao}: no apt.dat met "
-                f"thresholds (apron≥{apron_threshold:.0%}, "
-                f"taxi≥{taxi_threshold:.0%}); falling back to "
-                f"highest combined coverage: "
-                f"apron={scores[0][1]:.0%} taxi={scores[0][2]:.0%}.")
-        except Exception:
-            pass
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: no apt.dat met "
+            f"thresholds (apron≥{apron_threshold:.0%}, "
+            f"taxi≥{taxi_threshold:.0%}); falling back to "
+            f"highest combined coverage: "
+            f"apron={scores[0][1]:.0%} taxi={scores[0][2]:.0%}.")
         return scores[0][0]
     return APR.find_airport_apt_dat(xplane_root, icao)
 

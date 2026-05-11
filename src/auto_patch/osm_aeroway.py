@@ -13,7 +13,14 @@ Public API:
     extract_road_info(dico_airports, tile, road_layer=None)
                                      — big-roads near airport boundaries
 """
+from shapely.errors import GEOSException, TopologicalError
+
 import O4_UI_Utils as UI
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError, KeyError,
+             GEOSException, TopologicalError, IndexError)
 
 __all__ = [
     "extract_taxiway_info",
@@ -151,7 +158,7 @@ def extract_building_info(airport_layer, dico_airports, tile,
                             "footprint": coords,
                             "source": source_label,
                         })
-                except Exception:
+                except _GEOM_EXC:
                     pass
 
             # 2a: Terminal ways
@@ -228,16 +235,16 @@ def extract_building_info(airport_layer, dico_airports, tile,
                                             > 0.5 * bldg_rel.area):
                                         is_dup = True
                                         break
-                                except Exception:
+                                except _GEOM_EXC:
                                     pass
                             if not is_dup:
                                 buildings.append({
                                     "footprint": coords,
                                     "source": "building",
                                 })
-                    except Exception:
+                    except _GEOM_EXC:
                         pass
-            except Exception:
+            except _GEOM_EXC:
                 pass
 
         if buildings:
@@ -323,7 +330,7 @@ def extract_road_info(dico_airports, tile, road_layer=None):
                     ls = shp_geom.LineString(road_rel)
                     if not boundary_buf.intersects(ls):
                         continue
-                except Exception:
+                except _GEOM_EXC:
                     continue
 
                 is_tunnel = wtags.get("tunnel") in ("yes", "building_passage")
@@ -334,7 +341,7 @@ def extract_road_info(dico_airports, tile, road_layer=None):
                     "tunnel": is_tunnel,
                     "bridge": is_bridge,
                 })
-        except Exception:
+        except _GEOM_EXC:
             pass
 
         if roads:
