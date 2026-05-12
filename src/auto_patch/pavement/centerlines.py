@@ -58,6 +58,7 @@ __all__ = [
     "SIGNIFICANT_BEND_DEG",
     "_bridge_same_ref_polylines",
     "_extract_osm_taxi_centerlines",
+    "_find_width_transition_breakpoints",
     "_insert_points_on_boundary",
     "_insert_points_on_ring",
     "_split_by_width_profile",
@@ -760,6 +761,115 @@ def _sub_ref_narrow_corridor(
     return result
 
 
+
+
+def _find_width_transition_breakpoints(
+    centerlines: List[Tuple[LineString, str]],
+    pav_union: Polygon,
+    widen_factor: float = 1.5,
+    n_probes_per_100m: float = 0.5,
+    min_probes: int = 12,
+    max_probes: int = 60,
+) -> List[Tuple[float, float]]:
+    """Find axial positions along each centerline where the
+    perpendicular half-width transitions between "narrow" and
+    "wide" zones.  Each transition is added to the global
+    junction-points list so downstream ``_split_centerlines_at_points``
+    can split the centerline at width-change locations.
+
+    Per user 2026-05-12: apt.dat row-1202 has fewer, longer taxi
+    edges than OSM aeroway — a single 500 m apt.dat V edge can
+    span multiple pavement-width regimes (constant 41 m corridor +
+    61 m widened section near an apron-merge), where the OSM
+    target had each regime represented by a separate way.
+    Width-transition detection finds these regime boundaries
+    geometrically and adds them as split points so V (and similar
+    long-edge apt.dat taxis) get the same multi-rect breakdown
+    target uses.
+
+    Algorithm per centerline:
+      1. Probe perpendicular half-width at evenly-spaced axial
+         positions (``_perpendicular_half_at`` from rects.py).
+      2. ``narrow_hw`` = MIN probe value.
+      3. Walk probes in order; track NARROW vs WIDE state
+         (wide = hw > narrow_hw * widen_factor).
+      4. On any state change, emit a breakpoint at the midpoint
+         between the two adjacent probes.
+
+    Endpoint probes do NOT emit breakpoints (the centerline
+    endpoint is already a natural breakpoint or junction).
+    """
+    from .rects import _natural_half_width
+    if pav_union is None or pav_union.is_empty:
+        return []
+
+    RAY_CAP_M = 40.0
+    RAY_STEP_M = 0.5
+
+    def _perp_hw_at(ls: LineString, t: float) -> float:
+        dt = min(2.0, ls.length * 0.05)
+        t0 = max(0.0, t - dt)
+        t1 = min(ls.length, t + dt)
+        a = ls.interpolate(t0)
+        b = ls.interpolate(t1)
+        tx, ty = b.x - a.x, b.y - a.y
+        mag = math.hypot(tx, ty)
+        if mag < 1e-6:
+            return 0.0
+        ux, uy = tx / mag, ty / mag
+        nx, ny = -uy, ux
+        pt = ls.interpolate(t)
+        ox, oy = pt.x, pt.y
+        sides: List[float] = []
+        for sign in (-1, 1):
+            side = RAY_CAP_M
+            d = 0.0
+            while d <= RAY_CAP_M:
+                qx = ox + sign * nx * d
+                qy = oy + sign * ny * d
+                if not pav_union.contains(Point(qx, qy)):
+                    side = d
+                    break
+                d += RAY_STEP_M
+            sides.append(side)
+        return sum(sides) / 2.0 if sides else 0.0
+
+    breakpoints: List[Tuple[float, float]] = []
+    for ls, _ref in centerlines:
+        if ls.length < 60.0:
+            continue
+        n_probes = max(min_probes, min(max_probes,
+                                        int(ls.length * n_probes_per_100m
+                                            / 100.0)))
+        probes: List[Tuple[float, float]] = []  # (t, hw)
+        for k in range(n_probes):
+            t = (k + 0.5) / n_probes * ls.length
+            hw = _perp_hw_at(ls, t)
+            if hw > 0.1:
+                probes.append((t, hw))
+        if len(probes) < 4:
+            continue
+        narrow_hw = min(p[1] for p in probes)
+        if narrow_hw < 3.0:
+            continue
+        threshold = narrow_hw * widen_factor
+        prev_wide = probes[0][1] > threshold
+        for i in range(1, len(probes)):
+            t_i, hw_i = probes[i]
+            curr_wide = hw_i > threshold
+            if curr_wide != prev_wide:
+                # Transition between probe i-1 and probe i.
+                # Emit breakpoint at the midpoint.
+                t_mid = 0.5 * (probes[i - 1][0] + t_i)
+                # Skip if very close to either endpoint.
+                if (t_mid < 30.0
+                        or t_mid > ls.length - 30.0):
+                    prev_wide = curr_wide
+                    continue
+                pt = ls.interpolate(t_mid)
+                breakpoints.append((pt.x, pt.y))
+                prev_wide = curr_wide
+    return breakpoints
 
 
 def _split_centerlines_at_points(

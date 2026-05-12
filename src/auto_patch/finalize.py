@@ -56,6 +56,7 @@ from .elevation import (
     _report_within_shape_violations,
     _smooth_within_junction_adjacent_pair_grade,
     _snap_junction_altitudes_to_rect_corners,
+    _split_sloped_rects_at_violations,
 )
 from .groundside import (
     _drop_groundside_orphan_junctions,
@@ -172,6 +173,10 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     # the merge pass above can't catch it.  Visible as a thin
     # residue strip along diagonal-stub sloping edges.
     _drop_thin_orphan_slivers(layout, icao=icao)
+    # Note: _split_sloped_rects_at_violations runs from pipeline.py
+    # AFTER per_surface_solve has populated altitude_high/_low on
+    # rect shapes.  Calling it here (before solver) would find
+    # zero candidates because rects have None altitudes here.
     # Per user 2026-05-03: when the per-surface solver is on,
     # geometry passes above (overlap clip, push-off, sliver merge)
     # may have moved or added vertices since the solver finished.

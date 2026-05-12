@@ -144,6 +144,7 @@ __all__ = [
     "_load_airport_dem",
     "_match_elev",
     "_merge_sliver_junctions_into_neighbours",
+    "_split_sloped_rects_at_violations",
     "_orient_rect_for_altitude",
     "_planar_fit",
     "_planar_fit_residuals",
@@ -2563,6 +2564,7 @@ from .junction_repair import (
     _clamp_junction_free_vertices,
     _drop_thin_orphan_slivers,
     _merge_sliver_junctions_into_neighbours,
+    _split_sloped_rects_at_violations,
     _subdivide_violating_junctions,
 )
 

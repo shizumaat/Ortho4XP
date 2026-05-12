@@ -1136,3 +1136,207 @@ def _drop_thin_orphan_slivers(
     return len(to_drop)
 
 
+def _split_sloped_rects_at_violations(
+        layout: "PavementLayout",
+        icao: str = "",
+        on_edge_tol_m: float = 1.5,
+        min_t_margin: float = 0.05,
+        ) -> int:
+    """Split sloped 4-corner rects when a junction vertex lies on
+    one of their sloping (long) edges.
+
+    A sloped rect carries ``altitude_high`` / ``altitude_low`` with
+    the canonical [high, low, low, high] corner order (corners 0/3
+    are HIGH, corners 1/2 are LOW).  Junction polygons MUST share
+    runway/rect vertices only on the SHORT edges (corners 0-3 or
+    1-2); a junction vertex on a sloping edge (0-1 or 3-2) creates
+    a 4-corner-rect topology violation where the rect's continuous
+    high→low slope on that side has a foreign vertex in the
+    middle.  When the per-vertex altitude solver runs, the
+    junction's altitude at the violating vertex disagrees with the
+    rect's interpolated altitude, producing a visible step (the
+    SPJC pavement-grade test catches these as mid-edge violations
+    against primary_parallel V).
+
+    For each violation, split the rect at the violating vertex's
+    axial position into two sloped sub-rects.  Both sub-rects
+    remain 4-corner sloped rects with their own altitude_high /
+    altitude_low.  The violating vertex now coincides with a
+    sub-rect's short-edge corner instead of sitting on a
+    sloping edge — topology fixed.
+
+    Per user 2026-05-12: this addresses sloping-edge violations
+    introduced when the width-transition splitter
+    (_find_width_transition_breakpoints) creates V parallel rects
+    in regions target treats as junction territory.  The new
+    rects' sloping edges then pass through adjacent junction
+    polygons, picking up junction vertices.
+
+    Returns the number of rect splits performed.
+    """
+    SLOPED_ROLES = (
+        ROLE_STUB, ROLE_PRIMARY_PARALLEL,
+        ROLE_SECONDARY_PARALLEL, ROLE_CROSS_CONNECTOR,
+    )
+    on_edge_tol2 = on_edge_tol_m * on_edge_tol_m
+
+    # Collect candidate sloped rects.
+    candidates: List[int] = []
+    for i, s in enumerate(layout.shapes):
+        if s.role not in SLOPED_ROLES:
+            continue
+        if s.altitude_high is None or s.altitude_low is None:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except _GEOM_EXC:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        candidates.append(i)
+    if not candidates:
+        return 0
+
+    # Collect junction vertices.
+    j_verts: List[Tuple[float, float]] = []
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            jc = list(s.polygon.exterior.coords)
+        except _GEOM_EXC:
+            continue
+        if jc and jc[0] == jc[-1]:
+            jc = jc[:-1]
+        j_verts.extend(jc)
+    if not j_verts:
+        return 0
+
+    def _proj_t(pt, a, b):
+        ax, ay = a; bx, by = b
+        dx = bx - ax; dy = by - ay
+        L2 = dx * dx + dy * dy
+        if L2 < 1e-6:
+            return None, None
+        t = ((pt[0] - ax) * dx + (pt[1] - ay) * dy) / L2
+        cx = ax + t * dx; cy = ay + t * dy
+        d2 = (pt[0] - cx) ** 2 + (pt[1] - cy) ** 2
+        return t, d2
+
+    n_splits = 0
+    splits: Dict[int, List[float]] = {}  # shape_idx -> list of t values
+    for idx in candidates:
+        s = layout.shapes[idx]
+        coords = list(s.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        c0, c1, c2, c3 = coords
+        # Sloping edge 1: c0 (high) -> c1 (low).
+        # Sloping edge 2: c3 (high) -> c2 (low).
+        # For each junction vertex (not at a corner), check distance
+        # to each sloping edge.  Collect violating t values.
+        rect_corner_set = {tuple(c) for c in coords}
+        ts: List[float] = []
+        for jv in j_verts:
+            if tuple(jv) in rect_corner_set:
+                continue
+            for a, b in [(c0, c1), (c3, c2)]:
+                t, d2 = _proj_t(jv, a, b)
+                if t is None or d2 is None:
+                    continue
+                if d2 > on_edge_tol2:
+                    continue
+                if t < min_t_margin or t > 1.0 - min_t_margin:
+                    continue
+                ts.append(t)
+                break
+        if ts:
+            # Cluster nearby t values (< 0.05 apart).
+            ts.sort()
+            merged: List[float] = []
+            for t in ts:
+                if not merged or t - merged[-1] > 0.05:
+                    merged.append(t)
+            splits[idx] = merged
+
+    if not splits:
+        return 0
+
+    # Apply splits.  For each candidate, create N+1 sub-rects from
+    # N split positions.
+    new_shapes: List["BuiltShape"] = []
+    drop_idxs: set = set()
+    for idx, ts in splits.items():
+        s = layout.shapes[idx]
+        coords = list(s.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        c0, c1, c2, c3 = [tuple(c) for c in coords]
+        alt_h = float(s.altitude_high)
+        alt_l = float(s.altitude_low)
+
+        def _interp_pt(a, b, t):
+            return (a[0] + t * (b[0] - a[0]),
+                    a[1] + t * (b[1] - a[1]))
+
+        boundaries = [0.0] + ts + [1.0]
+        for k in range(len(boundaries) - 1):
+            t_a = boundaries[k]
+            t_b = boundaries[k + 1]
+            if t_b - t_a < 0.02:
+                continue
+            # Corners of this sub-rect: high at t_a, low at t_b.
+            sub_c0 = _interp_pt(c0, c1, t_a)
+            sub_c1 = _interp_pt(c0, c1, t_b)
+            sub_c2 = _interp_pt(c3, c2, t_b)
+            sub_c3 = _interp_pt(c3, c2, t_a)
+            from shapely.geometry import Polygon
+            try:
+                poly = Polygon([sub_c0, sub_c1, sub_c2, sub_c3,
+                                 sub_c0])
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_empty or poly.geom_type != "Polygon":
+                    continue
+            except _GEOM_EXC:
+                continue
+            import copy
+            new_s = copy.copy(s)
+            new_s.polygon = poly
+            new_s.altitude_high = round(alt_h + t_a * (alt_l - alt_h), 1)
+            new_s.altitude_low = round(alt_h + t_b * (alt_l - alt_h), 1)
+            new_s.node_altitudes = None
+            # If new sub-rect is effectively flat (delta < 0.1m),
+            # convert to flat altitude.
+            if abs(new_s.altitude_high - new_s.altitude_low) < 0.1:
+                avg = 0.5 * (new_s.altitude_high + new_s.altitude_low)
+                new_s.altitude = round(avg, 1)
+                new_s.altitude_high = None
+                new_s.altitude_low = None
+            new_shapes.append(new_s)
+            n_splits += 1
+        drop_idxs.add(idx)
+
+    if not new_shapes:
+        return 0
+    layout.shapes = [
+        s for k, s in enumerate(layout.shapes)
+        if k not in drop_idxs
+    ] + new_shapes
+    try:
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: split "
+            f"{len(splits)} sloped rect(s) into "
+            f"{n_splits} sub-rect(s) at junction-vertex "
+            f"sloping-edge violations.")
+    except _GEOM_EXC:
+        pass
+    return n_splits
+
+

@@ -1268,6 +1268,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
         junction_points = _find_junction_points(
             nodes, ways, to_m, osm_centerlines=osm_centerlines)
 
+    # Width-transition breakpoints: experimented with this
+    # (user 2026-05-12 option A) — found that splitting V at
+    # detected width transitions creates new V rects in regions
+    # where target treats the pavement as junction territory.
+    # Those new rects' sloping edges introduce cross-shape
+    # altitude-step violations against adjacent junctions
+    # (failed pavement-grade test).  Disabled.  V under-
+    # segmentation (target 5 rects vs v20 3 rects) remains a
+    # known limitation of the apt.dat-derived centerline.
+    pass
+
     # ── Diagonal-stub trim at primary-parallel SPINES ────────────
     # Per user 2026-04-27: a diagonal stub (B/C/D/E/G overall db
     # ∈ [20°, 45°)) should END where its centerline crosses the
@@ -2124,6 +2135,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
             _snap_junction_altitudes_to_rect_corners(
                 layout, interior_proximity_m=3.0)
 
+        # Per user 2026-05-12: split sloped 4-corner rects where a
+        # junction vertex lies on a sloping (long) edge.  Runs
+        # AFTER per_surface_solve + subdivide passes have set the
+        # altitude_high/_low tags so the function can detect
+        # sloped rects (the layout shapes have None altitudes
+        # before the solver populates them).  Splitting the rect
+        # at the violating vertex's axial position eliminates the
+        # rule violation (vertex coincides with a sub-rect's
+        # short-edge corner instead of being mid-sloping-edge).
+        from .junction_repair import _split_sloped_rects_at_violations
+        _split_sloped_rects_at_violations(layout, icao=icao)
+
         # Per user 2026-05-10: shapes cannot cross integer lat/lon
         # tile boundaries (X-Plane / Ortho4XP render each 1°x1° tile
         # separately).  Cut a 10 m gap along every tile boundary
@@ -2253,6 +2276,7 @@ from .pavement.stubs import _emit_primary_parallel_runway_stubs
 # ──────────────────────────────────────────────────────────────────
 from .pavement.centerlines import (
     _extract_osm_taxi_centerlines,
+    _find_width_transition_breakpoints,
     _split_centerlines_at_points,
 )
 
