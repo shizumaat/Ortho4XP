@@ -397,6 +397,31 @@ def build_airport_pavement(icao: str, xplane_root: str,
         cl_L2 = cl_dx * cl_dx + cl_dy * cl_dy
         if cl_L2 < 1.0:
             continue
+        # Extend centerline endpoints by blast pads so ``t`` is
+        # computed in the blast-extended frame — matching both the
+        # rect_boundary (which includes blast pads, see
+        # ``_runway_rect_m``) and the segmenter's own phys_end_a/b
+        # parameterisation (which also absorbs blast pads).  Without
+        # this, a row-110 vertex sitting in the blast-pad zone (e.g.
+        # SPJC 16R V1 throat at 1.79 m off the runway boundary,
+        # ax≈−5 m in row-100 frame) lands at t<0 and gets dropped
+        # by ``end_skirt`` — the segmenter never sees it as a
+        # candidate breakpoint, so the sloped end-segment (which
+        # must stay 4-corner) can't split there to give the apron
+        # junction a shared snap node.
+        blast_a_m = r.blast_a_m or 0.0
+        blast_b_m = r.blast_b_m or 0.0
+        if blast_a_m > 0.0 or blast_b_m > 0.0:
+            row100_dist = math.sqrt(cl_L2)
+            ux = cl_dx / row100_dist
+            uy = cl_dy / row100_dist
+            cl_ax -= ux * blast_a_m
+            cl_ay -= uy * blast_a_m
+            cl_bx += ux * blast_b_m
+            cl_by += uy * blast_b_m
+            cl_dx = cl_bx - cl_ax
+            cl_dy = cl_by - cl_ay
+            cl_L2 = cl_dx * cl_dx + cl_dy * cl_dy
         phys_dist = math.sqrt(cl_L2)
         # Avoid the runway end zones — the segmenter handles those
         # via thresholds + physical-end anchors and we don't want
