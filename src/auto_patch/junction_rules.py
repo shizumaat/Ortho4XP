@@ -2118,9 +2118,37 @@ def stitch_pavement_to_flat_runways(
                             continue
                         cx = r1x + tr * rseg_dx
                         cy = r1y + tr * rseg_dy
-                        # Schedule insert on the runway edge at tr.
-                        rwy_inserts[id(rwy)].setdefault(
-                            ri, []).append((tr, cx, cy))
+                        # Symmetric 3 m euclidean dedup against
+                        # existing rwy_inserts on this edge — same
+                        # threshold as the post-pass runway-side
+                        # dedup (line ~2218 below) and Phase A's
+                        # snap-target dedup.  Without this check,
+                        # Phase B unconditionally adds (cx, cy) to
+                        # BOTH rwy_inserts AND pav_local_inserts,
+                        # then the post-pass dedup silently drops
+                        # the runway-side insert when it lands
+                        # within 3 m of a pre-existing entry — but
+                        # the pav-side insert survives, leaving the
+                        # junction polygon with an apron-edge
+                        # vertex that has no matching runway corner.
+                        # Found at SPJC -10110 V1 throat: junction
+                        # -10184 had orphan vertex at ax=44.28 perp
+                        # +22.47 (2.92 m past the pre-existing 41.36
+                        # insert from Phase A), unshared with the
+                        # adjacent flat runway segment.  Symmetric
+                        # dedup at insert time keeps both sides in
+                        # sync.
+                        existing = rwy_inserts[id(rwy)].setdefault(
+                            ri, [])
+                        duplicate = False
+                        for _et, ex, ey in existing:
+                            if ((cx - ex) ** 2 + (cy - ey) ** 2
+                                    < 9.0):
+                                duplicate = True
+                                break
+                        if duplicate:
+                            continue
+                        existing.append((tr, cx, cy))
                         # Schedule insert on the pav edge at the
                         # corresponding fraction tp.  same_dir →
                         # tp = tr; reversed → tp = 1 - tr.
