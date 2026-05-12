@@ -309,7 +309,9 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                         to_m=None,
                         apron_candidates_m: Optional[
                             List[Polygon]] = None,
-                        tile_dem=None) -> None:
+                        tile_dem=None,
+                        current_tile_lat: Optional[int] = None,
+                        current_tile_lon: Optional[int] = None) -> None:
     """Phase-2: add altitude tags to runways (segmented), taxi
     rects, and terminal pads.  Junctions / aprons / buildings are
     left un-elevated this iteration.
@@ -322,11 +324,26 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     heavily modify the land, so DEM is a soft preference, not a
     constraint — nodes free from runway anchors follow DEM
     only when no grade-compliance rule forces otherwise.
+
+    ``current_tile_lat`` / ``current_tile_lon`` identify the tile
+    being processed by the driver — must match the DEM's tile
+    (Ortho4XP's ``tile.dem`` is indexed in current-build-tile
+    coords).  ``None`` falls back to ``floor(anchor)`` which is
+    correct only for single-tile airports.  See pipeline.py.
     """
     lat0, lon0 = layout.anchor
-    tile_lat = int(math.floor(lat0))
-    tile_lon = int(math.floor(lon0))
+    # Per user 2026-05-12: keep DEM-tile and indexing-coords in
+    # lockstep.  Use current_tile_lat/lon only when ``tile_dem`` is
+    # provided (DEM is the current build tile); otherwise load the
+    # anchor tile DEM and use anchor coords.  See pipeline.py for the
+    # rationale.
     dem = _load_airport_dem(lat0, lon0, override_dem=tile_dem)
+    if tile_dem is not None and current_tile_lat is not None:
+        tile_lat = current_tile_lat
+        tile_lon = current_tile_lon
+    else:
+        tile_lat = int(math.floor(lat0))
+        tile_lon = int(math.floor(lon0))
 
     # Meter-space projection (local — the layout's to_m is not
     # exposed, so reconstruct).

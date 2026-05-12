@@ -2002,10 +2002,27 @@ def build_airport_pavement(icao: str, xplane_root: str,
         if USE_PER_SURFACE_SOLVER and layout.anchor is not None:
             from .elevation import _load_airport_dem
             from .elevation_per_surface import solve as per_surface_solve
+            # Per user 2026-05-12: keep DEM-tile and indexing-coords
+            # in lockstep.  ``_load_airport_dem`` returns the override
+            # (= driver's current-build-tile DEM) if provided, else
+            # loads the anchor tile.  So the coords to use are:
+            #   - current_tile_lat/lon when tile_dem is provided
+            #     (DEM is the current build tile);
+            #   - floor(anchor) when tile_dem is None (DEM is the
+            #     anchor tile, standalone / test path).
+            # Previously used floor(anchor) unconditionally — WRONG
+            # for cross-tile airports during a neighbour-tile build
+            # where ``current_tile`` and ``anchor_tile`` diverge
+            # (e.g. SPLP anchor in -13/-78 while Ortho4XP is building
+            # -13/-77), causing _sample_dem to read the wrong row.
             dem = tile_dem if tile_dem is not None else _load_airport_dem(
                 layout.anchor[0], layout.anchor[1])
-            tile_lat = math.floor(layout.anchor[0])
-            tile_lon = math.floor(layout.anchor[1])
+            if tile_dem is not None and current_tile_lat is not None:
+                tile_lat = current_tile_lat
+                tile_lon = current_tile_lon
+            else:
+                tile_lat = int(math.floor(layout.anchor[0]))
+                tile_lon = int(math.floor(layout.anchor[1]))
             per_surface_solve(layout, icao,
                                dem=dem,
                                tile_lat=tile_lat, tile_lon=tile_lon)

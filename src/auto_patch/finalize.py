@@ -93,7 +93,9 @@ def run_phase2(layout, icao, xplane_root, apt, *,
         layout, icao, xplane_root, apt,
         osm_nodes=nodes, osm_ways=ways, to_m=to_m,
         apron_candidates_m=apron_candidates,
-        tile_dem=tile_dem)
+        tile_dem=tile_dem,
+        current_tile_lat=current_tile_lat,
+        current_tile_lon=current_tile_lon)
     # Elevation phase can subdivide junctions, decompose holed
     # polygons, and otherwise modify polygon geometry — re-run
     # the shared-vertex collapse + overlap-clip so the
