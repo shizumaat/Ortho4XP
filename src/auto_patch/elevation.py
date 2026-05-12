@@ -140,6 +140,7 @@ __all__ = [
     "_enforce_shared_vertex_altitudes",
     "_find_cifp_path",
     "_latlon_to_m_local",
+    "_drop_thin_orphan_slivers",
     "_load_airport_dem",
     "_match_elev",
     "_merge_sliver_junctions_into_neighbours",
@@ -2560,6 +2561,7 @@ from .junction_repair import (
     SUBDIVIDE_VIOLATION_GRADE,
     _build_clamp_geom_state,
     _clamp_junction_free_vertices,
+    _drop_thin_orphan_slivers,
     _merge_sliver_junctions_into_neighbours,
     _subdivide_violating_junctions,
 )

@@ -49,6 +49,7 @@ from .elevation import (
     SHARED_VERTEX_CLUSTER_TOL_M,
     _compute_elevations,
     _drop_overlap_against_fixed_shapes,
+    _drop_thin_orphan_slivers,
     _enforce_shared_vertex_altitudes,
     _load_airport_dem,
     _merge_sliver_junctions_into_neighbours,
@@ -162,6 +163,15 @@ def run_phase2(layout, icao, xplane_root, apt, *,
     # adjacent to -10243 = 30 k m²).  Merge them back so
     # JOSM doesn't show two near-duplicate polygons.
     _merge_sliver_junctions_into_neighbours(layout, icao=icao)
+    # Per user 2026-05-12: drop thin orphan sliver junctions that
+    # form residue along a stub / parallel rect's long edge.  These
+    # appear when the apt.dat row-110 pavement boundary curves
+    # inward between a rect's two corners, leaving a thin strip
+    # uncovered.  The strip is geometrically isolated from the
+    # surrounding apron (touches only via rect-shared vertices), so
+    # the merge pass above can't catch it.  Visible as a thin
+    # residue strip along diagonal-stub sloping edges.
+    _drop_thin_orphan_slivers(layout, icao=icao)
     # Per user 2026-05-03: when the per-surface solver is on,
     # geometry passes above (overlap clip, push-off, sliver merge)
     # may have moved or added vertices since the solver finished.

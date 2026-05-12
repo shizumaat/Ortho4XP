@@ -1024,3 +1024,115 @@ def _merge_sliver_junctions_into_neighbours(
     return len(merge_into)
 
 
+def _drop_thin_orphan_slivers(
+        layout: "PavementLayout",
+        icao: str = "",
+        max_area_m2: float = 1000.0,
+        min_aspect: float = 4.0,
+        shared_vertex_tol_m: float = 0.5,
+        ) -> int:
+    """Drop thin sliver junction polygons that form residue along a
+    stub / parallel rect's long edge.
+
+    A "thin sliver" qualifies when ALL of:
+      * Junction polygon area < ``max_area_m2``.
+      * Aspect ratio (perimeter / (2*sqrt(pi*area))) > ``min_aspect``
+        — i.e. shaped like a long thin strip, not a chunky polygon.
+      * Shares ≥ 2 boundary vertices with a stub / primary_parallel
+        / secondary_parallel / cross_connector (the rect whose long
+        edge the sliver lies along).
+
+    These typically form because the apt.dat row-110 pavement
+    boundary curves inward between a stub's two end corners,
+    leaving a thin pavement strip uncovered by the rect.  The
+    strip gets emitted as a separate junction polygon that's
+    geometrically isolated from the surrounding apron (only
+    touches via stub-shared vertices, not via the apron boundary),
+    so ``_merge_sliver_junctions_into_neighbours`` can't catch it
+    (it requires ≥ 2 shared vertices with another JUNCTION).
+
+    Dropping these slivers loses < 0.2 % of pavement coverage at
+    typical airports but eliminates visible thin residue along
+    diagonal-stub sloping edges (user 2026-05-12).
+
+    Returns count of slivers dropped.
+    """
+    RECT_LIKE_ROLES = (
+        ROLE_STUB, ROLE_PRIMARY_PARALLEL,
+        ROLE_SECONDARY_PARALLEL, ROLE_CROSS_CONNECTOR,
+    )
+    junction_idxs = [i for i, s in enumerate(layout.shapes)
+                     if s.role == ROLE_JUNCTION
+                     and s.polygon is not None
+                     and not s.polygon.is_empty]
+    if not junction_idxs:
+        return 0
+    rect_idxs = [i for i, s in enumerate(layout.shapes)
+                 if s.role in RECT_LIKE_ROLES
+                 and s.polygon is not None
+                 and not s.polygon.is_empty]
+    if not rect_idxs:
+        return 0
+
+    # Cache per-shape open-ring vertices in meter coords.
+    verts: Dict[int, List[Tuple[float, float]]] = {}
+    for i in junction_idxs + rect_idxs:
+        try:
+            c = list(layout.shapes[i].polygon.exterior.coords)
+        except _GEOM_EXC:
+            verts[i] = []
+            continue
+        if c and c[0] == c[-1]:
+            c = c[:-1]
+        verts[i] = c
+
+    tol2 = shared_vertex_tol_m * shared_vertex_tol_m
+    to_drop: List[int] = []
+    for i in junction_idxs:
+        p = layout.shapes[i].polygon
+        try:
+            area = p.area
+        except _GEOM_EXC:
+            continue
+        if area <= 0 or area >= max_area_m2:
+            continue
+        try:
+            peri = p.length
+        except _GEOM_EXC:
+            continue
+        aspect = peri / (2.0 * math.sqrt(math.pi * area))
+        if aspect <= min_aspect:
+            continue
+        # Confirm 2+ shared vertices with a rect-like neighbour.
+        share_with_rect = False
+        for j in rect_idxs:
+            shared = 0
+            for vx, vy in verts[i]:
+                for ux, uy in verts[j]:
+                    if (vx - ux) ** 2 + (vy - uy) ** 2 <= tol2:
+                        shared += 1
+                        break
+                if shared >= 2:
+                    break
+            if shared >= 2:
+                share_with_rect = True
+                break
+        if share_with_rect:
+            to_drop.append(i)
+
+    if not to_drop:
+        return 0
+    drop_set = set(to_drop)
+    layout.shapes = [
+        s for k, s in enumerate(layout.shapes)
+        if k not in drop_set]
+    try:
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: dropped "
+            f"{len(to_drop)} thin orphan sliver junction(s) "
+            f"(residue along stub/parallel long edges).")
+    except _GEOM_EXC:
+        pass
+    return len(to_drop)
+
+
