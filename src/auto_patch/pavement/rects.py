@@ -283,6 +283,49 @@ def _build_taxi_rects(
             members.sort(key=lambda m: -emitted[m][1].length)
             for m in members[1:]:
                 drop.add(m)
+
+    # Per user 2026-05-12: diagonal-parent stub refs (B/C/D/E/G at
+    # SPJC — single-letter taxis whose OSM parent way is overall
+    # diagonal to the runway) should have EXACTLY ONE rect.  Any
+    # additional rect emitted from a curving sub-segment of the
+    # same taxi is a fragmentation artefact and must be dropped
+    # regardless of geometric proximity.  Cluster-based dedup
+    # above keeps these when the fragments are > OVERLAP_PROX_M
+    # apart (e.g. SPJC -10030 was 35 m from -10017 along the C
+    # taxi); without this single-rect rule, the fragment splits
+    # the runway-side junction into multiple pieces.
+    if rwy_centerlines and ref_overall_bearings:
+        try:
+            _rwy0 = rwy_centerlines[0]
+            _rc0 = list(_rwy0.coords)
+            _rwy0_b = (math.degrees(math.atan2(
+                _rc0[-1][0] - _rc0[0][0],
+                _rc0[-1][1] - _rc0[0][1])) % 180.0)
+        except _GEOM_EXC:
+            _rwy0_b = None
+        if _rwy0_b is not None:
+            diag_stubs: Dict[str, List[int]] = {}
+            for i, (_r, _a, role, ref) in enumerate(emitted):
+                if i in drop:
+                    continue
+                if role != ROLE_STUB or not ref:
+                    continue
+                if any(c.isdigit() for c in ref):
+                    continue  # sub-refs handled by cluster dedup
+                if ref not in ref_overall_bearings:
+                    continue
+                _ref_db = abs(
+                    ref_overall_bearings[ref] - _rwy0_b)
+                _ref_db = min(_ref_db, 180.0 - _ref_db)
+                if 20.0 <= _ref_db < 45.0:
+                    diag_stubs.setdefault(ref, []).append(i)
+            for ref, idxs in diag_stubs.items():
+                if len(idxs) <= 1:
+                    continue
+                idxs.sort(key=lambda m: -emitted[m][1].length)
+                for m in idxs[1:]:
+                    drop.add(m)
+
     keep: List[Tuple[Polygon, LineString, str, str]] = [
         item for i, item in enumerate(emitted) if i not in drop]
     return keep
@@ -1169,29 +1212,18 @@ def _classify_role(axis: LineString, width: float,
         dist_rwy = 1e6
     length = axis.length
 
-    # Per user 2026-05-05: parallel rects (db < 20°) are NEVER stubs.
-    # Classify by distance to runway alone.  Sub-refs (digit-suffixed)
-    # and diagonal-parent overrides apply only when the local axis
-    # is NOT parallel — a sub-ref like A1 that happens to run parallel
-    # to the runway is a parallel segment of A, not a stub.
-    if db < 20.0:
-        if dist_rwy < 400.0:
-            return ROLE_PRIMARY_PARALLEL
-        return ROLE_SECONDARY_PARALLEL
-
-    # db ≥ 20° from here on.  Sub-ref + diagonal-parent rules force
-    # STUB (the rect is a runway-side connector even if the local
-    # axis is perpendicular enough for cross-connector classification).
-    if ref and any(c.isdigit() for c in ref):
-        return ROLE_STUB
-
-    # Diagonal-parent check: if this rect's REF has an overall-
+    # Diagonal-parent check FIRST: if the rect's REF has an overall-
     # DIAGONAL parent OSM way (parent db_overall ∈ [20°, 45°)),
     # force STUB regardless of the local segment bearing.  At SPJC
-    # B/C/E/G enter the runway at shallow angles; without this check,
-    # a curving end-segment of B (db_local = 18°, but parallel-band
-    # disqualifies it now) — actually parallel-band is db < 20° and
-    # already returned, so this branch only hits when local db ≥ 20°.
+    # B/C/E/G enter the runway at shallow angles; a curving sub-
+    # segment can have db_local = 19° (just inside the parallel
+    # band), which historically misclassified it as
+    # PRIMARY_PARALLEL — fragmenting the diagonal-stub junction
+    # area into separate parallel + multiple junction polygons.
+    # This check must run BEFORE the db<20° → PRIMARY_PARALLEL
+    # branch below so the near-parallel sub-segment is caught
+    # (user 2026-05-12; fixes SPJC stub C -10030 misclassification
+    # and the resulting 3-junction split between runway and stub C).
     if (ref and ref_overall_bearings
             and ref in ref_overall_bearings
             and rwy_centerlines):
@@ -1211,6 +1243,21 @@ def _classify_role(axis: LineString, width: float,
                     return ROLE_STUB
         except _GEOM_EXC:
             pass
+
+    # Sub-ref check (digit suffix → always STUB), now also runs
+    # before the db<20° branch so e.g. a curving V3 sub-segment
+    # with db_local = 18° still classifies as STUB rather than
+    # short PRIMARY_PARALLEL fragments.
+    if ref and any(c.isdigit() for c in ref):
+        return ROLE_STUB
+
+    # Per user 2026-05-05: parallel rects (db < 20°) that pass
+    # the diagonal-parent + sub-ref filters above are NEVER stubs.
+    # Classify by distance to runway alone.
+    if db < 20.0:
+        if dist_rwy < 400.0:
+            return ROLE_PRIMARY_PARALLEL
+        return ROLE_SECONDARY_PARALLEL
 
     if db > 45.0 and length >= 20.0:
         if dist_rwy > 250.0:
