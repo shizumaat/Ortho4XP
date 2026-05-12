@@ -1869,33 +1869,26 @@ def stitch_pavement_to_flat_runways(
     corner_tol_m: float = SHARED_VERTEX_TOL_M,
     near_edge_snap_m: float = 2.5,
 ) -> None:
-    """For each junction polygon whose boundary contains an edge
-    coincident with a flat runway shape's boundary edge, insert
-    shared vertices along that edge at the perpendicular foot of
-    every other junction vertex.  Both polygons gain matching
-    bucket-shared vertices on the shared edge (user 2026-05-09).
-
-    Why: cap-projection in the per-surface solver propagates HARD
-    anchors at the role's grade × Euclidean distance.  A junction
-    adjacent to a 400 m blast pad currently shares only the 2 edge
-    endpoints with the runway — interior junction vertices 22 m
-    perpendicular to the edge end up 200+ m diagonal from the
-    nearest HARD anchor, allowing a 3 m drop within cap.  Inserting
-    perpendicular-foot vertices on the shared edge at every interior
-    vertex's projection cuts the cap-distance to its perpendicular
-    component, so junction interiors lift to within ~0.3 m of the
-    runway elevation instead of stalling at terrain.
-
-    A pav edge is "coincident" with a runway edge when both
-    endpoints land within ``corner_tol_m`` of two adjacent runway
-    corners (in either direction).  Only flat runway shapes
-    (``role=runway``, single ``altitude=`` tag, no
-    ``altitude_high``/``altitude_low``) are targeted — sloped 4-
-    corner segments must keep their canonical [high, low, low,
-    high] vertex order for OSM emit.
+    """Snap pav vertices that sit within ``near_edge_snap_m`` of a
+    flat runway edge onto the runway boundary, and schedule a
+    matching runway-side insert so the two polygons share a bucket
+    vertex at every snap.  Only flat runway shapes (``role=runway``,
+    single ``altitude=`` tag, no ``altitude_high``/``altitude_low``)
+    are targeted — sloped 4-corner segments must keep their
+    canonical [high, low, low, high] vertex order for OSM emit.
 
     Run BEFORE the per-surface solver so the new shared vertices
     feed HARD anchors.
+
+    Per user 2026-05-12: a prior "Phase B" projected EVERY
+    non-coincident pav vertex (including ones far from the runway
+    boundary) perpendicular onto the shared edge, creating
+    arbitrary corners on flat runway segments at interior-vertex
+    projections.  Removed.  Junction interiors are now anchored
+    only via the per-surface Jacobi solver's standard propagation
+    from real shared corners (segment seams + Phase A snaps); the
+    grade test showed no measurable elevation impact when this
+    projection pass was disabled.
     """
     flat_runways = [s for s in layout.shapes
                     if s.role == ROLE_RUNWAY
@@ -2031,182 +2024,6 @@ def stitch_pavement_to_flat_runways(
                         pav.node_altitudes = pav_alts + [pav_alts[0]]
             except _GEOM_EXC:
                 pass
-
-    # ── Phase B: coincident-edge perpendicular projection ────────
-    for pav in pavements:
-        poly = pav.polygon
-        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
-            continue
-        try:
-            pav_coords = _open_ring(list(poly.exterior.coords))
-        except _GEOM_EXC:
-            continue
-        n_pav = len(pav_coords)
-        if n_pav < 3:
-            continue
-
-        node_alts = pav.node_altitudes
-        ring_closed_alts = (
-            node_alts is not None
-            and len(node_alts) == n_pav + 1
-            and node_alts[0] == node_alts[-1])
-        if node_alts is not None and (
-                len(node_alts) == n_pav
-                or ring_closed_alts):
-            pav_alts: Optional[List[float]] = list(
-                node_alts[:-1] if ring_closed_alts
-                else node_alts)
-        else:
-            pav_alts = None
-
-        # Inserts to apply to THIS pav polygon: pi -> [(t, x, y)].
-        pav_local_inserts: dict = {}
-
-        for rwy in flat_runways:
-            try:
-                rwy_coords = _open_ring(list(
-                    rwy.polygon.exterior.coords))
-            except _GEOM_EXC:
-                continue
-            n_rwy = len(rwy_coords)
-            if n_rwy < 3:
-                continue
-
-            # Find pav edges coincident with rwy edges.
-            for pi in range(n_pav):
-                pj = (pi + 1) % n_pav
-                p1x, p1y = pav_coords[pi]
-                p2x, p2y = pav_coords[pj]
-                seg_dx = p2x - p1x
-                seg_dy = p2y - p1y
-                seg2 = seg_dx * seg_dx + seg_dy * seg_dy
-                if seg2 < 1.0:
-                    continue
-                for ri in range(n_rwy):
-                    rj = (ri + 1) % n_rwy
-                    r1x, r1y = rwy_coords[ri]
-                    r2x, r2y = rwy_coords[rj]
-                    # Same direction: p1≈r1 and p2≈r2.
-                    same_dir = (
-                        (p1x - r1x) ** 2 + (p1y - r1y) ** 2
-                        <= corner_tol2
-                        and (p2x - r2x) ** 2 + (p2y - r2y) ** 2
-                        <= corner_tol2)
-                    # Reverse: p1≈r2 and p2≈r1.
-                    rev_dir = (not same_dir) and (
-                        (p1x - r2x) ** 2 + (p1y - r2y) ** 2
-                        <= corner_tol2
-                        and (p2x - r1x) ** 2 + (p2y - r1y) ** 2
-                        <= corner_tol2)
-                    if not same_dir and not rev_dir:
-                        continue
-                    # Shared edge found.  Project every pav vertex
-                    # NOT on this edge onto the runway edge segment.
-                    rseg_dx = r2x - r1x
-                    rseg_dy = r2y - r1y
-                    rseg2 = rseg_dx * rseg_dx + rseg_dy * rseg_dy
-                    if rseg2 < 1.0:
-                        continue
-                    for vi, (vx, vy) in enumerate(pav_coords):
-                        if vi == pi or vi == pj:
-                            continue
-                        # Project onto runway edge.
-                        tr = (
-                            (vx - r1x) * rseg_dx
-                            + (vy - r1y) * rseg_dy) / rseg2
-                        if tr <= 0.001 or tr >= 0.999:
-                            continue
-                        cx = r1x + tr * rseg_dx
-                        cy = r1y + tr * rseg_dy
-                        # Symmetric 3 m euclidean dedup against
-                        # existing rwy_inserts on this edge — same
-                        # threshold as the post-pass runway-side
-                        # dedup (line ~2218 below) and Phase A's
-                        # snap-target dedup.  Without this check,
-                        # Phase B unconditionally adds (cx, cy) to
-                        # BOTH rwy_inserts AND pav_local_inserts,
-                        # then the post-pass dedup silently drops
-                        # the runway-side insert when it lands
-                        # within 3 m of a pre-existing entry — but
-                        # the pav-side insert survives, leaving the
-                        # junction polygon with an apron-edge
-                        # vertex that has no matching runway corner.
-                        # Found at SPJC -10110 V1 throat: junction
-                        # -10184 had orphan vertex at ax=44.28 perp
-                        # +22.47 (2.92 m past the pre-existing 41.36
-                        # insert from Phase A), unshared with the
-                        # adjacent flat runway segment.  Symmetric
-                        # dedup at insert time keeps both sides in
-                        # sync.
-                        existing = rwy_inserts[id(rwy)].setdefault(
-                            ri, [])
-                        duplicate = False
-                        for _et, ex, ey in existing:
-                            if ((cx - ex) ** 2 + (cy - ey) ** 2
-                                    < 9.0):
-                                duplicate = True
-                                break
-                        if duplicate:
-                            continue
-                        existing.append((tr, cx, cy))
-                        # Schedule insert on the pav edge at the
-                        # corresponding fraction tp.  same_dir →
-                        # tp = tr; reversed → tp = 1 - tr.
-                        tp = tr if same_dir else (1.0 - tr)
-                        pav_local_inserts.setdefault(
-                            pi, []).append((tp, cx, cy))
-                    break  # one shared rwy edge per pav edge
-
-        # Apply pav-side inserts (after walking all rwy pairs for
-        # this pav).
-        if not pav_local_inserts:
-            continue
-        new_coords: List[Tuple[float, float]] = []
-        new_alts: Optional[List[float]] = (
-            [] if pav_alts is not None else None)
-        for pi in range(n_pav):
-            new_coords.append(pav_coords[pi])
-            if new_alts is not None:
-                new_alts.append(pav_alts[pi])
-            if pi in pav_local_inserts:
-                pts = sorted(pav_local_inserts[pi],
-                             key=lambda x: x[0])
-                last_t: float = -1.0
-                # Edge endpoint altitudes for linear interp on the
-                # pav side.  These are PAV's existing values (will
-                # be overwritten by solver via bucket-share, but
-                # initialise to something sensible).
-                pj = (pi + 1) % n_pav
-                a_alt = pav_alts[pi] if pav_alts is not None else None
-                b_alt = pav_alts[pj] if pav_alts is not None else None
-                for tp, cx, cy in pts:
-                    if tp - last_t < 1e-4:
-                        continue
-                    new_coords.append((cx, cy))
-                    if new_alts is not None:
-                        if a_alt is not None and b_alt is not None:
-                            new_alts.append(
-                                a_alt + tp * (b_alt - a_alt))
-                        else:
-                            new_alts.append(
-                                a_alt if a_alt is not None
-                                else (b_alt if b_alt is not None
-                                       else 0.0))
-                    last_t = tp
-        if len(new_coords) < 3:
-            continue
-        try:
-            new_poly = Polygon(new_coords + [new_coords[0]])
-            if not new_poly.is_valid:
-                new_poly = new_poly.buffer(0)
-            if (new_poly.is_empty
-                    or new_poly.geom_type != "Polygon"):
-                continue
-        except _GEOM_EXC:
-            continue
-        pav.polygon = new_poly
-        if new_alts is not None:
-            pav.node_altitudes = new_alts + [new_alts[0]]
 
     # Apply runway-side inserts.
     for rwy in flat_runways:
