@@ -1410,15 +1410,22 @@ def build_airport_pavement(icao: str, xplane_root: str,
 
         trimmed_centerlines: List[Tuple[LineString, str]] = []
         for ls, ref in osm_centerlines:
-            # Only PERPENDICULAR centerlines (perp_diff < 25°)
-            # need this 30 m buffer pull-back.  Diagonals are
-            # handled by the SEPARATE corridor-trim pass below
-            # (which subtracts the imagined primary-parallel
-            # corridor from the diagonal's apron-side end).
-            # Stacking both gave a too-aggressive shortening at
-            # SPJC (B 203 m → 92 m).
+            # Per user 2026-05-12: extend the 30 m runway-buffer
+            # pull-back to DIAGONAL centerlines too (was perpendicular-
+            # only).  Reason: a diagonal stub's centerline at, say,
+            # 27° to the runway axis can have its runway-side endpoint
+            # 10-15 m off the runway pavement edge.  Without
+            # perpendicular clearance, the rect built from that
+            # centerline has its runway-side long-edge snapped onto
+            # the runway boundary (SPJC stubs E + G ended up 0.5 m
+            # off the runway edge — the snap collapsed the adjacent
+            # junction polygon to a sliver).  Apply the 30 m
+            # buffer-pullback to everything that's NOT essentially
+            # parallel to the runway (perp_diff < 70°); pure
+            # parallels skip — they shouldn't shorten by 30 m on
+            # their runway-facing end.
             pd = _perp_diff_to_runway(ls)
-            if pd >= PERP_TRIM_MAX_DEG:
+            if pd >= DIAG_TRIM_MAX_DEG:
                 trimmed_centerlines.append((ls, ref))
                 continue
             _buf = rwy_buffered

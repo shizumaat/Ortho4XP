@@ -912,10 +912,12 @@ def _split_centerlines_at_points(
         delta = min(delta, 180.0 - delta)
         # Perpendicular = 90°.  Taxis that connect to the runway
         # AT AN ANGLE (not parallel, not perpendicular) get the
-        # diagonal-stub treatment: 35 % rect length biased 20 %
-        # of the gap AWAY from the runway-facing endpoint (user
-        # 2026-05-12 — was toward; flipped so the junction polygon
-        # has space between the rect and the runway).  Primary
+        # diagonal-stub treatment: fixed 30 m margin on each end
+        # of the centerline gap, no bias (user 2026-05-12 — was
+        # 35 %-retained biased-away; the bias overshot short
+        # stubs into adjacent primary_parallel territory).  Stub
+        # length = gap − 60 m; dropped if below the 40 m emit
+        # floor.  Primary
         # parallels (delta ≈ 0°, perp_diff ≈ 90°) stay at 15 %;
         # perpendicular cross-connectors (delta ≈ 90°,
         # perp_diff ≈ 0°) stay at 15 %.  B/C/E/G at SPJC measure
@@ -933,18 +935,28 @@ def _split_centerlines_at_points(
         # Removed the length gate; the angle alone classifies.
         perp_diff = abs(delta - 90.0)
         if 20.0 < perp_diff < 75.0:
-            # Per user 2026-04-28: the 30 % diagonal-stub margin is
-            # appropriate ONLY when at least one endpoint sits AT a
-            # runway boundary — i.e. the segment IS the stub between
+            # Per user 2026-04-28: the diagonal-stub margin is
+            # appropriate ONLY when at least one endpoint sits near
+            # the runway — i.e. the segment IS the stub between
             # a parallel taxi and the runway.  When NEITHER endpoint
             # is near a runway, the segment is a non-stub diagonal
             # connector (e.g. CYXY E nodes 2-4 transitioning between
             # the south-of-apron parallel section and the apron-
             # internal parallel section, perp_diff ≈ 60° but both
             # ends far from any runway).  Such segments shouldn't
-            # lose 60 % of their length to junction-margin trim;
-            # they're not bordered by junctions on both sides.
-            STUB_ENDPOINT_RUNWAY_M = 50.0
+            # get the stub treatment; they're not bordered by
+            # junctions on both sides.
+            #
+            # Per user 2026-05-12: threshold bumped 50 → 80 m to
+            # cover centerlines that have just been trimmed back
+            # by the 30 m runway-buffer pull-back in pipeline.py
+            # (runway_centerline-to-trimmed-endpoint distance =
+            # half_width + 30 = 22.5 + 30 ≈ 52.5 m).  At 50 m the
+            # buffer-trimmed endpoint fell just past the threshold
+            # and the segment was reclassified as a non-stub
+            # diagonal connector, dropping the 30 m fixed-margin
+            # treatment and causing V3 at SPJC to disappear.
+            STUB_ENDPOINT_RUNWAY_M = 80.0
             ep0 = Point(c[0])
             ep1 = Point(c[-1])
             ep0_near = any(
@@ -1155,47 +1167,30 @@ def _split_centerlines_at_points(
                 m_start = 0.30 * gap
                 m_end = 0.30 * gap
             elif gap_margin_frac >= 0.25:
-                # Non-perpendicular diagonal stub (V3-like): 35 %
-                # retained, biased AWAY from the runway-facing axis
-                # endpoint so the rect sits visually centered in the
-                # apron-to-runway gap with room for a junction
-                # polygon between rect and runway.
+                # Non-perpendicular diagonal stub (V3-like).
                 #
-                # Per user 2026-05-12: the bias direction was
-                # previously TOWARD the runway, which placed the
-                # rect's runway-side corner right at the runway
-                # boundary (corner-snap-to-pavement then anchored it
-                # there).  The adjacent junction polygon collapsed
-                # to a sliver because the rect occupied the space
-                # where the junction should sit.  Reversed: bias
-                # 20 % of the gap AWAY from the runway → rect's
-                # runway-side end pulls back ~52 % of the gap,
-                # leaving the 0..52 % portion of the gap for the
-                # junction (canonical SPJC stub G case).
-                retained = 0.35 * gap
-                remaining_margin = gap - retained
-                bias = 0.20 * gap
-                # Which endpoint is closer to a runway?
-                if rwy_centerlines:
-                    ep0 = ls.interpolate(p0)
-                    ep1 = ls.interpolate(p1)
-                    d0 = min(ep0.distance(r) for r in rwy_centerlines)
-                    d1 = min(ep1.distance(r) for r in rwy_centerlines)
-                    runway_is_p0_side = d0 < d1
-                else:
-                    runway_is_p0_side = True
-                # Larger margin on the runway side → rect shifts AWAY
-                # from runway; smaller margin on the apron side →
-                # rect extends toward apron.
-                if runway_is_p0_side:
-                    m_start = remaining_margin / 2.0 + bias
-                    m_end = remaining_margin / 2.0 - bias
-                else:
-                    m_start = remaining_margin / 2.0 - bias
-                    m_end = remaining_margin / 2.0 + bias
-                # Clamp margins to be non-negative
-                m_start = max(0.0, m_start)
-                m_end = max(0.0, m_end)
+                # Per user 2026-05-12: centered, no bias.  Fixed
+                # 30 m margin on each end so the junction polygons
+                # at the runway-facing and apron-facing ends have
+                # room to follow the pavement curves that lead into
+                # the diagonal.  Stub length = gap − 60 m; if that
+                # would fall below the 40 m emit floor, the
+                # downstream filter drops the stub.
+                #
+                # Earlier iterations of this rule used a 35 %-retained
+                # margin biased 20 % of the gap TOWARD or AWAY from
+                # the runway.  Both directions had problems: TOWARD
+                # placed the rect's runway-corner at the runway edge
+                # (corner-snap collapsed the adjacent junction to a
+                # sliver); AWAY pushed the apron-end of short stubs
+                # into adjacent primary_parallel territory, where
+                # the absorption pass dropped the rect entirely
+                # (V3 at SPJC).  Fixed 30 m each side, no bias, is
+                # length-independent and gives junction polygons a
+                # predictable approach corridor on both sides.
+                STUB_END_MARGIN_M = 30.0
+                m_start = STUB_END_MARGIN_M
+                m_end = STUB_END_MARGIN_M
                 # Recompute retained so p0+m_start..p1-m_end fits
                 if gap - m_start - m_end < MIN_SEGMENT_LEN_M:
                     continue
