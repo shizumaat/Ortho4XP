@@ -191,22 +191,22 @@ def cut_layout_at_tile_boundaries(
             new_shapes.append(s)
             continue
         if diff.is_empty:
-            continue
-        if diff.geom_type == "Polygon":
-            pieces: List[Polygon] = [diff]
+            # Source polygon entirely inside the cut buffer.  No
+            # pavement pieces but a bridge will be emitted below.
+            pieces: List[Polygon] = []
+        elif diff.geom_type == "Polygon":
+            pieces = [diff]
         elif diff.geom_type == "MultiPolygon":
             pieces = [g for g in diff.geoms
                       if g.geom_type == "Polygon" and not g.is_empty]
         else:
-            # Unexpected result (e.g. GeometryCollection); keep original.
+            # Unexpected result (e.g. non-empty GeometryCollection);
+            # keep the original shape and skip the cut + bridge.
             if _in_current_tile(s.polygon):
                 new_shapes.append(s)
             continue
         pieces = [p for p in pieces if p.area >= min_piece_area_m2]
-        # Drop pieces outside the current tile.
         pieces = [p for p in pieces if _in_current_tile(p)]
-        if not pieces:
-            continue
 
         slope_sampler = _make_slope_sampler(s)
         for piece in pieces:

@@ -214,27 +214,82 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
     # interior get inserted as new shared vertices upstream so the
     # solver gets denser HARD anchors along long flat runs (blast
     # pads, runway-interior flats).
-    for s in layout.shapes:
-        if s.role != ROLE_RUNWAY:
-            continue
-        if s.polygon is None or s.polygon.is_empty:
-            continue
-        coords = _open_ring(list(s.polygon.exterior.coords))
-        if len(coords) < 3:
-            continue
-        if s.altitude_high is not None and s.altitude_low is not None:
-            if len(coords) != 4:
+    # Two-pass runway HARD seeding: process non-regraded (CIFP only)
+    # shapes first, then regraded shapes (those with node_altitudes
+    # from the seam pipeline) — the second pass OVERRIDES any shared
+    # corner the first pass set.  This ensures that when a runway is
+    # segmented into sub-rects and only the seam-crossing sub-rect
+    # was regraded, the regraded values propagate to its shared
+    # threshold corners with adjacent sub-rects.
+    for pass_node_alts in (False, True):
+        for s in layout.shapes:
+            if s.role != ROLE_RUNWAY:
                 continue
-            per = [s.altitude_high, s.altitude_low,
-                   s.altitude_low, s.altitude_high]
-        elif s.altitude is not None:
-            per = [float(s.altitude)] * len(coords)
-        else:
-            continue
-        for (x, y), a in zip(coords, per):
-            b = _corner_elevation_bucket(x, y)
-            idx = bucket_to_idx.get(b)
-            if idx is not None and not is_hard[idx]:
+            if s.polygon is None or s.polygon.is_empty:
+                continue
+            has_node_alts = bool(s.node_altitudes)
+            if has_node_alts != pass_node_alts:
+                continue
+            coords = _open_ring(list(s.polygon.exterior.coords))
+            if len(coords) < 3:
+                continue
+            if s.altitude_high is not None and s.altitude_low is not None:
+                if len(coords) != 4:
+                    continue
+                per = [s.altitude_high, s.altitude_low,
+                       s.altitude_low, s.altitude_high]
+            elif s.altitude is not None:
+                per = [float(s.altitude)] * len(coords)
+            elif s.node_altitudes:
+                per = [float(a) for a in s.node_altitudes[:len(coords)]]
+                if len(per) < len(coords):
+                    per += [per[-1]] * (len(coords) - len(per))
+            else:
+                continue
+            for (x, y), a in zip(coords, per):
+                b = _corner_elevation_bucket(x, y)
+                idx = bucket_to_idx.get(b)
+                if idx is None:
+                    continue
+                # Pass 1 (CIFP): only set if not already HARD.
+                # Pass 2 (regraded): always override.
+                if pass_node_alts or not is_hard[idx]:
+                    elev[idx] = float(a)
+                    is_hard[idx] = True
+                    have_initial[idx] = True
+
+    # Per user 2026-05-13: seam vertices are HARD anchors with
+    # OVERRIDE priority over runway CIFP corners.  When a runway
+    # interior vertex is on a tile-boundary seam, its DEM altitude
+    # (already written into node_altitudes by apply_seam_dem_anchors)
+    # wins over the CIFP-interpolated value at the same position.
+    # Architecturally: seam wins because terrain mesh at the tile
+    # boundary is pinned to raw HGT by Ortho4XP's preserve_boundary,
+    # and we need pavement to match terrain there to avoid a visible
+    # cliff in X-Plane.
+    seam_keys = getattr(layout, "_seam_anchor_keys", None) or set()
+    if seam_keys:
+        for s in layout.shapes:
+            if s.polygon is None or s.polygon.is_empty:
+                continue
+            if not s.node_altitudes:
+                continue
+            coords = _open_ring(list(s.polygon.exterior.coords))
+            if len(coords) < 3:
+                continue
+            alts = list(s.node_altitudes[:len(coords)])
+            for (x, y), a in zip(coords, alts):
+                # Match the bucket convention used by seam_anchors.
+                from ..layout import SHARED_VERTEX_TOL_M
+                bk_s = 1.0 / SHARED_VERTEX_TOL_M
+                seam_bk = (int(round(x * bk_s)), int(round(y * bk_s)))
+                if seam_bk not in seam_keys:
+                    continue
+                b = _corner_elevation_bucket(x, y)
+                idx = bucket_to_idx.get(b)
+                if idx is None:
+                    continue
+                # Seam wins: override any existing HARD value too.
                 elev[idx] = float(a)
                 is_hard[idx] = True
                 have_initial[idx] = True
@@ -579,7 +634,16 @@ def _writeback(layout, elev, bucket_to_idx):
     )
     n_terms = n_rects = n_juncs = 0
     for s in layout.shapes:
-        if s.role not in PAVEMENT_ROLES or s.role == ROLE_RUNWAY:
+        if s.role not in PAVEMENT_ROLES:
+            continue
+        # Runway shapes are normally skipped (their altitudes come
+        # from CIFP — HARD-anchored, immutable through the solver).
+        # Exception (user 2026-05-13): seam-converted runway sub-rects
+        # have node_altitudes; we need to write back per-vertex
+        # solver-output altitudes so shared corners with adjacent
+        # sub-rects agree on the regraded value.  CIFP-only 4-corner
+        # runway sub-rects with altitude_high/low are left alone.
+        if s.role == ROLE_RUNWAY and not s.node_altitudes:
             continue
         if s.polygon is None or s.polygon.is_empty:
             continue
@@ -601,23 +665,37 @@ def _writeback(layout, elev, bucket_to_idx):
             s.node_altitudes = None
             n_terms += 1
         elif s.role in SLOPING_RECT_ROLES:
-            if len(coords_open) != 4:
-                continue
-            new_coords, hi, lo = _canonicalise_rect(
-                coords_open, corner_elevs, s.source_axis,
-                _short_end_pairs_by_axis)
-            if new_coords is None:
-                continue
-            if new_coords != coords_open:
-                # Rotate the rect's polygon to canonical order so
-                # the OSM-emit convention `[high, low, low, high]`
-                # matches the actual axis-end geometry.
-                s.polygon = Polygon(new_coords + [new_coords[0]])
-            s.altitude_high = round(float(hi), 1)
-            s.altitude_low = round(float(lo), 1)
-            s.altitude = None
-            s.node_altitudes = None
-            n_rects += 1
+            # Per user 2026-05-13: keep node_altitudes when the shape
+            # came in with them — even for 4-corner shapes.  This
+            # preserves per-vertex precision for runway sub-rects
+            # adjacent to seam-affected sub-rects: their shared
+            # corners receive HARD seam altitudes that aren't coplanar
+            # with the other 2 CIFP corners, so altitude_high/low
+            # (which assumes a planar surface) would average and
+            # introduce a > 1 m step at the shared boundary.
+            had_node_alts = s.node_altitudes is not None
+            if len(coords_open) == 4 and not had_node_alts:
+                new_coords, hi, lo = _canonicalise_rect(
+                    coords_open, corner_elevs, s.source_axis,
+                    _short_end_pairs_by_axis)
+                if new_coords is None:
+                    continue
+                if new_coords != coords_open:
+                    s.polygon = Polygon(new_coords + [new_coords[0]])
+                s.altitude_high = round(float(hi), 1)
+                s.altitude_low = round(float(lo), 1)
+                s.altitude = None
+                s.node_altitudes = None
+                n_rects += 1
+            else:
+                alts = [round(float(e), 1) for e in corner_elevs]
+                if ring_closed:
+                    alts.append(alts[0])
+                s.node_altitudes = alts
+                s.altitude_high = None
+                s.altitude_low = None
+                s.altitude = None
+                n_rects += 1
         elif s.role == ROLE_JUNCTION:
             alts = [round(float(e), 1) for e in corner_elevs]
             if ring_closed:
@@ -625,6 +703,19 @@ def _writeback(layout, elev, bucket_to_idx):
             s.node_altitudes = alts
             s.altitude = None
             n_juncs += 1
+        elif s.role == ROLE_RUNWAY:
+            # Seam-converted runway sub-rect — write per-vertex
+            # altitudes (the only runway shapes that reach here have
+            # node_altitudes pre-set; the skip-guard above filters
+            # the CIFP-only altitude_high/low ones).
+            alts = [round(float(e), 1) for e in corner_elevs]
+            if ring_closed:
+                alts.append(alts[0])
+            s.node_altitudes = alts
+            s.altitude = None
+            s.altitude_high = None
+            s.altitude_low = None
+            n_rects += 1
     return n_terms, n_rects, n_juncs
 
 

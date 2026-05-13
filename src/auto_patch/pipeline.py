@@ -2041,6 +2041,33 @@ def build_airport_pavement(icao: str, xplane_root: str,
             else:
                 tile_lat = int(math.floor(layout.anchor[0]))
                 tile_lon = int(math.floor(layout.anchor[1]))
+
+            # ── Seam-anchor pipeline (user 2026-05-13) ────────────
+            # 1) Insert ring vertices at integer lat/lon line crossings
+            #    and convert sloped rects to node_altitudes.
+            # 2) Sample DEM at each seam vertex via dem.alt_strict
+            #    (deterministic across tiles via SRTM overlap).
+            # 3) Stage A: regrade each runway's threshold altitudes
+            #    against seam HARD anchors with FAA grade + K-factor
+            #    rules; CIFP threshold altitudes act as soft preference.
+            # 4) Solver runs as before — _seed_elevations now honors
+            #    seam HARD anchors with OVERRIDE priority over CIFP.
+            from .seam_anchors import (
+                split_pavement_at_seams, apply_seam_dem_anchors)
+            from .runway_regrade import regrade_runways_in_layout
+            n_split = split_pavement_at_seams(layout)
+            n_seam = apply_seam_dem_anchors(
+                layout, dem, tile_lat, tile_lon)
+            n_regraded = regrade_runways_in_layout(
+                layout, dem, tile_lat, tile_lon)
+            seam_keys = getattr(layout, "_seam_anchor_keys", set())
+            if seam_keys or n_seam or n_regraded:
+                UI.vprint(1,
+                    f"  [pav-builder] {icao}: seam pipeline — "
+                    f"{len(seam_keys)} seam vert(s), "
+                    f"{n_seam} DEM-anchored, "
+                    f"{n_regraded} runway(s) regraded.")
+
             per_surface_solve(layout, icao,
                                dem=dem,
                                tile_lat=tile_lat, tile_lon=tile_lon)

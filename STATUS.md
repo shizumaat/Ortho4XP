@@ -1,239 +1,263 @@
-# Auto-Patch Status — 2026-05-12: TILE-CUT / DIAGONAL STUB / SLOPING-EDGE REFINEMENTS
+# Auto-Patch Status — 2026-05-13: SEAM-ANCHOR ARCHITECTURE + DIAGONAL-STUB TRAPEZOID
 
 ## TL;DR
 
-**9 commits since the last status.md** (commit `8921aa6`, the
-2026-05-11 status entry).  207 of 208 tests pass.  Only the
-pre-existing `test_compare_target_spjc` fixture failure remains
-(the fixture is OSM-derived; the build switched to apt.dat in the
-previous session, so spatial-match positions differ by 1-3 m).
+**Major architecture change this session.**  Replaced the tile-cut
+bridge polygon mechanism with **seam DEM HARD anchors** that win
+priority over CIFP runway thresholds.  Pavement at the integer
+lat/lon tile boundary is now pinned to the raw HGT pixel value
+(deterministic across both adjacent tile builds via SRTM 1-pixel
+overlap), and the elevation solver propagates FAA-grade-compliant
+altitudes outward from the seam.  X-Plane's terrain mesh — pinned to
+the same raw HGT at the seam via Ortho4XP's
+``preserve_boundary=True`` smoothing — now matches pavement at the
+seam by construction.  No more visible cliff.
 
-This session was driven by user-directed refinement of the
-auto-patch output at SPJC, working through visible issues in
-`/tmp/SPJC_v*.osm` outputs.  Five themes:
+Also landed: diagonal-stub **trapezoid** emission for digit-ref
+sub-rect refs whose pavement flares wide at the apron end
+(SPJC's V3 diagonal connector emits correctly now).
 
-1. **Cross-tile elevation determinism + regression test** (commit
-   `cc3c312`).  Found and fixed a coord/DEM mismatch in
-   `per_surface_solve` + `_compute_elevations` for cross-tile
-   airports.  Added [tests/test_tile_cut_parity.py](tests/test_tile_cut_parity.py)
-   that builds SPLP twice (anchor tile + neighbour tile) and
-   asserts elevations agree at the cut (pre-fix worst |dz| =
-   4.80 m, post-fix < 1 m).
+**Test status:** 217 / 217 pass.  Both fixture-based compare-target
+gates (SPJC + SPLP — the latter newly added) validate clean.
 
-2. **Phase B asymmetric dedup → removed entirely** (commits
-   `05f03f9`, `9bd94b1`).  `stitch_pavement_to_flat_runways`'s
-   Phase B perpendicular-projection pass was creating arbitrary-
-   looking corners on flat runway segments at perpendicular
-   projections of interior junction vertices.  After
-   confirming zero grade-test impact when disabled, removed
-   entirely (200 lines deleted).  Junction interiors anchored
-   to runway altitude via Phase A snaps + per-surface solver.
+**Branch:** `dev` (3+ commits ahead of last status).
+**Tag baselines:**
+* `spjc-good-baseline` (commit ``4d97f89``, 2026-05-07) — pre-seam.
+* (planned for this session) — post-seam SPJC/SPLP fixtures.
 
-3. **Sloped end-segment split at blast-pad pav vertex** (commit
-   `5bab14c`).  pipeline.py's `pav_runway_intersections`
-   capture used row-100 frame for `t` but the rect_boundary it
-   tests against uses the blast-extended frame; the mismatch
-   filtered out blast-pad-zone pavement vertices.  Extending
-   `cl_a/b` by `blast_a/b_m` in pipeline.py captures the SPJC
-   V1-throat row-110 vertex (1.79 m off runway boundary, 5.27 m
-   into the blast pad).  The runway segmenter then splits the
-   sloped end-segment at that fraction, giving the apron
-   junction an inline 4-corner sub-rect to snap to.
-
-4. **Diagonal-stub geometry overhaul** (commits `5404f25`,
-   `e4f8a9a`, `4f1e0c9`, `ba10a41`):
-   * Flipped the 20 % bias from TOWARD-runway to AWAY-from-
-     runway, then replaced bias entirely with a centered 30 m
-     fixed margin on each end of the gap.
-   * Extended the 30 m runway-buffer pull-back from
-     perpendicular-only to all centerlines with
-     `perp_diff < 70°` (diagonal stubs were skipping it).
-   * Moved the diagonal-parent + sub-ref STUB rules in
-     `_classify_role` BEFORE the `db<20°` parallel branch so a
-     curving sub-segment of a diagonal taxi (SPJC C had a 75 m
-     near-parallel slice at `db_local = 19.2°`) doesn't slip
-     through as PRIMARY_PARALLEL.  Added a complementary
-     "single-rect" dedup for diagonal-parent stub refs.
-   * Post-process drop of thin orphan sliver junctions adjacent
-     to stubs/parallels.  SPJC 3 → 0 thin slivers.
-
-5. **Sloped-rect split at junction-vertex sloping-edge
-   violations** (commit `41c50cd`).  When a junction polygon has
-   a vertex on the sloping (long) edge of a sloped 4-corner
-   rect, the rect splits at that vertex's axial position into
-   two sloped sub-rects (both 4-corner, altitude_high /
-   altitude_low linearly interpolated).  The junction vertex
-   now coincides with a sub-rect's short-edge corner instead of
-   sitting on a sloping edge — topology violation fixed.  SPJC
-   1 → 0 violations.
-
-**Branch:** `dev` (56 commits ahead of `origin/dev`).
-**Tag baseline:** `spjc-good-baseline` (commit `4d97f89`,
-2026-05-07).
-
-## Commits this session
+## Commits this session (since 9b7164d STATUS 2026-05-12)
 
 ```
-41c50cd Split sloped rects at junction-vertex sloping-edge violations
-4f1e0c9 Run diagonal-parent + sub-ref STUB rules before db<20° parallel check
-ba10a41 Drop thin orphan sliver junctions adjacent to stub/parallel rects
-e4f8a9a Diagonal stub: 30 m fixed margin + 30 m runway-perp buffer trim
-5404f25 Flip diagonal-stub margin bias: AWAY from runway, not toward
-cc3c312 Fix coord/DEM mismatch in per_surface_solve + _compute_elevations
-9bd94b1 Remove Phase B perpendicular-projection from stitch pass
-05f03f9 Symmetric Phase B insert dedup in stitch_pavement_to_flat_runways
-5bab14c Capture blast-pad pav vertices for sloped end-segment split
+(pending commit — large architectural change)
 ```
+
+The pending commit contains:
+* Diagonal-stub trapezoid fallback in ``_rect_from_axis_extended``
+  (accept_asymmetric mode for digit refs with parent db ≥ 20°).
+* Classifier tightening: digit→STUB now requires ``db_local ≥ 15°``.
+* New module ``src/auto_patch/seam_anchors.py``:
+  ``split_pavement_at_seams`` inserts seam vertices, converts seam-
+  affected sloped rects (and all sub-rects of an affected runway
+  chain) to ``node_altitudes``, records seam-vertex bucket keys;
+  ``apply_seam_dem_anchors`` writes ``dem.alt_strict`` values into
+  ``node_altitudes`` at every seam vertex.
+* New module ``src/auto_patch/runway_regrade.py``:
+  Stage A regrade solver.  Re-optimises runway threshold altitudes
+  against seam HARD anchors with FAA grade cap (1.5 %) and K-factor
+  (305 m, ARC Cat C/D default) constraints.  Closed-form 1D-per-
+  threshold optimisation with graceful relaxation.
+* Solver changes in ``unified_jacobi.py``:
+  ``_seed_elevations`` does 2-pass runway HARD seeding (CIFP first,
+  regraded shapes override) + seam-HARD override (seam wins over
+  CIFP).  ``_writeback`` preserves ``node_altitudes`` representation
+  for shapes that came in with it; handles runway shapes with
+  ``node_altitudes`` (the seam-converted ones).
+* Pipeline integration in ``pipeline.py``: seam pipeline runs
+  between DEM load and ``per_surface_solve``.
+* Tile-cut bridge polygon mechanism removed entirely
+  (``ROLE_TILE_CUT_BRIDGE`` deleted, bridge emission block removed,
+  ``box`` import dropped from ``tile_cut.py``, grade-limit entry
+  removed from ``config.py``).
+* ``_resample_node_altitudes_nn`` upgraded to **edge interpolation**:
+  cut-edge vertices now use linear gradient of the underlying old
+  edge instead of nearest-neighbour, eliminating jumpy NN artefacts
+  at cut buffer boundaries.
+* New unit tests: ``tests/test_runway_regrade.py`` (8 cases, all
+  pass) covering no-seam / single-seam / two-seam / K-factor /
+  grade-cap edge cases.
+* Compare-target test now covers SPLP in addition to SPJC.
+  Baselines reset to current canonical builds (regenerated 2026-05-13).
+* Tile-cut parity test simplified: bridge-vertex test removed
+  (bridges gone); seam parity now guaranteed by construction.
 
 ## Build / verify commands
 
 ```bash
-# Full test suite (207/208 pass; pre-existing SPJC compare-target fail)
+# Full test suite (217/217 pass).
 venv/bin/python3 -m pytest tests/ --tb=short -q
 
-# Build SPJC + write OSM for visual review
+# Build SPJC + write OSM for visual review.
 venv/bin/python3 - <<'PY'
 import sys; sys.path.insert(0, "src")
 from auto_patch.pipeline import build_airport_pavement
-layout = build_airport_pavement(
-    "SPJC", "/Users/noah/X-Plane 12", compute_elevations=True)
-layout.to_osm("/tmp/SPJC.osm")
-print("wrote /tmp/SPJC.osm")
+for icao in ("SPJC", "SPLP"):
+    layout = build_airport_pavement(
+        icao, "/Users/noah/X-Plane 12", compute_elevations=True)
+    layout.to_osm(f"/tmp/{icao}.osm")
+    print(f"wrote /tmp/{icao}.osm — {len(layout.shapes)} shapes")
 PY
 
-# Cross-tile regression test (needs SPLP scenery + S13W077 + S13W078 hgt)
+# Cross-tile regression (needs SPLP + S13W077 + S13W078 hgt).
 venv/bin/python3 -m pytest tests/test_tile_cut_parity.py -v
+
+# Compare-target gates (both airports).
+venv/bin/python3 -m pytest tests/test_compare_target.py -v
 ```
 
-## Geometry state at SPJC v23 (current dev tip)
+## Seam-anchor architecture
 
-**Diagonal-stub min-distance-to-runway-edge (m):**
+The seam-anchor pipeline runs inside ``build_airport_pavement`` after
+DEM load and before ``per_surface_solve``:
 
-| ref | d_rwy_edge | notes |
-|-----|-----------|-------|
-| A   | 62.5      | F-style loop ramp |
-| B   | 25.7      | diagonal stub |
-| C   | 19.8      | diagonal stub |
-| D   | 55.8      | apron-internal |
-| E   | 20.4      | diagonal stub |
-| F   | 71.4      | F-style loop ramp |
-| G   | 25.6      | diagonal stub |
-| L (×3) | 34.8, 54.8, 136.5 | parallel sub-pieces |
-| L3, L5 | 40.8, 52.0 | sub-refs |
-| V1, V2, V3, V5 | 44.2, 57.5, runway-crossing, 40.3 | sub-refs |
+```
+1. split_pavement_at_seams(layout)
+   For every pavement shape whose polygon boundary intersects any
+   integer lat/lon line in the airport footprint:
+     a. Insert ring vertices at the intersection points (deterministic
+        from polygon geometry alone, identical in both tile builds).
+     b. Convert sloped 4-corner rects to node_altitudes representation
+        — seam vertices get linearly-interpolated placeholder altitudes.
+     c. For each runway whose chain has ANY seam-crossing sub-rect,
+        convert ALL sub-rects in the chain to node_altitudes (so the
+        shared corners between regraded and non-regraded sub-rects can
+        carry independent per-vertex altitudes).
+     d. Record every seam vertex's bucket key in layout._seam_anchor_keys.
 
-**Junction count:** 38 (target 44; v20 was 38).
-**Multi-node flat runways:** 0.
-**Thin orphan slivers:** 0.
-**Sloping-edge rule violations:** 0.
+2. apply_seam_dem_anchors(layout, dem, tile_lat, tile_lon)
+   For every vertex in layout._seam_anchor_keys, overwrite the
+   placeholder altitude with dem.alt_strict at that vertex's lat/lon.
+   alt_strict (vs alt_nostrict) ensures both tile builds sample the
+   identical SRTM pixel — SRTM .hgt files include the boundary pixel
+   in both adjacent tiles' arrays.
 
-## Investigated and abandoned this session
+3. regrade_runways_in_layout(layout, dem, tile_lat, tile_lon)
+   For each runway sub-rect with seam vertices:
+     a. Identify threshold corners (non-seam vertices) and seam
+        vertices, projected onto source_axis.
+     b. Call regrade_runway with CIFP-seeded threshold altitudes and
+        DEM-anchored seam altitudes.
+     c. Stage A QP solves for adjusted threshold altitudes that
+        minimise CIFP-deviation subject to grade cap + K-factor.
+     d. Write adjusted altitudes back to the shape's node_altitudes.
+   Per user 2026-05-13 design: SEAM WINS over CIFP at conflict points.
 
-### Width-transition splitting (option A from user's option D)
+4. per_surface_solve(layout, dem, tile_lat, tile_lon)
+   The unified Jacobi:
+     - 2-pass HARD seeding: CIFP-only shapes first, regraded shapes
+       (those with node_altitudes from the seam pipeline) second
+       with OVERRIDE priority.
+     - Seam-HARD override: walks layout._seam_anchor_keys and pins
+       matching solver-graph nodes to their DEM altitudes (wins
+       over runway CIFP if both apply at the same node).
+     - Cap projection propagates SOFT nodes from HARDs respecting
+       FAA grade limits.
+     - Writeback preserves node_altitudes when the shape came in
+       with them; converts to altitude_high/low only for CIFP-only
+       4-corner rects.
+```
 
-Implemented [`_find_width_transition_breakpoints`](src/auto_patch/pavement/centerlines.py:769)
-(probe perpendicular half-width along each centerline, split at
-narrow ↔ wide transitions using widen_factor=1.5).  Successfully
-brought SPJC V parallel count from 3 → 5 (matching target's 5).
-**But** the new V rects sit in regions target treats as junction
-territory; their sloping edges then introduced 33 mid-edge step
-violations against adjacent junctions (failing the pavement-grade
-test, cap 10).
+## Geometry state at SPJC + SPLP (current dev tip)
 
-Disabled in [pipeline.py](src/auto_patch/pipeline.py:1271)
-behind a `pass` placeholder, comment block documenting the
-finding.  Function `_find_width_transition_breakpoints` remains
-exported in case future work needs it.
+**SPJC (single-tile):**
+* 896 total shapes (was 894 pre-V3-diagonal-trapezoid)
+* boundary 603, junction 40, runway 91, primary_parallel 28,
+  stub 20, cross_connector 9, retaining_wall 66, tunnel_ramp 36,
+  secondary_parallel 1, terminal 2
+* 1 within-shape grade WARN (pre-existing, junction 35.5→33.7
+  d=22.4m de=1.8m → 8.0 %)
+* Seam pipeline: 4 seam verts, 4 DEM-anchored, 0 runways regraded
+  (airport boundary touches a seam but the runway doesn't)
 
-### Cross-taxi geometric intersection splitting (option B)
+**SPLP (cross-tile, lon=-77 cut):**
+* 155 shapes (boundary 123, runway 23, junction 4,
+  primary_parallel 2, stub 3)
+* Seam pipeline: 22 seam verts, 25 DEM-anchored, 3 runway
+  sub-rects regraded
+* Runway 02/20 threshold shifts: A −1.47 m, B +2.70 m
+* 14 within-shape grade WARN (all on the big 65-vertex junction
+  spanning the coastal-terrain gradient; these are all-pair
+  Euclidean violations on naturally varying terrain — solver's
+  adjacency-graph grade is satisfied)
 
-Already in the pipeline at
-[pipeline.py:1243-1261](src/auto_patch/pipeline.py:1243).
-Inspected at length — SPJC's missing V splits (Issue 2 below)
-are NOT at any apt.dat-detectable cross-taxi intersection.
-Target's splits there come from OSM way fragmentation that
-apt.dat doesn't capture.  No improvement available without
-changing centerline data source.
+## Investigated and resolved this session
 
-## OPEN WORK — where to pick up
+### Diagonal V3 stub at SPJC
 
-### Hot topic: TILE-BOUNDARY SLICE WIDTH 5 m → 0.5 m (USER'S NEXT TASK)
+**Pre-fix:** 5 V3 centerlines (50/53/140/57/53 m at bearings
+152/141/126/142/148°) entered ``_build_taxi_rects``; the 140 m
+diagonal at bearing 126° failed ``_rect_from_axis_extended``'s
+symmetry retry loop (width asymmetry 42-47 %, never converged) and
+was silently discarded.  Junction ``-10169`` then drew a 100+ m
+straight edge across the diagonal pavement.
 
-**Current:** [`tile_cut.py:45`](src/auto_patch/tile_cut.py:45)
-defaults `half_width_m: float = 5.0`, producing a **10 m gap**
-along every integer-lat/lon line passing through the airport
-footprint.
+**Fix:** Added ``accept_asymmetric=True`` fallback in
+``_rect_from_axis_extended`` — returns the most-symmetric snapped
+quadrilateral encountered across all retries when the digit-ref's
+parent way is diagonal (``db_axis ≥ 20°``).  Also tightened the
+digit→STUB classifier at ``rects.py:1251`` to require
+``db_local ≥ 15°``, so near-parallel V3 sub-segments classify
+correctly.  V3 now emits as a 6461 m² trapezoid at bearing 300°
+(split into 2 sub-rects post-emit), and junction ``-10169``
+shrinks from 63 corners to 5.
 
-**Target:** reduce to `half_width_m = 0.5`, producing a **1 m
-gap**.  Tighter gap means less pavement lost to the cut.
+### Cross-tile seam (SPLP)
 
-**Files to touch:**
-* [`src/auto_patch/tile_cut.py:45`](src/auto_patch/tile_cut.py:45)
-  — change the default.
-* Verify with the [`test_tile_cut_parity.py`](tests/test_tile_cut_parity.py)
-  regression test — the test currently uses `NEAR_CUT_M = 15`
-  to identify near-cut vertices; tighten if needed to reflect
-  the new 1 m gap geometry.
-* `cut_polys = [line.buffer(half_width_m, cap_style=2)`
-  at [`tile_cut.py:111`](src/auto_patch/tile_cut.py:111).
-  Tighter buffer = smaller geometric difference = more
-  pavement retained, but also less margin for
-  floating-point seam alignment between adjacent tiles.
-* Check that the cut still produces clean shape splits at
-  0.5 m (shapely's polygon difference with a thin buffer can
-  produce sliver geometries that get filtered by
-  `min_piece_area_m2: float = 1.0`).
+**Pre-fix:** Tile-cut bridge polygons covered the 10 m gap with
+``slope_sampler``-interpolated altitudes.  Empirical measurement
+showed the visible step lives outside the gap (at the pavement-to-
+DEM transition) where bridges have no effect.
 
-**Validation:**
-* Run `tests/test_tile_cut_parity.py` for SPLP cross-tile parity.
-* Build SPJC + SPLP and visually inspect the cut seams.
-* Ensure no new sliver-merge or sliver-drop log lines flag
-  unexpected drops.
-
-### Known limitations (not addressed this session)
-
-* **Issue 2 (v23 -10169 junction has 650 m straight edge across
-  grass):** SPJC's V parallel is missing a rect at ax 2090..2394
-  (target has -10012 there).  Target splits V there based on OSM
-  way fragmentation; apt.dat row-1202 has a single long edge
-  through that range with no cross-taxi geometric intersection.
-  Width-transition splitting (the user's option A) could fix
-  this but breaks the pavement-grade test (new V rects in
-  target's junction territory produce 33 mid-edge violations).
-  Documented in the commit message for `41c50cd`.
-
-* **`test_compare_target_spjc` fixture mismatch:** the SPJC
-  target fixture was generated from OSM-derived geometry before
-  the apt.dat-primary switch.  Position differences of 1-3 m
-  break the spatial-match floor counts.  Regeneration deferred
-  until the diagonal-stub + V-parallel geometry is final.
-
-* **Within-shape grade WARN at SPJC:** 1 violation worst-case
-  8.0 % on junction -10159 (35.5 → 33.7, d=22.4 m, de=1.8 m).
-  Pre-existing and consistent across sessions; not yet
-  investigated.
-
-* **Exception-hardening item 3 (project_todos):** broad-except
-  pass is done within `src/auto_patch/` but the wider Ortho4XP
-  codebase outside `auto_patch/` may still have similar issues.
-  Out of scope unless requested.
+**Fix:** Switched to seam-DEM HARD anchors (see architecture
+section above).  Bridges removed.  Cross-tile parity:
+* Seam vertices: 0.000 m worst |dz| (by construction).
+* Cut-edge vertices (5 m off seam): typically ≤ 1 m
+  (edge-interpolation resampler).
 
 ## Reference artefacts
 
-* `/tmp/SPJC_v23.osm` — most recent SPJC build (commit `41c50cd`).
-* `/tmp/SPJC_v22.osm` — width-split experiment (abandoned).
-* `/tmp/SPJC_v20.osm` — pre-classifier-fix state.
-* `tests/fixtures/SPJC_target.osm` — OSM-derived baseline gate
-  (pre-apt.dat-switch).  Regeneration deferred.
-* The un-tracked `+60-140/` directory at the repo root: 24 stray
-  `.hgt` elevation-tile files that should live under
-  `Elevation_data/+60-140/`.  Per user direction: leave
-  untracked, never include in `git add -A`.
+* ``tests/fixtures/SPJC_target.osm`` — canonical SPJC build,
+  regenerated 2026-05-13.  Forward baseline gate for SPJC.
+* ``tests/fixtures/SPLP_target.osm`` — canonical SPLP build,
+  regenerated 2026-05-13.  Forward baseline gate for SPLP.
+* ``/tmp/SPJC.osm`` / ``/tmp/SPLP.osm`` — most recent local builds.
+* ``+60-140/`` directory at repo root: 24 stray ``.hgt`` files
+  that should live under ``Elevation_data/+60-140/``.  Per user
+  direction: leave untracked.
+
+## OPEN WORK — where to pick up
+
+### CYXY missing junctions
+
+User report 2026-05-13: CYXY appears to be missing almost all
+junctions.  Not yet investigated.  Pick this up next session.
+
+### In-sim validation (SPLP)
+
+Rebuild SPLP via the full Ortho4XP pipeline (need
+``Patches/-13-077/SPLP_auto.patch.osm`` +
+``Patches/-13-078/SPLP_auto.patch.osm`` regenerated post-this-
+session's changes) and walk the seam in X-Plane.  Architecturally
+the cliff should be gone; visual confirmation pending.
+
+### Within-shape grade WARN at SPLP
+
+14 violations on the big 65-vertex junction that spans steep
+coastal terrain (54-80 m across the airport).  These are all-pair
+Euclidean violations between non-adjacent vertices on a single
+polygon — the solver's adjacency-graph grade IS satisfied locally,
+but ``check_grade``'s all-pair check finds far-apart vertex pairs
+with naturally varying terrain altitudes.  Two paths if needed:
+(a) split the big junction along the steep-terrain gradient lines
+so each sub-junction's span is smaller, or (b) change
+``check_grade`` to use axis-aligned grade (which is what FAA
+actually mandates).  Not urgent — these are WARN, not FAIL.
 
 ## Memory notes for next agent
 
-Saved under `~/.claude/projects/-Users-noah-Ortho4XP-shred86/memory/`:
-* No new memory entries this session — all decisions captured in
-  commit messages.  Existing memories `feedback_root_cause_only`,
-  `feedback_general_solutions`, `feedback_shape_rules`,
-  `project_target_osm` remain authoritative.
+Saved under ``~/.claude/projects/-Users-noah-Ortho4XP-shred86/memory/``:
+No new memory entries this session — all decisions captured in this
+status file + commit messages.  Existing memories
+``feedback_root_cause_only``, ``feedback_general_solutions``,
+``feedback_shape_rules``, ``project_target_osm``,
+``feedback_boundary_clamp_asymmetric`` remain authoritative.
+
+User design rules established this session:
+* **Seam wins over everything** — tile-boundary DEM is the
+  canonical hard anchor.  CIFP runway thresholds adjust to satisfy
+  seam + grade.  Other pavement adjusts to satisfy runway + seam +
+  grade.  Visible cliff in X-Plane is unacceptable.
+* **FAA grade rules everywhere when possible** — runway: 1.5 %
+  longitudinal + K-factor vertical curves (default K = 305 m
+  for ARC Cat C/D).  Taxiway/junction: 1.5 % grade cap.
+  Apron/terminal: 1.0 % grade cap.  Relax only when seam HARD
+  anchors force it.

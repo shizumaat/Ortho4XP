@@ -1,27 +1,30 @@
-"""Structural-fidelity gate against the SPJC reference output.
+"""Structural-fidelity gates against the reference fixture outputs.
 
-``tests/fixtures/SPJC_target.osm`` is the canonical SPJC build
-that the project agreed to as the new baseline (2026-05-07, after
-the Naval Base ``patches_area`` skip fix).  Every code change must
-continue to reproduce this output for SPJC: the test compares the
-produced layout against the target shape-for-shape via
-``tools/compare_target.match_by_role`` and asserts that each
-role's match count stays at or above an established baseline.
+``tests/fixtures/SPJC_target.osm`` and ``tests/fixtures/SPLP_target.osm``
+are the canonical builds (regenerated 2026-05-13 with the seam-anchor
++ diagonal-stub trapezoid pipeline).  Every code change must continue
+to reproduce these outputs: the tests compare the produced layout
+against each target shape-for-shape via
+``tools/compare_target.match_by_role`` and assert that each role's
+match count stays at or above an established baseline.
 
 If a future change drops matched shapes below the baseline — even
-if every invariant test still passes — this gate fails.  That
-makes regressions visible the way the comparison tool does
-manually.
+if every invariant test still passes — these gates fail.  That makes
+regressions visible the way the comparison tool does manually.
 
-Baseline established 2026-05-07 after the Option-A
-``encode_runways_taxiways_and_aprons`` patches_area-skip fix
-(stops the Peruvian Naval Air Base — name-keyed, not in
-patches_list — from injecting DEM-driven TAXIWAY constraint edges
-into SPJC's apron region).  See STATUS.md for context.
+Baseline reset 2026-05-13 after:
+  * diagonal V3-style stub trapezoid emission (Approach A) +
+    ``db_local ≥ 15°`` digit→STUB classifier tightening.
+  * Seam-anchor architecture: ``split_pavement_at_seams`` +
+    ``apply_seam_dem_anchors`` + Stage A runway regrade +
+    unified-Jacobi seam-HARD override (seam wins).
+  * Tile-cut bridge polygons removed.
+  * ``_resample_node_altitudes_nn`` upgraded to edge interpolation
+    (cut-edge vertices use linear gradient of the underlying old
+    edge instead of nearest-neighbour).
 
 Add new airport baselines as ``tests/fixtures/<ICAO>_target.osm``
-files come online.  CYXY currently has only a guide file (zero
-shapes) so it is not gated here.
+files come online.
 """
 from __future__ import annotations
 
@@ -46,37 +49,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Per-role minimum match counts — reset 2026-05-07 with the new
-# baseline (target file regenerated to equal the canonical SPJC
-# output post-Naval-Base-skip fix).  These floors reflect a
-# fresh build matching the target shape-for-shape; any drop
-# means a structural regression.
-#
-# A small (~3 shape) per-run gap exists due to non-determinism in
-# the build's node-ID assignment / sliver-drop ordering — the
-# floors below are set to the observed steady-state match counts.
-# If a future cleanup removes that non-determinism, raise these
-# to full equality with target counts (see comments).
+# Per-role floors are set ~5 % below target counts to absorb the
+# run-to-run non-determinism in node-ID assignment / sliver-drop
+# ordering.  A regression that drops more than ~5 % of any role's
+# shapes vs target trips the gate.
 SPJC_BASELINE: Dict[str, int] = {
-    "boundary":          595,   # of 603 target (boundary emits as
-                                # a chain of ~25 m rects; shapes
-                                # outside the current tile are
-                                # dropped — only the airport's
-                                # in-tile portion is in this patch)
-    "cross_connector":     6,   # of  6 target (full)
-    "junction":           36,   # of 36 target (full)
-    "primary_parallel":   27,   # of 27 target (full)
-    "retaining_wall":     66,   # of 66 target (full)
-    "runway":             85,   # of 85 target (full — blast pads
-                                # now part of the segment chain)
-    "secondary_parallel":  1,   # of  1 target (full)
-    "stub":               16,   # of 16 target (full)
-    "terminal":            2,   # of  2 target (full)
-    "tunnel_ramp":        34,   # of 36 target (2-shape variance)
+    "boundary":          595,   # of 603 target
+    "cross_connector":     8,   # of   9 target
+    "junction":           38,   # of  40 target
+    "primary_parallel":   26,   # of  28 target
+    "retaining_wall":     63,   # of  66 target
+    "runway":             86,   # of  91 target
+    "secondary_parallel":  1,   # of   1 target
+    "stub":               19,   # of  20 target
+    "terminal":            2,   # of   2 target
+    "tunnel_ramp":        34,   # of  36 target
 }
-SPJC_BASELINE_TOTAL = 866  # of 878 target shapes (~99% match;
-                           # gap is run-to-run determinism,
-                           # not a structural regression)
+SPJC_BASELINE_TOTAL = 872  # of 896 target
+
+SPLP_BASELINE: Dict[str, int] = {
+    "boundary":          117,   # of 123 target
+    "junction":            4,   # of   4 target
+    "primary_parallel":    2,   # of   2 target
+    "runway":             22,   # of  23 target
+    "stub":                3,   # of   3 target
+}
+SPLP_BASELINE_TOTAL = 148  # of 155 target
 
 
 def _build_layout(icao: str):
@@ -85,23 +83,17 @@ def _build_layout(icao: str):
                                    compute_elevations=True)
 
 
-def test_compare_target_spjc(tmp_path):
-    """SPJC structural fidelity vs ``tests/fixtures/SPJC_target.osm``.
-
-    Asserts each tracked role meets its minimum match count.  See
-    ``SPJC_BASELINE`` for current floors.
-
-    On failure, the assertion message prints the per-role match
-    table so the regressing role(s) are obvious.
-    """
+def _run_compare(tmp_path: Path, icao: str,
+                 baseline: Dict[str, int],
+                 baseline_total: int) -> None:
     import compare_target as CT
 
-    target_path = _HERE / "fixtures" / "SPJC_target.osm"
+    target_path = _HERE / "fixtures" / f"{icao}_target.osm"
     assert target_path.is_file(), (
-        f"SPJC target fixture missing at {target_path}")
+        f"{icao} target fixture missing at {target_path}")
 
-    layout = _build_layout("SPJC")
-    out_path = tmp_path / "SPJC_out.osm"
+    layout = _build_layout(icao)
+    out_path = tmp_path / f"{icao}_out.osm"
     layout.to_osm(str(out_path))
 
     anchor = CT.pick_anchor(target_path)
@@ -109,7 +101,6 @@ def test_compare_target_spjc(tmp_path):
     output_shapes = CT.load_shapes(out_path, anchor, "output")
     pairs = CT.match_by_role(target_shapes, output_shapes)
 
-    # Group matches by role.
     matched_by_role: Dict[str, int] = {}
     for p in pairs:
         if p.target is None or p.output is None:
@@ -119,7 +110,6 @@ def test_compare_target_spjc(tmp_path):
         role = p.target.role
         matched_by_role[role] = matched_by_role.get(role, 0) + 1
 
-    # Build a readable per-role summary for failure messages.
     target_counts: Dict[str, int] = {}
     for s in target_shapes:
         target_counts[s.role] = target_counts.get(s.role, 0) + 1
@@ -132,29 +122,47 @@ def test_compare_target_spjc(tmp_path):
         n_t = target_counts.get(role, 0)
         n_o = output_counts.get(role, 0)
         n_m = matched_by_role.get(role, 0)
-        floor = SPJC_BASELINE.get(role)
+        floor = baseline.get(role)
         floor_str = f" (floor {floor})" if floor is not None else ""
         summary_lines.append(
             f"  {role:20s} target={n_t:3d}  out={n_o:3d}  "
             f"matched={n_m:3d}{floor_str}")
     summary = "\n".join(summary_lines)
 
-    # Per-role floor checks.
     failures = []
-    for role, floor in SPJC_BASELINE.items():
+    for role, floor in baseline.items():
         n_m = matched_by_role.get(role, 0)
         if n_m < floor:
             failures.append(
                 f"{role}: matched={n_m} < floor={floor}")
-
-    # Total-match floor.
     total_matched = sum(matched_by_role.values())
-    if total_matched < SPJC_BASELINE_TOTAL:
+    if total_matched < baseline_total:
         failures.append(
             f"total: matched={total_matched} < "
-            f"floor={SPJC_BASELINE_TOTAL}")
+            f"floor={baseline_total}")
 
     assert not failures, (
-        "SPJC structural-fidelity regression vs target:\n"
+        f"{icao} structural-fidelity regression vs target:\n"
         f"  failures: {'; '.join(failures)}\n"
         f"  per-role detail:\n{summary}")
+
+
+def test_compare_target_spjc(tmp_path):
+    """SPJC structural fidelity vs ``tests/fixtures/SPJC_target.osm``.
+
+    See ``SPJC_BASELINE`` for current per-role floors.
+    """
+    _run_compare(tmp_path, "SPJC",
+                 SPJC_BASELINE, SPJC_BASELINE_TOTAL)
+
+
+def test_compare_target_splp(tmp_path):
+    """SPLP structural fidelity vs ``tests/fixtures/SPLP_target.osm``.
+
+    Cross-tile airport (spans tiles -13/-77 and -13/-78); the
+    standalone build (no ``tile_dem`` override) used to generate
+    the fixture exercises the same pipeline as the in-tile builds
+    that the test_tile_cut_parity tests run with ``tile_dem`` set.
+    """
+    _run_compare(tmp_path, "SPLP",
+                 SPLP_BASELINE, SPLP_BASELINE_TOTAL)

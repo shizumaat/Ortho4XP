@@ -163,6 +163,27 @@ def _build_taxi_rects(
         width = 2.0 * trim_narrow_hw
         rect = _rect_from_axis_extended(trimmed, width, pav_non_rwy,
                                         apt_vertices=apt_vertices)
+        # Diagonal-stub fallback (user 2026-05-12): when the strict
+        # symmetric-rect builder rejects a digit-ref centerline whose
+        # bearing is diagonal to the runway, retry with
+        # accept_asymmetric=True.  Diagonal connectors (V3 at SPJC,
+        # similar refs elsewhere) physically flare wide where they
+        # meet aprons/parallels; the resulting snapped quad is a
+        # trapezoid, not a rectangle, but it carries the correct
+        # 4 corner positions to anchor the surrounding junction
+        # polygon.  Without this fallback the rect is silently
+        # discarded and the junction perimeter draws a 100+ m
+        # straight edge across the diagonal pavement.
+        if ((rect is None or rect.is_empty)
+                and ref and any(c.isdigit() for c in ref)
+                and rwy_centerlines):
+            db_axis = _axis_to_nearest_rwy_db(
+                trimmed, rwy_centerlines)
+            if db_axis is not None and db_axis >= 20.0:
+                rect = _rect_from_axis_extended(
+                    trimmed, width, pav_non_rwy,
+                    apt_vertices=apt_vertices,
+                    accept_asymmetric=True)
         if rect is None or rect.is_empty:
             continue
         # Skip invalid rects (self-intersecting after snap).
@@ -841,6 +862,7 @@ def _rect_from_axis_extended(axis: LineString, width: float,
                             pav: Polygon,
                             apt_vertices: Optional[
                                 List[Tuple[float, float]]] = None,
+                            accept_asymmetric: bool = False,
                             ) -> Optional[Polygon]:
     """Build a rect around the axis at its first-to-last direction.
 
@@ -858,6 +880,16 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     most likely it's too long and needs to be shortened a bit so
     it's not pulled into a junction."  Retry once with the axis
     trimmed by ``ASYM_TRIM_FRAC`` of its length on the wider end.
+
+    When ``accept_asymmetric`` is True, the function returns the
+    MOST-SYMMETRIC snapped quadrilateral encountered across all
+    retries even if no iteration converges to within the symmetry
+    tolerances.  Used as a fallback for diagonal-stub refs where
+    the diagonal connector pavement physically flares wide at the
+    apron end (asymmetry can't be eliminated by trimming).  The
+    returned quad is still a 4-corner sloped shape that downstream
+    code can handle as a "rect" — corners ordered [H, L, L, H]
+    along the axis — but its long edges have unequal lengths.
     """
     from shapely.ops import substring
 
@@ -882,16 +914,18 @@ def _rect_from_axis_extended(axis: LineString, width: float,
     MAX_ASYM_RETRIES = 15          # 15 * 5 % = up to 75 % shrink
 
     cur_axis = axis
+    best_snapped: Optional[List[Tuple[float, float]]] = None
+    best_asym_score = float("inf")
     for attempt in range(MAX_ASYM_RETRIES + 1):
         coords = list(cur_axis.coords)
         if len(coords) < 2:
-            return None
+            break
         p1 = coords[0]
         p2 = coords[-1]
         dx, dy = p2[0] - p1[0], p2[1] - p1[1]
         mag = math.hypot(dx, dy)
         if mag < 1e-6:
-            return None
+            break
         ux, uy = dx / mag, dy / mag
         px, py = -uy, ux
         half = width / 2.0
@@ -905,11 +939,9 @@ def _rect_from_axis_extended(axis: LineString, width: float,
             corners, pav, apt_vertices)
         if snapped is None:
             # Degenerate rect (≥2 corners collapsed within 1 m of
-            # each other after snap) — reject.  Per user 2026-05-11:
-            # do NOT reject apron-interior rects here; let the
-            # absorption pass split them per the long-edge-adjacent
-            # ruleset.
-            return None
+            # each other after snap).  Stop iterating — further
+            # shrinks will only collapse more aggressively.
+            break
 
         # Symmetry check: equal widths (end1 vs end2) AND equal
         # lengths (side1 vs side2).
@@ -929,6 +961,12 @@ def _rect_from_axis_extended(axis: LineString, width: float,
         length_ratio = (length_asym / max_l) if max_l > 1e-6 else 0.0
         symmetric = (width_ratio <= ASYM_WIDTH_RATIO_TOL
                      and length_ratio <= ASYM_LENGTH_RATIO_TOL)
+        # Track the most-symmetric snapped quad in case we exit
+        # without converging — accept_asymmetric will return it.
+        asym_score = width_ratio + length_ratio
+        if asym_score < best_asym_score:
+            best_asym_score = asym_score
+            best_snapped = snapped
         if symmetric or attempt == MAX_ASYM_RETRIES:
             return Polygon(snapped)
 
@@ -945,6 +983,16 @@ def _rect_from_axis_extended(axis: LineString, width: float,
             cur_axis = substring(cur_axis, new_start, new_end)
         except _GEOM_EXC:
             return Polygon(snapped)
+    # Loop fell through (snap returned None on some retry, or the
+    # axis collapsed).  Diagonal-stub callers use ``accept_asymmetric``
+    # to fall back to the best snapped quad encountered along the way.
+    # Per user 2026-05-12: SPJC's V3 diagonal connector flares wide
+    # at the apron end (width asymmetry 42-47%, never converges by
+    # axis shrink); without this fallback the rect is silently
+    # discarded and the surrounding junction draws a 100+ m straight
+    # edge across the diagonal pavement.
+    if accept_asymmetric and best_snapped is not None:
+        return Polygon(best_snapped)
     return None
 
 
@@ -1244,11 +1292,17 @@ def _classify_role(axis: LineString, width: float,
         except _GEOM_EXC:
             pass
 
-    # Sub-ref check (digit suffix → always STUB), now also runs
-    # before the db<20° branch so e.g. a curving V3 sub-segment
-    # with db_local = 18° still classifies as STUB rather than
-    # short PRIMARY_PARALLEL fragments.
-    if ref and any(c.isdigit() for c in ref):
+    # Sub-ref check (digit suffix → STUB), now also runs before the
+    # db<20° branch so e.g. a curving V3 sub-segment with
+    # db_local = 18° still classifies as STUB rather than short
+    # PRIMARY_PARALLEL fragments.  Per user 2026-05-12: require
+    # db_local >= 15° so digit-ref segments that are essentially
+    # parallel to the runway (e.g. SPJC V3 near-parallel pieces
+    # at db = 6° / 12°, geometrically part of V) classify as
+    # PRIMARY_PARALLEL.  The diagonal-parent check above already
+    # caught curving sub-segments whose PARENT way is diagonal;
+    # this gate only fires on standalone near-parallel sub-refs.
+    if ref and any(c.isdigit() for c in ref) and db >= 15.0:
         return ROLE_STUB
 
     # Per user 2026-05-05: parallel rects (db < 20°) that pass

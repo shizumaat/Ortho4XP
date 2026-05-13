@@ -976,16 +976,33 @@ def _resample_node_altitudes_nn(
         ) -> Optional[List[float]]:
     """Given a new polygon (post geometry edit) and the OLD ring's
     open-form coords + closed-form altitudes, return a fresh
-    ``node_altitudes`` list (closed) for ``new_poly`` by nearest-
-    neighbour sampling each new ring vertex against the old ring.
+    ``node_altitudes`` list (closed) for ``new_poly``.
+
+    For each new vertex, sample its altitude via:
+      1. **Edge interpolation (preferred).**  Find the OLD edge that
+         contains the new vertex (perpendicular distance ≤
+         ``EDGE_TOL_M``).  Compute the parametric position ``t`` along
+         that edge and linearly interpolate between the edge's two
+         endpoint altitudes.  This is the correct sampling for
+         vertices inserted by ``polygon.difference`` / ``buffer(0)``
+         / boundary clip — they sit exactly on old edges by shapely's
+         geometric guarantee, so the edge's linear gradient is the
+         authoritative source.
+      2. **Nearest-neighbour (fallback).**  When no old edge contains
+         the new vertex (rare; happens for vertices inserted in the
+         polygon interior or after a degenerate buffer(0) repair),
+         fall back to NN against old-ring vertices.
+
+    Per user 2026-05-13: pure NN historically produced jumpy
+    altitude deltas at cut-edge vertices — two adjacent new vertices
+    on the same old edge could pick *different* old endpoints as
+    their nearest, fabricating a step that didn't exist in the
+    pre-cut shape's smooth altitude field.  Edge interpolation
+    preserves the original gradient.
 
     Used wherever a polygon edit (boundary clip, buffer(0) repair,
-    push-off, sliver merge, etc.) changes the vertex count and we
-    would otherwise have to drop ``node_altitudes`` — a bare drop
-    leaves the polygon with no elevation guidance, which X-Plane
-    can render as a terrain spike (or, for very large boundary
-    polygons, crash on load — see HECA's 1066-vertex airport
-    boundary that lost altitudes during tunnel-clip).
+    push-off, sliver merge, tile-cut, etc.) changes the vertex
+    count and we would otherwise have to drop ``node_altitudes``.
 
     Returns None if the inputs are insufficient to resample.
     """
@@ -1008,13 +1025,45 @@ def _resample_node_altitudes_nn(
         new_open = new_open[:-1]
     if not new_open:
         return None
+
+    n_old = min(len(old_open), len(src_alts_open))
+    EDGE_TOL_M = 0.5  # perpendicular distance for "on edge"
+    EDGE_TOL_M2 = EDGE_TOL_M * EDGE_TOL_M
+
     new_alts: List[float] = []
     for nx, ny in new_open:
+        # Pass 1: edge interpolation.
+        best_edge_d2 = float("inf")
+        best_edge_alt: Optional[float] = None
+        for k in range(n_old):
+            sx, sy = old_open[k]
+            tx, ty = old_open[(k + 1) % n_old]
+            dx, dy = tx - sx, ty - sy
+            seg_len2 = dx * dx + dy * dy
+            if seg_len2 < 1e-9:
+                continue
+            t = ((nx - sx) * dx + (ny - sy) * dy) / seg_len2
+            if t < -1e-3 or t > 1.0 + 1e-3:
+                continue
+            t = max(0.0, min(1.0, t))
+            px, py = sx + t * dx, sy + t * dy
+            d2 = (nx - px) ** 2 + (ny - py) ** 2
+            if d2 > EDGE_TOL_M2 or d2 >= best_edge_d2:
+                continue
+            a_s = src_alts_open[k]
+            a_t = src_alts_open[(k + 1) % n_old]
+            best_edge_d2 = d2
+            best_edge_alt = a_s + t * (a_t - a_s)
+        if best_edge_alt is not None:
+            new_alts.append(round(float(best_edge_alt), 1))
+            continue
+
+        # Pass 2: nearest-neighbour fallback (interior vertex / no
+        # containing edge).
         best_d2 = float("inf")
         best_a = src_alts_open[0]
-        for k, (sx, sy) in enumerate(old_open):
-            if k >= len(src_alts_open):
-                break
+        for k in range(n_old):
+            sx, sy = old_open[k]
             d2 = (nx - sx) ** 2 + (ny - sy) ** 2
             if d2 < best_d2:
                 best_d2 = d2
