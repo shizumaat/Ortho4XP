@@ -2174,6 +2174,19 @@ def build_airport_pavement(icao: str, xplane_root: str,
         from .junction_repair import _split_sloped_rects_at_violations
         _split_sloped_rects_at_violations(layout, icao=icao)
 
+        # Per user 2026-05-13 (CYXY way -10483 overlap report):
+        # downstream passes (subdivide_violating_junctions, stitch,
+        # sloping-edge split) reshape junctions after the
+        # boundary→DEM bridge was emitted.  Re-clip every bridge
+        # against the final pavement footprint so no bridge overlaps
+        # any junction / terminal / taxi rect / runway.
+        from .boundary import _clip_boundary_bridges_against_pavement
+        n_clipped = _clip_boundary_bridges_against_pavement(layout)
+        if n_clipped:
+            UI.vprint(1,
+                f"  [pav-builder] {icao}: re-clipped {n_clipped} "
+                f"boundary→DEM bridge polygon(s) against final pavement.")
+
         # Per user 2026-05-10: shapes cannot cross integer lat/lon
         # tile boundaries (X-Plane / Ortho4XP render each 1°x1° tile
         # separately).  Cut a 10 m gap along every tile boundary

@@ -71,7 +71,137 @@ from .elevation import _resample_node_altitudes_nn, _sample_dem
 __all__ = [
     "_emit_airport_boundary_shape",
     "_emit_boundary_dem_bridge",
+    "_clip_boundary_bridges_against_pavement",
 ]
+
+
+def _clip_boundary_bridges_against_pavement(
+        layout: "PavementLayout",
+        min_area_m2: float = 25.0) -> int:
+    """Post-process: re-subtract pavement (junction/terminal/rect/
+    runway) from every ``boundary_dem_bridge`` shape.
+
+    ``_emit_boundary_dem_bridge`` subtracts the junctions/terminals
+    present AT EMIT TIME, but downstream passes (per_surface_solve,
+    subdivide_violating_junctions, stitch_pavement_polygons,
+    _split_sloped_rects_at_violations) reshape pavement polygons —
+    a junction may merge with a neighbour, a subdivide may grow
+    a junction across the bridge boundary, etc.  Any such growth
+    creates a stale overlap because the bridge was clipped against
+    the bridge's emit-time snapshot.
+
+    This pass runs LAST, just before tile_cut, against the final
+    pavement geometry.  Per user 2026-05-13 (CYXY way -10483
+    overlap report): zero tolerance for bridge↔pavement overlap.
+
+    Returns the number of bridge shapes modified (clipped or dropped).
+    """
+    bridges = [s for s in layout.shapes
+               if s.role == ROLE_BOUNDARY
+               and s.ref == "boundary_dem_bridge"
+               and s.polygon is not None
+               and not s.polygon.is_empty]
+    if not bridges:
+        return 0
+
+    # Roles that bridges must NOT overlap.  We exclude other
+    # boundary shapes (ribbon + DEM bridges) because they share
+    # vertices by design at the airport perimeter.
+    NON_BRIDGE_PAVEMENT = {
+        ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+        ROLE_STUB, ROLE_CROSS_CONNECTOR,
+        ROLE_JUNCTION, ROLE_TERMINAL, ROLE_APRON,
+    }
+    obstacles = [s for s in layout.shapes
+                 if s.role in NON_BRIDGE_PAVEMENT
+                 and s.polygon is not None
+                 and not s.polygon.is_empty]
+    if not obstacles:
+        return 0
+
+    n_modified = 0
+    new_shapes: List[BuiltShape] = []
+    for s in layout.shapes:
+        if (s.role != ROLE_BOUNDARY
+                or s.ref != "boundary_dem_bridge"
+                or s.polygon is None
+                or s.polygon.is_empty):
+            new_shapes.append(s)
+            continue
+        bridge_poly = s.polygon
+        old_alts = s.node_altitudes
+        old_open = list(bridge_poly.exterior.coords)
+        if old_open and old_open[0] == old_open[-1]:
+            old_open = old_open[:-1]
+        modified = False
+        for obs in obstacles:
+            try:
+                if not bridge_poly.intersects(obs.polygon):
+                    continue
+                inter_area = bridge_poly.intersection(obs.polygon).area
+                if inter_area <= 0.0:
+                    continue
+                bridge_poly = bridge_poly.difference(obs.polygon)
+                modified = True
+            except _GEOM_EXC:
+                continue
+            if bridge_poly.is_empty:
+                break
+            if bridge_poly.geom_type not in (
+                    "Polygon", "MultiPolygon",
+                    "GeometryCollection"):
+                bridge_poly = None
+                break
+        if bridge_poly is None or bridge_poly.is_empty:
+            n_modified += 1
+            continue
+        if not modified:
+            new_shapes.append(s)
+            continue
+        # Extract Polygon members.  difference() can yield Polygon,
+        # MultiPolygon, or GeometryCollection (when subtracted
+        # boundaries touch at points/edges).
+        if bridge_poly.geom_type == "Polygon":
+            pieces = [bridge_poly]
+        elif bridge_poly.geom_type == "MultiPolygon":
+            pieces = list(bridge_poly.geoms)
+        elif bridge_poly.geom_type == "GeometryCollection":
+            pieces = [g for g in bridge_poly.geoms
+                      if g.geom_type == "Polygon"]
+        else:
+            pieces = []
+        pieces = [p for p in pieces
+                  if p.is_valid and not p.is_empty
+                  and p.area >= min_area_m2]
+        if not pieces:
+            n_modified += 1
+            continue
+        # Keep the largest piece (consistent with emit-time logic).
+        pieces.sort(key=lambda g: -g.area)
+        keep = pieces[0]
+        new_s = BuiltShape(
+            polygon=keep,
+            role=s.role,
+            ref=s.ref,
+            source_axis=s.source_axis,
+            altitude=s.altitude,
+            altitude_high=s.altitude_high,
+            altitude_low=s.altitude_low,
+            node_altitudes=None,
+            is_bridge=s.is_bridge,
+        )
+        # Resample node_altitudes via edge interpolation against the
+        # ORIGINAL bridge ring's per-vertex altitudes.
+        if old_alts is not None and old_open:
+            new_alts = _resample_node_altitudes_nn(
+                keep, old_open, old_alts)
+            if new_alts is not None:
+                new_s.node_altitudes = new_alts
+        new_shapes.append(new_s)
+        n_modified += 1
+
+    layout.shapes = new_shapes
+    return n_modified
 
 
 def _emit_airport_boundary_shape(

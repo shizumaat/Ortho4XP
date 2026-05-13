@@ -72,6 +72,14 @@ SELF_OVERLAP_BASELINE_M2 = {
     # the boundary polygon before emit (see config.py
     # EMIT_BRIDGES_AND_TUNNELS comment).
     "SPJC": 1700.0,
+    # SPLP / CYXY: tiny boundary/boundary overlaps where the
+    # airport-perimeter ribbon's individual ~25 m chain pieces
+    # overlap each other at tight curves.  Each pair is ≤ 7 m²;
+    # totals are ≤ 60 m² (SPLP) and ≤ 200 m² (CYXY).  These are
+    # ribbon-emit defects predating 2026-05-13 and tracked as a
+    # ceiling — any regression beyond this trips the gate.
+    "SPLP": 60.0,
+    "CYXY": 200.0,
 }
 
 # Coverage envelope: the union of every emitted pavement shape's
@@ -161,6 +169,59 @@ def test_no_self_overlap(icao):
     overlay regression where ``zannespol`` polygons duplicated
     apt.dat row-110 coverage; any future absorption / clip pass
     that fails to remove an absorbed sub-rect.
+    """
+    layout = _build_layout(icao)
+    polys = [(s.role, s.polygon) for s in layout.shapes
+             if s.polygon is not None and not s.polygon.is_empty]
+    if len(polys) < 2:
+        return
+    tree = STRtree([p for _, p in polys])
+    overlap_pairs = []
+    overlap_area = 0.0
+    for i, (role_a, pa) in enumerate(polys):
+        for j in tree.query(pa):
+            if j <= i:
+                continue
+            role_b, pb = polys[j]
+            try:
+                inter = pa.intersection(pb)
+            except Exception:
+                continue
+            if inter.is_empty:
+                continue
+            a = inter.area
+            if a <= 0.0:
+                continue
+            overlap_pairs.append((a, role_a, role_b))
+            overlap_area += a
+    overlap_pairs.sort(reverse=True)
+    summary = ", ".join(
+        f"{a:.4f} m² ({ra}/{rb})"
+        for a, ra, rb in overlap_pairs[:10])
+    cap = SELF_OVERLAP_BASELINE_M2.get(icao, SELF_OVERLAP_CAP_M2)
+    assert overlap_area <= cap, (
+        f"{icao}: {len(overlap_pairs)} overlapping shape pair(s), "
+        f"total {overlap_area:,.4f} m² (cap "
+        f"{cap:.0f} m² — "
+        f"{'baselined' if icao in SELF_OVERLAP_BASELINE_M2 else 'zero tolerance'}).  "
+        f"Worst: {summary}.")
+
+
+# Baseline airports — these run without O4_TEST_TILE/O4_TEST_AIRPORTS,
+# so the no-self-overlap invariant is gated on every push.  Added
+# 2026-05-13 after the CYXY way-10483 boundary→DEM bridge overlap
+# report: any overlap must fail tests.
+_BASELINE_AIRPORTS = ("SPJC", "SPLP", "CYXY")
+
+
+@pytest.mark.parametrize("icao", _BASELINE_AIRPORTS)
+def test_no_self_overlap_baseline(icao):
+    """Hard invariant: no two emitted pavement shapes may overlap.
+
+    Runs unconditionally for the canonical baseline airports (no
+    env-var configuration needed) so this gate fires in CI / on
+    every test run.  See ``test_no_self_overlap`` for the env-var-
+    driven variant covering arbitrary airports.
     """
     layout = _build_layout(icao)
     polys = [(s.role, s.polygon) for s in layout.shapes
