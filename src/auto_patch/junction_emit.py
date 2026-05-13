@@ -173,9 +173,22 @@ def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
     if _eff_rwy is not None and not _eff_rwy.is_empty:
         residue = residue.difference(_eff_rwy)
 
-    pieces = (list(residue.geoms)
-              if residue.geom_type == "MultiPolygon" else [residue])
-    pieces = [p for p in pieces
+    # Per user 2026-05-13 (CYXY missing-junctions bug): shapely's
+    # difference can return a GeometryCollection when residue
+    # boundary touches the subtracted geometries at points/edges
+    # (producing dangling LineStrings alongside the Polygon pieces).
+    # Treating GeometryCollection as a single non-Polygon piece used
+    # to drop EVERY junction polygon — at CYXY all 31 residue
+    # Polygons were silently filtered out, leaving only the 2
+    # runway-crossing junctions.  Walk both MultiPolygon AND
+    # GeometryCollection geoms to recover the Polygon members.
+    if residue.geom_type == "MultiPolygon":
+        raw_pieces = list(residue.geoms)
+    elif residue.geom_type == "GeometryCollection":
+        raw_pieces = list(residue.geoms)
+    else:
+        raw_pieces = [residue]
+    pieces = [p for p in raw_pieces
               if p.geom_type == "Polygon"
               and not p.is_empty
               and p.area >= MIN_JUNCTION_AREA_M2]
