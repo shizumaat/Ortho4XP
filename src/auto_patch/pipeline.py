@@ -376,7 +376,16 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # was off-edge, so widening the tolerance just unlocks more
     # near-runway pavement landmarks as segmentation breakpoints
     # without distorting the segmenter's output geometry.
-    INTERSECTION_PROX_M = 3.0
+    #
+    # Per user 2026-05-14: bumped 3.0 → 6.0 m to capture SPLP's
+    # north-end pavement corners drawn ~5 m INSIDE the runway
+    # rect.  At 3 m those corners were missed; the runway
+    # segmenter put no seam there, and the apron junction between
+    # the A stub and the runway had to span ~110 m of runway
+    # boundary (segment 25's full length) without a shared-vertex
+    # snap point — the junction's runway edge ran past the A-stub
+    # corner with no clean trapezoid shape.
+    INTERSECTION_PROX_M = 6.0
     # Dedup proportionally to PROX so multi-vertex clusters of a
     # single pavement transition (row-110 boundaries drawn with 3-4
     # vertices within a 3 m span at the runway edge) collapse to one
@@ -462,12 +471,28 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # corners on -10109's east edge that pinched -10182).
         intersections.sort(key=lambda x: x[0])
         dedup_m2 = INTERSECTION_DEDUP_M * INTERSECTION_DEDUP_M
+        # Per user 2026-05-14: also dedup by ALONG-AXIS distance.
+        # With INTERSECTION_PROX_M widened to 6 m we pick up
+        # opposite-side pavement vertices at the same chart-level
+        # runway transition (e.g. SPLP north end: an outside-edge
+        # vertex on the west boundary at one t and an inside-the-
+        # rect vertex on the east boundary at a t value only 4 m
+        # along the runway).  Euclidean dedup misses these (10 m
+        # apart across the runway), but they represent the SAME
+        # transition and should collapse to one seam.  Otherwise
+        # the runway segmenter inserts two adjacent seams ~4 m
+        # apart and the resulting micro-segment fails the grade
+        # check at the 23 % vertex-pair grade on its short edge.
+        INTERSECTION_DEDUP_ALONG_M = 5.0
         deduped: List[Tuple[float, float, float]] = []
         for t, px, py in intersections:
             if deduped:
                 dpx = px - deduped[-1][1]
                 dpy = py - deduped[-1][2]
                 if dpx * dpx + dpy * dpy < dedup_m2:
+                    continue
+                dt_along_m = abs(t - deduped[-1][0]) * phys_dist
+                if dt_along_m < INTERSECTION_DEDUP_ALONG_M:
                     continue
             deduped.append((t, px, py))
         # Convert intersection meter-coords back to lat/lon via the
@@ -1756,9 +1781,59 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # (2243,-1666) L=93 W=78 both sit ~100 m out from the runway
     # polygon boundary.  Add an extra stub rect at the path vertex
     # just OUTSIDE the runway along the path.
+    # Per user 2026-05-14: prefer apt.dat taxi-network as the
+    # authoritative source for runway-end stub detection.  Build
+    # one linemerged polyline per apt.dat taxi name (UNTRIMMED —
+    # the trimming in ``taxi_centerlines`` runs ``split_merged_
+    # centerline`` which curve-skips at runway-end transitions,
+    # losing exactly the endpoints this function needs to detect).
+    # The function falls back to OSM ways when apt.dat is absent.
+    apt_merged_polylines: Optional[
+        List[Tuple[LineString, str]]] = None
+    if apt is not None and apt.taxi_nodes and apt.taxi_edges:
+        from shapely.ops import linemerge as _linemerge
+        by_name_segs: Dict[str, List[LineString]] = {}
+        for edge in apt.taxi_edges:
+            if edge.kind == "runway":
+                continue
+            if (edge.node_from not in apt.taxi_nodes
+                    or edge.node_to not in apt.taxi_nodes):
+                continue
+            na = apt.taxi_nodes[edge.node_from]
+            nb = apt.taxi_nodes[edge.node_to]
+            ax, ay = to_m(na.lon, na.lat)
+            bx, by = to_m(nb.lon, nb.lat)
+            if (ax - bx) ** 2 + (ay - by) ** 2 < 0.01:
+                continue
+            try:
+                by_name_segs.setdefault(
+                    edge.name, []).append(
+                    LineString([(ax, ay), (bx, by)]))
+            except _GEOM_EXC:
+                continue
+        apt_merged_polylines = []
+        for name, segs in by_name_segs.items():
+            if len(segs) == 1:
+                apt_merged_polylines.append((segs[0], name))
+                continue
+            try:
+                merged = _linemerge(MultiLineString(segs))
+            except _GEOM_EXC:
+                for s in segs:
+                    apt_merged_polylines.append((s, name))
+                continue
+            if merged.is_empty:
+                continue
+            if merged.geom_type == "LineString":
+                apt_merged_polylines.append((merged, name))
+            elif merged.geom_type == "MultiLineString":
+                for g in merged.geoms:
+                    if not g.is_empty:
+                        apt_merged_polylines.append((g, name))
     extra_stubs = _emit_primary_parallel_runway_stubs(
         nodes, ways, to_m, layout.runway_union, pav_union,
-        apt_pav_vertices, taxi_rects)
+        apt_pav_vertices, taxi_rects,
+        apt_centerlines=apt_merged_polylines)
     taxi_rects.extend(extra_stubs)
 
     # ── Drop overlapping taxi rects ───────────────────────────────

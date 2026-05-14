@@ -392,7 +392,48 @@ class PavementLayout:
             # cell_size + profile so X-Plane uses spline
             # interpolation between the high and low short
             # edges, matching the legacy auto-patch format.
-            if s.altitude_high is not None and s.altitude_low is not None:
+            #
+            # Per user 2026-05-14: runway segments should emit as
+            # altitude= (flat) or altitude_high+altitude_low
+            # (sloped 4-corner) rather than node_altitudes when
+            # their per-vertex profile collapses to the canonical
+            # [H, L, L, H] pattern.  ``seam_anchors`` converts
+            # the entire runway chain to node_altitudes when any
+            # one sub-rect has inserted seam vertices, so even
+            # the unmodified 4-corner segments carry per-vertex
+            # arrays here.  Detect the canonical pattern at the
+            # emit boundary and emit canonical tags so X-Plane
+            # reads them as proper sloped rects (cleaner downstream
+            # rendering and matches what the rest of the patch
+            # format expects for runway-role shapes).
+            n_corners = max(0, len(ext_nids) - 1)
+            canonical_tags: Optional[Dict[str, str]] = None
+            if (s.role == ROLE_RUNWAY
+                    and n_corners == 4
+                    and ext_elevs is not None
+                    and len(ext_elevs) == len(ext_nids)
+                    and len(ext_elevs) >= 5):
+                e = ext_elevs
+                _CANON_EQ_TOL = 0.05  # 5 cm
+                if (abs(e[0] - e[3]) < _CANON_EQ_TOL
+                        and abs(e[1] - e[2]) < _CANON_EQ_TOL
+                        and abs(e[0] - e[4]) < _CANON_EQ_TOL):
+                    eh = (e[0] + e[3]) / 2.0
+                    el = (e[1] + e[2]) / 2.0
+                    if abs(eh - el) >= 0.1:
+                        canonical_tags = {
+                            "altitude_high": f"{eh:.1f}",
+                            "altitude_low": f"{el:.1f}",
+                            "cell_size": "2",
+                            "profile": "spline",
+                        }
+                    else:
+                        canonical_tags = {
+                            "altitude": f"{(eh + el) / 2.0:.1f}",
+                        }
+            if canonical_tags is not None:
+                tags.update(canonical_tags)
+            elif s.altitude_high is not None and s.altitude_low is not None:
                 tags["altitude_high"] = f"{s.altitude_high:.1f}"
                 tags["altitude_low"] = f"{s.altitude_low:.1f}"
                 tags["cell_size"] = "2"

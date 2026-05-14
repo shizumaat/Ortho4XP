@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import pytest
 
@@ -67,33 +67,59 @@ SPJC_BASELINE: Dict[str, int] = {
 }
 SPJC_BASELINE_TOTAL = 872  # of 896 target
 
-SPLP_BASELINE: Dict[str, int] = {
+# SPLP is cross-tile (spans -13/-77 and -13/-78).  Each tile-half has
+# its own baseline; a regression in either half trips the gate.
+SPLP_BASELINE_TILE_M77: Dict[str, int] = {
     "boundary":          117,   # of 123 target
-    "junction":            4,   # of   4 target
+    "junction":            6,   # of   7 target
     "primary_parallel":    2,   # of   2 target
     "runway":             22,   # of  23 target
     "stub":                3,   # of   3 target
 }
-SPLP_BASELINE_TOTAL = 148  # of 155 target
+SPLP_BASELINE_TILE_M77_TOTAL = 150  # of 158 target
+
+SPLP_BASELINE_TILE_M78: Dict[str, int] = {
+    "boundary":          167,   # of 176 target
+    "junction":            6,   # of   7 target
+    "primary_parallel":    4,   # of   4 target
+    "runway":             14,   # of  15 target
+    "stub":                4,   # of   4 target
+    "terminal":            1,   # of   1 target
+}
+SPLP_BASELINE_TILE_M78_TOTAL = 196  # of 207 target
 
 
-def _build_layout(icao: str):
+def _build_layout(icao: str, tile_lat=None, tile_lon=None):
     from auto_patch.pipeline import build_airport_pavement
+    if tile_lat is not None and tile_lon is not None:
+        from O4_DEM_Utils import DEM as O4DEM
+        dem = O4DEM(tile_lat, tile_lon, fill_nodata="to zero")
+        return build_airport_pavement(
+            icao, xplane_root(), compute_elevations=True,
+            tile_dem=dem,
+            current_tile_lat=tile_lat,
+            current_tile_lon=tile_lon)
     return build_airport_pavement(icao, xplane_root(),
                                    compute_elevations=True)
 
 
 def _run_compare(tmp_path: Path, icao: str,
                  baseline: Dict[str, int],
-                 baseline_total: int) -> None:
+                 baseline_total: int,
+                 target_path: Optional[Path] = None,
+                 tile_lat: Optional[int] = None,
+                 tile_lon: Optional[int] = None) -> None:
     import compare_target as CT
 
-    target_path = _HERE / "fixtures" / f"{icao}_target.osm"
+    if target_path is None:
+        target_path = _HERE / "fixtures" / f"{icao}_target.osm"
     assert target_path.is_file(), (
         f"{icao} target fixture missing at {target_path}")
 
-    layout = _build_layout(icao)
-    out_path = tmp_path / f"{icao}_out.osm"
+    layout = _build_layout(icao, tile_lat=tile_lat, tile_lon=tile_lon)
+    suffix = (f"_tile{tile_lat:+d}{tile_lon:+d}"
+              if tile_lat is not None else "")
+    out_path = tmp_path / f"{icao}{suffix}_out.osm"
     layout.to_osm(str(out_path))
 
     anchor = CT.pick_anchor(target_path)
@@ -156,13 +182,22 @@ def test_compare_target_spjc(tmp_path):
                  SPJC_BASELINE, SPJC_BASELINE_TOTAL)
 
 
-def test_compare_target_splp(tmp_path):
-    """SPLP structural fidelity vs ``tests/fixtures/SPLP_target.osm``.
+@pytest.mark.parametrize("tile_lat,tile_lon,baseline,baseline_total", [
+    (-13, -77, SPLP_BASELINE_TILE_M77, SPLP_BASELINE_TILE_M77_TOTAL),
+    (-13, -78, SPLP_BASELINE_TILE_M78, SPLP_BASELINE_TILE_M78_TOTAL),
+])
+def test_compare_target_splp(tmp_path, tile_lat, tile_lon,
+                              baseline, baseline_total):
+    """SPLP structural fidelity, validated per tile half.
 
-    Cross-tile airport (spans tiles -13/-77 and -13/-78); the
-    standalone build (no ``tile_dem`` override) used to generate
-    the fixture exercises the same pipeline as the in-tile builds
-    that the test_tile_cut_parity tests run with ``tile_dem`` set.
+    SPLP is a cross-tile airport (spans -13/-77 and -13/-78); each
+    tile build emits a different subset of pavement after the
+    tile-boundary cut.  The fixtures ``SPLP_target_tile-13-77.osm``
+    and ``SPLP_target_tile-13-78.osm`` are the canonical outputs for
+    each half; a regression in EITHER half trips this gate.
     """
-    _run_compare(tmp_path, "SPLP",
-                 SPLP_BASELINE, SPLP_BASELINE_TOTAL)
+    target_path = (_HERE / "fixtures"
+                   / f"SPLP_target_tile{tile_lat:+d}{tile_lon:+d}.osm")
+    _run_compare(tmp_path, "SPLP", baseline, baseline_total,
+                 target_path=target_path,
+                 tile_lat=tile_lat, tile_lon=tile_lon)

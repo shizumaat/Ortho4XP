@@ -47,6 +47,8 @@ def _emit_primary_parallel_runway_stubs(
     pav_union: Optional[Polygon],
     apt_vertices: Optional[List[Tuple[float, float]]],
     existing_taxi_rects: List[Tuple[Polygon, LineString, str, str]],
+    apt_centerlines: Optional[
+        List[Tuple[LineString, str]]] = None,
 ) -> List[Tuple[Polygon, LineString, str, str]]:
     """Emit an extra STUB rect at each primary parallel OSM path
     endpoint that terminates INSIDE the runway polygon.
@@ -104,34 +106,47 @@ def _emit_primary_parallel_runway_stubs(
                                 # primary parallels (SPLP main taxi
                                 # is 2640 m unrefed)
 
-    # Gather per-ref OSM lines (for parallel refs like A/F/L at
-    # SPJC), PLUS unrefed taxi ways (for SPLP whose primary taxis
-    # are all unrefed).  The unrefed ways are merged together and
-    # only very long (>UNREFED_MIN_LEN_M) merged polylines qualify
-    # as "primary parallels" for stub emission.
+    # Gather per-ref centerlines.  Prefer apt.dat taxi-network
+    # (authoritative, refed at airports like SPLP whose OSM is
+    # unrefed) over OSM ways (used at airports without apt.dat
+    # coverage).  Per user 2026-05-14: at SPLP the OSM taxiways
+    # share an unrefed northeast endpoint, so OSM-based detection
+    # emits an unrefed stub at the North runway end while apt.dat
+    # (29 'A'-named edges) has the proper ref.  Using apt.dat
+    # gives the stub its correct ref while inheriting all the
+    # downstream centering / clearance logic.
     by_ref: Dict[str, List[LineString]] = {}
-    for wid, nds, tags in ways:
-        if tags.get("aeroway") != "taxiway":
-            continue
-        ref = tags.get("ref", "")
-        # Sub-refs (letter+digit, e.g. V1, L3) are short connector
-        # spurs at every airport — never the long parallel taxi
-        # we're hunting for here.  All other refs (or no ref) are
-        # candidates; the length filter at the end (UNREFED_MIN_LEN_M
-        # for unrefed; the by-ref endpoint test for everything else)
-        # keeps only the long ones that touch the runway.
-        if ref and any(c.isdigit() for c in ref):
-            continue
-        pts = []
-        for n in nds:
-            if n in nodes:
-                lat, lon = nodes[n]
-                pts.append(to_m(lon, lat))
-        if len(pts) >= 2:
-            try:
-                by_ref.setdefault(ref, []).append(LineString(pts))
-            except _GEOM_EXC:
-                pass
+    if apt_centerlines:
+        for ls, name in apt_centerlines:
+            # Sub-refs (letter+digit) are short connector spurs —
+            # never the long primary parallel we're hunting for.
+            if name and any(c.isdigit() for c in name):
+                continue
+            by_ref.setdefault(name, []).append(ls)
+    else:
+        for wid, nds, tags in ways:
+            if tags.get("aeroway") != "taxiway":
+                continue
+            ref = tags.get("ref", "")
+            # Sub-refs (letter+digit, e.g. V1, L3) are short
+            # connector spurs at every airport — never the long
+            # parallel taxi we're hunting for here.  All other
+            # refs (or no ref) are candidates; the length filter
+            # at the end (UNREFED_MIN_LEN_M for unrefed; the
+            # by-ref endpoint test for everything else) keeps
+            # only the long ones that touch the runway.
+            if ref and any(c.isdigit() for c in ref):
+                continue
+            pts = []
+            for n in nds:
+                if n in nodes:
+                    lat, lon = nodes[n]
+                    pts.append(to_m(lon, lat))
+            if len(pts) >= 2:
+                try:
+                    by_ref.setdefault(ref, []).append(LineString(pts))
+                except _GEOM_EXC:
+                    pass
 
     # Pre-compute existing rect union for overlap detection
     existing_rects_union = None
@@ -236,11 +251,34 @@ def _emit_primary_parallel_runway_stubs(
                     # Endpoint is OUTSIDE the runway but within
                     # OUTSIDE_NEAR_RWY_M.  The taxi curves to
                     # runway at this end but doesn't enter runway
-                    # pavement (SPLP NE end at 127 m).  Use the
-                    # endpoint itself as the stub center — target
-                    # rect sits at the ramp where the taxi
-                    # approaches runway.
-                    exit_idx = 0 if end_idx == 0 else len(coords) - 1
+                    # pavement (SPLP NE end at 127 m, CYXY F end
+                    # at 11 m).  Walk inward along the path until
+                    # d_rwy exceeds STUB_EXIT_D_M, same as the
+                    # inside-endpoint branch.  Without this walk
+                    # the center sits AT the runway-facing
+                    # endpoint and the rect ends up touching (or
+                    # buried in) the runway.  The Min-clearance
+                    # guardrail and gap-midpoint centering below
+                    # then handle the geometry uniformly with the
+                    # inside case.
+                    start_i = (end_idx if end_idx >= 0
+                               else len(coords) - 1)
+                    step = 1 if end_idx == 0 else -1
+                    exit_idx = None
+                    i = start_i
+                    while 0 <= i < len(coords):
+                        d = Point(coords[i]).distance(rwy_boundary)
+                        if d > STUB_EXIT_D_M:
+                            exit_idx = i
+                            break
+                        i += step
+                    if exit_idx is None:
+                        # Path never reaches the widening
+                        # threshold — fall back to the original
+                        # behaviour (stub at the endpoint) so we
+                        # still emit something at the ramp.
+                        exit_idx = (0 if end_idx == 0
+                                    else len(coords) - 1)
                     interp_cx = coords[exit_idx][0]
                     interp_cy = coords[exit_idx][1]
 
@@ -283,7 +321,7 @@ def _emit_primary_parallel_runway_stubs(
                 # tighter cap; A/F/L at SPJC are perpendicular by
                 # construction so the same formula applies.)
                 target_len = max(50.0, min(STUB_LEN_M, width + 5.0))
-                # ----- L-style pull-back -----
+                # ----- Stub area centering -----
                 # Distinguish L-style "primary parallel curving
                 # into a stub" (narrow connector pavement) from
                 # A/F-style "loop ramp" (wide rwy-end pavement).
@@ -291,63 +329,91 @@ def _emit_primary_parallel_runway_stubs(
                 # • Wide  (≥ NARROW_PAV_M): loop ramp — keep stub
                 #   centred AT exit_idx (the apex of the loop is
                 #   exactly where the user wants the rect).
-                # • Narrow (< NARROW_PAV_M): smooth curve from a
-                #   primary parallel into the runway — the user
-                #   2026-04-27 spec calls for the diagonal rule:
-                #   pull the rect centre BACK along the path
-                #   toward the runway by 0.35 × gap (gap = path
-                #   length from runway-boundary crossing to
-                #   exit_idx).  Matches the diagonal-rule 35 %
-                #   retention used by ``_split_centerlines_at_points``
-                #   for V3-style diagonal stubs.  At SPJC this
-                #   lands the L stub at d_rwy ≈ 65 m (matching
-                #   user's target hand-edit from d_rwy ≈ 103 m
-                #   the loop-ramp rule gave).
+                # • Narrow (< NARROW_PAV_M): the "stub area" is the
+                #   connector pavement between the runway and the
+                #   apron-widening point (exit_idx).  Per user
+                #   2026-05-14 invariant: the rect sits CENTERED
+                #   in the stub area with a junction on either
+                #   side (one between rect and runway, one between
+                #   rect and apron).  Center the rect at the
+                #   midpoint of the gap_curve so both junctions
+                #   get equal room.  The MIN_RUNWAY_CLEARANCE_M
+                #   guardrail below then trims the axis if either
+                #   end is still too close to the runway after
+                #   centering.
                 NARROW_PAV_M = 60.0
-                PULL_BACK_FRAC = 0.35
-                if (endpoint_inside and ref
-                        and width < NARROW_PAV_M):
+                PULL_BACK_FRAC = 0.5
+                # The pull-back applies for narrow connector
+                # pavement on BOTH endpoint branches: when the
+                # polyline endpoint sits inside the runway
+                # (endpoint_inside; e.g. SPJC L/F) the runway
+                # anchor is the polyline's runway-boundary
+                # crossing; when the endpoint sits outside but
+                # within OUTSIDE_NEAR_RWY_M (endpoint_outside_near;
+                # e.g. CYXY F at d_rwy ≈ 11 m) the anchor is the
+                # endpoint itself.  Wide pavement (loop ramps,
+                # SPJC F-style) skips the pull-back to keep the
+                # stub centred at the loop apex (exit_idx).
+                apply_pullback = (
+                    ref and width < NARROW_PAV_M
+                    and (endpoint_inside or endpoint_outside_near))
+                if apply_pullback:
                     pull_path: List[Tuple[float, float]] = []
-                    # Find runway-boundary crossing (last in-rwy
-                    # vertex → first out-of-rwy vertex; intersect
-                    # the connecting segment with the runway
-                    # boundary).
                     s = 1 if end_idx == 0 else -1
-                    k = (end_idx if end_idx >= 0
-                         else len(coords) - 1)
-                    last_in = None
-                    while 0 <= k < len(coords):
-                        ptk = Point(coords[k])
-                        dk = ptk.distance(rwy_boundary)
-                        if (runway_union.contains(ptk)
-                                or dk <= ENDPOINT_INSIDE_TOL_M):
-                            last_in = k
-                            k += s
+                    if endpoint_inside:
+                        # Find runway-boundary crossing (last
+                        # in-rwy vertex → first out-of-rwy
+                        # vertex; intersect the connecting
+                        # segment with the runway boundary).
+                        k = (end_idx if end_idx >= 0
+                             else len(coords) - 1)
+                        last_in = None
+                        while 0 <= k < len(coords):
+                            ptk = Point(coords[k])
+                            dk = ptk.distance(rwy_boundary)
+                            if (runway_union.contains(ptk)
+                                    or dk <= ENDPOINT_INSIDE_TOL_M):
+                                last_in = k
+                                k += s
+                            else:
+                                break
+                        if (last_in is not None
+                                and 0 <= k < len(coords)):
+                            cross_pt = coords[k]
+                            try:
+                                seg = LineString(
+                                    [coords[last_in], coords[k]])
+                                cd = seg.difference(runway_union)
+                                if (not cd.is_empty
+                                        and cd.geom_type
+                                        == "LineString"):
+                                    cc = list(cd.coords)
+                                    d0 = math.hypot(
+                                        cc[0][0] - coords[last_in][0],
+                                        cc[0][1] - coords[last_in][1])
+                                    d1 = math.hypot(
+                                        cc[-1][0] - coords[last_in][0],
+                                        cc[-1][1] - coords[last_in][1])
+                                    cross_pt = (cc[0] if d0 < d1
+                                                else cc[-1])
+                            except _GEOM_EXC:
+                                pass
+                            pull_path.append(
+                                (cross_pt[0], cross_pt[1]))
+                            m = k
                         else:
-                            break
-                    if last_in is not None and 0 <= k < len(coords):
-                        cross_pt = coords[k]
-                        try:
-                            seg = LineString(
-                                [coords[last_in], coords[k]])
-                            cd = seg.difference(runway_union)
-                            if (not cd.is_empty
-                                    and cd.geom_type == "LineString"):
-                                cc = list(cd.coords)
-                                d0 = math.hypot(
-                                    cc[0][0] - coords[last_in][0],
-                                    cc[0][1] - coords[last_in][1])
-                                d1 = math.hypot(
-                                    cc[-1][0] - coords[last_in][0],
-                                    cc[-1][1] - coords[last_in][1])
-                                cross_pt = (cc[0] if d0 < d1
-                                            else cc[-1])
-                        except _GEOM_EXC:
-                            pass
+                            m = None
+                    else:
+                        # endpoint_outside_near: anchor at the
+                        # OSM endpoint (the closest path point to
+                        # the runway) and walk inward to exit_idx.
+                        start_i = (end_idx if end_idx >= 0
+                                   else len(coords) - 1)
                         pull_path.append(
-                            (cross_pt[0], cross_pt[1]))
-                        # Walk from there to exit_idx (inclusive).
-                        m = k
+                            (coords[start_i][0],
+                             coords[start_i][1]))
+                        m = start_i
+                    if m is not None:
                         while True:
                             pull_path.append(
                                 (coords[m][0], coords[m][1]))
@@ -363,11 +429,15 @@ def _emit_primary_parallel_runway_stubs(
                         except _GEOM_EXC:
                             gap = 0.0
                         if gap > 30.0:
-                            # New centre at (1 - PULL_BACK_FRAC)
-                            # along the path FROM the runway side,
-                            # i.e. PULL_BACK_FRAC * gap inland of
-                            # the boundary crossing.
-                            new_along = (1.0 - PULL_BACK_FRAC) * gap
+                            # New centre at PULL_BACK_FRAC along
+                            # the gap path measured from the
+                            # runway-boundary crossing.  At
+                            # PULL_BACK_FRAC = 0.5 this is the
+                            # midpoint of the stub area — runway
+                            # on one side, apron-widening on the
+                            # other, with equal room for a
+                            # junction on each side.
+                            new_along = PULL_BACK_FRAC * gap
                             cpt = gap_curve.interpolate(new_along)
                             cx, cy = cpt.x, cpt.y
                             # Local tangent at the new centre.
@@ -385,12 +455,86 @@ def _emit_primary_parallel_runway_stubs(
                             cy - uy * target_len / 2)
                 ax_end = (cx + ux * target_len / 2,
                           cy + uy * target_len / 2)
+                # Per user 2026-05-14: a stub must never touch the
+                # runway — the rect sits inside the stub area with
+                # a junction between the rect's runway-facing
+                # short edge and the runway boundary.  If either
+                # axis endpoint is within MIN_RUNWAY_CLEARANCE_M
+                # of the runway boundary (after which corner snap
+                # would glue the short-edge corners onto the
+                # runway boundary), shrink the axis SYMMETRICALLY
+                # from both ends to keep the rect centred on
+                # (cx, cy) while pulling the runway-facing end
+                # back to MIN_RUNWAY_CLEARANCE_M.  If the resulting
+                # axis is shorter than MIN_STUB_LEN_M, drop the
+                # stub entirely — the connector is too narrow to
+                # accommodate both junctions and a meaningful rect.
+                # Clearance must exceed RUNWAY_ADJACENCY_TOL_M
+                # (config.py = 20 m).  Otherwise the rect's runway-
+                # facing corners sit inside the runway-adjacency
+                # window and ``_enforce_runway_1to1_sharing`` later
+                # snaps them to runway corners — stretching the
+                # adjacent junction polygon into the runway-side
+                # gap and producing junction/junction overlap.
+                # SPJC target B/G runway-end stubs sit at d_rwy
+                # ≈ 20-26 m, validating ~22 m as the natural
+                # value.
+                MIN_RUNWAY_CLEARANCE_M = 22.0
+                MIN_STUB_LEN_M = 25.0
+                # Use runway_union (a solid) so an axis endpoint
+                # inside the runway reads d=0 — boundary distance
+                # alone wraps around and reports a small positive
+                # value for points just past the boundary into the
+                # runway, which would let the shortfall test pass
+                # while the rect's runway-facing corners still glue
+                # onto the runway boundary in the snap step.
+                try:
+                    d_start = Point(*ax_start).distance(runway_union)
+                    d_end = Point(*ax_end).distance(runway_union)
+                except _GEOM_EXC:
+                    d_start = d_end = float("inf")
+                shortfall = max(
+                    MIN_RUNWAY_CLEARANCE_M - d_start,
+                    MIN_RUNWAY_CLEARANCE_M - d_end,
+                    0.0,
+                )
+                if shortfall > 0.0:
+                    new_len = target_len - 2.0 * shortfall
+                    if new_len < MIN_STUB_LEN_M:
+                        continue
+                    target_len = new_len
+                    ax_start = (cx - ux * target_len / 2,
+                                cy - uy * target_len / 2)
+                    ax_end = (cx + ux * target_len / 2,
+                              cy + uy * target_len / 2)
                 try:
                     stub_axis = LineString([ax_start, ax_end])
                 except _GEOM_EXC:
                     continue
+                # Snap against a pav with the runway-clearance
+                # buffer carved out so corner snapping and
+                # perpendicular extension can't pull the rect's
+                # short-edge corners onto the runway boundary.
+                # Without this, the runway boundary is the
+                # closest pav.boundary point for an axis endpoint
+                # placed at d_rwy ≈ MIN_RUNWAY_CLEARANCE_M and
+                # the snap glues the corner to the runway.  The
+                # carved boundary introduces a new edge at the
+                # clearance offset; corners snap there instead,
+                # preserving the runway gap that the surrounding
+                # junction needs.
+                try:
+                    pav_for_snap = pav_union.difference(
+                        runway_union.buffer(
+                            MIN_RUNWAY_CLEARANCE_M))
+                    if (pav_for_snap.is_empty
+                            or pav_for_snap.geom_type
+                            not in ("Polygon", "MultiPolygon")):
+                        pav_for_snap = pav_union
+                except _GEOM_EXC:
+                    pav_for_snap = pav_union
                 rect = _rect_from_axis_extended(
-                    stub_axis, width, pav_union,
+                    stub_axis, width, pav_for_snap,
                     apt_vertices=apt_vertices)
                 if rect is None or rect.is_empty:
                     continue
@@ -411,9 +555,11 @@ def _emit_primary_parallel_runway_stubs(
                 # outward perpendicular to the axis until it hits
                 # the apt.dat pavement boundary — turning the rect
                 # into a trapezoid that covers the FULL ramp width
-                # at each end independently.
+                # at each end independently.  Uses the same
+                # runway-buffered pav so the extension can't
+                # cross into the clearance gap.
                 rect = _extend_rect_corners_perpendicular(
-                    rect, stub_axis, pav_union)
+                    rect, stub_axis, pav_for_snap)
                 if rect is None or rect.is_empty:
                     continue
                 # Skip if the stub would overlap an existing rect
