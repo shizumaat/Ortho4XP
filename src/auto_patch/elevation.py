@@ -414,8 +414,40 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
         # Drop the single-rect runway shapes; replace with segments.
         old_runways = [s for s in layout.shapes if s.role == ROLE_RUNWAY]
         layout.shapes = [s for s in layout.shapes if s.role != ROLE_RUNWAY]
+        # Fallback ref when a segment tuple doesn't carry a desig pair
+        # (older chain entries before 2026-05-14 didn't tag the source
+        # runway).  Keeps emit safe if a future segmenter path forgets
+        # to append the pair.
         ref_fallback = "/".join(sorted(set(
             f"{r.desig_a}/{r.desig_b}" for r in apt.runways)))
+
+        def _ref_from_desig_pair(desig_pair):
+            """Per user 2026-05-14: tag each runway segment with the
+            ref of the SOURCE runway it was generated for, not the
+            airport-wide merged ref.  At CYXY each runway's chain
+            now emits with its own pair (e.g. ``14R/32L``) so
+            downstream code (junction propagation, OSM consumers,
+            audit reports) can identify which runway each segment
+            belongs to instead of getting the same opaque
+            ``02/20/14L/32R/14R/32L`` string on every segment.
+
+            Strips the ``RW`` prefix that CIFP designators carry so
+            the emitted ref matches the apt.dat row-100 convention
+            already used at single-runway airports like SPLP
+            (``02/20`` rather than ``RW02/RW20``).
+            """
+            def _strip(d):
+                if not d:
+                    return d
+                return d[2:] if d.startswith("RW") else d
+            if desig_pair is None:
+                return ref_fallback
+            a, b = desig_pair
+            a = _strip(a)
+            b = _strip(b)
+            if a and b:
+                return f"{a}/{b}"
+            return a or b or ref_fallback
         # Legacy generate_patch_osm pads each side by
         # RUNWAY_MARGIN=3 m for imagery coverage; strip that so
         # the segmented runways match the apt.dat width that our
@@ -427,9 +459,14 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             # consolidated polygon covering N centerline samples at
             # uniform elevation, with intermediate corners at pav_
             # intersection positions.  Tagged tuple shape:
-            #   ("MULTI_FLAT", [(lat, lon), ...], elev, width)
-            if len(seg) == 4 and seg[0] == "MULTI_FLAT":
-                _, samples_ll, elev_flat, width_m = seg
+            #   ("MULTI_FLAT", [(lat, lon), ...], elev, width, desig_pair)
+            if (len(seg) >= 4 and seg[0] == "MULTI_FLAT"):
+                _tag = seg[0]
+                samples_ll = seg[1]
+                elev_flat = seg[2]
+                width_m = seg[3]
+                desig_pair = seg[4] if len(seg) >= 5 else None
+                seg_ref = _ref_from_desig_pair(desig_pair)
                 width_m = max(1.0,
                                width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
                 samples_xy = [
@@ -458,13 +495,17 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 if poly.is_empty or poly.geom_type != "Polygon":
                     continue
                 shape = BuiltShape(
-                    polygon=poly, role=ROLE_RUNWAY, ref=ref_fallback)
+                    polygon=poly, role=ROLE_RUNWAY, ref=seg_ref)
                 shape.altitude = round(float(elev_flat), 1)
                 layout.shapes.append(shape)
                 new_runway_polys.append(poly)
                 continue
-            # Legacy 4-corner (sloped or flat).
-            lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m = seg
+            # Legacy 4-corner (sloped or flat).  Tuple shape:
+            # (lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m,
+            #  desig_pair) — pair optional for backward compat.
+            lat_a, lon_a, elev_a, lat_b, lon_b, elev_b, width_m = seg[:7]
+            desig_pair = seg[7] if len(seg) >= 8 else None
+            seg_ref = _ref_from_desig_pair(desig_pair)
             width_m = max(1.0, width_m - 2.0 * _LEGACY_RUNWAY_MARGIN)
             ax, ay = _latlon_to_m_local(lat_a, lon_a, lat0, lon0, cos0)
             bx, by = _latlon_to_m_local(lat_b, lon_b, lat0, lon0, cos0)
@@ -510,7 +551,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
             if poly.is_empty or poly.geom_type != "Polygon":
                 continue
             shape = BuiltShape(
-                polygon=poly, role=ROLE_RUNWAY, ref=ref_fallback)
+                polygon=poly, role=ROLE_RUNWAY, ref=seg_ref)
             if abs(eh - el) >= 0.1:
                 shape.altitude_high = round(eh, 1)
                 shape.altitude_low = round(el, 1)

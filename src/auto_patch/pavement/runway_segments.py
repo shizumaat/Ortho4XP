@@ -1118,6 +1118,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     add_flat_multi_rect(samples_ll, flat_elev, patch_width)
                     runway_chain.append((
                         "MULTI_FLAT", samples_ll, flat_elev, patch_width,
+                        (desig_a, desig_b),
                     ))
                     idx = end_idx
                 else:
@@ -1132,6 +1133,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                         s_a[0], s_a[1], elevs[idx],
                         s_b[0], s_b[1], elevs[idx + 1],
                         patch_width,
+                        (desig_a, desig_b),
                     ))
                     idx += 1
 
@@ -1155,6 +1157,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     ext_a[0], ext_a[1], elevs[0],
                     phys_end_a[0], phys_end_a[1], elevs[0],
                     patch_width,
+                    (desig_a, desig_b),
                 ))
             if blast_b > 0.1:
                 ext_b = extend_point(
@@ -1171,6 +1174,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                     phys_end_b[0], phys_end_b[1], elevs[-1],
                     ext_b[0], ext_b[1], elevs[-1],
                     patch_width,
+                    (desig_a, desig_b),
                 ))
 
         else:
@@ -1192,6 +1196,7 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 ext[0], ext[1], elev_a,
                 ext2[0], ext2[1], elev_a,
                 patch_width,
+                (desig_a, None),
             ))
 
     # ── Assemble OSM XML ─────────────────────────────────────────────────────
