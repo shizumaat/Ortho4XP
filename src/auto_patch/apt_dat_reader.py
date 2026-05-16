@@ -1077,21 +1077,42 @@ def taxi_centerlines(
     :func:`pavement.centerlines._extract_osm_taxi_centerlines` so the
     rect builder can consume either source interchangeably.
 
-    Steps:
+    Architecture (user 2026-05-15):
+
       1. Group taxi edges by ``name``.  Drop ``kind == "runway"``
          edges (taxi paths crossing a runway — not pavement we emit).
-      2. Convert each edge's endpoints (node_from / node_to) to meter
-         coords via the caller-supplied ``to_m(lon, lat)``.
-      3. Build one ``LineString`` per edge, then ``linemerge`` per
-         name group so consecutive edges along the same taxiway
-         collapse into a single polyline.
-      4. Run each merged polyline through
-         :func:`pavement.centerlines.split_merged_centerline` so
-         significant bends become separate rect-axis segments.
-         Without this step apt.dat taxi-network polylines (whose
-         nodes track every chart-level vertex) emit as single
-         straight rects spanning curves, visibly drifting off the
-         actual pavement at every bend.
+      2. Identify **chart-level junction nodes** — nodes referenced
+         by edges of ≥ 2 distinct taxi names OR endpoints of any
+         runway-typed edge.  These are the authoritative locations
+         where one taxiway's pavement ends and an adjacent taxiway /
+         runway's pavement begins.
+      3. Linemerge each per-name group, then **pre-split every
+         resulting polyline at any interior vertex that coincides
+         with a chart-level junction node** so each emitted polyline
+         runs cleanly between two junctions.
+      4. RDP-simplify each pre-split sub-polyline (1.5 m tol) to drop
+         tiny chart noise; emit each as ONE centerline.
+
+    Pre-splitting at junctions (instead of bend-splitting after the
+    fact via ``split_merged_centerline``) avoids three cascading
+    failure modes that previously dropped pavement to junction
+    residue (CYXY D-west, user 2026-05-15):
+
+      * Mid-corridor curves treated as junction territory and
+        dropped from the centerline (the curve-skip in
+        ``split_merged_centerline`` over-fires for taxiways whose
+        polyline curves through but doesn't end at the runway).
+      * Bend-induced splits create short sub-segments that the
+        downstream ``_split_centerlines_at_points`` 30 m fixed
+        diagonal-stub margin then consumes entirely.
+      * RDP simplification dropping a runway-crossing node because
+        it's near-collinear with surrounding curve vertices, leaving
+        ``_split_centerlines_at_points`` with no anchor to split at.
+
+    Pre-splitting at junctions makes the chart-level junction
+    structure the authoritative geometry source — single-name
+    polylines remain single rects even when they curve, multi-name
+    junctions become explicit split points.
     """
     from shapely.geometry import LineString, MultiLineString
     from shapely.ops import linemerge
@@ -1102,12 +1123,20 @@ def taxi_centerlines(
     if not nodes or not edges:
         return []
 
+    # ── Step 1: group taxi edges by name + identify junction nodes ──
     by_name: Dict[str, List[LineString]] = {}
+    node_names: Dict[str, set] = {}
+    runway_endpoint_node_ids: set = set()
     for edge in edges:
-        # Drop taxi paths crossing a runway — those exist only to
-        # define the taxi route for ATC purposes; no pavement is
-        # emitted from them (the runway emit covers that footprint).
         if edge.kind == "runway":
+            # Runway-typed edges don't contribute pavement (the
+            # runway emit covers that footprint).  But every node
+            # they touch IS a chart-level junction — that's where
+            # a taxiway crosses or terminates on a runway.
+            if edge.node_from in nodes:
+                runway_endpoint_node_ids.add(edge.node_from)
+            if edge.node_to in nodes:
+                runway_endpoint_node_ids.add(edge.node_to)
             continue
         if (edge.node_from not in nodes
                 or edge.node_to not in nodes):
@@ -1124,10 +1153,23 @@ def taxi_centerlines(
         except (ValueError, TypeError):
             continue
         by_name.setdefault(edge.name, []).append(seg)
+        node_names.setdefault(edge.node_from, set()).add(edge.name)
+        node_names.setdefault(edge.node_to, set()).add(edge.name)
+
+    # Junction = node referenced by ≥ 2 distinct taxi names OR by
+    # any runway-typed edge.  Convert to a set of metric-space
+    # positions (rounded to 0.1 m) for fast vertex matching.
+    junction_pts_m: set = set(
+        (round(to_m(nodes[nid].lon, nodes[nid].lat)[0], 1),
+         round(to_m(nodes[nid].lon, nodes[nid].lat)[1], 1))
+        for nid in (set(
+            n for n, ns in node_names.items() if len(ns) >= 2)
+            | runway_endpoint_node_ids)
+        if nid in nodes)
 
     out: List[Tuple[LineString, str]] = []
     for name, segments in by_name.items():
-        # Linemerge per name into one (or a few) connected polylines.
+        # ── Step 2: linemerge per-name into connected polyline(s) ──
         merged_lines: List[LineString] = []
         if len(segments) == 1:
             merged_lines = [segments[0]]
@@ -1144,9 +1186,84 @@ def taxi_centerlines(
                 elif merged.geom_type == "MultiLineString":
                     merged_lines = [ls for ls in merged.geoms
                                     if not ls.is_empty]
-        # Apply the same RDP + bend-split as OSM-derived centerlines
-        # so curves become break points and adjacent straight
-        # sections emit as separate rect axes.
+
+        # ── Step 3: pre-split at interior junction vertices.
+        # Each sub-polyline now runs cleanly between two chart-level
+        # junctions.  Mid-polyline curves remain part of a single
+        # sub-polyline — they're route bends within ONE taxiway,
+        # not transitions to another ref. ──
+        # ── Step 4: bend-split each sub-polyline.  This preserves
+        # the existing multi-rect decomposition of curving taxiways
+        # (e.g. CYXY's E north chain emits as primary E + stub E
+        # rects, not one bent mega-rect).  ``split_merged_centerline``
+        # also handles RDP-simplification and the curve-skip rule
+        # for true-junction curves (a taxiway curving onto a runway
+        # threshold).  Its at-endpoint check (see centerlines.py)
+        # prevents the curve-skip from firing on mid-polyline route
+        # curves — necessary because pre-split sub-polylines may
+        # still contain curve clusters that aren't at the runway
+        # endpoint (e.g. CYXY's D-west bends at apt.dat nodes 2 and
+        # 1, mid-polyline between E_split and the runway crossing). ──
         for ls in merged_lines:
-            out.extend(split_merged_centerline(ls, name, rwy_centerlines))
+            sub_polylines = _split_polyline_at_junction_vertices(
+                ls, junction_pts_m)
+            for sub_ls in sub_polylines:
+                out.extend(split_merged_centerline(
+                    sub_ls, name, rwy_centerlines))
     return out
+
+
+def _split_polyline_at_junction_vertices(
+    ls: "LineString",
+    junction_pts_m: "set",
+    tol: float = 0.5,
+) -> "List[LineString]":
+    """Split ``ls`` at every INTERIOR vertex that coincides (within
+    ``tol`` m) with a chart-level junction position.  Returns a list
+    of sub-polylines.  The polyline's own endpoints are not used as
+    split points — they bound the polyline naturally.
+
+    If the polyline has no interior junction vertices, returns
+    ``[ls]`` unchanged.
+    """
+    from shapely.geometry import LineString
+    try:
+        coords = list(ls.coords)
+    except (ValueError, TypeError):
+        return [ls]
+    if len(coords) < 3 or not junction_pts_m:
+        return [ls]
+    tol2 = tol * tol
+    split_indices: List[int] = []
+    for i in range(1, len(coords) - 1):
+        x, y = coords[i]
+        rx, ry = round(x, 1), round(y, 1)
+        if (rx, ry) in junction_pts_m:
+            split_indices.append(i)
+            continue
+        # Fallback: scan for any junction point within tol m.
+        # Cheap because junction_pts_m is small (typically < 30
+        # entries per airport).
+        for jx, jy in junction_pts_m:
+            if (x - jx) ** 2 + (y - jy) ** 2 <= tol2:
+                split_indices.append(i)
+                break
+    if not split_indices:
+        return [ls]
+    sub_lines: List[LineString] = []
+    start_idx = 0
+    for split_idx in split_indices:
+        sub_coords = coords[start_idx:split_idx + 1]
+        if len(sub_coords) >= 2:
+            try:
+                sub_lines.append(LineString(sub_coords))
+            except (ValueError, TypeError):
+                pass
+        start_idx = split_idx
+    sub_coords = coords[start_idx:]
+    if len(sub_coords) >= 2:
+        try:
+            sub_lines.append(LineString(sub_coords))
+        except (ValueError, TypeError):
+            pass
+    return sub_lines or [ls]

@@ -1833,7 +1833,8 @@ def build_airport_pavement(icao: str, xplane_root: str,
     extra_stubs = _emit_primary_parallel_runway_stubs(
         nodes, ways, to_m, layout.runway_union, pav_union,
         apt_pav_vertices, taxi_rects,
-        apt_centerlines=apt_merged_polylines)
+        apt_centerlines=apt_merged_polylines,
+        rwy_centerlines=rwy_centerlines)
     taxi_rects.extend(extra_stubs)
 
     # ── Drop overlapping taxi rects ───────────────────────────────

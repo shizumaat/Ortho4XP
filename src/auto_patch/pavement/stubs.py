@@ -49,6 +49,7 @@ def _emit_primary_parallel_runway_stubs(
     existing_taxi_rects: List[Tuple[Polygon, LineString, str, str]],
     apt_centerlines: Optional[
         List[Tuple[LineString, str]]] = None,
+    rwy_centerlines: Optional[List[LineString]] = None,
 ) -> List[Tuple[Polygon, LineString, str, str]]:
     """Emit an extra STUB rect at each primary parallel OSM path
     endpoint that terminates INSIDE the runway polygon.
@@ -294,6 +295,46 @@ def _emit_primary_parallel_runway_stubs(
                     continue
                 ux, uy = dx / mag, dy / mag
                 cx, cy = interp_cx, interp_cy
+                # ── Skip perpendicular runway crossings ─────────
+                # Per user 2026-05-16: this function emits the
+                # "ramp" where a primary parallel MERGES into the
+                # runway (i.e. approaches the runway threshold at
+                # a shallow angle, parallel-ish to the runway).
+                # For a PERPENDICULAR taxiway that simply crosses
+                # the runway (CYXY taxiway D crosses 14R/32L at
+                # node 135 and 14L/32R at node 121), there is no
+                # ramp — the runway pavement takes over.  Without
+                # this check the function emits a wrong-shaped
+                # stub centered on the runway-adjacent path
+                # vertex, planting a junction-area-sized rect
+                # right where a clean junction polygon should be.
+                # Test: local path direction vs nearest runway
+                # bearing.  If perp_diff < 60° (i.e. taxi is
+                # within 60° of perpendicular to runway, not
+                # within 30° of parallel), skip.
+                if rwy_centerlines:
+                    local_b = math.degrees(
+                        math.atan2(ux, uy)) % 180.0
+                    try:
+                        nearest_r = min(
+                            rwy_centerlines,
+                            key=lambda r: Point(cx, cy).distance(r))
+                        _rc = list(nearest_r.coords)
+                        _rx = _rc[-1][0] - _rc[0][0]
+                        _ry = _rc[-1][1] - _rc[0][1]
+                        _rmag = math.hypot(_rx, _ry)
+                    except _GEOM_EXC:
+                        _rmag = 0.0
+                    if _rmag > 1e-6:
+                        rwy_b = math.degrees(
+                            math.atan2(_rx, _ry)) % 180.0
+                        db = abs(local_b - rwy_b)
+                        db = min(db, 180.0 - db)
+                        # db close to 0° = parallel (a ramp)
+                        # db close to 90° = perpendicular (a
+                        # crossing — skip).  30° is the boundary.
+                        if db > 20.0:
+                            continue
                 # First-pass axis at default length, used only to
                 # probe the local pavement width.
                 ax_start = (cx - ux * STUB_LEN_M / 2,

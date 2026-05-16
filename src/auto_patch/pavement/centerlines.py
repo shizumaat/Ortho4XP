@@ -288,14 +288,34 @@ def split_merged_centerline(
         if len(cl) == 1:
             events.append((cl[0], "point"))
         else:
-            # Only treat curve as junction interval if
-            # NEAR A RUNWAY (per user rule 3: "primary
-            # taxiway curves and intersects the runway"
-            # → straight rect, curve = junction, perp =
-            # stub).  Curves in the middle of the
-            # airport (e.g. A's gentle bend) stay as
-            # single break points.
+            # Only treat curve as junction interval (skip the curve
+            # so it becomes junction territory) when BOTH:
+            #
+            #   (a) the cluster is NEAR A RUNWAY (per user rule 3:
+            #       "primary taxiway curves and intersects the
+            #       runway" → straight rect, curve = junction, perp
+            #       = stub), AND
+            #   (b) the cluster sits at one of the polyline's
+            #       ENDPOINTS — i.e. the curve IS the transition
+            #       between this taxiway and another ref (typically
+            #       a runway threshold).
+            #
+            # A cluster in the middle of a polyline is a route curve
+            # along a single continuous taxiway and must remain rect
+            # territory; skipping it would drop the mid-corridor
+            # pavement to junction residue and cause the neighbour
+            # rect to expand past the split point into the abandoned
+            # pavement.  See CYXY taxiway D bends at apt.dat nodes 2
+            # and 1 — mid-polyline between E_split (141) and the
+            # runway crossing (135), 55 m from runway centerline —
+            # without test (b), -10003 (primary E south) overshot
+            # past node 141 to occupy the would-be D-west pavement
+            # (user 2026-05-15).
+            #
+            # Curves nowhere near a runway (e.g. A's gentle bend
+            # mid-airport) fail (a) and stay as single break points.
             near_rwy = False
+            at_endpoint = False
             if rwy_centerlines:
                 cluster_mid = scoords[cl[len(cl) // 2]]
                 cp = Point(cluster_mid)
@@ -304,6 +324,15 @@ def split_merged_centerline(
                         near_rwy = True
                         break
             if near_rwy:
+                cs = Point(scoords[cl[0]])
+                ce = Point(scoords[cl[-1]])
+                ls_start = Point(scoords[0])
+                ls_end = Point(scoords[-1])
+                CLUSTER_TO_POLYLINE_END_TOL_M = 30.0
+                at_endpoint = (
+                    cs.distance(ls_start) < CLUSTER_TO_POLYLINE_END_TOL_M
+                    or ce.distance(ls_end) < CLUSTER_TO_POLYLINE_END_TOL_M)
+            if near_rwy and at_endpoint:
                 events.append((cl[0], "interval_start"))
                 events.append((cl[-1], "interval_end"))
             else:
@@ -924,9 +953,29 @@ def _split_centerlines_at_points(
     # downstream junction balloons into.  At bend-shared endpoints
     # use a small fixed margin (``BEND_ENDPOINT_MARGIN_M``) instead
     # of the percentage so the rect extends right up to the bend.
+    #
+    # Per user 2026-05-15: that 5 m bend-shared margin is correct
+    # for SAME-REF bends (where two sub-segments of one continuous
+    # taxiway meet at an angle change — only the tiny natural
+    # triangular junction at the angle is needed).  It is WRONG
+    # for MULTI-REF chart-level junctions (where ≥ 2 distinct
+    # taxiway names converge, or a taxiway meets a runway) — the
+    # 5 m override forces adjacent rects to KISS at the junction,
+    # leaving no room for a proper junction polygon and producing
+    # rect bodies that extend into the junction area (CYXY -10007
+    # SE corner 26 m from chart junction node 141, when the user
+    # expects it 50 m+ away to leave room for the D-E junction
+    # polygon).  At chart-level junctions, force a larger margin
+    # (``CHART_JUNCTION_MARGIN_M``) so the rect ends well before
+    # the junction position.  This margin REPLACES the bend-shared
+    # 5 m override AND the percentage margin when at chart-junction
+    # (the chart geometry, not the angle change, is what bounds
+    # the rect here).
     BEND_ENDPOINT_MARGIN_M = 5.0
+    CHART_JUNCTION_MARGIN_M = 25.0
     BEND_SHARED_TOL_M = 25.0
     bend_share_tol2 = BEND_SHARED_TOL_M * BEND_SHARED_TOL_M
+    chart_junction_tol2 = BEND_SHARED_TOL_M * BEND_SHARED_TOL_M
     centerline_endpoints: List[Tuple[Tuple[float, float],
                                      Tuple[float, float]]] = []
     for ls, _ref in centerlines:
@@ -948,6 +997,23 @@ def _split_centerlines_at_points(
             for px, py in (s2, e2):
                 if (ex - px) ** 2 + (ey - py) ** 2 <= bend_share_tol2:
                     return True
+        return False
+
+    def _is_chart_junction(endpoint: Tuple[float, float]) -> bool:
+        """True iff ``endpoint`` is within ``BEND_SHARED_TOL_M`` of
+        any chart-level junction position (passed in via
+        ``split_points`` — apt.dat nodes referenced by ≥ 2 distinct
+        taxi names OR endpoints of any runway-typed edge).  This
+        distinguishes a multi-ref intersection (needs a sizable
+        junction polygon between adjacent rect bodies) from a
+        same-ref bend (a small triangular junction is sufficient).
+        """
+        if not split_points:
+            return False
+        ex, ey = endpoint
+        for (sx, sy) in split_points:
+            if (ex - sx) ** 2 + (ey - sy) ** 2 <= chart_junction_tol2:
+                return True
         return False
 
     def _avg_perp_halfwidth(ls: LineString, t: float) -> float:
@@ -1185,10 +1251,24 @@ def _split_centerlines_at_points(
             if gap < MIN_SEGMENT_LEN_M:
                 continue
             # Will this segment emit under any plausible margin?
-            min_retained_frac = 0.35
-            if gap * min_retained_frac < 40.0 and gap * (1 - 2 * gap_margin_frac) < 40.0:
-                # Won't emit — skip so it doesn't shift end-indexing.
-                continue
+            # Diagonal stubs (gap_margin_frac >= 0.25) use fixed
+            # 30 m margins, falling back to proportional 0.15 each
+            # side when the fixed margins would consume too much
+            # of a short gap (CYXY D-west, user 2026-05-15).  Test
+            # eligibility against the fallback retention so short
+            # diagonal stubs are kept as candidates.
+            if gap_margin_frac >= 0.25:
+                # Fixed 30 m × 2 OR fallback 0.15 × 2 = 0.70 retained.
+                fallback_retained = gap * 0.70
+                fixed_retained = gap - 60.0
+                best_retained = max(fallback_retained, fixed_retained)
+                if best_retained < 40.0:
+                    continue
+            else:
+                min_retained_frac = 0.35
+                if (gap * min_retained_frac < 40.0
+                        and gap * (1 - 2 * gap_margin_frac) < 40.0):
+                    continue
             candidates.append((p0, p1))
         # Cross-connector detection: full centerline is perpendicular
         # (within 20°) to nearest runway AND its midpoint is > 250 m
@@ -1301,7 +1381,23 @@ def _split_centerlines_at_points(
                 STUB_END_MARGIN_M = 30.0
                 m_start = STUB_END_MARGIN_M
                 m_end = STUB_END_MARGIN_M
-                # Recompute retained so p0+m_start..p1-m_end fits
+                # Per user 2026-05-15: when the fixed 30 m margins
+                # would consume too much of a short gap (e.g. a
+                # pre-split sub-polyline between adjacent junctions
+                # where the chart pavement is only 70-120 m long
+                # after corridor trim), fall back to a proportional
+                # margin so the diagonal stub can still emit as a
+                # small rect.  Without this fallback, CYXY taxiway
+                # D-west (post-corridor-trim 71 m, two pre-split
+                # bend-split halves) drops both halves to the 15 m
+                # MIN_SEGMENT_LEN_M floor — leaving the pavement
+                # between E_split and the runway-D junction as
+                # residue absorbed into the SE apron U-junction.
+                # The 40 m emit-floor below still rejects truly
+                # tiny stubs.
+                if gap - m_start - m_end < 40.0:
+                    m_start = 0.15 * gap
+                    m_end = 0.15 * gap
                 if gap - m_start - m_end < MIN_SEGMENT_LEN_M:
                     continue
             else:
@@ -1353,14 +1449,35 @@ def _split_centerlines_at_points(
                 # half the gap — fall back to the percentage margin
                 # so the rect doesn't extend into apron territory.
                 return float('inf')
-            if start_is_bend and abs(p0) < 0.5:
-                bm = _bend_margin_at(0.0, +1)
-                if bm != float('inf'):
-                    m_start = min(m_start, bm)
-            if end_is_bend and abs(p1 - ls.length) < 0.5:
-                bm = _bend_margin_at(ls.length, -1)
-                if bm != float('inf'):
-                    m_end = min(m_end, bm)
+            # Margin selection at each endpoint:
+            #
+            #   * Chart-level junction (multi-ref or runway-touch):
+            #     REPLACE m_* with CHART_JUNCTION_MARGIN_M.  The
+            #     chart-junction polygon needs room — the bend-
+            #     shared 5 m fallback would force adjacent rects
+            #     to overlap at the junction position.
+            #
+            #   * Same-ref bend-shared (no chart junction): use
+            #     the small bend-margin so the rect extends right
+            #     up to the angle change (only a tiny triangular
+            #     junction is unavoidable).
+            #
+            #   * Neither: use the percentage margin (already set
+            #     in m_start / m_end above).
+            if abs(p0) < 0.5:
+                if _is_chart_junction(_start_endpoint):
+                    m_start = max(CHART_JUNCTION_MARGIN_M, m_start)
+                elif start_is_bend:
+                    bm = _bend_margin_at(0.0, +1)
+                    if bm != float('inf'):
+                        m_start = min(m_start, bm)
+            if abs(p1 - ls.length) < 0.5:
+                if _is_chart_junction(_end_endpoint):
+                    m_end = max(CHART_JUNCTION_MARGIN_M, m_end)
+                elif end_is_bend:
+                    bm = _bend_margin_at(ls.length, -1)
+                    if bm != float('inf'):
+                        m_end = min(m_end, bm)
             rect_p0 = p0 + m_start
             rect_p1 = p1 - m_end
             if rect_p1 - rect_p0 < MIN_SEGMENT_LEN_M:

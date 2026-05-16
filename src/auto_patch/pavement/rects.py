@@ -225,6 +225,31 @@ def _build_taxi_rects(
             # stays as residue → junction.
             continue
 
+        # ── Long-edge-at-pavement-boundary check (user 2026-05-16) ──
+        # Invariant: a rect's two LONG edges (parallel to source_axis)
+        # must coincide with the natural pavement boundary on the
+        # outside — i.e. just outward of the long edge is NON-pavement
+        # (grass / out-of-airport).  If just-outward is still pavement,
+        # the rect is sitting in the INTERIOR of a wider pavement area
+        # (a junction at a multi-ref intersection) and is mis-sized:
+        # its long edges cut THROUGH pavement that should be junction
+        # territory, putting "junctions on its sloping edges" (the
+        # user-invariant we wanted to enforce) and pulling junction
+        # polygons into the rect's slope-grade chain.
+        #
+        # Concrete case (CYXY D-west, user 2026-05-16): the 155 m
+        # D polyline from node 141 (E_split) to node 135 (runway
+        # crossing) runs through E-D junction → narrow D taxi →
+        # D-runway junction.  Probing for natural half-width gives
+        # a wide value (~32 m) because most samples sit in the
+        # junction-wide areas — the rect emits as a 64 m × 75 m
+        # quasi-rectangle whose long edges sit deep inside junction
+        # pavement (with adjacent junctions on both sides).  Drop
+        # the rect so the pavement stays as junction residue.
+        if not _rect_long_edges_at_pavement_boundary(
+                rect, trimmed, pav_non_rwy):
+            continue
+
         role = _classify_role(trimmed, width, rwy_centerlines,
                                rwy_union, ref=ref,
                                ref_overall_bearings=ref_overall_bearings)
@@ -350,6 +375,103 @@ def _build_taxi_rects(
     keep: List[Tuple[Polygon, LineString, str, str]] = [
         item for i, item in enumerate(emitted) if i not in drop]
     return keep
+
+
+def _rect_long_edges_at_pavement_boundary(
+    rect: Polygon,
+    axis: LineString,
+    pav: Polygon,
+    offset_m: float = 5.0,
+    n_samples: int = 5,
+    interior_frac_tol: float = 0.0,
+) -> bool:
+    """Return True iff every sample point taken just-outward of the
+    rect's LONG edges (parallel to ``axis``) lies OUTSIDE ``pav``.
+
+    A taxi rect's long edges should sit at the natural pavement
+    boundary — grass on one side, taxi pavement on the other.  If
+    pavement extends past the long edge (sample inside ``pav``),
+    the rect is sitting in the INTERIOR of a wider pavement area
+    (a junction at a multi-ref intersection or apron) and the
+    long edge would BE the boundary between rect pavement and
+    junction pavement — putting a junction polygon adjacent to
+    the rect's sloping edge (user invariant: no junctions on
+    sloping rect edges).
+
+    Long edges are identified geometrically: the two of the four
+    rect-ring edges whose direction is closest to ``axis``
+    direction (cosine > 0.7, i.e. within ~45°).
+
+    ``offset_m`` (default 5 m) is the outward perpendicular probe
+    distance — larger than typical boundary precision (~1 m) but
+    smaller than typical junction width (~30 m).
+    ``interior_frac_tol`` is the fraction of samples allowed
+    inside ``pav`` before failing — 0.0 means even one sample
+    inside fails the invariant (strict; matches the user's "no
+    junction on sloping edge" rule).
+    """
+    if pav is None or pav.is_empty:
+        return True
+    try:
+        axis_coords = list(axis.coords)
+    except _GEOM_EXC:
+        return True
+    if len(axis_coords) < 2:
+        return True
+    adx = axis_coords[-1][0] - axis_coords[0][0]
+    ady = axis_coords[-1][1] - axis_coords[0][1]
+    a_mag = math.hypot(adx, ady)
+    if a_mag < 1e-6:
+        return True
+    aux, auy = adx / a_mag, ady / a_mag
+    try:
+        rect_coords = list(rect.exterior.coords)
+    except _GEOM_EXC:
+        return True
+    if rect_coords and rect_coords[0] == rect_coords[-1]:
+        rect_coords = rect_coords[:-1]
+    if len(rect_coords) != 4:
+        # Not a clean 4-corner rect — defer to other checks.
+        return True
+    centroid = rect.centroid
+    cx, cy = centroid.x, centroid.y
+    for i in range(4):
+        a = rect_coords[i]
+        b = rect_coords[(i + 1) % 4]
+        edx = b[0] - a[0]
+        edy = b[1] - a[1]
+        e_mag = math.hypot(edx, edy)
+        if e_mag < 1e-6:
+            continue
+        # Long edges: direction within ~45° of axis (cos > 0.7).
+        cos_with_axis = abs((edx * aux + edy * auy) / e_mag)
+        if cos_with_axis <= 0.7:
+            continue
+        # Outward perpendicular: from edge midpoint away from
+        # rect centroid.
+        mx = 0.5 * (a[0] + b[0])
+        my = 0.5 * (a[1] + b[1])
+        ox = mx - cx
+        oy = my - cy
+        o_mag = math.hypot(ox, oy)
+        if o_mag < 1e-6:
+            # Edge midpoint == centroid (degenerate); skip.
+            continue
+        ox /= o_mag
+        oy /= o_mag
+        n_inside = 0
+        for k in range(n_samples):
+            t = (k + 0.5) / n_samples
+            sx = a[0] + t * edx + ox * offset_m
+            sy = a[1] + t * edy + oy * offset_m
+            try:
+                if pav.contains(Point(sx, sy)):
+                    n_inside += 1
+            except _GEOM_EXC:
+                continue
+        if n_inside / n_samples > interior_frac_tol:
+            return False
+    return True
 
 
 def _merge_collinear_rects_principled(
