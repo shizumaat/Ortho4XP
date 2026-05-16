@@ -383,16 +383,24 @@ def _emit_airport_boundary_shape(
             p0: Tuple[float, float],
             p1: Tuple[float, float],
             alt0: float, alt1: float,
+            perp0: Tuple[float, float],
+            perp1: Tuple[float, float],
             ) -> Optional[Tuple[Polygon, Optional[float], float]]:
         """Build a 4-corner rect spanning the boundary segment
-        p0 → p1 with strip half-width.  Convention: corners 0, 3 at
-        the HIGH-altitude end, corners 1, 2 at the LOW end (matches
-        runway segment emit).  Returns
-        ``(polygon, altitude_high, altitude_low)`` with
-        ``altitude_high=None`` for flat segments (``altitude_low``
-        carries the single flat value in that case).
+        p0 → p1.  ``perp0`` / ``perp1`` are PER-VERTEX perpendicular
+        offsets (already scaled by half-width) so the rect uses the
+        SAME perpendicular at p0 as the preceding rect did at its
+        p1 — i.e., adjacent rects share their flat (cross) edge
+        nodes exactly.
+
+        Convention: corners 0, 3 at the HIGH-altitude end, corners
+        1, 2 at the LOW end (matches runway segment emit).
+        Returns ``(polygon, altitude_high, altitude_low)`` with
+        ``altitude_high=None`` for flat segments.
         """
-        # Order so p0 is the HIGH end (alt0 >= alt1).
+        # Order so p0 is the HIGH end (alt0 >= alt1).  When swapping,
+        # swap the perpendiculars too so each corner gets its
+        # vertex's perp.
         if abs(alt0 - alt1) < 0.1:
             eh: Optional[float] = None
             el = round((alt0 + alt1) / 2.0, 1)
@@ -402,6 +410,7 @@ def _emit_airport_boundary_shape(
         else:
             p0, p1 = p1, p0
             alt0, alt1 = alt1, alt0
+            perp0, perp1 = perp1, perp0
             eh = round(alt0, 1)
             el = round(alt1, 1)
         dx = p1[0] - p0[0]
@@ -409,16 +418,11 @@ def _emit_airport_boundary_shape(
         L = math.hypot(dx, dy)
         if L < 0.5:
             return None
-        # Perpendicular unit vector × half-width.  Sign matches
-        # ``pavement.runway_geometry.runway_corners`` so adjacent
-        # rects don't accidentally flip ring orientation.
-        perp_x = -dy / L * strip_half_width_m
-        perp_y = dx / L * strip_half_width_m
         corners = [
-            (p0[0] + perp_x, p0[1] + perp_y),  # 0 high-left
-            (p1[0] + perp_x, p1[1] + perp_y),  # 1 low-left
-            (p1[0] - perp_x, p1[1] - perp_y),  # 2 low-right
-            (p0[0] - perp_x, p0[1] - perp_y),  # 3 high-right
+            (p0[0] + perp0[0], p0[1] + perp0[1]),  # 0 high-left
+            (p1[0] + perp1[0], p1[1] + perp1[1]),  # 1 low-left
+            (p1[0] - perp1[0], p1[1] - perp1[1]),  # 2 low-right
+            (p0[0] - perp0[0], p0[1] - perp0[1]),  # 3 high-right
         ]
         try:
             poly = _Polygon(corners)
@@ -442,18 +446,64 @@ def _emit_airport_boundary_shape(
         dense = _densify_ring(ring_coords)
         if len(dense) < 4:
             continue
-        # Walk consecutive pairs; emit a rect per pair.
+        # Pre-compute PER-VERTEX perpendiculars so adjacent rects
+        # share their inner & outer corners at the shared vertex
+        # (per user 2026-05-16: boundary rects must connect along
+        # the flat cross edges, otherwise the chain has gaps /
+        # overlaps at every bend).  The perp at vertex i is the
+        # half-width offset of the average tangent direction of the
+        # two segments meeting at i.  At straight runs this equals
+        # the per-segment perp; at bends, it produces a clean
+        # bevel join (no overlap, no gap between adjacent rects).
+        dense_open = dense[:-1] if (dense and dense[0] == dense[-1]) else dense
+        N_open = len(dense_open)
+        vertex_perp: List[Tuple[float, float]] = []
+        for k in range(N_open):
+            p_prev = dense_open[(k - 1) % N_open]
+            p_cur = dense_open[k]
+            p_next = dense_open[(k + 1) % N_open]
+            dx_in = p_cur[0] - p_prev[0]
+            dy_in = p_cur[1] - p_prev[1]
+            Lin = math.hypot(dx_in, dy_in)
+            if Lin < 1e-9:
+                px_in = py_in = 0.0
+            else:
+                px_in = -dy_in / Lin
+                py_in = dx_in / Lin
+            dx_out = p_next[0] - p_cur[0]
+            dy_out = p_next[1] - p_cur[1]
+            Lout = math.hypot(dx_out, dy_out)
+            if Lout < 1e-9:
+                px_out = py_out = 0.0
+            else:
+                px_out = -dy_out / Lout
+                py_out = dx_out / Lout
+            avg_x = (px_in + px_out) / 2.0
+            avg_y = (py_in + py_out) / 2.0
+            L_avg = math.hypot(avg_x, avg_y)
+            if L_avg < 1e-9:
+                avg_x = px_in if Lin > 0 else px_out
+                avg_y = py_in if Lin > 0 else py_out
+            vertex_perp.append(
+                (avg_x * strip_half_width_m,
+                 avg_y * strip_half_width_m))
+        # Walk consecutive pairs; emit a rect per pair.  Use the
+        # per-vertex perp at each pair endpoint so adjacent rects
+        # share the flat (cross) edge nodes exactly.
         n_pairs = len(dense) - 1
         for i in range(n_pairs):
             p0 = dense[i]
             p1 = dense[i + 1]
+            perp0 = vertex_perp[i % N_open]
+            perp1 = vertex_perp[(i + 1) % N_open]
             a0 = _runway_clamped_alt(p0[0], p0[1])
             a1 = _runway_clamped_alt(p1[0], p1[1])
             if a0 is None:
                 a0 = 0.0
             if a1 is None:
                 a1 = 0.0
-            built = _rect_for_segment(p0, p1, float(a0), float(a1))
+            built = _rect_for_segment(p0, p1, float(a0), float(a1),
+                                       perp0, perp1)
             if built is None:
                 continue
             poly, eh, el = built
