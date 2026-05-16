@@ -13,6 +13,7 @@ with internal callers in ``O4_Airport_Pavement_Builder``):
 from __future__ import annotations
 
 import math
+from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from shapely.errors import GEOSException, TopologicalError
@@ -183,12 +184,50 @@ def _emit_primary_parallel_runway_stubs(
             # named taxi.  Process all of them.
             processed_lines = list(lines)
 
+        # Per-ref endpoint-occurrence count for chain-terminal
+        # detection.  apt.dat refed taxis form a graph where
+        # endpoint coords are either chain TERMINALS (count == 1,
+        # the chain literally ends here) or INTERNAL graph nodes
+        # (count >= 2, where two pass-through edges join or three+
+        # edges fork).  Only count == 1 endpoints are candidates
+        # for runway-ramp stubs; internal nodes (including forks)
+        # are graph junctions where the chain continues outward
+        # along OTHER branches, and the runway-facing branch's
+        # true terminus is further along (or there is no runway
+        # terminus on any branch).  Without this filter, a fork
+        # point that happens to lie within OUTSIDE_NEAR_RWY_M of
+        # the runway boundary emits a phantom stub at the fork
+        # itself, even though the fork is NOT a runway terminus
+        # (e.g. SPLP A graph forks at (-195,-108) and (3,501) sit
+        # 130 m from runway and currently produce phantom stubs
+        # in the gap between primary-parallel chunks).
+        ENDPOINT_KEY_TOL_M = 0.5
+        def _ep_key(p):
+            return (round(p[0] / ENDPOINT_KEY_TOL_M)
+                    * ENDPOINT_KEY_TOL_M,
+                    round(p[1] / ENDPOINT_KEY_TOL_M)
+                    * ENDPOINT_KEY_TOL_M)
+        endpoint_counts: Counter = Counter()
+        for ml in processed_lines:
+            c = list(ml.coords)
+            if len(c) >= 2:
+                endpoint_counts[_ep_key(c[0])] += 1
+                endpoint_counts[_ep_key(c[-1])] += 1
+
         for ml in processed_lines:
             coords = list(ml.coords)
             if len(coords) < 2:
                 continue
             # Check both endpoints for runway-terminating condition
             for end_idx in (0, -1):
+                # Skip non-terminal endpoints: the chain continues
+                # outward through this graph node along other
+                # branches, so the runway-facing terminus (if any)
+                # is reached on one of those branches, not here.
+                n_at_pt = endpoint_counts.get(
+                    _ep_key(coords[end_idx]), 0)
+                if n_at_pt >= 2:
+                    continue
                 ep_pt = Point(coords[end_idx])
                 d_ep = ep_pt.distance(rwy_boundary)
                 endpoint_inside = (
