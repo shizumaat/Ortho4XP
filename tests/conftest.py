@@ -47,6 +47,35 @@ def xplane_available() -> bool:
             and os.path.isdir(os.path.join(root, "Custom Data", "CIFP")))
 
 
+# Baseline airports (user 2026-05-16): these run unconditionally on
+# every invariant / grade / overlap test, providing CI coverage for
+# the canonical geometry classes we need to support:
+#
+#   * SPJC — apron-heavy, multi-ref diagonal stubs, sloped runway,
+#     hand-drawn target available for structural regression.
+#   * SPLP — single runway with built-up threshold pad, multi-tile
+#     output, sloped runway with seam anchors.  Target available.
+#   * CYXY — multi-runway crossings (D crosses 14R/32L and 14L/32R),
+#     chart-level E-D junction, parallel taxi E with diagonal stub
+#     E and primary-parallel south extension into the apron.
+#
+# Adding KBNA / HECA to this list once Phase-1 baselines are stable
+# would expand coverage to (4) terminal-heavy taxi network with
+# multiple intersecting parallels, and (5) wide-runway desert
+# airport with extensive aprons.
+#
+# Hand-drawn target comparison stays SPJC/SPLP-only — those are the
+# regression-gate fixtures.  Invariant tests apply universally.
+_BASELINE_AIRPORTS: tuple = ("SPJC", "SPLP", "CYXY")
+
+
+def baseline_airports() -> tuple:
+    """Return the canonical baseline airport list every invariant
+    test should run against unconditionally.  See module-level
+    ``_BASELINE_AIRPORTS`` for the rationale."""
+    return _BASELINE_AIRPORTS
+
+
 _AIRPORTS_CACHE: Optional[List[str]] = None
 
 

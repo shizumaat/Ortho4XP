@@ -32,7 +32,27 @@ import pytest
 from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
 
-from conftest import airports_under_test, xplane_available, xplane_root
+from conftest import (
+    airports_under_test, baseline_airports,
+    xplane_available, xplane_root,
+)
+
+
+def _test_airports() -> list:
+    """Union of baseline airports (always-run) + env-gated airports.
+
+    Per user 2026-05-16: invariant tests must run on every canonical
+    baseline airport unconditionally so geometry regressions can't
+    slip past CI without being noticed.  ``O4_TEST_AIRPORTS=...``
+    still extends the set for ad-hoc coverage of additional ICAOs.
+    """
+    seen = set()
+    out = []
+    for ic in list(baseline_airports()) + list(airports_under_test()):
+        if ic not in seen:
+            seen.add(ic)
+            out.append(ic)
+    return out
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE.parent / "src"
@@ -205,9 +225,7 @@ def _shape_label(layout, idx: int, s) -> str:
     return f"#{idx}({s.role}{('/' + ref) if ref else ''})"
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_junction_boundary_near_centerline(icao):
     """Per user 2026-04-30: a valid junction's pavement edge is
     always "relatively close" to a converging taxiway / runway
@@ -282,9 +300,7 @@ def test_junction_boundary_near_centerline(icao):
             f"taxi/runway centerline.  Top: {summary}.")
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_junction_vertex_count_bounded(icao):
     """Per shape rule: junction = incoming-corners + ≤ 4 trace per
     arc.  A junction with > ``MAX_JUNCTION_VERTICES`` vertices means
@@ -332,9 +348,7 @@ def test_junction_vertex_count_bounded(icao):
             f"vertex cap {cap}.  Top: {summary}.")
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_junction_neighbour_corners_shared(icao):
     """Coverage invariant: for every junction polygon, every vertex
     of a neighbouring shape (rect / runway / terminal / another
@@ -408,9 +422,7 @@ def test_junction_neighbour_corners_shared(icao):
         f"from any junction vertex (cap {cap}).  Top: {summary}.")
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_taxi_rects_not_alongside_apron(icao):
     """Per user 2026-04-30 absorption rule
     (`_drop_primary_parallels_embedded_in_pavement`): a taxi rect

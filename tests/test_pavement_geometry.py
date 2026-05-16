@@ -30,7 +30,23 @@ import pytest
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
-from conftest import airports_under_test, xplane_available, xplane_root
+from conftest import (
+    airports_under_test, baseline_airports,
+    xplane_available, xplane_root,
+)
+
+
+def _test_airports() -> list:
+    """Union of baseline airports (always-run) + env-gated airports.
+    Per user 2026-05-16: invariant tests run on every canonical
+    baseline airport unconditionally."""
+    seen = set()
+    out = []
+    for ic in list(baseline_airports()) + list(airports_under_test()):
+        if ic not in seen:
+            seen.add(ic)
+            out.append(ic)
+    return out
 
 _HERE = Path(__file__).resolve().parent
 _TOOLS = _HERE.parent / "tools"
@@ -157,9 +173,7 @@ def _source_pavement_union(icao: str):
         return None
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_no_self_overlap(icao):
     """Per user 2026-04-30 hard invariant: NO two emitted pavement
     shapes may overlap, ever.  No floating-point allowance.
@@ -207,14 +221,14 @@ def test_no_self_overlap(icao):
         f"Worst: {summary}.")
 
 
-# Baseline airports — these run without O4_TEST_TILE/O4_TEST_AIRPORTS,
-# so the no-self-overlap invariant is gated on every push.  Added
-# 2026-05-13 after the CYXY way-10483 boundary→DEM bridge overlap
-# report: any overlap must fail tests.
-_BASELINE_AIRPORTS = ("SPJC", "SPLP", "CYXY")
+# Baseline airports come from ``conftest.baseline_airports()``
+# (user 2026-05-16): the canonical set every invariant test runs
+# against unconditionally.  Originally just ``("SPJC", "SPLP",
+# "CYXY")`` for the no-self-overlap check; now applied across every
+# invariant test in this file.
 
 
-@pytest.mark.parametrize("icao", _BASELINE_AIRPORTS)
+@pytest.mark.parametrize("icao", baseline_airports())
 def test_no_self_overlap_baseline(icao):
     """Hard invariant: no two emitted pavement shapes may overlap.
 
@@ -260,9 +274,7 @@ def test_no_self_overlap_baseline(icao):
         f"Worst: {summary}.")
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_no_vertex_on_sloping_rect_edge(icao):
     """Per user 2026-04-28 invariant: a junction (or any non-rect)
     polygon vertex can only land on a sloping rect's CORNER, never
@@ -409,9 +421,7 @@ def _rect_flat_edges_from_shape(shape):
     return [edges[i] for i in short_idx]
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_no_vertex_on_sloping_rect_flat_edge(icao):
     """A sloping rect's FLAT (cross/short) edge — the side
     perpendicular to ``source_axis`` — is where the rect meets a
@@ -515,9 +525,7 @@ def test_no_vertex_on_sloping_rect_flat_edge(icao):
         assert False, msg
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_rect_short_edges_connect(icao):
     """Per user 2026-04-29: a sloping rect (primary_parallel,
     secondary_parallel, stub, cross_connector) has TWO short
@@ -613,9 +621,7 @@ def test_rect_short_edges_connect(icao):
         assert False, msg
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_coverage_within_source_envelope(icao):
     """Emitted pavement union must not exceed apt.dat + runway
     coverage by more than the airport's allowed fraction.  Catches

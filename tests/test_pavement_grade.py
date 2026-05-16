@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import baseline_airports
+
 _HERE = Path(__file__).resolve().parent
 _TOOLS = _HERE.parent / "tools"
 if str(_TOOLS) not in sys.path:
@@ -48,7 +50,12 @@ pytestmark = pytest.mark.skipif(
 # more than 1.5 % across its surface).  Most are long-thin and
 # sliver-triangle artefacts of ear-clipping the apron; cap is
 # calibrated to the current background so regressions trip the test.
-WITHIN_SHAPE_CAP = {"SPJC": 30, "SPLP": 30}
+#
+# Per user 2026-05-16: extended to ``baseline_airports()`` so the
+# grade gate fires on every canonical baseline airport.  CYXY caps
+# recorded as the current state (post 2026-05-16 geometry fixes);
+# any improvement should tighten them.
+WITHIN_SHAPE_CAP = {"SPJC": 30, "SPLP": 30, "CYXY": 50}
 # Mid-edge step cap: every triangle plane should match its
 # neighbours' surface along shared boundaries.  Samples along each
 # edge and compares to the nearest other-shape edge's interpolation.
@@ -72,10 +79,13 @@ WITHIN_SHAPE_CAP = {"SPJC": 30, "SPLP": 30}
 # (similar to tunnel_ramp / retaining_wall pattern at SPJC).  Cap
 # raised to the current observed step count to keep the gate
 # enforcing "no NEW regressions."
-MID_EDGE_CAP = {"SPJC": 10, "SPLP": 20}
+#
+# CYXY cap = 5 (post 2026-05-16 geometry fixes — record current
+# state so the test fires on regressions).
+MID_EDGE_CAP = {"SPJC": 10, "SPLP": 20, "CYXY": 5}
 
 
-@pytest.mark.parametrize("icao", ["SPJC", "SPLP"])
+@pytest.mark.parametrize("icao", list(baseline_airports()))
 def test_pavement_grade(tmp_path, icao):
     from auto_patch.pipeline import build_airport_pavement
     import check_grade

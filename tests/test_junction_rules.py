@@ -19,7 +19,22 @@ from typing import Dict, List, Tuple
 
 import pytest
 
-from conftest import airports_under_test, xplane_available, xplane_root
+from conftest import (
+    airports_under_test, baseline_airports,
+    xplane_available, xplane_root,
+)
+
+
+def _test_airports() -> list:
+    """Union of baseline airports (always-run) + env-gated airports.
+    See test_junction_invariants.py for rationale."""
+    seen = set()
+    out = []
+    for ic in list(baseline_airports()) + list(airports_under_test()):
+        if ic not in seen:
+            seen.add(ic)
+            out.append(ic)
+    return out
 
 
 _HERE = Path(__file__).resolve().parent
@@ -223,9 +238,7 @@ SLOPING_RECT_ROLES = ("primary_parallel", "secondary_parallel",
                       "stub", "cross_connector")
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_junction_no_long_edge_proximity(icao):
     """Rule 2: no junction vertex sits within ``SLOPING_EDGE_SNAP_M`` of
     a sloping rect's long edge unless the vertex coincides with one
@@ -323,9 +336,7 @@ def test_junction_no_long_edge_proximity(icao):
 # Placeholder tests — enable once each rule's emission pass lands.
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_junction_runway_node_sharing(icao):
     """Rule 1: each junction vertex on a runway boundary span must
     coincide EXACTLY (within ``SHARED_VERTEX_TOL_M``) with some
@@ -409,9 +420,7 @@ def test_junction_runway_node_sharing(icao):
         pytest.fail(msg)
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_large_junction_axis_aligned_borders(icao):
     """Rule 3: every junction edge that ISN'T on the apt.dat pavement
     boundary AND ISN'T on a shared anchor edge must run parallel or
@@ -521,9 +530,7 @@ def test_large_junction_axis_aligned_borders(icao):
         pytest.fail(msg)
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_no_narrow_neck_junctions(icao):
     """Rule 4: no junction has an MRR short side below
     ``NECK_ABSOLUTE_M`` and short/long ratio below ``NECK_RELATIVE``.
@@ -574,9 +581,7 @@ def test_no_narrow_neck_junctions(icao):
         pytest.fail(msg)
 
 
-@pytest.mark.parametrize("icao", airports_under_test() or [
-    pytest.param("(no airports)", marks=pytest.mark.skip(
-        reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
+@pytest.mark.parametrize("icao", _test_airports())
 def test_junction_vertices_outside_pavement(icao):
     """Rule 5 (user 2026-05-02): every junction vertex must sit
     OUTSIDE the apt.dat pavement boundary by at least
