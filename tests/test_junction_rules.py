@@ -265,9 +265,18 @@ def test_junction_no_long_edge_proximity(icao):
             continue
         # Per user 2026-05-02: flat rects (no altitude_high/low,
         # only ``altitude``) are exempt from sloping-rect connection
-        # rules — junctions can connect anywhere.
+        # rules — junctions can connect anywhere on their boundary.
+        # Their corners ARE still valid snap targets for junction
+        # vertices (per user 2026-05-09 flat-shape rule: a flat
+        # sub-rect produced by ``_split_sloped_rects_at_violations``
+        # carries a single altitude tag and can absorb junction
+        # vertices at any node).  Long-edge proximity isn't tested
+        # against flat rects, but flat-corner coincidence still
+        # exempts a vertex from violations against neighbouring
+        # sloped rects' long edges.
         if (s.altitude_high is None
                 or s.altitude_low is None):
+            rect_corners.extend(_rect_corners(s.polygon))
             continue
         for (a, b) in _rect_sloping_edges_from_shape(s):
             long_edges.append((a[0], a[1], b[0], b[1]))
