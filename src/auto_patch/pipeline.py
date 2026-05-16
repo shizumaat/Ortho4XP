@@ -2263,18 +2263,6 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 f"  [pav-builder] {icao}: re-clipped {n_clipped} "
                 f"boundary→DEM bridge polygon(s) against final pavement.")
 
-        # Final shared-vertex enforcement: the split-rect pass,
-        # bridge re-clip, groundside emit, and airport-boundary
-        # emit can each introduce non-junction polygon corners that
-        # sit on a junction's perimeter without being a junction
-        # vertex.  Insert each such orphan corner into the junction
-        # ring, interpolating node_altitudes between the edge
-        # endpoints.  Closes the Test 3 / Rule 3 invariant.
-        from .junction_repair import (
-            _insert_neighbour_vertices_into_junctions,
-        )
-        _insert_neighbour_vertices_into_junctions(layout, icao=icao)
-
         # Per user 2026-05-10: shapes cannot cross integer lat/lon
         # tile boundaries (X-Plane / Ortho4XP render each 1°x1° tile
         # separately).  Cut a 10 m gap along every tile boundary
