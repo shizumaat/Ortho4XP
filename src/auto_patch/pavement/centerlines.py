@@ -1154,6 +1154,49 @@ def _split_centerlines_at_points(
             return 0.30
         return 0.15
 
+    # Per user 2026-05-16: a split point should mark a place where
+    # MORE THAN ONE taxiway centerline crosses (a true intersection)
+    # or where a taxi crosses a runway.  The upstream
+    # ``taxi_junction_points`` also returns same-name graph forks
+    # (case ``degree_per_name[(nid, n)] >= 3`` — e.g. a 3-way branch
+    # internal to one taxiway's apt.dat graph) which are NOT
+    # geometric crossings of different centerlines.  At SPLP, A's
+    # graph has same-name forks at (-195,-108) and (3,501) that
+    # split A's centerline into short segments and produce phantom
+    # mid-chain stub rects.  Pre-filter ``split_points`` to keep
+    # only points where ≥ 2 distinct centerline refs pass within
+    # ``approach_tol_m`` (treating unnamed connectors as a distinct
+    # sentinel ref so a named taxi + connector counts), or where a
+    # runway centerline passes within the same tolerance.
+    validated_split_points: List[Tuple[float, float]] = []
+    if split_points:
+        _CONN_SENTINEL = "_conn"
+        for (sx, sy) in split_points:
+            sp = Point(sx, sy)
+            refs_near: set = set()
+            for ls_v, ref_v in centerlines:
+                try:
+                    if ls_v.distance(sp) <= approach_tol_m:
+                        refs_near.add(ref_v if ref_v else _CONN_SENTINEL)
+                        if len(refs_near) >= 2:
+                            break
+                except _GEOM_EXC:
+                    continue
+            if len(refs_near) >= 2:
+                validated_split_points.append((sx, sy))
+                continue
+            if rwy_centerlines:
+                near_runway = False
+                for rw in rwy_centerlines:
+                    try:
+                        if rw.distance(sp) <= approach_tol_m:
+                            near_runway = True
+                            break
+                    except _GEOM_EXC:
+                        continue
+                if near_runway:
+                    validated_split_points.append((sx, sy))
+
     result: List[Tuple[LineString, str]] = []
     for ls_idx, (ls, ref) in enumerate(centerlines):
         gap_margin_frac = _rect_margin_frac_for(ls, ref)
@@ -1177,7 +1220,7 @@ def _split_centerlines_at_points(
 
         # Collect cut params for intersections that lie on this line.
         cut_params: List[float] = []
-        for (sx, sy) in split_points or ():
+        for (sx, sy) in validated_split_points or ():
             sp = Point(sx, sy)
             if ls.distance(sp) > approach_tol_m:
                 continue
