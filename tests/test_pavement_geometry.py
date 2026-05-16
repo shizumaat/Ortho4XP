@@ -293,10 +293,20 @@ def test_no_vertex_on_sloping_rect_edge(icao):
     sloping_roles = {
         "runway", "primary_parallel", "secondary_parallel",
         "stub", "cross_connector"}
+    # Per user 2026-05-09: shapes carrying a single ``altitude=``
+    # tag (flat, no altitude_high/low) legitimately have variable
+    # node count — their elevation is constant, so extra ring
+    # vertices inserted by neighbouring junctions do not create
+    # kinks.  Only sloped rects (altitude_high+low set) and
+    # untagged residue (no altitude info at all) are subject to
+    # the 4-corner invariant.
     sloping = [s for s in layout.shapes
                if s.role in sloping_roles
                and s.polygon is not None
-               and not s.polygon.is_empty]
+               and not s.polygon.is_empty
+               and not (s.altitude is not None
+                        and s.altitude_high is None
+                        and s.altitude_low is None)]
     others = [s for s in layout.shapes
               if s.role not in sloping_roles
               and s.polygon is not None
