@@ -819,275 +819,378 @@ def _emit_boundary_dem_bridge(
                     runs[0] = runs[-1] + runs[0]
                     runs.pop()
 
+        # ── User's sequential-walk algorithm (2026-05-16) ─────────
+        # 1. Walk boundary; mark vertices within ``runway_clamp_
+        #    radius_m`` of any runway (B19's clamp radius is the
+        #    upstream condition that creates altitude gaps).
+        # 2. Each maximal contiguous "marked" stretch is a bridge
+        #    run: the bridge's outer edge walks those vertices.
+        # 3. For each run, snap from the run's end-vertex across to
+        #    the nearest pavement_union outer-ring vertex; then walk
+        #    pavement_union BACK toward the run start, collecting
+        #    canonical pavement vertices along the way.  Close the
+        #    polygon by snapping from the last pavement-walk vertex
+        #    to the run start.  By construction every bridge node
+        #    is either a boundary node (outer side) or a pavement-
+        #    union outer-ring node (inner side); no synthesised
+        #    intersection vertices; no overlap because both walks
+        #    are monotonic along their respective polygon
+        #    perimeters.
+        from shapely.ops import nearest_points
+
+        # Pre-build pavement_union outer ring (canonical nodes).
+        # Include runways so the bridge inner edge wraps around them
+        # (touching, not overlapping).
+        pav_for_inner = [
+            s.polygon for s in layout.shapes
+            if s.role != ROLE_BOUNDARY
+            and s.polygon is not None
+            and not s.polygon.is_empty]
+        pav_union_local: Optional[Polygon] = None
+        pav_ring_coords: List[Tuple[float, float]] = []
+        pav_ring_line: Optional[LineString] = None
+        if pav_for_inner:
+            try:
+                pav_union_local = unary_union(pav_for_inner)
+                if pav_union_local.geom_type == "Polygon":
+                    rc = list(pav_union_local.exterior.coords)
+                    if rc and rc[0] == rc[-1]:
+                        rc = rc[:-1]
+                    pav_ring_coords = [(float(x), float(y))
+                                        for (x, y) in rc]
+                elif pav_union_local.geom_type == "MultiPolygon":
+                    # Pick the largest component — bridges face the
+                    # main pavement mass; small disconnected pieces
+                    # aren't bridged.
+                    largest = max(
+                        pav_union_local.geoms,
+                        key=lambda g: g.area)
+                    rc = list(largest.exterior.coords)
+                    if rc and rc[0] == rc[-1]:
+                        rc = rc[:-1]
+                    pav_ring_coords = [(float(x), float(y))
+                                        for (x, y) in rc]
+            except _GEOM_EXC:
+                pav_ring_coords = []
+        if len(pav_ring_coords) >= 3:
+            try:
+                pav_ring_line = _LS(pav_ring_coords + [pav_ring_coords[0]])
+            except _GEOM_EXC:
+                pav_ring_line = None
+
+        # Altitude lookup for pav_ring nodes (round to 0.1 m).
+        pav_alt_lookup: Dict[Tuple[int, int], float] = {}
+        for (px, py, pa) in pav_edge_pts:
+            k = (int(round(px * 10)), int(round(py * 10)))
+            pav_alt_lookup[k] = float(pa)
+        def _pav_alt(px: float, py: float) -> float:
+            k = (int(round(px * 10)), int(round(py * 10)))
+            if k in pav_alt_lookup:
+                return pav_alt_lookup[k]
+            # Synthesised by unary_union — fall back to DEM
+            sd = _dem_alt(px, py)
+            return float(sd) if sd is not None else 0.0
+
         for run in runs:
             if len(run) < 2:
                 continue
-            # Outer edge: the boundary line vertices for the run,
-            # in order.
-            outer_pts = [(per_vert[i][0], per_vert[i][1])
-                         for i in run]
+            # Outer side of the bridge sits at the airport_boundary
+            # ribbon's INNER edge — offset inward by
+            # ``strip_half_width_m`` (2.5m) from the boundary line.
+            # This places the bridge's outer vertices on the same
+            # locus as the ribbon's interior-side nodes, eliminating
+            # the 2.5m ribbon overlap that walking the raw boundary
+            # would produce.
+            STRIP_HALF_WIDTH_M = 2.5
+            raw_outer_pts: List[Tuple[float, float]] = []
+            raw_outer_alts: List[float] = []
+            for ii_in_run, i_dense in enumerate(run):
+                raw_outer_pts.append(
+                    (per_vert[i_dense][0], per_vert[i_dense][1]))
+                raw_outer_alts.append(
+                    round(float(per_vert[i_dense][2]), 1))
+            # Compute inward-perpendicular offset per vertex from
+            # the local boundary tangent (average of the two
+            # adjacent segments).  The two perpendiculars are
+            # disambiguated by ``boundary_poly.contains()`` on a
+            # short probe.
+            outer_pts = []
+            outer_alts = list(raw_outer_alts)
+            n_raw = len(raw_outer_pts)
+            for k, (bx, by) in enumerate(raw_outer_pts):
+                if 0 < k < n_raw - 1:
+                    prev_pt = raw_outer_pts[k - 1]
+                    next_pt = raw_outer_pts[k + 1]
+                elif k > 0:
+                    prev_pt = raw_outer_pts[k - 1]
+                    next_pt = (bx, by)
+                else:
+                    prev_pt = (bx, by)
+                    next_pt = (raw_outer_pts[k + 1]
+                                if n_raw > 1 else (bx, by))
+                tx = next_pt[0] - prev_pt[0]
+                ty = next_pt[1] - prev_pt[1]
+                tmag = math.hypot(tx, ty)
+                if tmag < 1e-6:
+                    outer_pts.append((bx, by))
+                    continue
+                ux = tx / tmag
+                uy = ty / tmag
+                probe = _Point(bx + (-uy) * 0.5, by + ux * 0.5)
+                if boundary_poly.contains(probe):
+                    perp_x = -uy
+                    perp_y = ux
+                else:
+                    perp_x = uy
+                    perp_y = -ux
+                outer_pts.append((bx + perp_x * STRIP_HALF_WIDTH_M,
+                                   by + perp_y * STRIP_HALF_WIDTH_M))
             if len(outer_pts) < 2:
                 continue
-            try:
-                outer_line = _LS(outer_pts)
-            except _GEOM_EXC:
-                continue
-            if outer_line.is_empty or outer_line.length < 1.0:
-                continue
-            # Build inner offset on whichever side is INSIDE the
-            # airport boundary polygon.
-            inner_line = None
-            for side in ("left", "right"):
-                try:
-                    off = outer_line.parallel_offset(
-                        bridge_depth_m, side=side, join_style=2)
-                except _GEOM_EXC:
-                    off = None
-                if off is None or off.is_empty:
-                    continue
-                # Probe a midpoint of the offset to test
-                # containment in the airport boundary.
-                try:
-                    mid = off.interpolate(0.5, normalized=True)
-                    if boundary_poly.contains(mid):
-                        inner_line = off
-                        break
-                except _GEOM_EXC:
-                    continue
-            if inner_line is None or inner_line.is_empty:
-                continue
-            # Build the bridge polygon: outer line + reversed
-            # inner line.  parallel_offset on the LEFT side returns
-            # a line in REVERSED order; on the RIGHT side it's in
-            # the same order.  Either way, we walk the outer
-            # forward then close along the inner.  Determine
-            # winding by trying both and keeping the valid one.
-            in_coords = list(inner_line.coords)
-            ring1 = list(outer_pts) + list(reversed(in_coords))
-            ring2 = list(outer_pts) + list(in_coords)
-            bridge_poly: Optional[Polygon] = None
-            for cand in (ring1, ring2):
-                try:
-                    p = _Polygon(cand)
-                    if not p.is_valid:
-                        p = p.buffer(0)
-                    if (not p.is_empty
-                            and p.geom_type == "Polygon"
-                            and p.area > 100.0):
-                        bridge_poly = p
-                        break
-                except _GEOM_EXC:
-                    continue
-            if bridge_poly is None:
-                continue
-            # Per user 2026-04-29: bridge polygons must stop 5 m
-            # short of any runway — never connect directly to
-            # runway pavement.  The bridge is a transition strip
-            # between the boundary ribbon and natural terrain;
-            # forcing a runway corner / edge into its outline
-            # would re-introduce sloping-rect-edge vertex
-            # violations and create grade conflicts at the
-            # runway interface.  Subtract a 5 m-buffered runway
-            # union so the bridge keeps a clean gap.
-            try:
-                runway_union = unary_union(
-                    [s.polygon for s in runway_shapes])
-                if runway_union is not None and not runway_union.is_empty:
-                    bridge_poly = bridge_poly.difference(
-                        runway_union.buffer(5.0))
-            except _GEOM_EXC:
-                pass
-            if (bridge_poly.is_empty
-                    or bridge_poly.geom_type
-                    not in ("Polygon", "MultiPolygon")):
-                continue
-            # Subtract NON-SLOPING pavement (junctions, terminals)
-            # and the boundary ribbon from the bridge.  These can
-            # overlap the bridge by hundreds of square metres
-            # without sharing vertices with sloping rects, so
-            # subtracting them is safe and necessary for the
-            # no-self-overlap test.
-            non_sloping_pav_polys: List[Polygon] = [
-                s.polygon for s in layout.shapes
-                if s.role in (ROLE_JUNCTION, ROLE_TERMINAL)
-                and s.polygon is not None
-                and not s.polygon.is_empty]
-            for sub_geom in non_sloping_pav_polys:
-                try:
-                    bridge_poly = bridge_poly.difference(sub_geom)
-                except _GEOM_EXC:
-                    pass
-                if bridge_poly.is_empty:
-                    break
-            if (bridge_poly.is_empty
-                    or bridge_poly.geom_type
-                    not in ("Polygon", "MultiPolygon")):
-                continue
-            if not bridge_poly.is_valid:
-                bridge_poly = bridge_poly.buffer(0)
-            if bridge_poly.geom_type == "MultiPolygon":
-                parts = sorted(bridge_poly.geoms,
-                               key=lambda g: -g.area)
-                bridge_poly = parts[0] if parts else None
-            if (bridge_poly is None
-                    or bridge_poly.is_empty
-                    or bridge_poly.geom_type != "Polygon"
-                    or bridge_poly.area < 100.0):
-                continue
-            # Subtract the boundary ribbon so the bridge starts at
-            # the ribbon's INNER edge instead of overlapping the
-            # ribbon's inner half.
-            if (ribbon_union is not None
-                    and not ribbon_union.is_empty):
-                try:
-                    bridge_poly = bridge_poly.difference(ribbon_union)
-                except _GEOM_EXC:
-                    pass
-                if bridge_poly.is_empty:
-                    continue
-                if not bridge_poly.is_valid:
-                    bridge_poly = bridge_poly.buffer(0)
-                if bridge_poly.geom_type == "MultiPolygon":
-                    parts = sorted(bridge_poly.geoms,
-                                   key=lambda g: -g.area)
-                    bridge_poly = parts[0] if parts else None
-                if (bridge_poly is None
-                        or bridge_poly.is_empty
-                        or bridge_poly.geom_type != "Polygon"
-                        or bridge_poly.area < 100.0):
-                    continue
-            # If the bridge polygon overlaps any sloping rect, the
-            # bridge run extended too close to pavement despite
-            # pre-filtering — trim against the rect union with a
-            # 0.1 m safety buffer (rather than risk creating
-            # vertices on a sloping rect's edge interior).
-            sloping_rect_polys: List[Polygon] = [
-                s.polygon for s in layout.shapes
-                if s.role in (
-                    ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
-                    ROLE_SECONDARY_PARALLEL, ROLE_STUB,
-                    ROLE_CROSS_CONNECTOR)
-                and s.polygon is not None
-                and not s.polygon.is_empty]
-            overlaps_rect = False
-            for r in sloping_rect_polys:
-                try:
-                    if (bridge_poly.intersection(r).area > 1.0):
-                        overlaps_rect = True
-                        break
-                except _GEOM_EXC:
-                    continue
-            if overlaps_rect:
-                # Trim the bridge against the sloping-rect union
-                # using buffered-shrink to avoid creating
-                # edge-interior vertices, then snap any near-corner
-                # vertex to its nearest sloping-rect corner.
-                try:
-                    rect_union = unary_union(sloping_rect_polys)
-                    # Buffer the rect union by > the
-                    # ``EDGE_PROX_M`` test tolerance (0.5 m) so any
-                    # vertex from the difference operation lands
-                    # outside that proximity band.
-                    bridge_poly = bridge_poly.difference(
-                        rect_union.buffer(1.0))
-                except _GEOM_EXC:
-                    bridge_poly = None
-                if (bridge_poly is None
-                        or bridge_poly.is_empty):
-                    continue
-                if bridge_poly.geom_type == "MultiPolygon":
-                    parts = sorted(bridge_poly.geoms,
-                                   key=lambda g: -g.area)
-                    bridge_poly = parts[0] if parts else None
-                if (bridge_poly is None
-                        or bridge_poly.geom_type != "Polygon"
-                        or bridge_poly.area < 100.0):
-                    continue
-                try:
-                    bridge_poly = (
-                        _snap_polygon_vertices_to_rect_corners(
-                            bridge_poly,
-                            sloping_rect_polys,
-                            snap_tol_m=5.0))
-                except _GEOM_EXC:
-                    pass
-                if (bridge_poly is None
-                        or bridge_poly.is_empty
-                        or bridge_poly.geom_type != "Polygon"
-                        or bridge_poly.area < 100.0):
-                    continue
-            # Per-vertex altitudes.  Per user 2026-04-28:
-            # the bridge is meant to FILL the gap between the
-            # boundary (at clamped altitude) and the nearest
-            # pavement (at the pavement's emitted altitude).  So
-            # each vertex gets a distance-weighted blend of those
-            # two values:
-            #
-            #   alt(V) = (w_o · clamped_at_outer + w_p · pav_alt)
-            #            / (w_o + w_p)
-            #
-            # with weights w_o = 1 / max(d_outer, ε),
-            # w_p = 1 / max(d_pav, ε) — i.e. inverse-distance
-            # interpolation.  Vertices on the outer edge land at
-            # clamped; vertices touching pavement land at the
-            # pavement altitude; interior vertices smoothly
-            # interpolate.  This eliminates the previous
-            # "DEM-everywhere" inner edge that sat 12–35 m below
-            # the surrounding pavement at CYXY and was the cause
-            # of the persistent valley the user reported.
-            outer_set = set((round(x, 1), round(y, 1))
-                            for x, y in outer_pts)
-            new_coords = list(bridge_poly.exterior.coords)
-            alts: List[float] = []
-            EPS_M = 0.5
-            for cx, cy in new_coords:
-                # Nearest clamped (outer-edge) point and its alt.
-                best_o_alt: Optional[float] = None
-                best_o_d = float('inf')
-                for idx in run:
-                    ox, oy, ca, _da = per_vert[idx]
-                    if math.isnan(ca):
+
+            # When no pavement is available, fall back to a 100m-
+            # inward synthesised inner edge.
+            if pav_ring_line is None or not pav_ring_coords:
+                # Build an inward-perpendicular polyline at
+                # ``bridge_depth_m`` for the inner edge.
+                # (Same logic as previous v1 fallback.)
+                ctr = boundary_poly.centroid
+                inner_pts: List[Tuple[float, float]] = []
+                inner_alts: List[float] = []
+                for (bx, by) in outer_pts:
+                    perp_x = ctr.x - bx
+                    perp_y = ctr.y - by
+                    pmag = math.hypot(perp_x, perp_y)
+                    if pmag < 1e-6:
+                        inner_pts.append((bx, by))
+                        inner_alts.append(0.0)
                         continue
-                    d = math.hypot(cx - ox, cy - oy)
-                    if d < best_o_d:
-                        best_o_d = d
-                        best_o_alt = ca
-                # Nearest pavement edge point and its alt.
-                pav_hit = _nearest_pav_alt(cx, cy)
-                key = (round(cx, 1), round(cy, 1))
-                # Quick exits: vertex sits exactly on outer edge or
-                # on a pavement edge.
-                if key in outer_set and best_o_alt is not None:
-                    alts.append(round(float(best_o_alt), 1))
+                    perp_x /= pmag
+                    perp_y /= pmag
+                    sx = bx + perp_x * bridge_depth_m
+                    sy = by + perp_y * bridge_depth_m
+                    sd = _dem_alt(sx, sy)
+                    inner_pts.append((sx, sy))
+                    inner_alts.append(
+                        round(float(sd), 1)
+                        if sd is not None else 0.0)
+                ring_pts = list(outer_pts) + list(reversed(inner_pts))
+                ring_alts = list(outer_alts) + list(reversed(inner_alts))
+            else:
+                # ── Step 1: snap run endpoints onto pav_union ring ──
+                start_b = outer_pts[0]
+                end_b = outer_pts[-1]
+                # Snap to nearest pav_union outer-ring VERTEX
+                # (not just nearest point — the snap target must be
+                # canonical).
+                def _nearest_pav_vertex(x: float, y: float
+                                          ) -> Tuple[int, float]:
+                    best_i = -1
+                    best_d = float('inf')
+                    for ii, (px, py) in enumerate(pav_ring_coords):
+                        d = math.hypot(px - x, py - y)
+                        if d < best_d:
+                            best_d = d
+                            best_i = ii
+                    return best_i, best_d
+                start_i, start_d = _nearest_pav_vertex(*start_b)
+                end_i, end_d = _nearest_pav_vertex(*end_b)
+                # Reject runs with no nearby pavement on either end.
+                if (start_i < 0 or end_i < 0
+                        or start_d > bridge_depth_m * 2
+                        or end_d > bridge_depth_m * 2):
+                    # Fall back to synthesised inner edge.
+                    ctr = boundary_poly.centroid
+                    inner_pts = []
+                    inner_alts = []
+                    for (bx, by) in outer_pts:
+                        perp_x = ctr.x - bx
+                        perp_y = ctr.y - by
+                        pmag = math.hypot(perp_x, perp_y)
+                        if pmag < 1e-6:
+                            inner_pts.append((bx, by))
+                            inner_alts.append(0.0)
+                            continue
+                        perp_x /= pmag
+                        perp_y /= pmag
+                        sx = bx + perp_x * bridge_depth_m
+                        sy = by + perp_y * bridge_depth_m
+                        sd = _dem_alt(sx, sy)
+                        inner_pts.append((sx, sy))
+                        inner_alts.append(
+                            round(float(sd), 1)
+                            if sd is not None else 0.0)
+                    ring_pts = list(outer_pts) + list(reversed(inner_pts))
+                    ring_alts = list(outer_alts) + list(reversed(inner_alts))
+                else:
+                    # ── Step 2: walk pav_ring from end_i back to start_i ──
+                    # Pick the direction whose initial step from
+                    # end_i is CLOSER to start_b than the opposite
+                    # direction's initial step (so we walk "back
+                    # toward the run start").
+                    n_ring = len(pav_ring_coords)
+                    fwd_first = pav_ring_coords[(end_i + 1) % n_ring]
+                    bwd_first = pav_ring_coords[(end_i - 1) % n_ring]
+                    d_fwd = math.hypot(fwd_first[0] - start_b[0],
+                                        fwd_first[1] - start_b[1])
+                    d_bwd = math.hypot(bwd_first[0] - start_b[0],
+                                        bwd_first[1] - start_b[1])
+                    step = +1 if d_fwd < d_bwd else -1
+                    # Walk pav_union from end_i back toward start;
+                    # STOP when current vertex is > 400 m from
+                    # start_b (the user's closure rule).  This
+                    # bounds the inner walk so a bridge run on one
+                    # side of the airport doesn't trace around to
+                    # the opposite side.
+                    CLOSURE_DIST_M = runway_clamp_radius_m  # 400m
+                    inner_pts = []
+                    inner_alts = []
+                    idx = end_i
+                    visited = 0
+                    while visited < n_ring:
+                        px, py = pav_ring_coords[idx]
+                        d_to_start = math.hypot(px - start_b[0],
+                                                 py - start_b[1])
+                        if d_to_start > CLOSURE_DIST_M:
+                            break
+                        inner_pts.append((float(px), float(py)))
+                        inner_alts.append(round(_pav_alt(px, py), 1))
+                        if idx == start_i:
+                            break
+                        idx = (idx + step) % n_ring
+                        visited += 1
+                    if len(inner_pts) < 2:
+                        continue
+                    # Close: last inner vertex → start_b via the
+                    # implicit short edge of the polygon ring.
+                    ring_pts = list(outer_pts) + list(inner_pts)
+                    ring_alts = list(outer_alts) + list(inner_alts)
+
+            if len(ring_pts) < 4:
+                continue
+            try:
+                bridge_poly = _Polygon(ring_pts)
+                if not bridge_poly.is_valid:
+                    fixed = bridge_poly.buffer(0)
+                    if (fixed.is_empty
+                            or fixed.geom_type != "Polygon"):
+                        continue
+                    fc = list(fixed.exterior.coords)
+                    if fc and fc[0] == fc[-1]:
+                        fc = fc[:-1]
+                    if len(fc) != len(ring_pts):
+                        continue
+                    bridge_poly = fixed
+                if bridge_poly.is_empty:
                     continue
-                if pav_hit is not None and pav_hit[1] < EPS_M:
-                    alts.append(round(float(pav_hit[0]), 1))
+                if bridge_poly.geom_type != "Polygon":
                     continue
-                # Distance-weighted blend.
-                if best_o_alt is None and pav_hit is None:
-                    # No reference — fall back to DEM, then 0.
-                    d = _dem_alt(cx, cy) or _clamped_alt(cx, cy)
-                    alts.append(round(float(d or 0.0), 1))
+                if bridge_poly.area < 100.0:
                     continue
-                if pav_hit is None:
-                    alts.append(round(float(best_o_alt), 1))
+            except _GEOM_EXC:
+                continue
+
+            # Final cleanup: subtract NON-RUNWAY pavement +
+            # ribbon to trim small residual overlaps from
+            # per-vertex / per-segment perpendicular mismatch.
+            # Runways are excluded (they need the 1m sloping-rect
+            # buffer per B12 to avoid creating bridge vertices on
+            # runway long edges, which the
+            # ``test_no_vertex_on_sloping_rect_edge`` invariant
+            # catches).  Runway-vs-bridge overlap is small after
+            # the canonical-node construction and stays under the
+            # overlap-baseline cap on its own.
+            cleanup_subs: List[Polygon] = []
+            non_runway_pav = [
+                s.polygon for s in layout.shapes
+                if s.role not in (ROLE_BOUNDARY, ROLE_RUNWAY)
+                and s.polygon is not None
+                and not s.polygon.is_empty]
+            if non_runway_pav:
+                try:
+                    nr_union = unary_union(non_runway_pav)
+                    if nr_union is not None and not nr_union.is_empty:
+                        cleanup_subs.append(nr_union)
+                except _GEOM_EXC:
+                    pass
+            if ribbon_union is not None and not ribbon_union.is_empty:
+                cleanup_subs.append(ribbon_union)
+            # Sloping-rect (runway / parallel / stub / cross-conn)
+            # union buffered by 1m so any intersection vertices the
+            # subtraction creates land OUTSIDE the
+            # ``EDGE_PROX_M`` test tolerance.
+            sloping_polys = [
+                s.polygon for s in layout.shapes
+                if s.role in (ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
+                              ROLE_SECONDARY_PARALLEL, ROLE_STUB,
+                              ROLE_CROSS_CONNECTOR)
+                and s.polygon is not None
+                and not s.polygon.is_empty]
+            if sloping_polys:
+                try:
+                    sr_union = unary_union(sloping_polys)
+                    if sr_union is not None and not sr_union.is_empty:
+                        cleanup_subs.append(sr_union.buffer(1.0))
+                except _GEOM_EXC:
+                    pass
+            for sub in cleanup_subs:
+                try:
+                    trimmed = bridge_poly.difference(sub)
+                except _GEOM_EXC:
+                    trimmed = None
+                if trimmed is None or trimmed.is_empty:
                     continue
-                if best_o_alt is None:
-                    alts.append(round(float(pav_hit[0]), 1))
-                    continue
-                d_o = max(best_o_d, EPS_M)
-                d_p = max(pav_hit[1], EPS_M)
-                w_o = 1.0 / d_o
-                w_p = 1.0 / d_p
-                blended = ((w_o * best_o_alt + w_p * pav_hit[0])
-                            / (w_o + w_p))
-                alts.append(round(float(blended), 1))
+                if trimmed.geom_type == "Polygon":
+                    bridge_poly = trimmed
+                elif trimmed.geom_type == "MultiPolygon":
+                    parts = sorted(trimmed.geoms,
+                                   key=lambda g: -g.area)
+                    if parts and parts[0].area >= 100.0:
+                        bridge_poly = parts[0]
+                    else:
+                        bridge_poly = None
+                        break
+                else:
+                    bridge_poly = None
+                    break
+            if bridge_poly is None or bridge_poly.is_empty:
+                continue
+            if bridge_poly.area < 100.0:
+                continue
+            # Resample altitudes for the (possibly reshaped) ring.
+            new_coords = list(bridge_poly.exterior.coords)
+            if new_coords and new_coords[0] == new_coords[-1]:
+                new_coords_open = new_coords[:-1]
+            else:
+                new_coords_open = new_coords
+            if len(new_coords_open) < 3:
+                continue
+            canon_alt: Dict[Tuple[int, int], float] = {}
+            for (cx, cy), ca in zip(
+                    list(outer_pts) + list(inner_pts),
+                    list(outer_alts) + list(inner_alts)):
+                ck = (int(round(cx * 10)), int(round(cy * 10)))
+                canon_alt[ck] = ca
+            ring_alts = []
+            for (cx, cy) in new_coords_open:
+                ck = (int(round(cx * 10)),
+                      int(round(cy * 10)))
+                ca = canon_alt.get(ck)
+                if ca is None:
+                    sd = _dem_alt(cx, cy)
+                    ca = (round(float(sd), 1)
+                          if sd is not None else 0.0)
+                ring_alts.append(ca)
+
+            node_alts = list(ring_alts) + [ring_alts[0]]
             layout.shapes.append(BuiltShape(
                 polygon=bridge_poly,
                 role=ROLE_BOUNDARY,
                 ref="boundary_dem_bridge",
-                node_altitudes=alts))
+                node_altitudes=node_alts,
+            ))
             n_emitted += 1
+
     return n_emitted
 
 

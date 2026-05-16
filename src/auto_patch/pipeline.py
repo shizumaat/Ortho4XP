@@ -2250,18 +2250,32 @@ def build_airport_pavement(icao: str, xplane_root: str,
         from .junction_repair import _split_sloped_rects_at_violations
         _split_sloped_rects_at_violations(layout, icao=icao)
 
-        # Per user 2026-05-13 (CYXY way -10483 overlap report):
-        # downstream passes (subdivide_violating_junctions, stitch,
-        # sloping-edge split) reshape junctions after the
-        # boundary→DEM bridge was emitted.  Re-clip every bridge
-        # against the final pavement footprint so no bridge overlaps
-        # any junction / terminal / taxi rect / runway.
-        from .boundary import _clip_boundary_bridges_against_pavement
-        n_clipped = _clip_boundary_bridges_against_pavement(layout)
-        if n_clipped:
-            UI.vprint(1,
-                f"  [pav-builder] {icao}: re-clipped {n_clipped} "
-                f"boundary→DEM bridge polygon(s) against final pavement.")
+        # Re-emit bridges instead of difference-clipping (user
+        # 2026-05-16 canonical-node rewrite).  Drop stale bridges
+        # and re-emit against final pavement state — every node
+        # then references a CURRENT pavement_union outer-ring
+        # vertex instead of a stale snapshot.
+        from .layout import ROLE_BOUNDARY as _ROLE_BOUNDARY
+        layout.shapes = [s for s in layout.shapes
+                         if not (s.role == _ROLE_BOUNDARY
+                                 and s.ref == "boundary_dem_bridge")]
+        try:
+            from .boundary import _emit_boundary_dem_bridge as _emit_br
+            from .elevation import _load_airport_dem as _ld_dem
+            _dem_pp = _ld_dem(layout.anchor[0], layout.anchor[1])
+            _tl = (current_tile_lat
+                   if current_tile_lat is not None
+                   else math.floor(layout.anchor[0]))
+            _tn = (current_tile_lon
+                   if current_tile_lon is not None
+                   else math.floor(layout.anchor[1]))
+            n_br2 = _emit_br(layout, _dem_pp, _tl, _tn)
+            if n_br2:
+                UI.vprint(1,
+                    f"  [pav-builder] {icao}: re-emitted "
+                    f"{n_br2} canonical-node bridge(s).")
+        except _GEOM_EXC:
+            pass
 
         # Per user 2026-05-10: shapes cannot cross integer lat/lon
         # tile boundaries (X-Plane / Ortho4XP render each 1°x1° tile
