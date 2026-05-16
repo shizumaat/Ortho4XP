@@ -1201,9 +1201,15 @@ def _split_sloped_rects_at_violations(
     if not candidates:
         return 0
 
-    # Collect junction vertices.
-    j_verts: List[Tuple[float, float]] = []
-    for s in layout.shapes:
+    # Collect junction vertices.  Carry (j_shape_idx, vertex_idx)
+    # so we can pull the originating vertex onto the new sub-rect
+    # corner after the split — without that, the rect side gets a
+    # new corner at the projection of the junction vertex onto the
+    # rect's long edge, but the junction vertex itself stays put
+    # ~ ``on_edge_tol_m`` perpendicular off the new sub-rect's edge
+    # (Tests 2 & 3 then flag the same geometry from two sides).
+    j_verts: List[Tuple[float, float, int, int]] = []
+    for s_idx, s in enumerate(layout.shapes):
         if s.role != ROLE_JUNCTION:
             continue
         if s.polygon is None or s.polygon.is_empty:
@@ -1214,7 +1220,8 @@ def _split_sloped_rects_at_violations(
             continue
         if jc and jc[0] == jc[-1]:
             jc = jc[:-1]
-        j_verts.extend(jc)
+        for v_idx, (jx, jy) in enumerate(jc):
+            j_verts.append((float(jx), float(jy), s_idx, v_idx))
     if not j_verts:
         return 0
 
@@ -1230,7 +1237,9 @@ def _split_sloped_rects_at_violations(
         return t, d2
 
     n_splits = 0
-    splits: Dict[int, List[float]] = {}  # shape_idx -> list of t values
+    # shape_idx -> [(cluster_t, [(j_idx, v_idx, jx, jy), ...]), ...]
+    splits: Dict[int, List[Tuple[float,
+                                  List[Tuple[int, int, float, float]]]]] = {}
     for idx in candidates:
         s = layout.shapes[idx]
         coords = list(s.polygon.exterior.coords)
@@ -1240,39 +1249,51 @@ def _split_sloped_rects_at_violations(
         # Sloping edge 1: c0 (high) -> c1 (low).
         # Sloping edge 2: c3 (high) -> c2 (low).
         # For each junction vertex (not at a corner), check distance
-        # to each sloping edge.  Collect violating t values.
-        rect_corner_set = {tuple(c) for c in coords}
-        ts: List[float] = []
-        for jv in j_verts:
-            if tuple(jv) in rect_corner_set:
+        # to each sloping edge.  Collect (t, j_idx, v_idx, jx, jy)
+        # so we can move the originating vertex to the new sub-rect
+        # corner after splitting.
+        rect_corner_set = {(c[0], c[1]) for c in coords}
+        ts: List[Tuple[float, int, int, float, float]] = []
+        for jx, jy, j_idx, v_idx in j_verts:
+            if (jx, jy) in rect_corner_set:
                 continue
             for a, b in [(c0, c1), (c3, c2)]:
-                t, d2 = _proj_t(jv, a, b)
+                t, d2 = _proj_t((jx, jy), a, b)
                 if t is None or d2 is None:
                     continue
                 if d2 > on_edge_tol2:
                     continue
                 if t < min_t_margin or t > 1.0 - min_t_margin:
                     continue
-                ts.append(t)
+                ts.append((t, j_idx, v_idx, jx, jy))
                 break
         if ts:
-            # Cluster nearby t values (< 0.05 apart).
-            ts.sort()
-            merged: List[float] = []
-            for t in ts:
-                if not merged or t - merged[-1] > 0.05:
-                    merged.append(t)
-            splits[idx] = merged
+            # Cluster nearby t values (< 0.05 apart).  Every junction
+            # vertex inside a cluster snaps to the same new sub-rect
+            # corner (representative t of the cluster).
+            ts.sort(key=lambda e: e[0])
+            clusters: List[Tuple[float,
+                                  List[Tuple[int, int, float, float]]]] = []
+            for (t, j_idx, v_idx, jx, jy) in ts:
+                if clusters and t - clusters[-1][0] <= 0.05:
+                    clusters[-1][1].append((j_idx, v_idx, jx, jy))
+                else:
+                    clusters.append((t, [(j_idx, v_idx, jx, jy)]))
+            splits[idx] = clusters
 
     if not splits:
         return 0
 
     # Apply splits.  For each candidate, create N+1 sub-rects from
-    # N split positions.
+    # N split positions, then snap each source junction vertex to
+    # the new sub-rect corner at its cluster's t.  ``junction_moves``
+    # collects per-junction vertex updates and is applied once per
+    # junction shape so node_altitudes alignment is preserved.
     new_shapes: List["BuiltShape"] = []
     drop_idxs: set = set()
-    for idx, ts in splits.items():
+    # junction_shape_idx -> {vertex_idx -> new_xy}
+    junction_moves: Dict[int, Dict[int, Tuple[float, float]]] = {}
+    for idx, clusters in splits.items():
         s = layout.shapes[idx]
         coords = list(s.polygon.exterior.coords)
         if coords and coords[0] == coords[-1]:
@@ -1285,7 +1306,8 @@ def _split_sloped_rects_at_violations(
             return (a[0] + t * (b[0] - a[0]),
                     a[1] + t * (b[1] - a[1]))
 
-        boundaries = [0.0] + ts + [1.0]
+        ts_only = [c[0] for c in clusters]
+        boundaries = [0.0] + ts_only + [1.0]
         for k in range(len(boundaries) - 1):
             t_a = boundaries[k]
             t_b = boundaries[k + 1]
@@ -1323,18 +1345,78 @@ def _split_sloped_rects_at_violations(
             n_splits += 1
         drop_idxs.add(idx)
 
+        # For each cluster, also move the originating junction
+        # vertices onto the new sub-rect corner — whichever of the
+        # two long-edge corners at parameter t is closer to each
+        # source vertex.  Without this, the junction vertex remains
+        # ~ ``on_edge_tol_m`` perpendicular off the new sub-rect's
+        # long edge (Test 2's Rule 2 violation pattern).
+        for cluster_t, v_data_list in clusters:
+            corner_a = _interp_pt(c0, c1, cluster_t)
+            corner_b = _interp_pt(c3, c2, cluster_t)
+            for (j_idx, v_idx, jx, jy) in v_data_list:
+                da = (jx - corner_a[0]) ** 2 + (jy - corner_a[1]) ** 2
+                db = (jx - corner_b[0]) ** 2 + (jy - corner_b[1]) ** 2
+                target = corner_a if da <= db else corner_b
+                # Last-write-wins if two rects' splits both name the
+                # same (j_idx, v_idx).  In practice each junction
+                # vertex is near at most one rect's long edge.
+                junction_moves.setdefault(j_idx, {})[v_idx] = target
+
     if not new_shapes:
         return 0
+
+    # Apply junction-vertex moves before swapping shapes, so we can
+    # still index layout.shapes by the original j_idx values.
+    n_jct_moves = 0
+    for j_idx, vert_updates in junction_moves.items():
+        if not (0 <= j_idx < len(layout.shapes)):
+            continue
+        j_shape = layout.shapes[j_idx]
+        if j_shape.polygon is None or j_shape.polygon.is_empty:
+            continue
+        try:
+            jc = list(j_shape.polygon.exterior.coords)
+        except _GEOM_EXC:
+            continue
+        had_close = bool(jc) and jc[0] == jc[-1]
+        if had_close:
+            jc = jc[:-1]
+        new_jc = list(jc)
+        for v_idx, new_xy in vert_updates.items():
+            if 0 <= v_idx < len(new_jc):
+                new_jc[v_idx] = new_xy
+        if had_close:
+            new_jc = new_jc + [new_jc[0]]
+        from shapely.geometry import Polygon
+        try:
+            new_poly = Polygon(new_jc)
+            if not new_poly.is_valid:
+                new_poly = new_poly.buffer(0)
+            if new_poly.is_empty:
+                continue
+            if new_poly.geom_type == "MultiPolygon":
+                new_poly = max(new_poly.geoms, key=lambda g: g.area)
+            if new_poly.geom_type != "Polygon":
+                continue
+        except _GEOM_EXC:
+            continue
+        j_shape.polygon = new_poly
+        n_jct_moves += len(vert_updates)
+
     layout.shapes = [
         s for k, s in enumerate(layout.shapes)
         if k not in drop_idxs
     ] + new_shapes
     try:
-        UI.vprint(1,
-            f"  [pav-builder] {icao}: split "
-            f"{len(splits)} sloped rect(s) into "
-            f"{n_splits} sub-rect(s) at junction-vertex "
-            f"sloping-edge violations.")
+        msg = (f"  [pav-builder] {icao}: split "
+               f"{len(splits)} sloped rect(s) into "
+               f"{n_splits} sub-rect(s) at junction-vertex "
+               f"sloping-edge violations")
+        if n_jct_moves:
+            msg += (f"; pulled {n_jct_moves} junction vertex(es) "
+                    f"to new corner")
+        UI.vprint(1, msg + ".")
     except _GEOM_EXC:
         pass
     return n_splits
