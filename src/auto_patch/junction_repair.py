@@ -1915,31 +1915,112 @@ def _absorb_rects_at_junction_perimeters(
         return 0
 
     # Apply junction extensions.  After union, the junction
-    # polygon's vertex set changes; the existing node_altitudes
-    # array no longer aligns by index.  Drop node_altitudes; the
-    # OSM emit will fall back to shape.altitude (a single value).
-    for j_idx, strips in junction_extensions.items():
+    # polygon's vertex set changes; we need to re-derive
+    # node_altitudes for the new vertex set.  Build a lookup
+    # table of (vertex_position → altitude) from the OLD junction
+    # corners (their committed altitudes) AND from the absorbed
+    # rect strip corners (altitudes derived from rect axial
+    # position).  Each new polygon vertex gets its altitude by
+    # nearest-known-vertex match.
+    from .layout import SHARED_VERTEX_TOL_M as _SVT
+    bucket = _SVT
+    for j_idx, strip_data in junction_extensions.items():
         j = layout.shapes[j_idx]
         if j.polygon is None or j.polygon.is_empty:
             continue
+        # Build altitude lookup BEFORE replacing polygon.
+        alt_lookup: Dict[Tuple[int, int], float] = {}
+        def _bkey(x, y):
+            return (round(x / bucket), round(y / bucket))
         try:
-            merged_strips = unary_union(strips)
+            old_coords = list(j.polygon.exterior.coords)
+            if old_coords and old_coords[0] == old_coords[-1]:
+                old_coords = old_coords[:-1]
+        except _GEOM_EXC:
+            old_coords = []
+        if j.node_altitudes and len(j.node_altitudes) >= len(old_coords):
+            for i, (cx, cy) in enumerate(old_coords):
+                if i < len(j.node_altitudes):
+                    alt_lookup[_bkey(cx, cy)] = float(
+                        j.node_altitudes[i])
+        elif j.altitude is not None:
+            for cx, cy in old_coords:
+                alt_lookup[_bkey(cx, cy)] = float(j.altitude)
+        # Strips are simple list of polygons here.  Each strip
+        # came from a rect with known altitudes — register its
+        # corners (corners 0,3 = high; corners 1,2 = low per the
+        # rect convention used in _strip_polygon).
+        # Looking at _strip_polygon: it builds p0 (lo*nx+ny), p1
+        # (hi*nx+ny), p2 (hi*-nx-ny), p3 (lo*-nx-ny) — so p0/p3
+        # are at t=t_lo (rect's high side), p1/p2 at t=t_hi (low).
+        # We tracked (strip, rect_alt_high, rect_alt_low, t_lo, t_hi)
+        # in the strip_data tuples.  For now, use a simpler approach:
+        # for each strip corner, infer altitude from interpolation
+        # along the junction's existing altitude field.
+        try:
+            merged_strips = unary_union(strip_data)
             new_j_poly = unary_union([j.polygon, merged_strips])
             if new_j_poly.geom_type == "MultiPolygon":
                 new_j_poly = max(new_j_poly.geoms,
                                   key=lambda g: g.area)
-            if (new_j_poly.geom_type == "Polygon"
+            if not (new_j_poly.geom_type == "Polygon"
                     and new_j_poly.is_valid
                     and not new_j_poly.is_empty):
-                j.polygon = new_j_poly
-                # Preserve altitude: use the median of existing
-                # node_altitudes as the flat altitude.
-                if j.node_altitudes:
-                    alts = list(j.node_altitudes)
-                    alts_sorted = sorted(alts)
-                    j.altitude = round(float(
-                        alts_sorted[len(alts_sorted) // 2]), 1)
-                    j.node_altitudes = None
+                continue
+            # Also register strip corners in alt_lookup.  Use the
+            # NEAREST OLD junction vertex's altitude (a reasonable
+            # approximation since the strip is adjacent to the
+            # junction).
+            for strip in strip_data:
+                try:
+                    s_coords = list(strip.exterior.coords)
+                    if s_coords and s_coords[0] == s_coords[-1]:
+                        s_coords = s_coords[:-1]
+                except _GEOM_EXC:
+                    continue
+                for sx, sy in s_coords:
+                    key = _bkey(sx, sy)
+                    if key in alt_lookup:
+                        continue
+                    # Find nearest old corner altitude.
+                    if old_coords:
+                        best_d2 = float("inf")
+                        best_alt = None
+                        for cx, cy in old_coords:
+                            d2 = (cx - sx) ** 2 + (cy - sy) ** 2
+                            if d2 < best_d2:
+                                best_d2 = d2
+                                k = _bkey(cx, cy)
+                                if k in alt_lookup:
+                                    best_alt = alt_lookup[k]
+                        if best_alt is not None:
+                            alt_lookup[key] = best_alt
+            j.polygon = new_j_poly
+            # Assign altitudes to the new polygon's vertices.
+            new_coords = list(new_j_poly.exterior.coords)
+            had_close = bool(new_coords) and new_coords[0] == new_coords[-1]
+            if had_close:
+                new_coords = new_coords[:-1]
+            if alt_lookup:
+                new_alts = []
+                for cx, cy in new_coords:
+                    key = _bkey(cx, cy)
+                    if key in alt_lookup:
+                        new_alts.append(alt_lookup[key])
+                        continue
+                    # Nearest known corner.
+                    best_d2 = float("inf")
+                    best_alt = 0.0
+                    for (kx, ky), alt in alt_lookup.items():
+                        # Recover x,y from the bucket key.
+                        d2 = ((kx * bucket - cx) ** 2
+                              + (ky * bucket - cy) ** 2)
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_alt = alt
+                    new_alts.append(round(best_alt, 1))
+                j.node_altitudes = new_alts + [new_alts[0]]
+                j.altitude = None
         except _GEOM_EXC:
             continue
 
