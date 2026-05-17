@@ -133,15 +133,9 @@ JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE = {
     "SPJC": {"max_offenders": 43, "max_distance_m": 567.0},
 }
 
-TAXI_RECT_ADJACENCY_REGRESSION_BASELINE = {
-    # SPJC: 42/42 surviving sloping rects flag at ≥ 10 % adjacent;
-    # all 42 actually flag at 100 % because the surrounding
-    # junction polygons cover most of the apron extent.  The
-    # legacy partial-absorption rule keeps corridor sections
-    # alongside apron-edge as legitimate rects — those fragments
-    # trip this whole-rect probe.
-    "SPJC": {"max_offenders": 42, "max_adjacent_frac": 1.00},
-}
+# Per user 2026-05-16: the shared-sloping-edge rule is universal —
+# no airport-specific exemptions.  A sloping rect's sloping edge
+# must never be shared by a junction/apron polygon's perimeter.
 
 ORPHAN_NEIGHBOUR_VERTEX_REGRESSION_BASELINE = {
     # SPJC: 5 vertex orphans:
@@ -424,53 +418,47 @@ def test_junction_neighbour_corners_shared(icao):
 
 @pytest.mark.parametrize("icao", _test_airports())
 def test_taxi_rects_not_alongside_apron(icao):
-    """Per user 2026-04-30 absorption rule
-    (`_drop_primary_parallels_embedded_in_pavement`): a taxi rect
-    that runs along an apron / junction edge for ≥ 10 % of its
-    axial length must be absorbed (or partially clipped) into that
-    other pavement.  The "taxiway runs along apron edge" case
-    folds the embedded portion into the apron (which drives
-    elevation); the part of the taxi that leaves the apron
-    survives as a shorter rect.
+    """Per user 2026-05-16: a sloping rect's SLOPING EDGE must
+    never be shared with a junction / apron polygon's perimeter.
 
-    Test method: replicate the absorption rule's probe — sample 5 m
-    steps along each surviving taxi rect's axis, place a probe
-    point ``OUTER_PROBE_M`` past each long edge, count steps where
-    EITHER probe lands inside any apron / junction polygon (other
-    than the rect itself).  A surviving rect should have < 10 % of
-    its steps adjacent; otherwise the absorption rule was bypassed
-    (corridor-ref exception, EITHER → BOTH switch, etc.) or the
-    apron / junction polygon was created after absorption ran.
+    Sharing a sloping edge means the junction's elevation has to
+    match the rect's per-axis linear slope along the seam — which
+    over-constrains the junction's elevation field and produces a
+    visible step/cliff at render time, plus violates the user's
+    "junctions don't live on sloping rect edges" architectural
+    invariant.
 
-    Per-airport regression baseline:
-    Airports listed in
-    ``TAXI_RECT_ADJACENCY_REGRESSION_BASELINE`` have a known-bad
-    ceiling (count + worst adjacency fraction); the test fails
-    only if either exceeds the recorded value.  Other airports
-    are gated tightly (zero offenders).  Note this test surfaces
-    the same root issue as the junction-vertex / boundary-distance
-    tests at SPJC: surrounding junction polygons are too sprawling,
-    so every surviving rect probes "alongside" them.
+    The right outcome when a rect was going to share a sloping
+    edge with a junction is for the rect to be absorbed (full or
+    partial clip): the apron / junction covers that footprint and
+    slopes multi-directionally instead.
+
+    Detection: for each sloping rect, build its 2 sloping-edge
+    line segments (corners 0-1 and 2-3 per the
+    ``_rect_from_axis_extended`` convention).  For each junction /
+    apron polygon, walk its perimeter as consecutive vertex pairs;
+    if a junction perimeter segment lies along (within
+    ``EDGE_PERP_TOL_M`` perpendicular AND substantially overlaps
+    axially with) a sloping edge, flag the rect.
+
+    No airport-specific baseline — the invariant is universal.
     """
     layout = _build_layout(icao)
-    other_pav = [
-        s.polygon for s in layout.shapes
-        if s.role in {"apron", "junction"}
-        and s.polygon is not None
-        and not s.polygon.is_empty]
-    if not other_pav:
-        pytest.skip(f"{icao}: no apron/junction polygons emitted")
-    try:
-        other_union = unary_union(other_pav)
-    except Exception:
-        pytest.skip(f"{icao}: apron/junction union failed")
-
     sloping_roles = {"primary_parallel", "secondary_parallel",
                      "stub", "cross_connector"}
-    SAMPLE_STEP_M = 5.0
-    OUTER_PROBE_M = 5.0
-    ADJACENCY_FRAC = 0.10
-    MIN_AXIS_M = 30.0
+    other_roles = {"junction", "apron"}
+
+    EDGE_PERP_TOL_M = 1.0
+    OVERLAP_MIN_M = 2.0
+
+    def _project_param(px, py, ax, ay, bx, by, L2):
+        # Returns (t, perp_dist).  t is parametric along (a→b).
+        dx = bx - ax
+        dy = by - ay
+        t = ((px - ax) * dx + (py - ay) * dy) / L2
+        fx = ax + t * dx
+        fy = ay + t * dy
+        return t, math.hypot(px - fx, py - fy)
 
     offenders = []
     for idx, s in enumerate(layout.shapes):
@@ -483,69 +471,68 @@ def test_taxi_rects_not_alongside_apron(icao):
             coords = coords[:-1]
         if len(coords) != 4:
             continue
-        # Axis from short-edge midpoints (corners 0,3 → one short
-        # edge; 1,2 → other), matching the absorption rule.
-        a_mid = (0.5 * (coords[0][0] + coords[3][0]),
-                 0.5 * (coords[0][1] + coords[3][1]))
-        b_mid = (0.5 * (coords[1][0] + coords[2][0]),
-                 0.5 * (coords[1][1] + coords[2][1]))
-        ax, ay = b_mid[0] - a_mid[0], b_mid[1] - a_mid[1]
-        L = math.hypot(ax, ay)
-        if L < MIN_AXIS_M:
-            continue
-        ux, uy = ax / L, ay / L
-        nx, ny = -uy, ux
-        half_w = math.hypot(
-            coords[0][0] - a_mid[0], coords[0][1] - a_mid[1])
-        if half_w < 1.0:
-            continue
-        outer = half_w + OUTER_PROBE_M
-        # Defensive: subtract the rect itself in case an apron
-        # polygon ever included its footprint by accident.
-        try:
-            test_pav = other_union.difference(s.polygon)
-        except Exception:
-            test_pav = other_union
-        n_steps = max(2, int(L / SAMPLE_STEP_M) + 1)
-        adj_steps = 0
-        for i in range(n_steps):
-            u = min(L, i * SAMPLE_STEP_M)
-            cx = a_mid[0] + u * ux
-            cy = a_mid[1] + u * uy
-            try:
-                lp = Point(cx + nx * outer, cy + ny * outer)
-                rp = Point(cx - nx * outer, cy - ny * outer)
-                if (test_pav.contains(lp)
-                        or test_pav.contains(rp)):
-                    adj_steps += 1
-            except Exception:
-                pass
-        frac = adj_steps / n_steps
-        if frac >= ADJACENCY_FRAC:
-            offenders.append((frac, _shape_label(layout, idx, s),
-                              adj_steps * SAMPLE_STEP_M, L))
+        # Sloping edges: corners (0,1) and (2,3) per
+        # _rect_from_axis_extended convention.
+        sloping_edges = [(coords[0], coords[1]),
+                         (coords[2], coords[3])]
+        worst_overlap = 0.0
+        worst_label = None
+        for o_idx, o in enumerate(layout.shapes):
+            if o is s:
+                continue
+            if o.role not in other_roles:
+                continue
+            if o.polygon is None or o.polygon.is_empty:
+                continue
+            o_coords = list(o.polygon.exterior.coords)
+            if o_coords and o_coords[0] == o_coords[-1]:
+                o_coords = o_coords[:-1]
+            n = len(o_coords)
+            if n < 3:
+                continue
+            for (ax, ay), (bx, by) in sloping_edges:
+                edge_L2 = (bx - ax) ** 2 + (by - ay) ** 2
+                if edge_L2 < 1e-6:
+                    continue
+                edge_L = math.sqrt(edge_L2)
+                # For each junction perimeter segment, find if it
+                # overlaps the rect's sloping edge in [0, 1] t-space.
+                for i in range(n):
+                    px, py = o_coords[i]
+                    qx, qy = o_coords[(i + 1) % n]
+                    tp, dp = _project_param(
+                        px, py, ax, ay, bx, by, edge_L2)
+                    tq, dq = _project_param(
+                        qx, qy, ax, ay, bx, by, edge_L2)
+                    if dp > EDGE_PERP_TOL_M or dq > EDGE_PERP_TOL_M:
+                        continue
+                    # Clamp the segment's t-range to [0, 1].
+                    t_lo = max(0.0, min(tp, tq))
+                    t_hi = min(1.0, max(tp, tq))
+                    if t_hi <= t_lo:
+                        continue
+                    overlap_m = (t_hi - t_lo) * edge_L
+                    if overlap_m < OVERLAP_MIN_M:
+                        continue
+                    if overlap_m > worst_overlap:
+                        worst_overlap = overlap_m
+                        worst_label = _shape_label(
+                            layout, o_idx, o)
+        if worst_overlap >= OVERLAP_MIN_M:
+            offenders.append((
+                worst_overlap, _shape_label(layout, idx, s),
+                worst_label))
     offenders.sort(reverse=True)
-    summary = "; ".join(
-        f"{lbl} {f * 100:.0f}% adjacent "
-        f"({rm:.0f}m of {ll:.0f}m axis)"
-        for f, lbl, rm, ll in offenders[:5])
-    baseline = TAXI_RECT_ADJACENCY_REGRESSION_BASELINE.get(icao)
-    if baseline:
-        n_off = len(offenders)
-        worst_frac = offenders[0][0] if offenders else 0.0
-        assert n_off <= baseline["max_offenders"], (
-            f"{icao}: {n_off} taxi rect(s) ≥ "
-            f"{ADJACENCY_FRAC * 100:.0f}% adjacent — exceeds "
-            f"known-bad baseline of {baseline['max_offenders']}.  "
-            f"Top: {summary}.")
-        assert worst_frac <= baseline["max_adjacent_frac"] + 0.01, (
-            f"{icao}: worst rect {worst_frac * 100:.0f}% adjacent, "
-            f"exceeds known-bad baseline of "
-            f"{baseline['max_adjacent_frac'] * 100:.0f}%.  "
-            f"Top: {summary}.")
-    else:
-        assert not offenders, (
-            f"{icao}: {len(offenders)} surviving taxi rect(s) have "
-            f"≥ {ADJACENCY_FRAC * 100:.0f}% of long-edge probes "
-            f"inside apron/junction pavement — the absorption rule "
-            f"should have clipped them.  Top: {summary}.")
+    if offenders:
+        summary = "; ".join(
+            f"{rect} sloping edge shared {ov:.1f}m with {jn}"
+            for ov, rect, jn in offenders[:8])
+        msg = (
+            f"{icao}: {len(offenders)} sloping rect(s) share a "
+            f"sloping edge with a junction/apron (≥ "
+            f"{OVERLAP_MIN_M:.0f}m overlap within "
+            f"{EDGE_PERP_TOL_M:.1f}m perpendicular).  "
+            f"Sloping rects must be absorbed (full or partial) "
+            f"when they would share a sloping edge.  "
+            f"First {min(8, len(offenders))}: {summary}.")
+        assert False, msg
