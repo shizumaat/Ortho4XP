@@ -129,6 +129,12 @@ def apply_junction_rules(layout: PavementLayout) -> None:
     # the original ``taxi_rects`` polygons; reading from layout
     # guarantees we snap against the geometry the test sees.
     _snap_to_sloping_edge_corners(layout)
+    # Phase 1b (user 2026-05-16): also snap "almost-at-the-corner"
+    # junction vertices that landed on a sloping rect's FLAT (cross)
+    # edge.  Conservative tolerance — only pulls vertices that are
+    # within 2 m perpendicular AND within 10 m of one corner — so
+    # legitimate wrap-points further from corners are unaffected.
+    _snap_junction_vertices_to_rect_flat_edge_corners(layout)
 
     # Phase 2 (landed): Rule 1 — junction-runway 1:1 sharing.
     _enforce_runway_1to1_sharing(layout)
@@ -304,6 +310,151 @@ def _point_perp_dist_within_segment(
     fx = ax + t * dx
     fy = ay + t * dy
     return math.hypot(px - fx, py - fy)
+
+
+def _snap_junction_vertices_to_rect_flat_edge_corners(
+    layout: PavementLayout,
+    perp_tol_m: float = 2.0,
+    corner_max_m: float = 10.0,
+) -> None:
+    """Snap each junction vertex that lies within ``perp_tol_m``
+    perpendicular of a sloping rect's FLAT (cross / short) edge AND
+    within ``corner_max_m`` of one of that edge's two corners to
+    the nearer corner.
+
+    Per user 2026-05-16: sloping rects share their flat edge 1:1 —
+    only the two corners are legal shared vertices.  A junction
+    vertex sitting on the flat-edge interior (e.g. the CYXY apron
+    boundary vertex (-348.79, 75.05) that's 1 m perpendicular and
+    5.5 m from A2's corner (-344.85, 71.16)) violates that invariant
+    and produces an elevation step at the boundary.
+
+    Conservative tolerance: only snap "almost-at-the-corner" cases
+    (perpendicular ≤ 2 m, corner ≤ 10 m).  Vertices that are
+    perpendicular-close but corner-far are legitimate wrap-points
+    where the junction polygon walks AROUND the rect via its flat
+    edge — leave those alone (per the comment in
+    ``_snap_to_sloping_edge_corners`` reverting commit 5a50d00's
+    indiscriminate cross-edge snapping).
+    """
+    flat_edges: List[Tuple[float, float, float, float]] = []
+    rect_corner_set: set = set()
+    bucket = SHARED_VERTEX_TOL_M
+    for s in layout.shapes:
+        if s.role not in SLOPING_RECT_ROLES:
+            continue
+        if (s.altitude_high is None or s.altitude_low is None):
+            continue
+        rect = s.polygon
+        if rect is None or rect.is_empty \
+                or rect.geom_type != "Polygon":
+            continue
+        rc = list(rect.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        # Flat edges: corners (1,2) and (3,0) per
+        # _rect_from_axis_extended convention.
+        for ci_a, ci_b in ((1, 2), (3, 0)):
+            ax, ay = rc[ci_a]
+            bx, by = rc[ci_b]
+            flat_edges.append((float(ax), float(ay),
+                                float(bx), float(by)))
+        for cx, cy in rc:
+            rect_corner_set.add(
+                (round(cx / bucket), round(cy / bucket)))
+    if not flat_edges:
+        return
+
+    for shape in layout.shapes:
+        if shape.role != ROLE_JUNCTION:
+            continue
+        poly = shape.polygon
+        if poly is None or poly.is_empty \
+                or poly.geom_type != "Polygon":
+            continue
+        coords = list(poly.exterior.coords)
+        if not coords:
+            continue
+        node_alts = shape.node_altitudes
+        if node_alts is not None and len(node_alts) != len(coords):
+            node_alts = None
+        had_close = (coords[0] == coords[-1])
+        if had_close:
+            coords = coords[:-1]
+            if node_alts is not None:
+                node_alts = list(node_alts[:-1])
+        if len(coords) < 3:
+            continue
+        new_coords: List[Tuple[float, float]] = []
+        new_alts: Optional[List[float]] = (
+            [] if node_alts is not None else None)
+        changed = False
+        for i, (vx, vy) in enumerate(coords):
+            # If the vertex is already at a rect corner, keep as is.
+            key = (round(vx / bucket), round(vy / bucket))
+            if key in rect_corner_set:
+                new_coords.append((vx, vy))
+                if new_alts is not None:
+                    new_alts.append(node_alts[i])
+                continue
+            best_corner: Optional[Tuple[float, float]] = None
+            best_dc = corner_max_m
+            for ax, ay, bx, by in flat_edges:
+                d_perp = _point_perp_dist_within_segment(
+                    vx, vy, ax, ay, bx, by)
+                if d_perp is None or d_perp > perp_tol_m:
+                    continue
+                d_a = math.hypot(vx - ax, vy - ay)
+                d_b = math.hypot(vx - bx, vy - by)
+                near, dc = ((ax, ay), d_a) if d_a < d_b else (
+                    (bx, by), d_b)
+                if dc < best_dc:
+                    best_dc = dc
+                    best_corner = near
+            if best_corner is not None:
+                new_coords.append(best_corner)
+                changed = True
+                if new_alts is not None:
+                    new_alts.append(node_alts[i])
+            else:
+                new_coords.append((vx, vy))
+                if new_alts is not None:
+                    new_alts.append(node_alts[i])
+        if not changed:
+            continue
+        # Dedup consecutive identical vertices.
+        deduped: List[Tuple[float, float]] = []
+        deduped_alts: Optional[List[float]] = (
+            [] if new_alts is not None else None)
+        for j, (cx, cy) in enumerate(new_coords):
+            if deduped:
+                px, py = deduped[-1]
+                if math.hypot(cx - px, cy - py) <= bucket:
+                    continue
+            deduped.append((cx, cy))
+            if deduped_alts is not None:
+                deduped_alts.append(new_alts[j])
+        if len(deduped) < 3:
+            continue
+        try:
+            new_poly = Polygon(deduped).buffer(0)
+        except _GEOM_EXC:
+            continue
+        if new_poly.is_empty:
+            continue
+        if new_poly.geom_type == "MultiPolygon":
+            new_poly = max(new_poly.geoms, key=lambda g: g.area)
+        if new_poly.geom_type != "Polygon" or not new_poly.is_valid:
+            continue
+        # Reject if area collapsed significantly (snap created a
+        # degenerate / self-intersecting shape).
+        if new_poly.area < 0.5 * poly.area:
+            continue
+        shape.polygon = new_poly
+        if deduped_alts is not None:
+            shape.node_altitudes = deduped_alts + [deduped_alts[0]]
 
 
 def _snap_to_sloping_edge_corners(layout: PavementLayout) -> None:

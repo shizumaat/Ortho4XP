@@ -2069,6 +2069,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         from .junction_rules import (
             _align_rect_slope_to_axis,
             _enforce_runway_1to1_sharing,
+            _snap_junction_vertices_to_rect_flat_edge_corners,
             _snap_to_sloping_edge_corners,
             stitch_pavement_to_flat_runways,
             widen_junctions_to_runway_corners,
@@ -2079,6 +2080,7 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # multi-connection-allowed (per user 2026-05-02).
         _align_rect_slope_to_axis(layout)
         _snap_to_sloping_edge_corners(layout)
+        _snap_junction_vertices_to_rect_flat_edge_corners(layout)
         _enforce_runway_1to1_sharing(layout)
         # Rule 1 v6 widening (user 2026-05-02): runs ONLY here,
         # post-elevation, after the runway is segmented.  Inserts
@@ -2264,6 +2266,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # short-edge corner instead of being mid-sloping-edge).
         from .junction_repair import _split_sloped_rects_at_violations
         _split_sloped_rects_at_violations(layout, icao=icao)
+        # Re-run flat-edge corner snap: the rect split above introduces
+        # new sub-rect corners that may not align with adjacent junction
+        # vertices.  Snap "almost-at-the-corner" junction vertices
+        # (perpendicular ≤ 2 m, corner ≤ 10 m) to the new corners.
+        _snap_junction_vertices_to_rect_flat_edge_corners(layout)
 
         # Re-emit bridges instead of difference-clipping (user
         # 2026-05-16 canonical-node rewrite).  Drop stale bridges
