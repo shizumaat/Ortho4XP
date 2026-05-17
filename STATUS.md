@@ -1,144 +1,194 @@
-# Auto-Patch Status — 2026-05-16 (session 2 end): canonical-node bridge rewrite + per-vertex ribbon perp + 23→20 failures
+# Auto-Patch Status — 2026-05-17 session: single-pass absorption + Lima end + 20→16 failures
 
 ## TL;DR
 
-This session continued the Tier 1 work from the 2026-05-16 morning
-handoff (`4ae3230`).  Five commits landed taking the test suite
-from **23 → 20 failures**; the bridge feature was rewritten to
-build polygons from canonical nodes (boundary + pavement_union
-vertices) instead of `parallel_offset()` + layered `difference()`;
-the airport-boundary ribbon was fixed to share corners between
-adjacent rects in the chain.
+Fourteen commits this session. Tests went **20 → 16 failures**.
+Three user-reported visual issues fixed (CYXY E primary parallel
+chain absorbed into south apron; CYXY phantom stubs / junction
+wrapping eliminated; SPJC Lima end junctions now proper quadrilaterals
+sharing 2 runway corners).  The biggest architectural change: replaced
+the multi-pass probe-based absorption with a single-pass
+shared-sloping-edge absorption at the END of the pipeline, using
+actual junction polygons.
 
-**Committed this session (in order):**
+**Tests: 248 / 264 pass at HEAD.  16 failures = the remaining backlog.**
 
-1. `7b65cd4` — *Exempt flat shapes from sloping-rect 4-corner
-   invariant test.*  Per user 2026-05-09 flat-shape rule: a single
-   `altitude=` tag legitimately allows variable node count; the
-   test was over-strict on flat sub-rects (CYXY 6-corner runways
-   were flat sub-rects from `_split_sloped_rects_at_violations`).
-2. `6b61019` — *Accept flat-rect corners as valid snap targets in
-   Rule 2 test (`test_junction_no_long_edge_proximity`).*  Same
-   rationale — flat-rect corners are equally valid as sloped-rect
-   corners for junction-vertex coincidence.  SPLP Rule 2
-   violations 3 → 1 (the remaining 1 was the split-but-no-move
-   pattern fixed in c1e2ad0).
-3. `c1e2ad0` — *Pull junction vertex onto new sub-rect corner
-   during sloping-edge split.*  `_split_sloped_rects_at_violations`
-   projects the violating junction vertex onto the rect's long
-   edge to choose the split parameter and creates a new sub-rect
-   corner there — but the junction vertex itself was never moved.
-   Result: junction vertex sat ~on_edge_tol_m perpendicular off
-   the new sub-rect's long edge AND ~on_edge_tol_m from its
-   corner (Tests 2 & 3's same-geometry pattern).  Tracks
-   `(j_idx, v_idx)` through clustering and applies the move per
-   junction polygon.  SPLP+CYXY Test 2 fully passes; CYXY Test 3
-   14 → 10 violations.
-4. `3a21c89` — *Rewrite `_emit_boundary_dem_bridge` to use
-   canonical nodes.*  Replaces `parallel_offset()` + 5+ layered
-   `difference()` ops with a sequential walk: outer side offsets
-   the boundary inward by `strip_half_width_m`; inner side walks
-   `pavement_union`'s outer ring backward from the bridge run's
-   end vertex toward the start, stopping when more than
-   `runway_clamp_radius_m` (400 m) from the start.  Every bridge
-   vertex is canonical (boundary inner-offset or pavement_union
-   outer-ring vertex).  Final small `difference()` cleanup
-   against non-runway pavement + ribbon + sloping-rects-buffered
-   (1 m, per B12) trims sub-metre residual overlap.  Replaces
-   the `_clip_boundary_bridges_against_pavement` re-clip with a
-   re-emit after `_split_sloped_rects_at_violations`.  CYXY
-   Test 3 10 → 3 violations (remaining 3 are groundside + stub,
-   not bridge — different categories).
-5. `586b135` — *Boundary ribbon: use per-vertex perpendiculars in
-   rect chain.*  Visual report: adjacent boundary rects in the
-   chain didn't share their cross-edge nodes (each rect used its
-   own per-segment perp; perp at the shared boundary vertex
-   differed between adjacent rects).  Switch to per-vertex
-   perp (average of incoming + outgoing segment perps) so
-   adjacent rects share both inner and outer corners at every
-   boundary vertex exactly.
+## Commits this session (in order)
 
-**Tests: 244 / 264 pass at HEAD.  20 failures = the remaining backlog.**
+| Hash | What |
+|---|---|
+| `989b865` | Runway-stub emit: skip non-terminal per-ref endpoints.  Source B fix: stubs.py was firing at apt.dat graph forks (count ≥ 2 endpoints) that aren't true chain termini.  SPLP phantom A stubs gone. |
+| `b3206fb` | Centerline split: validate split points by distinct refs / runway.  Source A: _split_centerlines_at_points was over-splitting on same-name graph forks.  Defensive fix. |
+| `dd9be70` | Junction widening body-prox cap.  Pre-cut runway snap nodes already mark each junction's natural extent — walking one more chain step adds corners past the body.  SPLP runway-shared counts now match target exactly. |
+| `295ac06` | Primary-parallel partial-absorption: relax reject + restore split call.  Commit a9b0ef0 (prior session) had over-strict `_rect_long_edges_at_pavement_boundary` AND removed the `_split_primary_parallels_at_pavement_boundary` call.  Restored both — CYXY E now emits as 3 sub-rects through the south apron. |
+| `a34aaaf` | Drop unrefed phantom stubs (short rects + apron-edge runway stubs).  CYXY junction `-10082` no longer wraps phantom unrefed stubs. |
+| `3a32768` | Junction flat-edge snap: pull near-corner verts onto sloping-rect corners.  Conservative tolerance (≤ 2 m perp, ≤ 10 m corner) — only "almost-at-the-corner" cases.  Wired in twice (post-elevation snap + post-split). |
+| `62a2242` | **test_taxi_rects_not_alongside_apron**: rewrite with shared-edge rule.  Old probe-based rule (5 m perpendicular point inside polygon) flagged legitimate adjacent rects and required airport-specific exemption.  New rule: junction perimeter linestring overlap ≥ 2 m of rect's sloping edge within 1 m perp.  Universal, no exemptions. |
+| `21985bf` | Post-split absorption: fully-shared sloping edge → drop + extend junction.  Initial incremental absorption fix (full-edge-shared only). |
+| `e2efcae` | Single-pass sloping-edge absorption at end of pipeline.  Replaces incremental approach — runs ONCE after all post-elevation junction-refinement, with actual junction polygons.  Detects axial t-ranges of sloping-edge sharing, builds absorbed strip polygons, extends absorbing junctions via shapely union, clips / drops the rect.  Corner-wrap filter clamps t to [0.05, 0.95]. |
+| `52a6d8a` | Preserve junction node_altitudes when extending via absorption.  Bucket-index old junction corners → altitudes; assign nearest-old-corner altitude to new strip corners; build new node_altitudes for the union polygon's vertex set.  Fixes test_pavement_grade[CYXY] (was using median-altitude flat fallback). |
+| `1aa5a5a` | Re-run sloping / flat-edge cleanup after end-of-pipeline absorption.  Clipped sub-rects from absorption can have new corners that don't yet align with adjacent junction vertices; re-run _split_sloped_rects_at_violations + _snap_junction_vertices_to_rect_flat_edge_corners after absorption. |
+| `71ca504` | Absorption strip reuses rect corners to preserve neighbour sharing.  For full-absorption (t_lo=0, t_hi=1) reuse r.polygon directly so unary_union preserves the rect's exact corner positions — neighbour rects that shared short edges via those corners keep their connection through the extended junction's perimeter. |
+| `f69e395` | Bump runway-pavement intersection tolerance 6 → 12 m.  SPJC Lima end fix: apt.dat row-110 boundary at lat -12.036366 / lon -77.107520 sits 11.3 m perpendicular from the row-100 runway 16L rect (the runway shoulder).  At 6 m the vertex was missed, no runway seam fired at Lima's natural termination, Lima's end junction was a triangle with 1 runway corner. |
+| `629043c` | Frame INTERSECTION_PROX_M as RUNWAY_SHOULDER_M (7.6 m) + CHART_TOL_M (4.4 m).  Same numeric value (12 m) but expressed in terms of physical runway geometry.  SPJC 16L/34R declares shoulder surface codes 27/28 in apt.dat row 100 — shoulders exist even without explicit width. |
+
+## Visual issues fixed (user-reported)
+
+1. **CYXY E primary parallel chain absorbed into south apron**
+   (user 2026-05-16).  Way ID `-10082` was absorbing E's southern
+   primary parallel section due to commit a9b0ef0's over-strict
+   long-edge-at-boundary check + missing partial-absorption call.
+   E now emits as multi-segment chain through the south apron with
+   the corridor extending south to runway 02.
+
+2. **CYXY phantom stubs + junction wrapping eliminated**
+   (user 2026-05-16).  Junction `-10081` was wrapping ways
+   `-10467` and `-10468`.  Both were unrefed apt.dat fragments
+   (one short centerline → `_build_taxi_rects` stub, one
+   `_emit_primary_parallel_runway_stubs` from unrefed long
+   line at apron edge).  Filtered both paths.
+
+3. **SPJC Lima end junctions now proper quadrilaterals**
+   (user 2026-05-17).  South and north Lima end junctions were
+   triangles with only 1 runway corner shared.  Root cause: apt.dat
+   row-110 boundary vertex at Lima south end sits 11.3 m past the
+   row-100 runway rect (the runway shoulder); the
+   `pav_runway_intersections` proximity tolerance was 6 m so the
+   vertex was missed, no runway seam fired at Lima's natural
+   termination.  Bumped tolerance to RUNWAY_SHOULDER_M (7.6 m) +
+   CHART_TOL_M (4.4 m) = 12 m.  Both Lima end junctions now have
+   4 verts with 2 runway-shared corners.
 
 ## Visual eval output
 
-`/tmp/{SPJC,SPLP,CYXY}_current.osm` written at session end (after
-`586b135`).  Verify visually in JOSM:
-* **Boundary ribbon**: every consecutive pair of `airport_boundary`
-  shapes should share its cross-edge nodes exactly.  No more
-  gaps/overlaps at bends.
-* **CYXY bridge polygons**: 2 canonical-node bridges, inner edge
-  hugs junction/terminal/rect perimeters; outer edge sits at the
-  ribbon's interior side (2.5 m inward of boundary line).  No
-  bridge sweeps across pavement.
+`/tmp/{SPJC,SPLP,CYXY}_current.osm` written at session end.  Verify
+in JOSM:
 
-## The remaining backlog — 20 failing tests
+* **SPJC Lima end junctions** (south at lat -12.0365, north at lat
+  -12.008): both should be quadrilaterals with 2 runway-shared
+  corners (via OSM way IDs `-10193` south, `-10187` north).
+* **CYXY taxiway E**: south-end primary parallel chain should
+  extend south through the apron to runway 02, with the apron's
+  junction polygon (`-10082` area) absorbing only the embedded
+  portion.
+* **CYXY junction `-10081`**: should NOT wrap any small unrefed
+  stub rects — those phantom shapes are gone.
 
-User direction (2026-05-16, session-end):
+## The remaining backlog — 16 failing tests
 
-> Next task is to continue getting all tests passing, and SPJC,
-> SPLP, and CYXY airports generating correctly.
+User direction (2026-05-17 session-end):
 
-So: continue Tier 1 work, drive failures to 0, and verify visually
-that each baseline airport renders correctly.
+> Continue getting all tests passing and SPJC, SPLP, CYXY rendering
+> correctly.
 
-### Remaining Tier 1 invariant failures
+### Remaining test failures
 
-`test_junction_neighbour_corners_shared` at all 3 airports still
-fails — but the violations are NOT bridge-related anymore (the
-rewrite eliminated all bridge orphans at CYXY).  Remaining
-patterns:
+| Test | Detail |
+|---|---|
+| `test_compare_target_spjc` | `primary_parallel: matched=25 < floor=26; stub: matched=18 < floor=19` — same shortfall as previous session.  Geometry shift from a9b0ef0 lost 1 primary + 1 stub vs target.  Either fix the geometry regression or re-anchor floor (after visual confirmation that current geometry is OK). |
+| `test_compare_target_splp[-13--78-baseline1-196]` | Surfaced this session, likely from one of the SPLP-affecting absorption changes.  Look at A primary parallel match counts. |
+| `test_junction_boundary_near_centerline[SPJC,SPLP,CYXY]` | Pre-existing structural pattern — junctions whose perimeter strays > MAX_BOUNDARY_TO_CENTERLINE_M from any centerline (apron-territory pavement misclassified as junction).  Per status-comment: "should be re-classified as ``role=apron`` or split." |
+| `test_junction_vertex_count_bounded[SPLP]` | 1 violation: `#31(junction) verts=33` (cap 30).  Edge case. |
+| `test_junction_vertex_count_bounded[CYXY]` | 5 violations: `#76(junction) verts=103` (the biggest), `#99 verts=49`, `#73 verts=40`, `#92 verts=37`, `#83 verts=32`.  Mostly the big runway-crossing junction and a few near-cap cases. |
+| `test_junction_neighbour_corners_shared[CYXY]` | 1 violation: `#76(junction) ⟂ #466(groundside_pavement/groundside) at (-528.5, 558.5) miss=0.55m`.  Pre-existing 0.55 m groundside-vertex orphan from status.md backlog. |
+| `test_taxi_rects_not_alongside_apron[SPLP]` | 1 violation: `#1(primary_parallel/A) sloping edge shared 26.1m with #32(junction)`.  Partial-share case the end-of-pipeline absorption doesn't yet clip (the absorbed sub-rect's neighbours' altitudes would need careful re-derivation).  See "Partial-absorption clip" note below. |
+| `test_junction_no_long_edge_proximity[SPJC]` | Pre-existing (5–18 m perp distances).  Different pattern from CYXY/SPLP cases that c1e2ad0 fixed. |
+| `test_large_junction_axis_aligned_borders[CYXY]` | Pre-existing (96 violations, mostly bearing misalignment 32–41° at junctions around the runway-crossing area). |
+| `test_junction_vertices_outside_pavement[CYXY]` | 34 violations (most are inside-pav by 0.4–25 m, not outside).  Test name is misleading; mostly inside-pav verts that need to snap to pavement boundary. |
+| `test_no_vertex_on_sloping_rect_edge[SPLP]` | Phenomenon A — untagged clip residue: SPLP `runway(02/20)` 3-corner sliver + 5-corner pentagon.  Source: `_drop_overlap_against_fixed_shapes` (`elevation.py`) producing non-4-corner sloping rects via `_clip_keep_largest`. |
+| `test_rect_short_edges_connect[SPLP]` | Cross (short) edge of a stub not connecting to neighbour properly. |
+| `test_pavement_grade[SPJC]` | Cross-shape proximity violations from a9b0ef0 fallout.  Geometry shifted shared corners off alignment. |
+| `test_pavement_grade[SPLP]` | 38 within-shape grade/plane violations (cap 30).  Worst 30.76 % at junction.  Apron-junction grade rule violation (1.0 % cap exceeded by big factor at one apron). |
 
-| Airport | Count | Categories |
-|---|---|---|
-| **SPJC** | 6 (cap 5) | 5 vs `airport_boundary` (miss 1.4–7 m); 1 vs `runway/16L/34R` (miss 18.76 m, outlier) |
-| **SPLP** | 6 (cap 0) | All 6 vs `stub/A` sub-rect corners (miss 4.96–8.51 m) — twin-corner orphans from `_split_sloped_rects_at_violations` (c1e2ad0 fixed the source-vertex side; the OTHER long-edge corner has no matching junction vertex) |
-| **CYXY** | 3 (cap 0) | 1 vs `groundside_pavement` (0.55 m); 2 vs `stub` at (-333.5, 194.3) miss 22.48 m — pre-existing structural pattern around the runway crossing |
+### Suggested attack order
 
-**Suggested next direction** for Test 3:
-* **SPLP twin-corner**: extend `_split_sloped_rects_at_violations`
-  to also handle the OPPOSITE-side corner — when the source
-  vertex moves to one new sub-rect corner, find adjacent
-  junctions whose perimeter passes near the TWIN corner and
-  insert/snap there too.  Scoped insertion (only at split-
-  introduced corners, not arbitrary neighbours) avoids the
-  cascade-and-baseline-bloat of the reverted broad insertion
-  pass (`bf37313` reverted in `0c733ba`).
-* **CYXY groundside (0.55 m)**: junction#76 vertex sits 0.55 m
-  from groundside_pavement#463 vertex at (-528.5, 558.5).  A
-  terminal vertex 0.05 m from junction#76 was already
-  coincident.  Multi-shape near-coincidence at a single
-  junction corner.  Either snap groundside vertex to junction
-  (changes groundside shape slightly) or accept via baseline.
-* **CYXY 22 m stub orphans**: pre-existing pattern around the
-  runway crossing.  Needs targeted diagnosis.
-* **SPJC outliers**: 18.76 m miss vs runway/16L/34R is a far
-  outlier (junction vertex placed 18 m off any runway corner).
-  Pre-existing pre-`a9b0ef0` (per session-1 bisect).
+1. **CYXY mega-junction `#76` (103 verts)** — the runway-crossing
+   junction is far over the 30-vertex cap.  Splitting it or
+   reclassifying parts as apron would resolve:
+   - `test_junction_vertex_count_bounded[CYXY]` (5 violations,
+     #76 worst at 103)
+   - `test_junction_vertices_outside_pavement[CYXY]` (34
+     inside-pav verts likely in this junction's perimeter)
+   - `test_large_junction_axis_aligned_borders[CYXY]` (96
+     bearing-misalignment violations, mostly junction #76 edges)
+   - `test_junction_neighbour_corners_shared[CYXY]` (junction #76
+     vs groundside)
+   - `test_junction_boundary_near_centerline[CYXY]`
+   These 5 failures all touch the same root junction — fixing
+   it is the highest-leverage move on CYXY.
 
-### Other remaining failures
+2. **SPLP `_drop_overlap_against_fixed_shapes` clip artifacts**
+   (`test_no_vertex_on_sloping_rect_edge[SPLP]`).  Per status.md
+   backlog: prevent the clip from producing non-rect output, or
+   absorb / demote the post-clip artifacts.
 
-| Test | Airports | Pattern |
-|---|---|---|
-| `test_compare_target_*` | SPJC, SPLP | Target-fixture rect-match floors not met.  Per `a9b0ef0` commit message: SPJC stub matched=18<floor=19, primary_parallel matched=25<floor=26.  Geometry shift from CYXY-focused changes.  Either re-anchor fixture floors (after confirming shifts are improvements) or locate / fix the regression. |
-| `test_junction_no_long_edge_proximity[SPJC]` | SPJC | 6 violations (pre-existing pre-`a9b0ef0`, 5–18 m perp distances).  Different pattern from CYXY/SPLP cases that c1e2ad0 fixed.  Separate diagnosis needed. |
-| `test_no_vertex_on_sloping_rect_edge` | SPJC, SPLP | Phenomenon A — untagged clip residue: SPJC `stub(C)` n_corners=5 (overlap-clip pass produced non-rect); SPLP `runway(02/20)` 3-corner sliver + 5-corner pentagon.  Source: `_drop_overlap_against_fixed_shapes` (`elevation.py`) producing non-4-corner sloping rects via `_clip_keep_largest`.  Fix: either prevent clip from producing non-rect output, or absorb/demote-role the post-clip artifacts. |
-| `test_pavement_grade[SPJC]` | SPJC | 2 cross-shape proximity violations (`a9b0ef0` fallout).  Geometry shifted shared corners off alignment. |
-| `test_pavement_grade[SPLP]` | SPLP | 26 mid-edge steps > 0.5 m (cap 20), worst 1.90 m at junction -10034 / stub A boundary.  `a9b0ef0` fallout. |
-| `test_taxi_rects_not_alongside_apron[SPLP/CYXY]` | SPLP, CYXY | Junction residue around runway-crossing area (CYXY) or sub-rect E-D area; stub diagonals flanked by junction pavement. |
-| `test_junction_vertex_count_bounded[SPLP/CYXY]` | SPLP, CYXY | Junctions exceed vertex count caps.  May correlate with split-sloped-rect cascades. |
-| `test_junction_boundary_near_centerline[SPLP/CYXY]` | SPLP, CYXY | Junction polygon's boundary too close to a taxi centerline (would render as visible overlap). |
-| `test_large_junction_axis_aligned_borders[CYXY]` | CYXY | Junction polygon long edges aren't aligned to adjacent rect axes. |
-| `test_no_narrow_neck_junctions[CYXY]` | CYXY | Junctions with thin necks (residue around runway crossings has narrow fingers). |
-| `test_junction_vertices_outside_pavement[CYXY]` | CYXY | Junction ring has vertices outside `pav_union` (runway-crossing residue subtraction). |
-| `test_rect_short_edges_connect[SPLP]` | SPLP | Cross (short) edge of a stub not connecting to neighbour properly. |
+3. **SPLP `#31(junction) verts=33`** vertex cap — 3 over the
+   limit, probably a localized issue.
 
-### Visual generation issues to verify
+4. **test_compare_target_*** (SPJC, SPLP) — once visual geometry
+   confirmed correct, re-anchor target fixture floors.
 
-User asked for visual eval after tests pass.  Build with the
-provided one-liner below and inspect in JOSM:
+5. **SPLP A 26 m partial share**
+   (`test_taxi_rects_not_alongside_apron[SPLP]`) — needs partial
+   absorption support in `_absorb_rects_at_junction_perimeters`.
+   Currently the function detects both full and partial sharing
+   in t-range computation but only fully-drops or fully-keeps
+   based on whether ALL of [0, 1] − absorbed is < min_kept.
+   For SPLP A: 26 m absorbed of 1000 m total → kept range = ~974 m,
+   well above min_kept, so SHOULD be clipped.  Investigate why
+   it doesn't fire — possibly the partial-sharing detection's
+   corner-wrap clamp ([0.05, 0.95]) excludes the 26 m portion
+   because it's near a corner.
+
+## Architecture: single-pass absorption (post-emit)
+
+`_absorb_rects_at_junction_perimeters(layout, icao)` in
+`src/auto_patch/junction_repair.py:1631`.  Runs at the END of
+the pipeline (`src/auto_patch/pipeline.py:2287` area, after
+`_split_sloped_rects_at_violations` +
+`_snap_junction_vertices_to_rect_flat_edge_corners`).
+
+For each sloping rect:
+  1. Get 2 sloping edges (corners 0-1 and 2-3 per
+     `_rect_from_axis_extended` convention).
+  2. For each junction polygon, intersect `junction.boundary` with
+     `sloping_edge.buffer(perp_tol_m=0.5)`; project shared
+     LineString endpoints to axial t-range.
+  3. Clamp t-range to [0.05, 0.95] to exclude junction-wrap-at-
+     short-edge-corner false positives.
+  4. Merge all absorbed t-ranges; compute kept = [0, 1] − absorbed.
+  5. Filter kept by `min_kept_m = 20`; fold short kept ranges into
+     absorbed.
+  6. Build absorbed strip polygons; extend each absorbing
+     junction via `unary_union([junction.polygon, strip])`.
+  7. Build new sub-rect from each kept t-range; drop original.
+
+Strip-building (`_strip_polygon`): for full-absorption uses
+`r.polygon` directly so the union preserves the rect's exact
+corner positions (so neighbour rects keep their short-edge
+connections through the extended junction's perimeter).
+
+Altitude handling on extended junctions: bucket-index old corners
+→ altitudes; for new vertices use nearest-known-corner altitude.
+
+## Key memory files (read before continuing)
+
+* `feedback_general_solutions.md` — every fix must work at all
+  baseline airports.
+* `feedback_root_cause_only.md` — fix root causes; ASK before
+  band-aid post-process clean-up.
+* `feedback_shape_rules.md` — authoritative rect + junction
+  construction rules.
+* `feedback_grade_rules.md` — apron / junction grade rule.
+* `project_refactor_state.md` — extraction pattern.
+
+## How to verify / reproduce
 
 ```bash
+# Full test suite (~3 min):
+venv/bin/python3 -m pytest tests/ --tb=short -q
+
+# Single-airport build for visual inspection:
 venv/bin/python3 - <<'PY'
 import sys; sys.path.insert(0, "src")
 from auto_patch.pipeline import build_airport_pavement
@@ -149,148 +199,35 @@ for icao in ("SPJC", "SPLP", "CYXY"):
 PY
 ```
 
-Known visual checkpoints (user-reported across sessions):
-* SPJC + SPLP target fixtures — used to match before `a9b0ef0`,
-  now off by 1–2 rect matches.
-* CYXY D-E junction polygon size, D-west rect, primary E south
-  overshoot, rect-rect overlaps — these were the focus of
-  `a9b0ef0` and reportedly substantively fixed per the
-  morning STATUS handoff.
-* CYXY bridge polygons — new shapes from `3a21c89`; verify
-  they hug pavement on the inner side without crossing
-  pavement.
-
-## Architecture notes
-
-### Bridge architecture (post-`3a21c89`)
-
-The bridge is constructed in two passes:
-
-1. **`finalize.py:262` — initial emit** during the elevation
-   phase.  Uses the current pavement_union state.
-2. **`pipeline.py` (after `_split_sloped_rects_at_violations`,
-   line ~2253)** — drops finalize-time bridges and re-emits with
-   final pavement state.  Replaces the old
-   `_clip_boundary_bridges_against_pavement` re-clip (which used
-   `difference()` and re-introduced intersection vertices).
-
-If a future pass moves pavement vertices AFTER the re-emit, the
-bridges become stale.  Currently `_split_sloped_rects_at_violations`
-is the last pass that does this; the bridge re-emit runs right
-after it.
-
-### Boundary ribbon architecture (post-`586b135`)
-
-The airport boundary ribbon is a chain of 4-corner rectangles
-(one per densified boundary segment).  Each rect uses
-**per-vertex perpendiculars** (averaged across incoming +
-outgoing segment perps at each boundary vertex), so consecutive
-rects share their cross-edge nodes at the shared vertex.  My
-bridge rewrite uses the same per-vertex perp algorithm for its
-outer edge — so bridge outer vertices coincide with ribbon
-inner corners.
-
-### Test 3 / canonical-node invariant
-
-`test_junction_neighbour_corners_shared` enforces: every
-non-junction polygon vertex within `ORPHAN_NEAR_PERIMETER_M`
-(1.0 m) of a junction's perimeter MUST coincide with a junction
-vertex (within `ORPHAN_SAME_VERTEX_TOL_M` 0.10 m).  After
-`3a21c89`, bridge vertices satisfy this BY CONSTRUCTION (they're
-either canonical pavement nodes or 2.5 m off the boundary line
-where no pavement is present, beyond the 1 m perimeter check
-for any junction).  Remaining Test 3 failures involve other
-polygon classes (groundside, airport_boundary, stub sub-rects).
-
-## How to verify / reproduce
-
-```bash
-# Full test suite (slow — ~3 min):
-venv/bin/python3 -m pytest tests/ --tb=short -q
-
-# Run just the Test 3 family at all 3 airports:
-venv/bin/python3 -m pytest \
-  "tests/test_junction_invariants.py::test_junction_neighbour_corners_shared" \
-  --tb=long -v
-
-# Investigate any specific failure with detailed output:
-venv/bin/python3 -m pytest \
-  "tests/test_pavement_geometry.py::test_no_vertex_on_sloping_rect_edge[SPJC]" \
-  --tb=long -v
-```
-
-## Recommended next session
-
-Order of attack:
-
-1. **SPLP `_split_sloped_rects_at_violations` twin-corner**
-   (6 Test 3 violations).  Extend `c1e2ad0` to also handle the
-   OPPOSITE-side new sub-rect corner: when the source junction
-   vertex moves to one new corner, find adjacent junctions
-   whose perimeter passes near the TWIN corner and insert/snap.
-   Scoped to split-introduced corners only — no broader
-   insertion pass (the broad approach was tried in `bf37313`
-   and reverted in `0c733ba` due to cascade complexity).
-2. **Phenomenon A (untagged clip residue)** at SPJC + SPLP.
-   `_drop_overlap_against_fixed_shapes` produces non-rect
-   sloping rects.  Either prevent the clip (reject non-rect
-   output, absorb instead) or demote the clipped shape's role
-   to non-sloping.  See `feedback_root_cause_only.md` —
-   prefer source fix to post-process cleanup.
-3. **`test_compare_target_*` (SPJC, SPLP)** — investigate the
-   1-2 rect matches lost since `a9b0ef0`.  If shifts are real
-   improvements, re-anchor floor.  If regressions, locate +
-   fix.  Cross-reference with the visual eval for "did the
-   geometry get better or worse?"
-4. **`test_pavement_grade[SPJC, SPLP]`** — geometry shift
-   from `a9b0ef0` moved shared corners off elevation alignment.
-   Likely a small refinement to the chart-junction margin
-   (introduced in `a9b0ef0`'s change #4) — currently uses
-   `CHART_JUNCTION_MARGIN_M = 25` unconditionally.
-5. **CYXY-specific (Tier 2)**: `test_taxi_rects_not_alongside_apron`,
-   `test_large_junction_axis_aligned_borders`,
-   `test_no_narrow_neck_junctions`,
-   `test_junction_vertices_outside_pavement`.  All related to
-   runway-crossing residue at CYXY.  Diagnose collectively;
-   likely shared root cause in junction emit around runway
-   crossings.
-
-## Memory notes — read before continuing
-
-* `feedback_general_solutions.md` — every fix must work at all
-  baseline airports.  No airport-specific code.  Per user
-  2026-05-16: "any changes we make to fix bugs at any
-  particular airport always have to take into account whether
-  the change will work across all airports."
-* `feedback_root_cause_only.md` — fix root causes; ASK before
-  band-aid post-process clean-up.
-* `feedback_flat_segment_node_count.md` — `altitude=` tag ⇒
-  flat shape, any node count; `altitude_high/low` ⇒ 4-corner
-  sloped rect.  Tests 1 & 2 fixes in this session respect this.
-* `feedback_grade_rules.md` — apron / junction grade rule;
-  all-pair Euclidean only between pairs whose straight line
-  stays inside the polygon (user 2026-05-14 refinement).
-* `feedback_shape_rules.md` — authoritative rect + junction
-  construction rules.
-* `project_refactor_state.md` — extraction pattern.
-
 ## Files touched this session
 
 Source:
-* `src/auto_patch/boundary.py` — `_emit_boundary_dem_bridge`
-  rewritten (canonical-node sequential walk); per-vertex perp
-  in `_emit_airport_boundary_shape`.
-* `src/auto_patch/junction_repair.py` —
-  `_split_sloped_rects_at_violations` extended to move source
-  junction vertex onto new sub-rect corner.
-* `src/auto_patch/pipeline.py` — bridge re-emit after
-  `_split_sloped_rects_at_violations` (replaces re-clip pass).
+* `src/auto_patch/pavement/stubs.py` — count-1-only filter for
+  runway-stub emit (Source B).
+* `src/auto_patch/pavement/centerlines.py` — split-point
+  intersection validator (Source A).
+* `src/auto_patch/junction_rules.py` — body-prox widening cap +
+  conservative flat-edge corner snap.
+* `src/auto_patch/pavement/rects.py` — drop unrefed phantom
+  stubs + relax `_rect_long_edges_at_pavement_boundary` to
+  reject only when BOTH long edges majority-embedded.
+* `src/auto_patch/pavement/absorption.py` — restore
+  `_split_primary_parallels_at_pavement_boundary` (just call
+  re-added in pipeline; function unchanged).
+* `src/auto_patch/junction_repair.py` — added
+  `_absorb_rect_into_junction`,
+  `_drop_rects_with_shared_sloping_edge_and_absorb` (initial
+  incremental), then
+  `_absorb_rects_at_junction_perimeters` (single-pass at end).
+* `src/auto_patch/pipeline.py` — wired the absorption call, the
+  re-run-cleanup-after-absorption, the flat-edge snap, the
+  partial-absorption restore, and bumped `INTERSECTION_PROX_M`
+  to `RUNWAY_SHOULDER_M + CHART_TOL_M`.
 
 Tests:
-* `tests/test_pavement_geometry.py` — flat-shape exemption in
-  `test_no_vertex_on_sloping_rect_edge`.
-* `tests/test_junction_rules.py` — flat-rect corner exemption
-  in `test_junction_no_long_edge_proximity`.
+* `tests/test_junction_invariants.py` — rewrote
+  `test_taxi_rects_not_alongside_apron` with shared-edge rule;
+  removed `TAXI_RECT_ADJACENCY_REGRESSION_BASELINE`.
 
 ## Build commands (unchanged)
 
