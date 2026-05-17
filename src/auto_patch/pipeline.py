@@ -386,16 +386,24 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # snap point — the junction's runway edge ran past the A-stub
     # corner with no clean trapezoid shape.
     #
-    # Per user 2026-05-17: bumped 6.0 → 12.0 m to capture SPJC's
-    # apron-pavement vertices at the Lima south end (drawn ~11 m
-    # outside the runway rect — apt.dat row-110 polygon boundary
-    # at lat -12.036366 lon -77.107520 sits 11.3 m perpendicular
-    # from the row-100 runway 16L rect).  At 6 m these vertices
-    # were missed, the runway segmenter put no seam at Lima's
-    # natural termination, and Lima's south-end junction polygon
-    # degenerated into a triangle with only one runway-shared
-    # corner.
-    INTERSECTION_PROX_M = 12.0
+    # Per user 2026-05-17: budget = RUNWAY_SHOULDER_M (standard
+    # FAA shoulder allowance, ~7.6 m per side) + CHART_TOL_M.
+    # The runway rect from apt.dat row 100 covers only the
+    # published runway width; the actual paved area extends past
+    # this by the shoulder width on each side (SPJC's row 100
+    # declares shoulder surface code 27/28 for 16L/34R — shoulders
+    # are present but not given an explicit width in apt.dat).
+    # apt.dat row-110 boundary polygons that include the shoulder
+    # area sit up to ~RUNWAY_SHOULDER_M past the row-100 rect.
+    # Without this allowance the intersection collector misses
+    # SPJC's apt.dat boundary vertex at lat -12.036366 lon
+    # -77.107520 (11.3 m perpendicular from runway 16L rect — the
+    # shoulder edge), no runway seam fires at Lima's natural
+    # pavement termination, and Lima's end junction degenerates
+    # into a triangle.
+    RUNWAY_SHOULDER_M = 7.6
+    CHART_TOL_M = 4.4
+    INTERSECTION_PROX_M = RUNWAY_SHOULDER_M + CHART_TOL_M  # 12.0 m
     # Dedup proportionally to PROX so multi-vertex clusters of a
     # single pavement transition (row-110 boundaries drawn with 3-4
     # vertices within a 3 m span at the runway edge) collapse to one
