@@ -238,6 +238,20 @@ def _emit_primary_parallel_runway_stubs(
                     not endpoint_inside
                     and d_ep <= OUTSIDE_NEAR_RWY_M
                 )
+                # Per user 2026-05-16: for UNREFED apt.dat lines,
+                # the "endpoint within OUTSIDE_NEAR_RWY_M of runway"
+                # criterion catches apron edges where pavement
+                # happens to brush the runway boundary, producing
+                # phantom stubs deep inside aprons (CYXY 883 m
+                # unrefed line ending at lat 60.711 emits a stub
+                # at (-307, 166) wrapped by junction -10082).
+                # Restrict unrefed lines to TRUE runway-inside
+                # endpoints only — refed lines (SPJC A/F loop
+                # ramps, CYXY F ending 11 m from runway) keep the
+                # outside-near branch since the ref confirms the
+                # line IS a primary parallel.
+                if (not ref) and not endpoint_inside:
+                    continue
                 if not (endpoint_inside or endpoint_outside_near):
                     continue
 

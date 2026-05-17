@@ -253,6 +253,20 @@ def _build_taxi_rects(
         role = _classify_role(trimmed, width, rwy_centerlines,
                                rwy_union, ref=ref,
                                ref_overall_bearings=ref_overall_bearings)
+        # Per user 2026-05-16: drop unrefed STUB rects whose
+        # centerline is short.  Unrefed centerlines come from
+        # apt.dat taxi edges with no name — at most airports those
+        # are noise (small connector fragments) inside an apron
+        # rather than a real stub taxi.  Long unrefed centerlines
+        # (e.g. SPLP main taxi, 1.4 - 2.6 km) ARE real primary
+        # parallels and pass this filter (they'd already classify
+        # as primary_parallel, not stub).  Threshold 150 m: longer
+        # than typical apron-edge fragments, shorter than any real
+        # named-taxi stub at SPJC / SPLP / CYXY / KBNA / HECA.
+        from ..layout import ROLE_STUB
+        if (not ref and role == ROLE_STUB
+                and trimmed.length < 150.0):
+            continue
         emitted.append((rect, trimmed, role, ref))
         try:
             emitted_union = (unary_union([emitted_union, rect])
