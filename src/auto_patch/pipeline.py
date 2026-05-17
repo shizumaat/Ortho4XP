@@ -385,7 +385,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # boundary (segment 25's full length) without a shared-vertex
     # snap point — the junction's runway edge ran past the A-stub
     # corner with no clean trapezoid shape.
-    INTERSECTION_PROX_M = 6.0
+    #
+    # Per user 2026-05-17: bumped 6.0 → 12.0 m to capture SPJC's
+    # apron-pavement vertices at the Lima south end (drawn ~11 m
+    # outside the runway rect — apt.dat row-110 polygon boundary
+    # at lat -12.036366 lon -77.107520 sits 11.3 m perpendicular
+    # from the row-100 runway 16L rect).  At 6 m these vertices
+    # were missed, the runway segmenter put no seam at Lima's
+    # natural termination, and Lima's south-end junction polygon
+    # degenerated into a triangle with only one runway-shared
+    # corner.
+    INTERSECTION_PROX_M = 12.0
     # Dedup proportionally to PROX so multi-vertex clusters of a
     # single pavement transition (row-110 boundaries drawn with 3-4
     # vertices within a 3 m span at the runway edge) collapse to one
