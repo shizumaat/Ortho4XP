@@ -1626,3 +1626,336 @@ def _drop_rects_with_shared_sloping_edge_and_absorb(
     except _GEOM_EXC:
         pass
     return len(drop_indices)
+
+
+def _absorb_rects_at_junction_perimeters(
+        layout: "PavementLayout",
+        icao: str = "",
+        perp_tol_m: float = 0.5,
+        min_overlap_m: float = 5.0,
+        min_kept_m: float = 20.0,
+        ) -> int:
+    """Single-pass sloping-edge absorption using actual junction
+    polygons at the FINAL pipeline state.
+
+    Per user 2026-05-17 architectural directive: run absorption
+    ONCE at the very end of the pipeline (after all post-elevation
+    junction-refinement passes — split_sloped_rects_at_violations,
+    snap_junction_vertices_to_rect_flat_edge_corners, widening,
+    etc.).  Earlier placement (right after emit_junctions_and_finalize)
+    sees transient junction polygons that haven't been refined yet
+    — many SPJC corridor stubs (B, C, E) appear to have shared
+    sloping edges with the raw apron residue at that point, but
+    the later passes retract the apron so the stubs end up grass-
+    bordered.  Running absorption at the very end avoids those
+    false positives.
+
+    For each sloping rect:
+      1. For each of the rect's 2 sloping edges, find adjacent
+         junction polygons whose perimeter walks within
+         ``perp_tol_m`` perpendicular of the edge.
+      2. Compute the shared-edge LineString(s); project onto the
+         edge to get axial t-ranges (parameters 0..1).  Clamp away
+         the corner-wrap zone (t < 0.05 or t > 0.95) — junctions
+         wrapping at the rect's short-edge corner pick up tiny
+         stretches of sloping edge that aren't actual sharing.
+      3. Merge all absorbed t-ranges across both sloping edges.
+      4. Kept t-ranges = [0, 1] − absorbed.  Filter kept ranges by
+         ``min_kept_m`` axial length; ranges below the floor are
+         folded into the absorbed set (the rect is too short to
+         keep that fragment).
+      5. For each absorbed range: build the rect's strip polygon
+         (full width × axial range), union it into the absorbing
+         junction's polygon.  Drop the junction's node_altitudes
+         so the OSM emitter falls back to per-shape altitude
+         (rect altitudes were committed by the per-surface solver
+         and the new union polygon's vertex set doesn't match the
+         old altitude array; cleaner to drop than to remap).
+      6. For each kept range: build a new sub-rect polygon and
+         add it as a fresh ``BuiltShape``.
+      7. Drop the original rect.
+
+    Returns the number of rects modified (clipped or dropped).
+    """
+    from .layout import (BuiltShape, SHARED_VERTEX_TOL_M)
+    SLOPING_ROLES = (ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+                      ROLE_STUB, ROLE_CROSS_CONNECTOR)
+
+    junction_idx_list = [i for i, s in enumerate(layout.shapes)
+                          if s.role == ROLE_JUNCTION
+                          and s.polygon is not None
+                          and not s.polygon.is_empty
+                          and s.polygon.geom_type == "Polygon"]
+    if not junction_idx_list:
+        return 0
+
+    drop_indices: set = set()
+    new_rect_shapes: List["BuiltShape"] = []
+    n_dropped = 0
+    n_clipped = 0
+    junction_extensions: Dict[int, List[Polygon]] = {}
+
+    for r_idx, r in enumerate(layout.shapes):
+        if r.role not in SLOPING_ROLES:
+            continue
+        if r.polygon is None or r.polygon.is_empty:
+            continue
+        if r.polygon.geom_type != "Polygon":
+            continue
+        rc = list(r.polygon.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        a_mid = (0.5 * (rc[0][0] + rc[3][0]),
+                  0.5 * (rc[0][1] + rc[3][1]))
+        b_mid = (0.5 * (rc[1][0] + rc[2][0]),
+                  0.5 * (rc[1][1] + rc[2][1]))
+        adx = b_mid[0] - a_mid[0]
+        ady = b_mid[1] - a_mid[1]
+        axis_L = math.hypot(adx, ady)
+        if axis_L < 1.0:
+            continue
+        ux, uy = adx / axis_L, ady / axis_L
+        nx, ny = -uy, ux
+        half_w = math.hypot(rc[0][0] - a_mid[0],
+                              rc[0][1] - a_mid[1])
+        if half_w < 1.0:
+            continue
+        sloping_edges = [
+            LineString([rc[0], rc[1]]),
+            LineString([rc[2], rc[3]]),
+        ]
+        absorbed: List[Tuple[float, float, int, int]] = []
+        for edge_idx, edge_ls in enumerate(sloping_edges):
+            edge_len = edge_ls.length
+            if edge_len < 1.0:
+                continue
+            try:
+                edge_buf = edge_ls.buffer(perp_tol_m, cap_style=2)
+            except _GEOM_EXC:
+                continue
+            for j_idx in junction_idx_list:
+                if j_idx in drop_indices:
+                    continue
+                j = layout.shapes[j_idx]
+                try:
+                    shared = j.polygon.boundary.intersection(edge_buf)
+                except _GEOM_EXC:
+                    continue
+                if shared.is_empty:
+                    continue
+                if shared.geom_type == "LineString":
+                    parts = [shared]
+                elif shared.geom_type == "MultiLineString":
+                    parts = list(shared.geoms)
+                elif shared.geom_type == "GeometryCollection":
+                    parts = [g for g in shared.geoms
+                             if g.geom_type == "LineString"]
+                else:
+                    continue
+                for part in parts:
+                    if part.length < min_overlap_m:
+                        continue
+                    try:
+                        p_a = Point(part.coords[0])
+                        p_b = Point(part.coords[-1])
+                        t_a = edge_ls.project(p_a) / edge_len
+                        t_b = edge_ls.project(p_b) / edge_len
+                    except _GEOM_EXC:
+                        continue
+                    t_lo = max(0.0, min(t_a, t_b))
+                    t_hi = min(1.0, max(t_a, t_b))
+                    # Skip corner-wrap zones: junctions adjacent to
+                    # the rect at its SHORT edges pick up tiny
+                    # stretches of sloping edge right at the
+                    # corners.  Require the shared range to extend
+                    # past 5% from each corner into the edge
+                    # interior.
+                    INNER_T_MIN = 0.05
+                    INNER_T_MAX = 0.95
+                    t_lo_inner = max(INNER_T_MIN, t_lo)
+                    t_hi_inner = min(INNER_T_MAX, t_hi)
+                    if t_hi_inner <= t_lo_inner:
+                        continue
+                    inner_len = (t_hi_inner - t_lo_inner) * edge_len
+                    if inner_len < min_overlap_m:
+                        continue
+                    absorbed.append((t_lo, t_hi, j_idx, edge_idx))
+        if not absorbed:
+            continue
+        intervals = sorted([(s, e) for s, e, _j, _ei in absorbed])
+        merged: List[Tuple[float, float]] = [intervals[0]]
+        for s, e in intervals[1:]:
+            if s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0],
+                                max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        kept: List[Tuple[float, float]] = []
+        prev_end = 0.0
+        for s, e in merged:
+            if s > prev_end:
+                kept.append((prev_end, s))
+            prev_end = e
+        if prev_end < 1.0:
+            kept.append((prev_end, 1.0))
+        kept_keep = [(s, e) for s, e in kept
+                      if (e - s) * axis_L >= min_kept_m]
+        if len(kept_keep) == len(kept):
+            kept_final = kept_keep
+            absorbed_final = merged
+        else:
+            kept_final = kept_keep
+            absorbed_final = []
+            prev = 0.0
+            for s, e in sorted(kept_keep):
+                if s > prev:
+                    absorbed_final.append((prev, s))
+                prev = e
+            if prev < 1.0:
+                absorbed_final.append((prev, 1.0))
+        if not absorbed_final:
+            continue
+        def _strip_polygon(t_lo, t_hi):
+            u_lo = t_lo * axis_L
+            u_hi = t_hi * axis_L
+            p0 = (a_mid[0] + u_lo * ux + nx * half_w,
+                  a_mid[1] + u_lo * uy + ny * half_w)
+            p1 = (a_mid[0] + u_hi * ux + nx * half_w,
+                  a_mid[1] + u_hi * uy + ny * half_w)
+            p2 = (a_mid[0] + u_hi * ux - nx * half_w,
+                  a_mid[1] + u_hi * uy - ny * half_w)
+            p3 = (a_mid[0] + u_lo * ux - nx * half_w,
+                  a_mid[1] + u_lo * uy - ny * half_w)
+            try:
+                strip = Polygon([p0, p1, p2, p3])
+                if not strip.is_valid:
+                    strip = strip.buffer(0)
+                if strip.is_empty or strip.geom_type != "Polygon":
+                    return None
+                return strip
+            except _GEOM_EXC:
+                return None
+        for t_s, t_e in absorbed_final:
+            strip = _strip_polygon(t_s, t_e)
+            if strip is None or strip.is_empty:
+                continue
+            assigned = False
+            for orig_s, orig_e, j_idx, _ei in absorbed:
+                if orig_s < t_e and orig_e > t_s:
+                    junction_extensions.setdefault(
+                        j_idx, []).append(strip)
+                    assigned = True
+            if not assigned:
+                strip_c = strip.centroid
+                best = None
+                best_d2 = float("inf")
+                for j_idx in junction_idx_list:
+                    jc = layout.shapes[j_idx].polygon.centroid
+                    d2 = ((jc.x - strip_c.x) ** 2
+                          + (jc.y - strip_c.y) ** 2)
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best = j_idx
+                if best is not None:
+                    junction_extensions.setdefault(
+                        best, []).append(strip)
+        # Compute per-axial-range altitudes for new sub-rects from
+        # the parent rect's altitude_high / altitude_low.  Corners
+        # 0,3 → altitude_high; corners 1,2 → altitude_low (per the
+        # _rect_from_axis_extended convention).
+        parent_ah = r.altitude_high
+        parent_al = r.altitude_low
+        parent_alt = r.altitude
+        def _alt_at_t(t):
+            if parent_ah is not None and parent_al is not None:
+                return parent_ah + t * (parent_al - parent_ah)
+            if parent_alt is not None:
+                return parent_alt
+            return None
+        for t_s, t_e in kept_final:
+            new_rect = _strip_polygon(t_s, t_e)
+            if new_rect is None or new_rect.is_empty:
+                continue
+            new_axis = LineString([
+                (a_mid[0] + t_s * axis_L * ux,
+                 a_mid[1] + t_s * axis_L * uy),
+                (a_mid[0] + t_e * axis_L * ux,
+                 a_mid[1] + t_e * axis_L * uy),
+            ])
+            import copy
+            new_s = copy.copy(r)
+            new_s.polygon = new_rect
+            new_s.source_axis = new_axis
+            # Re-derive altitudes for the kept sub-rect from the
+            # parent rect's slope.  Sub-rect HIGH end is at the
+            # smaller t (closer to corner 0/3, parent HIGH side).
+            a_high_t = min(t_s, t_e)
+            a_low_t = max(t_s, t_e)
+            ah_new = _alt_at_t(a_high_t)
+            al_new = _alt_at_t(a_low_t)
+            if (ah_new is not None and al_new is not None
+                    and abs(ah_new - al_new) >= 0.1):
+                new_s.altitude_high = round(ah_new, 1)
+                new_s.altitude_low = round(al_new, 1)
+                new_s.altitude = None
+            elif ah_new is not None:
+                new_s.altitude = round(ah_new, 1)
+                new_s.altitude_high = None
+                new_s.altitude_low = None
+            new_rect_shapes.append(new_s)
+        drop_indices.add(r_idx)
+        if kept_final:
+            n_clipped += 1
+        else:
+            n_dropped += 1
+
+    if not drop_indices and not junction_extensions:
+        return 0
+
+    # Apply junction extensions.  After union, the junction
+    # polygon's vertex set changes; the existing node_altitudes
+    # array no longer aligns by index.  Drop node_altitudes; the
+    # OSM emit will fall back to shape.altitude (a single value).
+    for j_idx, strips in junction_extensions.items():
+        j = layout.shapes[j_idx]
+        if j.polygon is None or j.polygon.is_empty:
+            continue
+        try:
+            merged_strips = unary_union(strips)
+            new_j_poly = unary_union([j.polygon, merged_strips])
+            if new_j_poly.geom_type == "MultiPolygon":
+                new_j_poly = max(new_j_poly.geoms,
+                                  key=lambda g: g.area)
+            if (new_j_poly.geom_type == "Polygon"
+                    and new_j_poly.is_valid
+                    and not new_j_poly.is_empty):
+                j.polygon = new_j_poly
+                # Preserve altitude: use the median of existing
+                # node_altitudes as the flat altitude.
+                if j.node_altitudes:
+                    alts = list(j.node_altitudes)
+                    alts_sorted = sorted(alts)
+                    j.altitude = round(float(
+                        alts_sorted[len(alts_sorted) // 2]), 1)
+                    j.node_altitudes = None
+        except _GEOM_EXC:
+            continue
+
+    if drop_indices:
+        layout.shapes = [s for k, s in enumerate(layout.shapes)
+                          if k not in drop_indices]
+    if new_rect_shapes:
+        layout.shapes.extend(new_rect_shapes)
+
+    n_total = n_dropped + n_clipped
+    try:
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: end-of-pipeline "
+            f"absorption — {n_dropped} dropped, "
+            f"{n_clipped} clipped, "
+            f"{len(junction_extensions)} junction(s) extended.")
+    except _GEOM_EXC:
+        pass
+    return n_total
