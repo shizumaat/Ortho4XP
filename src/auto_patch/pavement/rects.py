@@ -385,18 +385,22 @@ def _rect_long_edges_at_pavement_boundary(
     n_samples: int = 5,
     interior_frac_tol: float = 0.0,
 ) -> bool:
-    """Return True iff every sample point taken just-outward of the
-    rect's LONG edges (parallel to ``axis``) lies OUTSIDE ``pav``.
+    """Return True iff at least one of the rect's LONG edges
+    (parallel to ``axis``) has its just-outward samples OUTSIDE
+    ``pav``.
 
-    A taxi rect's long edges should sit at the natural pavement
-    boundary — grass on one side, taxi pavement on the other.  If
-    pavement extends past the long edge (sample inside ``pav``),
-    the rect is sitting in the INTERIOR of a wider pavement area
-    (a junction at a multi-ref intersection or apron) and the
-    long edge would BE the boundary between rect pavement and
-    junction pavement — putting a junction polygon adjacent to
-    the rect's sloping edge (user invariant: no junctions on
-    sloping rect edges).
+    Per user 2026-05-16 refined: a rect is rejected as
+    "interior-to-pavement" ONLY when BOTH long edges have most of
+    their outward probes hit pavement (the rect sits inside a
+    multi-ref wide pavement area, like CYXY D-west passing through
+    E-D and D-runway junctions).  When only ONE long edge is
+    embedded — the partial-apron-adjacency case where the rect IS
+    a primary parallel passing alongside an apron — the rect must
+    survive so the downstream
+    ``_split_primary_parallels_at_pavement_boundary`` can clip
+    the embedded prefix/suffix and keep the unbounded middle as a
+    shorter rect.  Canonical case: CYXY taxi E with apron on its
+    west side along the NW half, free along the SE half.
 
     Long edges are identified geometrically: the two of the four
     rect-ring edges whose direction is closest to ``axis``
@@ -406,9 +410,9 @@ def _rect_long_edges_at_pavement_boundary(
     distance — larger than typical boundary precision (~1 m) but
     smaller than typical junction width (~30 m).
     ``interior_frac_tol`` is the fraction of samples allowed
-    inside ``pav`` before failing — 0.0 means even one sample
-    inside fails the invariant (strict; matches the user's "no
-    junction on sloping edge" rule).
+    inside ``pav`` before a long edge counts as "embedded"; the
+    rect is rejected only when BOTH long edges exceed this
+    threshold.
     """
     if pav is None or pav.is_empty:
         return True
@@ -435,6 +439,8 @@ def _rect_long_edges_at_pavement_boundary(
         return True
     centroid = rect.centroid
     cx, cy = centroid.x, centroid.y
+    long_edges_embedded = 0
+    long_edges_checked = 0
     for i in range(4):
         a = rect_coords[i]
         b = rect_coords[(i + 1) % 4]
@@ -469,8 +475,15 @@ def _rect_long_edges_at_pavement_boundary(
                     n_inside += 1
             except _GEOM_EXC:
                 continue
+        long_edges_checked += 1
         if n_inside / n_samples > interior_frac_tol:
-            return False
+            long_edges_embedded += 1
+    # Reject only when BOTH long edges are embedded (a rect that
+    # sits in the interior of a wide pavement region).  If only one
+    # is embedded, the partial-absorption pass will clip the
+    # embedded end and keep the unbounded middle.
+    if long_edges_checked >= 2 and long_edges_embedded >= 2:
+        return False
     return True
 
 

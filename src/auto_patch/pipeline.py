@@ -1947,6 +1947,21 @@ def build_airport_pavement(icao: str, xplane_root: str,
     taxi_rects = _drop_primary_parallels_embedded_in_pavement(
         taxi_rects, pav_union, runway_polys=runway_polys)
 
+    # ── Partial-absorption: clip primary-parallel prefix/suffix that
+    # is fully embedded in apron pavement, keeping the unbounded
+    # middle as a (shorter) rect.  Per user 2026-05-16: the
+    # absorption pattern is "rect emitted; apron absorbs only the
+    # portion sharing its sloping edge; remainder stays as a rect."
+    # _drop above handles FULL embedding (both long edges 100%
+    # inside); this helper handles PARTIAL embedding (one end of
+    # the rect's axis is inside, the rest is bounded).  Canonical
+    # case: CYXY taxi E NW-SE — NW half is embedded in SW apron,
+    # SE half extends free toward runway 02.
+    from .pavement.absorption import (
+        _split_primary_parallels_at_pavement_boundary)
+    taxi_rects = _split_primary_parallels_at_pavement_boundary(
+        taxi_rects, pav_union)
+
     # ── Detect bridge taxi rects from OSM (user 2026-04-29) ───────
     # Per OSM convention, bridge taxiways carry ``bridge=yes`` (or
     # any non-empty bridge=*) on their parent way.  Build a list of
