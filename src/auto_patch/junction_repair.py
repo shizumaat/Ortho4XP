@@ -1422,3 +1422,207 @@ def _split_sloped_rects_at_violations(
     return n_splits
 
 
+
+
+def _absorb_rect_into_junction(rect_shape, junction_shape):
+    """Extend ``junction_shape``'s polygon to include
+    ``rect_shape``'s footprint by replacing the shared sloping-edge
+    segment in the junction's perimeter with a walk via the rect's
+    far corners.
+
+    Returns True if absorption succeeded; False if the rect doesn't
+    share a sloping-edge with this junction or the resulting polygon
+    is invalid.
+    """
+    from .layout import SHARED_VERTEX_TOL_M
+    rc = list(rect_shape.polygon.exterior.coords)
+    if rc and rc[0] == rc[-1]:
+        rc = rc[:-1]
+    if len(rc) != 4:
+        return False
+    jc = list(junction_shape.polygon.exterior.coords)
+    had_close = bool(jc) and jc[0] == jc[-1]
+    if had_close:
+        jc = jc[:-1]
+    n = len(jc)
+    if n < 3:
+        return False
+    bucket = SHARED_VERTEX_TOL_M
+
+    def _key(p):
+        return (round(p[0] / bucket), round(p[1] / bucket))
+    rect_keys = [_key(c) for c in rc]
+
+    j_alts = junction_shape.node_altitudes
+    j_alts_open = (list(j_alts[:n])
+                   if j_alts is not None and len(j_alts) >= n
+                   else None)
+
+    for i in range(n):
+        ki = _key(jc[i])
+        ki1 = _key(jc[(i + 1) % n])
+        for c_a, c_b in ((0, 1), (2, 3)):
+            ka, kb = rect_keys[c_a], rect_keys[c_b]
+            forward = (ki == ka and ki1 == kb)
+            reverse = (ki == kb and ki1 == ka)
+            if not (forward or reverse):
+                continue
+            # Walk the OTHER sloping edge's corners.  For shared
+            # edge (0,1), the rect's other side goes 0 → 3 → 2 → 1.
+            # For (2,3), it goes 2 → 1 → 0 → 3.
+            if (c_a, c_b) == (0, 1):
+                other = [rc[3], rc[2]]
+            else:
+                other = [rc[1], rc[0]]
+            if reverse:
+                other = list(reversed(other))
+            # Build candidate junction with rect's far corners
+            # inserted between the shared-edge endpoints.
+            new_jc = jc[:i + 1] + other + jc[i + 1:]
+            try:
+                new_poly = Polygon(new_jc)
+                if not new_poly.is_valid:
+                    new_poly = new_poly.buffer(0)
+                if new_poly.is_empty:
+                    continue
+                if new_poly.geom_type == "MultiPolygon":
+                    new_poly = max(new_poly.geoms,
+                                    key=lambda g: g.area)
+                if new_poly.geom_type != "Polygon":
+                    continue
+                if not new_poly.is_valid or not new_poly.is_simple:
+                    continue
+            except _GEOM_EXC:
+                continue
+            # Sanity: new polygon should have GROWN (we added the
+            # rect's footprint).
+            if new_poly.area < junction_shape.polygon.area:
+                continue
+            # Commit.  Update node_altitudes by inserting the rect's
+            # corner altitudes (linearly interpolated from the
+            # rect's slope: corners 0,3 = high, corners 1,2 = low).
+            junction_shape.polygon = new_poly
+            if j_alts_open is not None:
+                # Pick altitudes for the 2 inserted corners.  For
+                # the OTHER-side walk we inserted [rc[3], rc[2]] or
+                # similar.  Use altitude_high for corners 0,3 and
+                # altitude_low for corners 1,2 per the rect's
+                # canonical slope convention.
+                ah = rect_shape.altitude_high
+                al = rect_shape.altitude_low
+                if ah is None or al is None:
+                    a_default = (rect_shape.altitude
+                                 if rect_shape.altitude is not None
+                                 else j_alts_open[i])
+                    ah = al = float(a_default)
+                hilo_for_corner = {0: ah, 1: al, 2: al, 3: ah}
+                if (c_a, c_b) == (0, 1):
+                    pair = [3, 2]
+                else:
+                    pair = [1, 0]
+                if reverse:
+                    pair = list(reversed(pair))
+                a_insert = [hilo_for_corner[p] for p in pair]
+                new_alts_open = (j_alts_open[:i + 1]
+                                 + a_insert
+                                 + j_alts_open[i + 1:])
+                junction_shape.node_altitudes = (
+                    new_alts_open + [new_alts_open[0]])
+            return True
+    return False
+
+
+def _drop_rects_with_shared_sloping_edge_and_absorb(
+        layout: "PavementLayout",
+        icao: str = "",
+        ) -> int:
+    """Detect sloping rects with a FULLY-SHARED sloping edge with a
+    junction polygon's perimeter (the
+    ``test_taxi_rects_not_alongside_apron`` invariant) and absorb
+    each into its adjacent junction by extending the junction
+    polygon to cover the rect's footprint.
+
+    The rect is then dropped.  Per user 2026-05-16: a sloping
+    rect's sloping edge must never be shared with a junction.
+
+    "Fully shared" means the junction perimeter has two CONSECUTIVE
+    vertices coinciding with the rect's two sloping-edge corners
+    (i.e. the junction walks the rect's whole sloping edge as a
+    single perimeter segment).  This catches the
+    ``_split_sloped_rects_at_violations`` output where a parent
+    rect is carved into many short sub-rects whose sloping edges
+    are entirely the boundary with an adjacent junction.
+
+    Partial-sharing cases (junction perimeter walks along part of
+    the rect's sloping edge but not corner-to-corner) are NOT
+    handled here — those need a separate clipping pass, since
+    dropping the whole rect would lose meaningful pavement.
+
+    Runs as a post-pass after ``_split_sloped_rects_at_violations``.
+
+    Returns the number of rects absorbed.
+    """
+    from .layout import SHARED_VERTEX_TOL_M
+    sloping = (ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
+                ROLE_STUB, ROLE_CROSS_CONNECTOR)
+    bucket = SHARED_VERTEX_TOL_M
+
+    def _key(p):
+        return (round(p[0] / bucket), round(p[1] / bucket))
+
+    drop_indices: set = set()
+    for r_idx, r in enumerate(layout.shapes):
+        if r.role not in sloping:
+            continue
+        if r.polygon is None or r.polygon.is_empty:
+            continue
+        rc = list(r.polygon.exterior.coords)
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        rect_keys = [_key(c) for c in rc]
+        # Look for any junction whose perimeter has 2 consecutive
+        # vertices matching a sloping-edge pair (0-1) or (2-3) of
+        # this rect.  Absorb into the first such junction found.
+        for j_idx, j in enumerate(layout.shapes):
+            if j is r or j.role != ROLE_JUNCTION:
+                continue
+            if j.polygon is None or j.polygon.is_empty:
+                continue
+            jc = list(j.polygon.exterior.coords)
+            if jc and jc[0] == jc[-1]:
+                jc = jc[:-1]
+            n = len(jc)
+            if n < 3:
+                continue
+            absorbed = False
+            for k in range(n):
+                ki = _key(jc[k])
+                ki1 = _key(jc[(k + 1) % n])
+                for c_a, c_b in ((0, 1), (2, 3)):
+                    ka, kb = rect_keys[c_a], rect_keys[c_b]
+                    if ((ki == ka and ki1 == kb)
+                            or (ki == kb and ki1 == ka)):
+                        if _absorb_rect_into_junction(r, j):
+                            drop_indices.add(r_idx)
+                            absorbed = True
+                        break
+                if absorbed:
+                    break
+            if absorbed:
+                break
+
+    if not drop_indices:
+        return 0
+
+    layout.shapes = [s for k, s in enumerate(layout.shapes)
+                     if k not in drop_indices]
+    try:
+        UI.vprint(1,
+            f"  [pav-builder] {icao}: absorbed "
+            f"{len(drop_indices)} sloping rect(s) into adjacent "
+            f"junction (shared sloping edge).")
+    except _GEOM_EXC:
+        pass
+    return len(drop_indices)

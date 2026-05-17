@@ -2271,6 +2271,17 @@ def build_airport_pavement(icao: str, xplane_root: str,
         # vertices.  Snap "almost-at-the-corner" junction vertices
         # (perpendicular ≤ 2 m, corner ≤ 10 m) to the new corners.
         _snap_junction_vertices_to_rect_flat_edge_corners(layout)
+        # Absorb sloping rects whose sloping edge ended up shared
+        # with an adjacent junction polygon's perimeter (the
+        # test_taxi_rects_not_alongside_apron invariant).  Common
+        # case: _split_sloped_rects_at_violations carved a parent
+        # rect into many short sub-rects, each with one sloping
+        # edge fully shared with the adjacent junction.  Per user
+        # 2026-05-16, those should be absorbed into the junction.
+        from .junction_repair import (
+            _drop_rects_with_shared_sloping_edge_and_absorb)
+        _drop_rects_with_shared_sloping_edge_and_absorb(
+            layout, icao=icao)
 
         # Re-emit bridges instead of difference-clipping (user
         # 2026-05-16 canonical-node rewrite).  Drop stale bridges
