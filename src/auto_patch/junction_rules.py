@@ -689,16 +689,28 @@ def _do_widen(
             continue
 
         # Snapshot the pre-widen polygon body for the body-
-        # proximity cap (per user 2026-05-05 followup).  Multi-step
-        # walking + bumped cap let the queue extend the runway-
-        # shared edge by 4-6 chain corners; without a geometric
-        # cap, polygons whose body is small but adjacent to a long
-        # runway-side stretch end up sharing 6+ corners that span
-        # 200+ m of runway, much further than the polygon's
-        # natural extent.  Reject any chain neighbor whose
+        # proximity cap (per user 2026-05-05 followup, implemented
+        # 2026-05-16).  Multi-step walking + bumped cap let the
+        # queue extend the runway-shared edge by 4-6 chain corners;
+        # without a geometric cap, polygons whose body is small but
+        # adjacent to a long runway-side stretch end up sharing 6+
+        # corners that span 200+ m of runway, much further than the
+        # polygon's natural extent.  Reject any chain neighbor whose
         # distance to the original body exceeds
         # ``WIDEN_BODY_PROX_M``.
+        #
+        # Per user 2026-05-16 (SPLP regression): with the runway
+        # pre-cut at every apt.dat-pavement projection (commit
+        # 15d3a89), the body's anchors already sit at the natural
+        # extent of the junction along the runway.  Walking one chain
+        # step further drops the corner ~30 m past the body's
+        # runway-side edge — i.e. > WIDEN_BODY_PROX_M from the body,
+        # so the prox cap correctly rejects it.  The runway-end-wrap
+        # case (SPJC J-10131) is preserved because the wrap body's
+        # boundary stays close to the chain corners along the wrap,
+        # so the cap still permits the walk.
         original_body = poly
+        WIDEN_BODY_PROX_M = 5.0
 
         # Identify runway-shared vertices in the polygon.
         # shared_in_poly: list of (poly_idx, chain_corner_position)
@@ -922,6 +934,22 @@ def _do_widen(
                     break
                 if _key(neighbor) in existing_keys:
                     continue
+                # Body-prox cap: the pre-widen polygon body already
+                # marks the junction's natural extent along the
+                # runway because the segmenter pre-cuts the runway
+                # at every adjacent-pavement projection.  Skip chain
+                # neighbors more than WIDEN_BODY_PROX_M from the
+                # pre-widen body — those sit beyond the pavement the
+                # junction actually borders.  Runway-end-wrap bodies
+                # (SPJC J-10131) keep their chain corners close to
+                # the wrapped boundary so the cap still permits the
+                # walk.
+                try:
+                    if (original_body.distance(Point(neighbor))
+                            > WIDEN_BODY_PROX_M):
+                        continue
+                except _GEOM_EXC:
+                    pass
                 # Decide insertion side: BEFORE poly_idx or AFTER.
                 # Pick the side whose angle is closer to the
                 # neighbor's bearing from the corner.
