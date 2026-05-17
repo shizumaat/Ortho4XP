@@ -2285,6 +2285,13 @@ def build_airport_pavement(icao: str, xplane_root: str,
         from .junction_repair import (
             _absorb_rects_at_junction_perimeters)
         _absorb_rects_at_junction_perimeters(layout, icao=icao)
+        # Re-run sloping-edge / flat-edge cleanup against the new
+        # geometry: clipped sub-rects from absorption may have new
+        # corners that don't yet align with adjacent junction
+        # vertices (junction vertex sitting on the new sub-rect's
+        # sloping edge interior).
+        _split_sloped_rects_at_violations(layout, icao=icao)
+        _snap_junction_vertices_to_rect_flat_edge_corners(layout)
 
         # Re-emit bridges instead of difference-clipping (user
         # 2026-05-16 canonical-node rewrite).  Drop stale bridges
