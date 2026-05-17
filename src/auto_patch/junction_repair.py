@@ -1818,16 +1818,34 @@ def _absorb_rects_at_junction_perimeters(
         if not absorbed_final:
             continue
         def _strip_polygon(t_lo, t_hi):
+            # Full-absorption: reuse the rect's exact polygon so
+            # the union preserves the rect's corner positions (the
+            # neighbour rects that shared those corners via short
+            # edges keep their connection through the extended
+            # junction's perimeter).
+            if t_lo <= 1e-6 and t_hi >= 1.0 - 1e-6:
+                return r.polygon
             u_lo = t_lo * axis_L
             u_hi = t_hi * axis_L
-            p0 = (a_mid[0] + u_lo * ux + nx * half_w,
-                  a_mid[1] + u_lo * uy + ny * half_w)
-            p1 = (a_mid[0] + u_hi * ux + nx * half_w,
-                  a_mid[1] + u_hi * uy + ny * half_w)
-            p2 = (a_mid[0] + u_hi * ux - nx * half_w,
-                  a_mid[1] + u_hi * uy - ny * half_w)
-            p3 = (a_mid[0] + u_lo * ux - nx * half_w,
-                  a_mid[1] + u_lo * uy - ny * half_w)
+            # For partial absorption, use the rect's original
+            # corner at boundaries that ARE at t=0 or t=1; only
+            # use axis-derived positions for the new mid-rect cut.
+            if t_lo <= 1e-6:
+                p0 = rc[0]
+                p3 = rc[3]
+            else:
+                p0 = (a_mid[0] + u_lo * ux + nx * half_w,
+                      a_mid[1] + u_lo * uy + ny * half_w)
+                p3 = (a_mid[0] + u_lo * ux - nx * half_w,
+                      a_mid[1] + u_lo * uy - ny * half_w)
+            if t_hi >= 1.0 - 1e-6:
+                p1 = rc[1]
+                p2 = rc[2]
+            else:
+                p1 = (a_mid[0] + u_hi * ux + nx * half_w,
+                      a_mid[1] + u_hi * uy + ny * half_w)
+                p2 = (a_mid[0] + u_hi * ux - nx * half_w,
+                      a_mid[1] + u_hi * uy - ny * half_w)
             try:
                 strip = Polygon([p0, p1, p2, p3])
                 if not strip.is_valid:
