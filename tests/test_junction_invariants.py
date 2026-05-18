@@ -248,21 +248,22 @@ def test_junction_boundary_near_centerline(icao):
 
 @pytest.mark.parametrize("icao", _test_airports())
 def test_junction_vertices_have_source(icao):
-    """Every junction vertex must originate from a geometric source:
-    a corner of an adjacent rect (sloping or runway), apron,
-    terminal, groundside, or boundary polygon.  Vertices without a
-    source are orphans added by densification or buffer rounding
-    and must be eliminated.
+    """Every junction vertex must originate from a geometric
+    source:
 
-    This is the dual of ``test_junction_neighbour_corners_shared``:
-    that test asserts neighbour vertices within 1 m of a junction
-    perimeter coincide with junction vertices; this test asserts
-    junction vertices coincide with neighbour-shape corners.
+    * A corner of an adjacent rect (sloping or runway), apron,
+      terminal, groundside, or boundary polygon, OR
+    * An apt.dat row-110 pavement polygon vertex — junctions are
+      built as ``pav_union.difference(rects)`` and inherit row-110
+      perimeter vertices structurally (see junction_emit.py).
 
-    Per user 2026-05-18: replaces the older "incoming-corners +
-    ≤ 4 trace per arc" vertex cap which reflected an obsolete
-    boundary-trace architecture.  Universal — no airport-specific
-    exemptions.
+    Vertices without a source are orphans added by densification
+    or buffer rounding and must be eliminated.
+
+    This is the dual of ``test_junction_neighbour_corners_shared``.
+
+    Per user 2026-05-18: no airport-specific exemptions, no
+    densification of junction perimeters.
     """
     from auto_patch.layout import SHARED_VERTEX_TOL_M
 
@@ -292,6 +293,12 @@ def test_junction_vertices_have_source(icao):
             coords = coords[:-1]
         source_corners.extend(
             (float(c[0]), float(c[1])) for c in coords)
+    # apt.dat row-110 pavement polygon vertices: junction perimeters
+    # following row-110 inherit these exactly via the residue
+    # subtraction.  Captured on the layout at pavement-union build
+    # time so the test sees the same source the builder did.
+    source_corners.extend(
+        getattr(layout, "apt_pavement_vertices", []) or [])
 
     if not source_corners:
         pytest.skip(

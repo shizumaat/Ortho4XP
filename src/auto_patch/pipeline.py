@@ -247,6 +247,24 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # 105 K m² → 35 K m² before this fix).
     apt_only_pav_polys: List[Polygon] = list(pav_polys)
 
+    # Capture every apt.dat row-110 pavement polygon vertex so the
+    # source-attribution test recognises junction perimeter
+    # vertices inherited from row-110 (junctions are built as
+    # ``pav_union.difference(rects)`` — see junction_emit.py).
+    _seen = set()
+    for _p in pav_polys:
+        try:
+            rings = [_p.exterior, *_p.interiors]
+        except _GEOM_EXC:
+            continue
+        for _r in rings:
+            for _x, _y in _r.coords:
+                _key = (round(_x, 2), round(_y, 2))
+                if _key in _seen:
+                    continue
+                _seen.add(_key)
+                layout.apt_pavement_vertices.append((float(_x), float(_y)))
+
     # ── Runway shoulder absorption ─────────────────────────────────
     # Long thin row-110 polygons parallel to a runway and touching
     # or overlapping it are runway shoulders (or, when wider than

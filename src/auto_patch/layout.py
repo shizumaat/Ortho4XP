@@ -186,6 +186,15 @@ class PavementLayout:
     # ``apt_dat_reader.taxi_centerlines``.
     apt_taxi_centerlines: List[Tuple[LineString, str]] = field(
         default_factory=list)
+    # apt.dat row-110 pavement polygon vertices, in meter space.
+    # Junction polygons are built as
+    # ``pav_union.difference(rects)`` and inherit their perimeter
+    # vertices from these (where the perimeter follows row-110)
+    # and from rect corners (where it abuts a rect).  Captured
+    # here so the source-attribution test can recognise them as
+    # legitimate vertex sources rather than densification orphans.
+    apt_pavement_vertices: List[Tuple[float, float]] = field(
+        default_factory=list)
 
     # ---- coordinate helpers ------------------------------------------
     def m_to_ll(self, x: float, y: float) -> Tuple[float, float]:
