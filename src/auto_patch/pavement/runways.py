@@ -286,6 +286,22 @@ def _resolve_runway_crossings(
             if i not in member_set]
         union_poly = _snap_polygon_vertices_to_rect_corners(
             union_poly, other_sloping_polys, snap_tol_m=5.0)
+        # Route through the canonical-point registry (user
+        # 2026-05-18) so the runway-crossing junction's corners
+        # are registered as canonical sources for any adjacent
+        # rect / junction that subsequently snaps near them.
+        try:
+            from ..canonical_points import (
+                snap_polygon_through_registry as _snap_reg)
+            _reg = getattr(layout, "canonical_points", None)
+            if _reg is not None:
+                union_poly = _snap_reg(union_poly, _reg)
+                if (union_poly is None
+                        or union_poly.is_empty
+                        or union_poly.geom_type != "Polygon"):
+                    continue
+        except _GEOM_EXC:
+            pass
         try:
             coords = list(union_poly.exterior.coords)
         except _GEOM_EXC:
