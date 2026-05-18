@@ -162,17 +162,14 @@ __all__ = [
 ]
 
 
-# FAA AC 150/5300-13B, Design Group III+ (commercial jetport):
-#   Taxiway longitudinal: max 1.5 % grade.
-#   Apron: max 1.0 % any direction.
-#   Runway longitudinal: max 1.5 % grade (handled by legacy).
+# Grade caps used by the per-surface elevation solver and the
+# audit / check_grade pass.  Aligned with the taxiway cap at 1.5 %
+# (user 2026-05-18): the apron-reclassification pass now folds
+# apron-territory pavement that the old solver was treating as
+# junction (1.5 %) into ROLE_APRON; matching the cap keeps the
+# reclassified shapes feasible without re-solving their elevation.
 TAXI_MAX_GRADE = 0.015
-APRON_MAX_GRADE = 0.010   # FAA apron cap, used for the apron-side
-                            # multi-source-Dijkstra cone in
-                            # ``_pin_apron_targets`` and the post-
-                            # pin grade reconciliation.  Tighter
-                            # than the taxi cap so apron polygons
-                            # don't slope > 1 % between vertices.
+APRON_MAX_GRADE = 0.015
 TAXI_ANCHOR_DIST_M = 30.0   # snap taxi rect end to runway segment
                              # elevation when within this distance
 
@@ -1240,10 +1237,10 @@ def _solve_pavement_elevations_unified(
              edge with |Δelev|/length > max_grade pulls its
              endpoints toward each other (or moves the soft one
              toward the anchored one).
-           - Per-shape role-specific grade caps:
+           - Per-shape role-specific grade caps (all 1.5 %; user
+             2026-05-18 aligned the apron cap with the taxi cap):
                runway/runway: 1.5 % (already enforced by HARD)
-               taxi rect: 1.5 %
-               apron / junction: 1.0 %
+               taxi rect / junction / apron / terminal: 1.5 %
                cross-shape: min of the two roles.
            - Terminal corners constrained to be FLAT (all corners
              of one terminal share a single value at every
@@ -2758,9 +2755,8 @@ def _report_within_shape_violations(
         try:
             import sys as _sys
             msg = (f"  [pav-builder] WARN: {icao}: {n_viol} within-shape "
-                   f"grade violations (junction ≤ 1.5 %, apron / "
-                   f"terminal ≤ 1.0 %, all-pair Euclidean within "
-                   f"polygon)")
+                   f"grade violations (junction / apron / terminal "
+                   f"≤ 1.5 %, all-pair Euclidean within polygon)")
             if worst_info is not None:
                 role, ref, ea, eb, d, de = worst_info
                 rstr = f"/{ref}" if ref else ""

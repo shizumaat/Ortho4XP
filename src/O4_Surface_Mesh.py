@@ -558,8 +558,9 @@ def adaptive_triangulate(
         sample_dem: callable (x, y) -> float (elevation) or None.
             Called for every non-anchored vertex and for every
             candidate fidelity refinement sample.
-        max_grade: maximum allowed plane gradient per triangle (e.g.
-            0.010 for aprons, 0.015 for taxiways and junctions).
+        max_grade: maximum allowed plane gradient per triangle
+            (0.015 for all surfaces; user 2026-05-18 aligned the
+            apron cap with the taxi cap).
         fidelity_tol: refine until every triangle's interior agrees
             with DEM within this many metres.
         max_extra_points: cap on the number of fidelity refinement

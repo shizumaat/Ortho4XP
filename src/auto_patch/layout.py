@@ -71,6 +71,15 @@ __all__ = [
 from O4_Geo_Utils import earth_radius as R_EARTH  # single source of truth
 SHARED_VERTEX_TOL_M = 0.5    # snap vertices closer than this together
 
+# Vertices that share an XY bucket but disagree on altitude by more
+# than ``VERTEX_ALT_MERGE_TOL_M`` are kept as separate node IDs.
+# Per user 2026-05-18 invariant: "two nodes can never share the
+# same location without sharing the same elevation."  Sub-metre
+# altitude differences are smoothed into one node (the rounded
+# average); larger differences represent a real wall / cliff and
+# must stay as distinct vertices so X-Plane renders the step.
+VERTEX_ALT_MERGE_TOL_M = 1.0
+
 
 # ──────────────────────────────────────────────────────────────────
 # Role-tag vocabulary
@@ -186,32 +195,68 @@ class PavementLayout:
         """Emit to a JOSM-readable OSM file with shared node IDs.
 
         Vertices within ``SHARED_VERTEX_TOL_M`` are assigned the same
-        node id, matching the target-OSM convention.  Polygons with
-        interior rings (holes, typical for junction polygons that
-        wrap around rects) are emitted as OSM multipolygon
-        relations — each ring becomes a closed way, and a relation
-        ties them together with role=outer / role=inner.
+        node id, matching the target-OSM convention.
+
+        Two invariants enforced at emit time (user 2026-05-18):
+
+        * ``Same-XY → same-altitude``: two vertices sharing an XY
+          bucket but disagreeing on altitude by more than
+          ``VERTEX_ALT_MERGE_TOL_M`` get DIFFERENT node IDs —
+          preserving real walls / cliffs / grade transitions
+          instead of collapsing them into a vertex with two
+          altitudes.
+        * ``Shared-corner altitude consensus``: when multiple shapes
+          DO share a node (their altitudes were within the merge
+          tolerance), each shape's emitted altitude tag at that
+          corner is rewritten to the mean of all contributing
+          shapes' altitudes.  Result: no cross-shape proximity
+          tear in the emitted OSM.  Shapes whose corners drift off
+          their original flat / sloping-rect pattern fall back to
+          ``node_altitudes`` so the per-corner consensus is
+          preserved.
         """
         bucket_size = SHARED_VERTEX_TOL_M
-        node_key_to_id: Dict[Tuple[int, int], int] = {}
+        # xy_bucket → list of (node_id, claimed_altitude_or_None).
+        # Altitude-aware bucketing: vertices land in the existing
+        # node only if their altitude is within
+        # VERTEX_ALT_MERGE_TOL_M of the bucket's claim.
+        xy_to_nodes: Dict[Tuple[int, int],
+                          List[Tuple[int, Optional[float]]]] = {}
         node_id_to_ll: Dict[int, Tuple[float, float]] = {}
+        # Accumulate every altitude contributed to each node so the
+        # post-intern consensus pass can average them.
+        node_id_to_alts: Dict[int, List[float]] = {}
         next_nid = [-1]
 
-        def _intern(x: float, y: float) -> int:
+        def _intern(x: float, y: float,
+                    alt: Optional[float] = None) -> int:
             kx = int(round(x / bucket_size))
             ky = int(round(y / bucket_size))
             key = (kx, ky)
-            if key in node_key_to_id:
-                return node_key_to_id[key]
+            existing = xy_to_nodes.get(key)
+            if existing:
+                # Find the first existing node within altitude
+                # tolerance.  None matches any altitude (no claim).
+                for nid, claimed in existing:
+                    if alt is None or claimed is None:
+                        if alt is not None:
+                            node_id_to_alts.setdefault(
+                                nid, []).append(alt)
+                        return nid
+                    if abs(claimed - alt) <= VERTEX_ALT_MERGE_TOL_M:
+                        node_id_to_alts.setdefault(
+                            nid, []).append(alt)
+                        return nid
+                # No altitude match: real wall / cliff.  Allocate
+                # a fresh node at the SAME lat/lon so X-Plane
+                # renders the vertical step between adjacent
+                # polygons.
             nid = next_nid[0]
             next_nid[0] -= 1
-            node_key_to_id[key] = nid
-            # Use the ACTUAL coordinates of the first vertex that
-            # landed in this bucket (not the bucket center).  Bucket
-            # centers can lie up to bucket_size/2 away from the real
-            # vertex, which introduces sub-metre overlaps between
-            # adjacent shapes after OSM round-trip.
+            xy_to_nodes.setdefault(key, []).append((nid, alt))
             node_id_to_ll[nid] = self.m_to_ll(x, y)
+            if alt is not None:
+                node_id_to_alts[nid] = [alt]
             return nid
 
         def _ring_to_nids(ring_coords, ring_elevs=None):
@@ -241,7 +286,11 @@ class PavementLayout:
                     elevs = elevs[:-1]
             if len(coords) < 3:
                 return None, None
-            nids = [_intern(x, y) for (x, y) in coords]
+            if elevs is not None and len(elevs) >= len(coords):
+                nids = [_intern(x, y, elevs[k])
+                        for k, (x, y) in enumerate(coords)]
+            else:
+                nids = [_intern(x, y) for (x, y) in coords]
             # Dedup any duplicate nid (consecutive OR not).
             seen: set = set()
             deduped_nids: List[int] = []
@@ -274,6 +323,10 @@ class PavementLayout:
         # processing; the rects' altitude_high/low tags prevail
         # where they cover.
         way_blocks: List[Tuple[int, List[int], Dict[str, str]]] = []
+        # Pass-1 holding pen: each entry survives validation +
+        # interning and waits for the consensus pass to write its
+        # altitude tags from the per-node mean.
+        pending: List[Tuple["BuiltShape", List[int]]] = []
         next_wid = [-10001]
         for s in self.shapes:
             # Validate the polygon's geometry before emission.
@@ -312,12 +365,38 @@ class PavementLayout:
                     poly = repaired
                 except _GEOM_EXC:
                     continue
-            # Pass node_altitudes alongside ring coords so dedup of
-            # duplicate nids drops the matching elevations too,
-            # keeping the per-vertex count invariant.
+            # Per-corner altitude derivation for shared-vertex
+            # altitude-bucketing.  Source-shape attribution:
+            #   * node_altitudes set → use directly
+            #   * altitude set (flat polygon) → broadcast to every corner
+            #   * altitude_high / altitude_low set (sloping rect, 4
+            #     corners ring + closing) → corners 0,3 = high;
+            #     corners 1,2 = low per ``_rect_from_axis_extended``
+            #     convention
+            # All three paths produce ring_elevs aligned with
+            # ``poly.exterior.coords`` (including the closing
+            # repeat).  Without per-corner altitudes the emitter
+            # can't enforce the same-XY → same-altitude invariant.
+            ring_elevs_input = s.node_altitudes
+            if ring_elevs_input is None:
+                ext_coords_open = list(poly.exterior.coords)
+                if (ext_coords_open
+                        and ext_coords_open[0] == ext_coords_open[-1]):
+                    ext_coords_open = ext_coords_open[:-1]
+                n_open = len(ext_coords_open)
+                if s.altitude is not None:
+                    ring_elevs_input = (
+                        [float(s.altitude)] * n_open
+                        + [float(s.altitude)])
+                elif (s.altitude_high is not None
+                      and s.altitude_low is not None
+                      and n_open == 4):
+                    eh = float(s.altitude_high)
+                    el = float(s.altitude_low)
+                    ring_elevs_input = [eh, el, el, eh, eh]
             ext_nids, ext_elevs = _ring_to_nids(
                 poly.exterior.coords,
-                s.node_altitudes)
+                ring_elevs_input)
             if ext_nids is None:
                 continue
             # Final validity check: rebuild the polygon from the
@@ -382,72 +461,83 @@ class PavementLayout:
                     continue
             except _GEOM_EXC:
                 continue
+            pending.append((s, ext_nids))
+
+        # ── Consensus pass ──────────────────────────────────────
+        # For each node id we now have every altitude any shape
+        # contributed.  The consensus altitude is the mean — used
+        # by the tag-writing pass below to enforce that every shape
+        # touching a node agrees on the corner's altitude.
+        node_id_to_consensus: Dict[int, Optional[float]] = {}
+        for nid, alts in node_id_to_alts.items():
+            if alts:
+                node_id_to_consensus[nid] = (
+                    sum(alts) / float(len(alts)))
+
+        def _corner_alt(nid: int) -> Optional[float]:
+            return node_id_to_consensus.get(nid)
+
+        # ── Tag-writing pass ────────────────────────────────────
+        # Each shape's altitude tags are derived from the consensus
+        # altitudes at its own corners.  Pattern detection picks
+        # the tightest tag form that preserves the per-corner
+        # values: all equal → flat ``altitude``; 4-corner rect
+        # matching [H, L, L, H] → ``altitude_high/low``; otherwise
+        # ``node_altitudes``.
+        _CANON_EQ_TOL = 0.05  # 5 cm — pattern-fit tolerance
+        for s, ext_nids in pending:
             tags = {
                 "aeroway": AEROWAY_FOR_ROLE.get(s.role, "taxiway"),
                 "role": s.role,
             }
             if s.ref:
                 tags["ref"] = s.ref
-            # Phase-2 elevation tags.  Sloped rects also carry
-            # cell_size + profile so X-Plane uses spline
-            # interpolation between the high and low short
-            # edges, matching the legacy auto-patch format.
-            #
-            # Per user 2026-05-14: runway segments should emit as
-            # altitude= (flat) or altitude_high+altitude_low
-            # (sloped 4-corner) rather than node_altitudes when
-            # their per-vertex profile collapses to the canonical
-            # [H, L, L, H] pattern.  ``seam_anchors`` converts
-            # the entire runway chain to node_altitudes when any
-            # one sub-rect has inserted seam vertices, so even
-            # the unmodified 4-corner segments carry per-vertex
-            # arrays here.  Detect the canonical pattern at the
-            # emit boundary and emit canonical tags so X-Plane
-            # reads them as proper sloped rects (cleaner downstream
-            # rendering and matches what the rest of the patch
-            # format expects for runway-role shapes).
-            n_corners = max(0, len(ext_nids) - 1)
-            canonical_tags: Optional[Dict[str, str]] = None
-            if (s.role == ROLE_RUNWAY
-                    and n_corners == 4
-                    and ext_elevs is not None
-                    and len(ext_elevs) == len(ext_nids)
-                    and len(ext_elevs) >= 5):
-                e = ext_elevs
-                _CANON_EQ_TOL = 0.05  # 5 cm
-                if (abs(e[0] - e[3]) < _CANON_EQ_TOL
-                        and abs(e[1] - e[2]) < _CANON_EQ_TOL
-                        and abs(e[0] - e[4]) < _CANON_EQ_TOL):
-                    eh = (e[0] + e[3]) / 2.0
-                    el = (e[1] + e[2]) / 2.0
-                    if abs(eh - el) >= 0.1:
-                        canonical_tags = {
-                            "altitude_high": f"{eh:.1f}",
-                            "altitude_low": f"{el:.1f}",
-                            "cell_size": "2",
-                            "profile": "spline",
-                        }
-                    else:
-                        canonical_tags = {
-                            "altitude": f"{(eh + el) / 2.0:.1f}",
-                        }
-            if canonical_tags is not None:
-                tags.update(canonical_tags)
-            elif s.altitude_high is not None and s.altitude_low is not None:
-                tags["altitude_high"] = f"{s.altitude_high:.1f}"
-                tags["altitude_low"] = f"{s.altitude_low:.1f}"
-                tags["cell_size"] = "2"
-                tags["profile"] = "spline"
-            elif (ext_elevs is not None
-                  and len(ext_elevs) == len(ext_nids)):
-                # Per-vertex elevation: comma-separated list, one
-                # value per ring nid (including the closing repeat).
-                # X-Plane mesh builder triangulates the polygon and
-                # interpolates linearly between vertex elevations.
-                tags["node_altitudes"] = ",".join(
-                    f"{e:.1f}" for e in ext_elevs)
-            elif s.altitude is not None:
-                tags["altitude"] = f"{s.altitude:.1f}"
+            # Closed ring includes the duplicate closing nid; per-
+            # corner consensus altitudes follow the same indexing.
+            corner_elevs = [_corner_alt(nid) for nid in ext_nids]
+            n_open = max(0, len(ext_nids) - 1)
+            have_all = (n_open >= 3
+                        and all(e is not None
+                                for e in corner_elevs[:n_open]))
+            if have_all:
+                open_alts = corner_elevs[:n_open]
+                all_min = min(open_alts)
+                all_max = max(open_alts)
+                # Try flat first.
+                if all_max - all_min <= _CANON_EQ_TOL:
+                    tags["altitude"] = (
+                        f"{sum(open_alts) / n_open:.1f}")
+                # Then 4-corner [H, L, L, H] sloping rect.
+                elif (n_open == 4
+                      and abs(open_alts[0] - open_alts[3])
+                              <= _CANON_EQ_TOL
+                      and abs(open_alts[1] - open_alts[2])
+                              <= _CANON_EQ_TOL
+                      and abs(open_alts[0] - open_alts[1]) > _CANON_EQ_TOL):
+                    eh = (open_alts[0] + open_alts[3]) / 2.0
+                    el = (open_alts[1] + open_alts[2]) / 2.0
+                    tags["altitude_high"] = f"{eh:.1f}"
+                    tags["altitude_low"] = f"{el:.1f}"
+                    tags["cell_size"] = "2"
+                    tags["profile"] = "spline"
+                else:
+                    # Per-corner values — including the closing
+                    # repeat — matching X-Plane's mesh builder
+                    # interpolation contract.
+                    tags["node_altitudes"] = ",".join(
+                        f"{e:.1f}" for e in corner_elevs)
+            else:
+                # No per-corner consensus available (no shape
+                # contributed altitudes to these nodes).  Fall
+                # back to the source shape's own tags.
+                if (s.altitude_high is not None
+                        and s.altitude_low is not None):
+                    tags["altitude_high"] = f"{s.altitude_high:.1f}"
+                    tags["altitude_low"] = f"{s.altitude_low:.1f}"
+                    tags["cell_size"] = "2"
+                    tags["profile"] = "spline"
+                elif s.altitude is not None:
+                    tags["altitude"] = f"{s.altitude:.1f}"
             way_blocks.append((next_wid[0], ext_nids, tags))
             next_wid[0] -= 1
         rel_blocks: List[Tuple[int, List[Tuple[int, str]],

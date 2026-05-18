@@ -27,6 +27,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from typing import List, Tuple
 
 import pytest
 from shapely.geometry import LineString, Point
@@ -83,11 +84,6 @@ pytestmark = pytest.mark.skipif(
 MAX_BOUNDARY_TO_CENTERLINE_M = 20.0
 BOUNDARY_SAMPLE_STEP_M = 5.0
 
-# Junction vertex cap: junction = incoming-corners + ≤ 4 trace per
-# arc (per shape-rule memory).  30 covers any realistic junction
-# even with 5 incoming arcs × max trace.
-MAX_JUNCTION_VERTICES = 30
-
 # Orphan neighbour vertices: zero, hard.  A neighbour vertex
 # touching a junction's perimeter line must coincide with one of
 # the junction's own ring vertices.
@@ -113,18 +109,6 @@ MAX_ORPHAN_NEIGHBOUR_VERTICES = 0
 # Airports without an explicit baseline use the default tight
 # value (zero offenders / hard cap) — those airports are still
 # fully gated by the original invariant.
-JUNCTION_VERTEX_REGRESSION_BASELINE = {
-    # SPJC: 12 junctions exceed the 30-vertex cap; worst = 340
-    # vertices (single mega-junction sprawling over the SE apron).
-    # Ground-truth target max is 36 — see test_compare_target_spjc.
-    # 2026-05-02: bumped 336 → 340 after Rule 1+2+3+4 enforcement
-    # adds a few snapped runway vertices to the central hub.  These
-    # are intentional per user 2026-05-01 (junction-runway 1:1
-    # sharing); the +4 vertex bump is the cost of exact node
-    # coincidence with the runway segments.
-    "SPJC": {"max_offenders": 12, "max_vertex_count": 340},
-}
-
 JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE = {
     # SPJC: all 43 junctions have boundary points > 20 m from
     # any centerline; worst is 566.8 m (at the same SE-apron
@@ -295,51 +279,83 @@ def test_junction_boundary_near_centerline(icao):
 
 
 @pytest.mark.parametrize("icao", _test_airports())
-def test_junction_vertex_count_bounded(icao):
-    """Per shape rule: junction = incoming-corners + ≤ 4 trace per
-    arc.  A junction with > ``MAX_JUNCTION_VERTICES`` vertices means
-    densification ran amok or boundary-trace exceeded the per-arc
-    cap.  At CYXY the -10070 regression had 80 vertices — ~45 from
-    long-edge densification midpoints, the rest from apt.dat
-    boundary trace.
+def test_junction_vertices_have_source(icao):
+    """Every junction vertex must originate from a geometric source:
+    a corner of an adjacent rect (sloping or runway), apron,
+    terminal, groundside, or boundary polygon.  Vertices without a
+    source are orphans added by densification or buffer rounding
+    and must be eliminated.
 
-    Per-airport regression baseline:
-    Airports listed in ``JUNCTION_VERTEX_REGRESSION_BASELINE``
-    have a known-bad ceiling (count + worst vertex count); the
-    test fails only if either exceeds the recorded value.  Other
-    airports are gated tightly (zero offenders).
+    This is the dual of ``test_junction_neighbour_corners_shared``:
+    that test asserts neighbour vertices within 1 m of a junction
+    perimeter coincide with junction vertices; this test asserts
+    junction vertices coincide with neighbour-shape corners.
+
+    Per user 2026-05-18: replaces the older "incoming-corners +
+    ≤ 4 trace per arc" vertex cap which reflected an obsolete
+    boundary-trace architecture.  Universal — no airport-specific
+    exemptions.
     """
+    from auto_patch.layout import SHARED_VERTEX_TOL_M
+
     layout = _build_layout(icao)
-    cap = MAX_JUNCTION_VERTICES
-    offenders = []
+
+    # Source shapes: anything that contributes a real geometric
+    # corner that a junction can legitimately anchor on.  Other
+    # junctions are excluded — two junctions sharing a vertex
+    # doesn't ground it in source geometry.
+    SOURCE_ROLES = {
+        "runway", "primary_parallel", "secondary_parallel",
+        "stub", "cross_connector",
+        "apron", "terminal", "groundside_pavement", "boundary",
+        "tunnel_ramp", "retaining_wall",
+    }
+    source_corners: List[Tuple[float, float]] = []
+    for s in layout.shapes:
+        if s.role not in SOURCE_ROLES:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except Exception:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        source_corners.extend(
+            (float(c[0]), float(c[1])) for c in coords)
+
+    if not source_corners:
+        pytest.skip(
+            f"{icao}: no source-shape corners to anchor junctions")
+
+    tol = SHARED_VERTEX_TOL_M
+    tol_sq = tol * tol
+
+    orphans: List[str] = []
     for idx, s in enumerate(layout.shapes):
         if s.role != "junction":
             continue
         if s.polygon is None or s.polygon.is_empty:
             continue
-        # Subtract the closing repeat.
-        n = len(s.polygon.exterior.coords) - 1
-        if n > cap:
-            offenders.append((n, _shape_label(layout, idx, s)))
-    offenders.sort(reverse=True)
-    summary = "; ".join(f"{lbl} verts={n}" for n, lbl in offenders[:5])
+        coords = list(s.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        for v_idx, (vx, vy) in enumerate(coords):
+            best_d_sq = min(
+                (cx - vx) ** 2 + (cy - vy) ** 2
+                for cx, cy in source_corners)
+            if best_d_sq > tol_sq:
+                d = math.sqrt(best_d_sq)
+                orphans.append(
+                    f"{_shape_label(layout, idx, s)} "
+                    f"vertex#{v_idx} at ({vx:.1f},{vy:.1f}) — "
+                    f"nearest source corner {d:.2f} m away")
 
-    baseline = JUNCTION_VERTEX_REGRESSION_BASELINE.get(icao)
-    if baseline:
-        n_off = len(offenders)
-        worst_n = offenders[0][0] if offenders else 0
-        assert n_off <= baseline["max_offenders"], (
-            f"{icao}: {n_off} junction polygon(s) exceed vertex cap "
-            f"{cap} — exceeds known-bad baseline of "
-            f"{baseline['max_offenders']}.  Top: {summary}.")
-        assert worst_n <= baseline["max_vertex_count"], (
-            f"{icao}: worst junction has {worst_n} vertices, "
-            f"exceeds known-bad baseline of "
-            f"{baseline['max_vertex_count']}.  Top: {summary}.")
-    else:
-        assert not offenders, (
-            f"{icao}: {len(offenders)} junction polygon(s) exceed "
-            f"vertex cap {cap}.  Top: {summary}.")
+    assert not orphans, (
+        f"{icao}: {len(orphans)} junction vertex(es) have no "
+        f"source-shape corner within {tol:.2f} m.  First 5:\n  "
+        + "\n  ".join(orphans[:5]))
 
 
 @pytest.mark.parametrize("icao", _test_airports())

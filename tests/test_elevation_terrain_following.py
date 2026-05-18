@@ -135,7 +135,9 @@ def test_cyxy_taxi_e_south_apron_follows_terrain():
 
 
 JUNCTION_MAX_GRADE = 0.015  # 1.5 %, matches FAA taxiway cap
-APRON_MAX_GRADE = 0.010     # 1.0 %, matches FAA apron cap
+APRON_MAX_GRADE = 0.015     # 1.5 % (user 2026-05-18): aligned with
+                              # the taxi cap so reclassified apron
+                              # shapes stay feasible.
 
 # Absolute rounding allowance for the within-junction grade audit.
 # Elevations are stored to 0.1 m precision, so a vertex pair can
@@ -206,8 +208,8 @@ WITHIN_SHAPE_GRADE_BASELINE: Dict[str, int] = {
     pytest.param("(no airports)", marks=pytest.mark.skip(
         reason="set O4_TEST_TILE=lat,lon or O4_TEST_AIRPORTS=ICAO,..."))])
 def test_within_junction_grade_compliance(icao):
-    """Junctions must satisfy ≤ 1.5 % Euclidean grade between any
-    pair of their vertices; aprons ≤ 1.0 %.
+    """Junctions and aprons must satisfy ≤ 1.5 % Euclidean grade
+    between any pair of their vertices.
 
     Per user 2026-05-03: junctions are multi-directional but still
     capped at 1.5 % from edge to edge in any direction.  An aircraft

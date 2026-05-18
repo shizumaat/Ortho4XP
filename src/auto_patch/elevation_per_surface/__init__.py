@@ -11,7 +11,7 @@ every connected vertex.  This violates the per-axis FAA grade rule:
   perpendicular to an unrelated surface like a parallel runway.
 * Junction / apron grade applies in any direction (multi-directional)
   within the polygon's surface, but not across to a different shape.
-* Terminals are flat; aprons follow terrain at 1.0 % grade.
+* Terminals are flat; aprons follow terrain at 1.5 % grade.
 * Only CIFP runway corners are immutable HARD anchors — terminals,
   aprons, and taxi rects can all adjust.
 

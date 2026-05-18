@@ -47,6 +47,7 @@ from .elevation import (
 from .layout import (
     BuiltShape,
     PavementLayout,
+    ROLE_APRON,
     ROLE_CROSS_CONNECTOR,
     ROLE_JUNCTION,
     ROLE_PRIMARY_PARALLEL,
@@ -2058,3 +2059,110 @@ def _absorb_rects_at_junction_perimeters(
     except _GEOM_EXC:
         pass
     return n_total
+
+
+# ── Apron reclassification ────────────────────────────────────────
+
+# Per user 2026-04-30 / 2026-05-18: a valid junction's pavement edge
+# always lies within ~one taxi-half-width of some converging
+# centerline.  A junction whose boundary strays farther contains
+# apron-territory pavement (no centerline running through it) and
+# should be reclassified as ``role=apron``.  Threshold matches
+# tests/test_junction_invariants.MAX_BOUNDARY_TO_CENTERLINE_M.
+_APRON_RECLASSIFY_MAX_DISTANCE_M = 20.0
+_APRON_RECLASSIFY_SAMPLE_STEP_M = 5.0
+
+
+def _aeroway_centerlines_union(layout: "PavementLayout"):
+    """Union of taxi + runway centerlines from layout shapes.
+
+    Taxi rects keep ``source_axis`` (the OSM centerline span the
+    rect was built from).  Runway segments don't carry
+    ``source_axis``; derive their long-axis from the 4 corners
+    (midpoints of the two short edges).
+    """
+    lines = []
+    for s in layout.shapes:
+        if s.source_axis is not None and not s.source_axis.is_empty:
+            lines.append(s.source_axis)
+            continue
+        if (s.role == ROLE_RUNWAY
+                and s.polygon is not None
+                and not s.polygon.is_empty):
+            try:
+                coords = list(s.polygon.exterior.coords)
+            except _GEOM_EXC:
+                continue
+            if coords and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            if len(coords) == 4:
+                a_mid = (0.5 * (coords[0][0] + coords[3][0]),
+                         0.5 * (coords[0][1] + coords[3][1]))
+                b_mid = (0.5 * (coords[1][0] + coords[2][0]),
+                         0.5 * (coords[1][1] + coords[2][1]))
+                lines.append(LineString([a_mid, b_mid]))
+    if not lines:
+        return None
+    try:
+        return unary_union(lines)
+    except _GEOM_EXC:
+        return None
+
+
+def _reclassify_apron_junctions(
+        layout: "PavementLayout",
+        icao: str = "",
+        cap_m: float = _APRON_RECLASSIFY_MAX_DISTANCE_M,
+        sample_step_m: float = _APRON_RECLASSIFY_SAMPLE_STEP_M,
+        ) -> int:
+    """Reclassify any junction whose boundary strays > ``cap_m``
+    from the nearest taxi/runway centerline as ``role=apron``.
+
+    The reclassification is geometric, not area-based: a 6-way
+    mega-intersection is a valid junction even when it's large,
+    but a pavement region without a centerline running through it
+    is apron territory regardless of size.
+
+    Returns the count of reclassified shapes.
+    """
+    centers = _aeroway_centerlines_union(layout)
+    if centers is None or centers.is_empty:
+        return 0
+    n_reclassified = 0
+    for s in layout.shapes:
+        if s.role != ROLE_JUNCTION:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            bnd = s.polygon.boundary
+            L = bnd.length
+        except _GEOM_EXC:
+            continue
+        if L <= 0:
+            continue
+        n_steps = max(2, int(L / sample_step_m) + 1)
+        max_d = 0.0
+        for i in range(n_steps):
+            u = min(L, i * sample_step_m)
+            try:
+                p = bnd.interpolate(u)
+                d = centers.distance(p)
+            except _GEOM_EXC:
+                continue
+            if d > max_d:
+                max_d = d
+                if max_d > cap_m:
+                    break
+        if max_d > cap_m:
+            s.role = ROLE_APRON
+            n_reclassified += 1
+    if n_reclassified:
+        try:
+            UI.vprint(1,
+                f"  [pav-builder] {icao}: reclassified "
+                f"{n_reclassified} junction(s) as apron "
+                f"(boundary > {cap_m:.0f} m from any centerline).")
+        except _GEOM_EXC:
+            pass
+    return n_reclassified

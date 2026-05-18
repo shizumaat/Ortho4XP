@@ -2311,6 +2311,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
         _split_sloped_rects_at_violations(layout, icao=icao)
         _snap_junction_vertices_to_rect_flat_edge_corners(layout)
 
+        # Apron reclassification (user 2026-05-18): a junction whose
+        # boundary strays > 20 m from any taxi/runway centerline
+        # contains apron-territory pavement (no centerline running
+        # through it) and should be tagged ``role=apron``.  Geometric,
+        # not area-based — a 6-way mega-intersection stays a junction.
+        from .junction_repair import _reclassify_apron_junctions
+        _reclassify_apron_junctions(layout, icao=icao)
+
         # Re-emit bridges instead of difference-clipping (user
         # 2026-05-16 canonical-node rewrite).  Drop stale bridges
         # and re-emit against final pavement state — every node

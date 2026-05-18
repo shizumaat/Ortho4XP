@@ -76,13 +76,12 @@ CAP_SWEEPS_PER_ITER = 5
 
 
 def _role_grade(role: str) -> float:
-    """Per-role max grade cap (user 2026-05-02):
-
-    * Runway, taxi rect, **junction**: 1.5 % (``TAXI_MAX_GRADE``).
-      Junctions are multi-directional but still capped at the
-      taxiway grade — they're transition zones a plane taxis across.
-    * Apron, terminal: 1.0 % (``APRON_MAX_GRADE``) — tighter FAA cap
-      for parking surfaces.
+    """Per-role max grade cap.  All roles now share ``TAXI_MAX_GRADE``
+    (1.5 %, user 2026-05-18): the apron-reclassification pipeline
+    pass folds true apron-territory pavement into ``ROLE_APRON``,
+    and the cap was relaxed from the FAA-1.0 % parking-surface limit
+    to match the taxiway cap so reclassified shapes don't trip the
+    solver / audit at every other vertex pair.
     """
     if role in (ROLE_RUNWAY, *SLOPING_RECT_ROLES, ROLE_JUNCTION):
         return TAXI_MAX_GRADE
