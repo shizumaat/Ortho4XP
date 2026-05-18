@@ -954,6 +954,13 @@ def build_airport_pavement(icao: str, xplane_root: str,
             f"  [pav-builder] {icao}: apt.dat has no taxi network; "
             f"using {len(osm_centerlines)} OSM aeroway-taxiway "
             f"centerline(s).")
+    # Preserve the full input centerline set for the apron-
+    # reclassification pass (junction_repair).  Surviving rect
+    # ``source_axis`` lines cover only the part of the network
+    # that emitted as taxi rects; centerlines absorbed into
+    # junction polygons or dropped during decomposition are no
+    # longer reachable from layout.shapes.
+    layout.apt_taxi_centerlines = list(osm_centerlines)
 
     # ── Terminal groundside-pavement subtraction (user 2026-04-29):
     # remove curbside / drop-off / parking pavement from pav_union

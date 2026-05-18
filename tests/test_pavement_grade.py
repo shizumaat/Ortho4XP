@@ -44,18 +44,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Soft cap on within-shape violations.  The check returns the UNION
-# of (1) vertex-pair grade violations along triangle edges AND
-# (2) planar-gradient violations (a triangle whose plane tilts
-# more than 1.5 % across its surface).  Most are long-thin and
-# sliver-triangle artefacts of ear-clipping the apron; cap is
-# calibrated to the current background so regressions trip the test.
-#
-# Per user 2026-05-16: extended to ``baseline_airports()`` so the
-# grade gate fires on every canonical baseline airport.  CYXY caps
-# recorded as the current state (post 2026-05-16 geometry fixes);
-# any improvement should tighten them.
-WITHIN_SHAPE_CAP = {"SPJC": 30, "SPLP": 30, "CYXY": 50}
+# Within-shape grade violations are a HARD failure (user 2026-05-18):
+# a vertex pair grading > 1.5 % within the same polygon means the
+# elevation solver produced an infeasible surface.  The fix is in
+# the solver / source geometry, not the test threshold.  Cap = 0
+# on every airport — no per-airport baselines, no soft cap.
+WITHIN_SHAPE_CAP = {"SPJC": 0, "SPLP": 0, "CYXY": 0}
 # Mid-edge step cap: every triangle plane should match its
 # neighbours' surface along shared boundaries.  Samples along each
 # edge and compares to the nearest other-shape edge's interpolation.
@@ -117,10 +111,11 @@ def test_pavement_grade(tmp_path, icao):
         f"{icao}: {len(steps)} edge/mid-edge steps > 0.5 m exceeds "
         f"cap {step_cap}.  Worst: {max(s.step_m for s in steps):.2f} "
         f"m step.")
-    # Soft cap — log warning if exceeded but still fail to surface
-    # regressions.
+    # Hard fail — within-shape grade violations indicate an
+    # infeasible elevation field; fix the solver / geometry, not
+    # the threshold.
     cap = WITHIN_SHAPE_CAP[icao]
     assert len(within) <= cap, (
         f"{icao}: {len(within)} within-shape grade/plane violations "
-        f"exceeds soft cap {cap}.  Worst: {within[0].grade_pct:.2f}% "
-        f"over {within[0].distance_m:.1f} m.")
+        f"(cap {cap}).  Worst: {within[0].grade_pct:.2f}% over "
+        f"{within[0].distance_m:.1f} m at {within[0].pt_a}.")

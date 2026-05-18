@@ -2063,25 +2063,40 @@ def _absorb_rects_at_junction_perimeters(
 
 # ── Apron reclassification ────────────────────────────────────────
 
-# Per user 2026-04-30 / 2026-05-18: a valid junction's pavement edge
-# always lies within ~one taxi-half-width of some converging
-# centerline.  A junction whose boundary strays farther contains
-# apron-territory pavement (no centerline running through it) and
-# should be reclassified as ``role=apron``.  Threshold matches
+# Per user 2026-04-30 / 2026-05-18: a junction whose boundary
+# strays > ``_APRON_RECLASSIFY_MAX_DISTANCE_M`` from the nearest
+# taxi/runway centerline contains apron-territory pavement and
+# should be reclassified as ``role=apron``.  Matches
 # tests/test_junction_invariants.MAX_BOUNDARY_TO_CENTERLINE_M.
 _APRON_RECLASSIFY_MAX_DISTANCE_M = 20.0
 _APRON_RECLASSIFY_SAMPLE_STEP_M = 5.0
 
 
 def _aeroway_centerlines_union(layout: "PavementLayout"):
-    """Union of taxi + runway centerlines from layout shapes.
+    """Union of every taxi + runway centerline known to the layout.
 
-    Taxi rects keep ``source_axis`` (the OSM centerline span the
-    rect was built from).  Runway segments don't carry
-    ``source_axis``; derive their long-axis from the 4 corners
-    (midpoints of the two short edges).
+    Sources, in priority order:
+
+    * ``layout.apt_taxi_centerlines`` — the full apt.dat / OSM
+      taxi network captured BEFORE rect-and-junction decomposition.
+      Centerlines that got absorbed into junction polygons survive
+      here even though they're no longer on any shape.  Without
+      this, a legitimate junction sitting on top of an absorbed
+      centerline would test as "no centerline within 20 m" and
+      get misflagged as apron.
+    * Surviving taxi rects' ``source_axis``.  Redundant with the
+      apt.dat set for most cases but catches OSM-only-derived
+      centerlines (custom packs without apt.dat row 1201/1202).
+    * Runway long-axes derived from each runway segment's 4 corners.
     """
     lines = []
+    apt_lines = getattr(layout, "apt_taxi_centerlines", None) or []
+    for item in apt_lines:
+        # apt.dat / OSM taxi extraction returns
+        # ``(LineString, name)`` tuples.
+        ln = item[0] if isinstance(item, tuple) else item
+        if ln is not None and not ln.is_empty:
+            lines.append(ln)
     for s in layout.shapes:
         if s.source_axis is not None and not s.source_axis.is_empty:
             lines.append(s.source_axis)
@@ -2122,6 +2137,13 @@ def _reclassify_apron_junctions(
     mega-intersection is a valid junction even when it's large,
     but a pavement region without a centerline running through it
     is apron territory regardless of size.
+
+    Centerline source is ``_aeroway_centerlines_union(layout)``,
+    which now includes the original apt.dat taxi-network lines
+    preserved on ``layout.apt_taxi_centerlines`` — without those,
+    centerlines absorbed into junction polygons during the rect /
+    junction decomposition would be missing from the union and
+    legitimate junctions would fail the boundary-distance test.
 
     Returns the count of reclassified shapes.
     """

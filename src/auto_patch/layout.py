@@ -174,6 +174,18 @@ class PavementLayout:
     # the bridge-detection step to walk the same scenery pack's
     # DSF and check for taxi-bridge OBJ placements.
     apt_dat_path: Optional[str] = None
+    # Full apt.dat taxi-network centerline set (preserved before
+    # rect / junction emission consumes some into absorbed
+    # polygons).  Used by the apron-reclassification pass to
+    # decide which junctions have a centerline running through
+    # them — surviving rect ``source_axis`` covers only ~40 % of
+    # the original centerlines at SPJC because the rest were
+    # absorbed into junction polygons, so the reclassification
+    # would otherwise misflag legitimate junctions as aprons.
+    # Stored as ``(LineString, name)`` tuples per
+    # ``apt_dat_reader.taxi_centerlines``.
+    apt_taxi_centerlines: List[Tuple[LineString, str]] = field(
+        default_factory=list)
 
     # ---- coordinate helpers ------------------------------------------
     def m_to_ll(self, x: float, y: float) -> Tuple[float, float]:

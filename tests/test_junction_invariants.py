@@ -157,41 +157,11 @@ def _build_layout(icao: str):
 
 
 def _aeroway_centerlines_m(layout):
-    """Union of taxi + runway centerlines available from
-    ``layout.shapes``.  Used as the "valid junction-boundary anchor"
-    set per the user 2026-04-30 rule.
-
-    Sources:
-      * Taxi rects keep ``source_axis`` (the OSM centerline span the
-        rect was built from).
-      * Runway segments are emitted as 4-corner rects without
-        ``source_axis``; we derive the long-axis from the corners.
-      * Junctions / terminals / aprons / bridges contribute nothing
-        — they're regions, not corridors.
+    """Delegate to the pipeline's centerlines helper so the test
+    and the reclassification pass agree on the centerline set.
     """
-    lines = []
-    for s in layout.shapes:
-        if s.source_axis is not None and not s.source_axis.is_empty:
-            lines.append(s.source_axis)
-            continue
-        if (s.role == "runway"
-                and s.polygon is not None
-                and not s.polygon.is_empty):
-            coords = list(s.polygon.exterior.coords)
-            if coords and coords[0] == coords[-1]:
-                coords = coords[:-1]
-            if len(coords) == 4:
-                a_mid = (0.5 * (coords[0][0] + coords[3][0]),
-                         0.5 * (coords[0][1] + coords[3][1]))
-                b_mid = (0.5 * (coords[1][0] + coords[2][0]),
-                         0.5 * (coords[1][1] + coords[2][1]))
-                lines.append(LineString([a_mid, b_mid]))
-    if not lines:
-        return None
-    try:
-        return unary_union(lines)
-    except Exception:
-        return None
+    from auto_patch.junction_repair import _aeroway_centerlines_union
+    return _aeroway_centerlines_union(layout)
 
 
 def _shape_label(layout, idx: int, s) -> str:
