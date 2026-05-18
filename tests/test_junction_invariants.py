@@ -27,7 +27,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import pytest
 from shapely.geometry import LineString, Point
@@ -76,12 +76,16 @@ pytestmark = pytest.mark.skipif(
 
 
 # Hard invariant thresholds — global, no per-airport relaxation.
-# Per user 2026-04-30: junction validity is a question of geometry,
-# not area.  A 6-way mega-intersection is a valid junction even
-# though it's large.  The invariant is "every boundary point lies
-# within ~one taxi-half-width of some converging centerline" — apron
-# mis-classifications break this; large valid junctions don't.
-MAX_BOUNDARY_TO_CENTERLINE_M = 20.0
+# Per user 2026-04-30 / 2026-05-18: junction validity is a question
+# of geometry, not area.  A 6-way mega-intersection is a valid
+# junction.  Threshold = 55 m to accommodate normal taxiway fillet
+# curves (apex sits ~22–50 m from the apt.dat straight-line
+# centerline at large airports).  Boundary points beyond that are
+# apron territory — there's no centerline running through them.
+# Must match
+# ``auto_patch.junction_repair._APRON_RECLASSIFY_MAX_DISTANCE_M``
+# so reclassification and the invariant test agree.
+MAX_BOUNDARY_TO_CENTERLINE_M = 55.0
 BOUNDARY_SAMPLE_STEP_M = 5.0
 
 # Orphan neighbour vertices: zero, hard.  A neighbour vertex
@@ -109,13 +113,7 @@ MAX_ORPHAN_NEIGHBOUR_VERTICES = 0
 # Airports without an explicit baseline use the default tight
 # value (zero offenders / hard cap) — those airports are still
 # fully gated by the original invariant.
-JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE = {
-    # SPJC: all 43 junctions have boundary points > 20 m from
-    # any centerline; worst is 566.8 m (at the same SE-apron
-    # mega-junction).  The 20 m threshold is tight for normal
-    # taxi-junction geometry but ours are apron-sized at SPJC.
-    "SPJC": {"max_offenders": 43, "max_distance_m": 567.0},
-}
+JUNCTION_BOUNDARY_DISTANCE_REGRESSION_BASELINE: Dict[str, dict] = {}
 
 # Per user 2026-05-16: the shared-sloping-edge rule is universal —
 # no airport-specific exemptions.  A sloping rect's sloping edge

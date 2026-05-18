@@ -279,12 +279,21 @@ def _clamp_junction_free_vertices(
                     for ei in grid[bucket]:
                         (s_other, ax, ay, bx, by,
                          ea, eb) = boundary_edges[ei]
+                        # Per user 2026-05-18: cross-shape grade
+                        # enforcement happens ONLY at shared corners
+                        # (via the OSM emitter's altitude-aware
+                        # vertex bucketing).  Two non-shared shapes
+                        # — a taxiway 70 m parallel to a runway, for
+                        # example — must be free to slope
+                        # independently along their own axes.
+                        # Restrict the clamp to same-junction edges
+                        # so cross-shape proximity doesn't impose a
+                        # phantom grade constraint.
+                        if s_other != si:
+                            continue
                         # Skip ONLY edges incident to THIS vertex —
                         # they trivially equal the vertex's own
-                        # elevation and would lock it in place.  All
-                        # other same-shape boundary edges DO
-                        # constrain it (the polygon's far-side
-                        # vertices, narrow-waist near-touches, etc.).
+                        # elevation and would lock it in place.
                         ek0, ek1 = edge_endpoints[ei]
                         if v_bucket == ek0 or v_bucket == ek1:
                             continue
@@ -451,20 +460,65 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
             new_shapes.append(s)
             continue
 
+        # Per user 2026-05-18: junctions slope ALONG converging
+        # centerlines only, not all-pair across the polygon.  Compute
+        # the worst grade as the max ALONG-AXIS grade across every
+        # centerline / runway long-axis passing through the polygon;
+        # cross-axial vertex pairs do NOT contribute.  Without this,
+        # the legacy all-pair check fires on legitimate bilinear
+        # junction slopes and drives the subdivide loop to chop
+        # valid junctions apart.
+        from shapely.geometry import Point as _PtSub
+        # Local import to dodge circular dep on the elevation module.
+        from .elevation_per_surface.unified_jacobi import (
+            _collect_junction_axes, JUNCTION_AXIS_PERP_TOL_M)
+        _axes_for_subdivide = _collect_junction_axes(layout, s.polygon)
+
         def _worst_grade(pts: List[Tuple[float, float]],
                          es: List[float]) -> Tuple[float,
                                                     Optional[Tuple[int, int]]]:
-            """Return (worst_grade, worst_pair_idx) over all
-            vertex pairs of ``pts`` within
-            SUBDIVIDE_MAX_PAIR_DIST_M and > 0.5 m apart.  The
-            distance floor is critical: < 0.5 m pairs are
-            essentially the same vertex with rounding noise
-            and produce huge spurious grades."""
+            """Worst per-axis grade across centerlines through the
+            junction.  Returns (grade, (i, j)) of the offending
+            vertex pair.  If no axes are found (centerline-less
+            junction — typically a future-apron pre-reclass), fall
+            back to all-pair Euclidean."""
             radius2 = SUBDIVIDE_MAX_PAIR_DIST_M ** 2
             min_d2 = 0.5 ** 2
             wg = 0.0
             wp = None
             m = len(pts)
+            if _axes_for_subdivide:
+                # Per-axis: for each axis, find near-axis vertices
+                # and check along-axis grade between them.
+                for axis in _axes_for_subdivide:
+                    near = []
+                    for a in range(m):
+                        p_a = _PtSub(pts[a][0], pts[a][1])
+                        try:
+                            along_a = axis.project(p_a)
+                            perp_a = axis.distance(p_a)
+                        except _GEOM_EXC:
+                            continue
+                        if perp_a <= JUNCTION_AXIS_PERP_TOL_M:
+                            near.append((a, along_a))
+                    for ia in range(len(near)):
+                        a, along_a = near[ia]
+                        ea = es[a]
+                        for ib in range(ia + 1, len(near)):
+                            b, along_b = near[ib]
+                            d_ = abs(along_a - along_b)
+                            if d_ < 0.5 or d_ * d_ > radius2:
+                                continue
+                            de_ = abs(ea - es[b])
+                            if de_ <= TAXI_MAX_GRADE * d_ + 0.10:
+                                continue
+                            g_ = de_ / d_
+                            if g_ > wg:
+                                wg = g_
+                                wp = (a, b)
+                return wg, wp
+            # Fallback: all-pair Euclidean for centerline-less
+            # junctions (will be reclassified to apron shortly).
             for a in range(m):
                 xa, ya = pts[a]
                 ea = es[a]
@@ -2063,12 +2117,19 @@ def _absorb_rects_at_junction_perimeters(
 
 # ── Apron reclassification ────────────────────────────────────────
 
-# Per user 2026-04-30 / 2026-05-18: a junction whose boundary
-# strays > ``_APRON_RECLASSIFY_MAX_DISTANCE_M`` from the nearest
-# taxi/runway centerline contains apron-territory pavement and
-# should be reclassified as ``role=apron``.  Matches
-# tests/test_junction_invariants.MAX_BOUNDARY_TO_CENTERLINE_M.
-_APRON_RECLASSIFY_MAX_DISTANCE_M = 20.0
+# Per user 2026-05-18: a junction whose boundary strays >
+# ``_APRON_RECLASSIFY_MAX_DISTANCE_M`` from the nearest taxi /
+# runway centerline contains apron-territory pavement and should
+# be reclassified as ``role=apron``.
+#
+# Threshold = 55 m.  Taxiway half-width is ~11.5 m and a normal
+# 90° fillet apex sits ~22 m from the centerline; large airport
+# fillets (SPJC mega-junctions, runway-taxi turn-off filleted to
+# match wide-body taxi paths) can extend up to ~50 m from the
+# straight-line apt.dat centerline.  55 m gives a small margin
+# above that while still clearly catching apron territory (which
+# extends 100 m+ from any centerline).
+_APRON_RECLASSIFY_MAX_DISTANCE_M = 55.0
 _APRON_RECLASSIFY_SAMPLE_STEP_M = 5.0
 
 

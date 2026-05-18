@@ -357,24 +357,86 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
 # ── Stage 3: edge construction (the per-axis rule lives here) ─────
 
 
+JUNCTION_AXIS_PERP_TOL_M = 15.0  # taxi half-width + small slack
+
+
+def _collect_junction_axes(layout, polygon):
+    """Return every centerline / runway long-axis that passes
+    through ``polygon`` — used by ``_build_edges`` to apply
+    per-axis grade constraints to a junction.
+
+    Sources:
+    * ``layout.apt_taxi_centerlines`` — full apt.dat taxi network.
+    * Each runway segment's long-axis (midpoints of its two short
+      edges), for runway-crossing junctions.
+    """
+    from shapely.geometry import LineString
+    axes = []
+    apt_lines = getattr(layout, "apt_taxi_centerlines", None) or []
+    for item in apt_lines:
+        ln = item[0] if isinstance(item, tuple) else item
+        if ln is None or ln.is_empty:
+            continue
+        try:
+            if polygon.intersects(ln):
+                axes.append(ln)
+        except _GEOM_EXC:
+            continue
+    for s2 in layout.shapes:
+        if s2.role != ROLE_RUNWAY:
+            continue
+        if s2.polygon is None or s2.polygon.is_empty:
+            continue
+        try:
+            if not polygon.intersects(s2.polygon):
+                continue
+            rc = list(s2.polygon.exterior.coords)
+        except _GEOM_EXC:
+            continue
+        if rc and rc[0] == rc[-1]:
+            rc = rc[:-1]
+        if len(rc) != 4:
+            continue
+        a_mid = (0.5 * (rc[0][0] + rc[3][0]),
+                 0.5 * (rc[0][1] + rc[3][1]))
+        b_mid = (0.5 * (rc[1][0] + rc[2][0]),
+                 0.5 * (rc[1][1] + rc[2][1]))
+        try:
+            axes.append(LineString([a_mid, b_mid]))
+        except _GEOM_EXC:
+            continue
+    return axes
+
+
 def _build_edges(layout, bucket_to_idx
                   ) -> Tuple[Dict[Tuple[int, int], float],
                              Dict[Tuple[int, int], float]]:
     """Build the unified graph's edge list with role-aware geometry.
 
-    For RECT roles: ring edges only (4 edges per polygon).  No
-    spatial pairs — the within-rect constraint is axial, not
-    cross-axial.
+    For RECT roles (taxi rects, runway segments): ring edges only.
+    The within-rect constraint is axial; cross-section flatness
+    groups handle the perpendicular dimension.
 
-    For JUNCTION / APRON / TERMINAL roles: ring edges + all-pair
-    Euclidean spatial edges within the polygon.  No radius cap —
-    every vertex pair on the same multi-directional surface is
-    constrained at the role's grade × Euclidean distance.
+    For JUNCTION: ring edges + per-axis grade edges.  For each
+    apt.dat taxi centerline or runway long-axis that passes
+    through the polygon, the vertices within
+    ``JUNCTION_AXIS_PERP_TOL_M`` perpendicular of the axis form
+    a group; edges between group members use the ALONG-AXIS
+    projected distance as the edge length.  Vertices not near any
+    axis are bound only by ring continuity.  Per user 2026-05-18:
+    a junction may slope in multiple directions along its
+    converging centerlines and 1.5 % is enforced ALONG each axis,
+    NOT cross-axially.
 
-    Per-edge cap = role's max grade × Euclidean length.  When two
-    shapes contribute to the same vertex pair (e.g. a shared edge),
-    the tighter cap wins.
+    For APRON / TERMINAL: ring edges + all-pair Euclidean spatial
+    edges.  Aprons must satisfy 1.5 % across the entire interior
+    surface (every-direction cap).
+
+    Per-edge cap = role's max grade × edge length.  When two
+    shapes contribute to the same vertex pair, the tighter cap
+    wins.
     """
+    from shapely.geometry import Point
     from auto_patch.elevation import _corner_elevation_bucket
     edge_grade: Dict[Tuple[int, int], float] = {}
     edge_length: Dict[Tuple[int, int], float] = {}
@@ -410,9 +472,52 @@ def _build_edges(layout, bucket_to_idx
             x2, y2 = coords[j]
             length = math.hypot(x2 - x1, y2 - y1)
             _add_edge(node_idx[i], node_idx[j], length, gr)
-        # Spatial pairs only for multi-directional roles.
+        # Rects / runways: ring-only, no spatial pairs.
         if s.role in SLOPING_RECT_ROLES or s.role == ROLE_RUNWAY:
             continue
+        if s.role == ROLE_JUNCTION:
+            # Per-axis edges: for each centerline through the
+            # polygon, find vertices within perpendicular tolerance,
+            # then add edges using along-axis projected distance.
+            # Vertices NOT near any axis (e.g. fillet apex points)
+            # are only constrained by ring continuity.
+            axes = _collect_junction_axes(layout, s.polygon)
+            if axes:
+                for axis in axes:
+                    # Project each vertex onto the axis; record
+                    # (along, perp) for vertices within the
+                    # perpendicular tolerance.
+                    near_axis: List[Tuple[int, float]] = []
+                    for i in range(m):
+                        p = Point(coords[i][0], coords[i][1])
+                        try:
+                            along = axis.project(p)
+                            perp = axis.distance(p)
+                        except _GEOM_EXC:
+                            continue
+                        if perp <= JUNCTION_AXIS_PERP_TOL_M:
+                            near_axis.append((i, along))
+                    # Add along-axis edges between every near-axis
+                    # pair.  Pairs that project to the same axis
+                    # position add no constraint from this axis;
+                    # another axis may constrain them.
+                    for a in range(len(near_axis)):
+                        i_a, along_a = near_axis[a]
+                        for b in range(a + 1, len(near_axis)):
+                            i_b, along_b = near_axis[b]
+                            d = abs(along_a - along_b)
+                            if d < 0.5:
+                                continue
+                            _add_edge(node_idx[i_a], node_idx[i_b],
+                                       d, gr)
+                continue
+            # Fall through: no centerline passes through this
+            # junction.  These are typically future aprons — the
+            # post-solver reclassification will catch them — but
+            # for the current solver pass we need SOME within-shape
+            # grade constraint, so treat as apron (all-pair
+            # Euclidean below).
+        # Apron / terminal: all-pair Euclidean.
         for i in range(m):
             xi, yi = coords[i]
             for j in range(i + 2, m):
