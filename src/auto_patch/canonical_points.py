@@ -32,8 +32,15 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Tuple
 
+from shapely.errors import GEOSException, TopologicalError
+from shapely.geometry import Polygon
 
-__all__ = ["CanonicalPointRegistry"]
+
+__all__ = ["CanonicalPointRegistry", "snap_polygon_through_registry"]
+
+
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 
 class CanonicalPointRegistry:
@@ -134,3 +141,52 @@ class CanonicalPointRegistry:
                         best_d = d
                         best = (px, py)
         return best
+
+
+def snap_polygon_through_registry(
+        poly: Optional[Polygon],
+        registry: Optional[CanonicalPointRegistry],
+) -> Optional[Polygon]:
+    """Route every vertex of ``poly``'s exterior + interior rings
+    through ``registry.get_or_add`` so drift introduced by
+    ``buffer(0)`` / ``unary_union`` / ``simplify`` resolves to
+    canonical (x, y) coordinates shared with adjacent shapes.
+
+    Returns the snapped polygon (a new ``Polygon`` if any vertex
+    moved, the input otherwise), or ``None`` if the snap produces
+    a degenerate shape.  If either input is ``None`` / empty, the
+    input is returned unchanged.
+    """
+    if registry is None or poly is None or poly.is_empty:
+        return poly
+
+    def _snap_ring(coords):
+        snapped = []
+        for x, y in coords:
+            cp = registry.get_or_add(float(x), float(y))
+            snapped.append(cp)
+        return snapped
+
+    try:
+        ext = _snap_ring(poly.exterior.coords)
+        if len(set(ext)) < 3:
+            return None
+        interiors = []
+        for ring in poly.interiors:
+            ri = _snap_ring(ring.coords)
+            if len(set(ri)) < 3:
+                continue
+            interiors.append(ri)
+        snapped_poly = Polygon(ext, interiors)
+        if not snapped_poly.is_valid:
+            snapped_poly = snapped_poly.buffer(0)
+            if (snapped_poly.is_empty
+                    or snapped_poly.geom_type not in (
+                        "Polygon", "MultiPolygon")):
+                return None
+            if snapped_poly.geom_type == "MultiPolygon":
+                snapped_poly = max(
+                    snapped_poly.geoms, key=lambda g: g.area)
+        return snapped_poly
+    except _GEOM_EXC:
+        return None

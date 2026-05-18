@@ -38,11 +38,18 @@ from .pavement.stubs import (
     _add_stub_to_runway_bridges,
     _clip_residue_at_stub_sloping_edges,
 )
+from .canonical_points import snap_polygon_through_registry
 from .pavement.union_helpers import _merge_near_touching
 from .pavement.vertices import (
     _enforce_shared_vertices,
     _validate_shared_vertex_invariant,
 )
+
+
+# Narrow exception tuple for shapely / numeric-geometry failure
+# modes.  Programming errors propagate so they surface immediately.
+_GEOM_EXC = (ValueError, TypeError,
+             GEOSException, TopologicalError, IndexError)
 
 # Narrow exception tuple for shapely / numeric-geometry failure
 # modes.  Programming errors propagate so they surface immediately.
@@ -247,6 +254,17 @@ def emit_junctions_and_finalize(layout, *, pav_union, emitted_taxi_rects,
                     continue
                 if (cleaned.geom_type != "Polygon"
                         or cleaned.is_empty
+                        or cleaned.area < MIN_JUNCTION_AREA_M2):
+                    continue
+                # Route every perimeter vertex through the canonical
+                # registry so any drift introduced by ``buffer(0)``
+                # validity repair (or by the upstream
+                # difference / decomposition) resolves to the same
+                # canonical (x, y) as the adjacent rect / runway /
+                # row-110 source point.  Per user 2026-05-18.
+                cleaned = snap_polygon_through_registry(
+                    cleaned, getattr(layout, "canonical_points", None))
+                if (cleaned is None or cleaned.is_empty
                         or cleaned.area < MIN_JUNCTION_AREA_M2):
                     continue
                 layout.shapes.append(BuiltShape(

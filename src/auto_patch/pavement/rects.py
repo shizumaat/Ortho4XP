@@ -111,23 +111,16 @@ def _build_taxi_rects(
     # / dedup classifier but no longer gates rect geometry.
     pav_non_rwy = pav_union
 
-    # Canonical-point registry (user 2026-05-18): every rect corner
-    # is resolved through a shared registry so adjacent rects
-    # converge on EXACT identical coordinates at intersection
-    # points.  Seeded with the apt.dat row-110 vertices + runway
-    # corners so the registry's "first wins" rule starts from the
-    # real input geometry, not from whichever rect happens to build
-    # first.  Without this registry, each rect snaps its corners
-    # to pav.boundary independently and lands at slightly different
-    # boundary points than its neighbour's corresponding corner —
-    # the cumulative drift drives ``buffer(0)`` validity repairs,
-    # sliver-corner removal, T-junction splits, and the
-    # vertex-source orphans observed downstream.
+    # Canonical-point registry: the pipeline builds + seeds the
+    # registry on ``layout.canonical_points`` BEFORE rect
+    # construction so every shape downstream resolves vertices
+    # through the same shared store.  When invoked from a context
+    # without a shared registry (tests / tools that call this
+    # function directly), build a local one seeded from pav_union
+    # + runway corners as a defensive fallback.
     if registry is None:
         registry = CanonicalPointRegistry(tol_m=SHARED_VERTEX_TOL_M)
-        # Seed with pav_union vertices.
         registry.seed(_pav_boundary_nodes(pav_union))
-        # Seed with runway corners.
         if rwy_union is not None and not rwy_union.is_empty:
             try:
                 for poly in (rwy_union.geoms

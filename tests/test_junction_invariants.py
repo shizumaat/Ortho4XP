@@ -306,6 +306,12 @@ def test_junction_vertices_have_source(icao):
 
     tol = SHARED_VERTEX_TOL_M
     tol_sq = tol * tol
+    # apt.dat row-110 boundary line: a junction vertex that sits
+    # ON a row-110 edge (between two row-110 vertices) is also a
+    # legitimate inheritance from the pavement union, not an
+    # orphan from densification / buffer drift.  Accept any
+    # junction vertex within ``tol`` of the boundary line.
+    pav_boundary = getattr(layout, "apt_pavement_boundary", None)
 
     orphans: List[str] = []
     for idx, s in enumerate(layout.shapes):
@@ -320,16 +326,27 @@ def test_junction_vertices_have_source(icao):
             best_d_sq = min(
                 (cx - vx) ** 2 + (cy - vy) ** 2
                 for cx, cy in source_corners)
-            if best_d_sq > tol_sq:
-                d = math.sqrt(best_d_sq)
-                orphans.append(
-                    f"{_shape_label(layout, idx, s)} "
-                    f"vertex#{v_idx} at ({vx:.1f},{vy:.1f}) — "
-                    f"nearest source corner {d:.2f} m away")
+            if best_d_sq <= tol_sq:
+                continue
+            # Fall back to row-110 boundary distance.
+            d = math.sqrt(best_d_sq)
+            if pav_boundary is not None:
+                try:
+                    d_b = pav_boundary.distance(Point(vx, vy))
+                except Exception:
+                    d_b = float("inf")
+                if d_b <= tol:
+                    continue
+                d = min(d, d_b)
+            orphans.append(
+                f"{_shape_label(layout, idx, s)} "
+                f"vertex#{v_idx} at ({vx:.1f},{vy:.1f}) — "
+                f"nearest source / pavement edge {d:.2f} m away")
 
     assert not orphans, (
         f"{icao}: {len(orphans)} junction vertex(es) have no "
-        f"source-shape corner within {tol:.2f} m.  First 5:\n  "
+        f"source-shape corner or pavement edge within "
+        f"{tol:.2f} m.  First 5:\n  "
         + "\n  ".join(orphans[:5]))
 
 

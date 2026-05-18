@@ -39,6 +39,7 @@ import O4_UI_Utils as UI
 _GEOM_EXC = (ValueError, TypeError,
              GEOSException, TopologicalError, IndexError)
 
+from .canonical_points import snap_polygon_through_registry
 from .elevation import (
     NEIGHBOUR_CLAMP_RADIUS_M,
     TAXI_MAX_GRADE,
@@ -718,7 +719,18 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
                 new_shapes.append(s)
                 continue
 
+        _registry = getattr(layout, "canonical_points", None)
         for sp, sub_pts, sub_elevs in validated_subs:
+            # Route through registry so the cut produces canonical
+            # corner coordinates shared with the parent ring's
+            # vertices (which are already in the registry).
+            if _registry is not None:
+                snapped_sp = snap_polygon_through_registry(
+                    sp, _registry)
+                if (snapped_sp is None or snapped_sp.is_empty
+                        or snapped_sp.geom_type != "Polygon"):
+                    continue
+                sp = snapped_sp
             sub_shape = BuiltShape(
                 polygon=sp, role=ROLE_JUNCTION, ref=s.ref)
             elev_range = max(sub_elevs) - min(sub_elevs)
@@ -734,7 +746,7 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
     return n_subdivided
 
 
-def _try_iso_elevation_cut(
+def _try_iso_elevation_cut(  # noqa: C901 (long helper, see body)
     s: "BuiltShape",
     ring: List[Tuple[float, float]],
     elevs: List[float],
@@ -1369,10 +1381,20 @@ def _split_sloped_rects_at_violations(
             if t_b - t_a < 0.02:
                 continue
             # Corners of this sub-rect: high at t_a, low at t_b.
-            sub_c0 = _interp_pt(c0, c1, t_a)
-            sub_c1 = _interp_pt(c0, c1, t_b)
-            sub_c2 = _interp_pt(c3, c2, t_b)
-            sub_c3 = _interp_pt(c3, c2, t_a)
+            # Route every interpolated corner through the canonical
+            # registry so it shares (x, y) with any junction vertex
+            # whose snap target lands on the same axial fraction
+            # below (``junction_moves`` step) — and so future
+            # passes see the same canonical coordinates.
+            _registry = getattr(layout, "canonical_points", None)
+            def _register(pt):
+                if _registry is None:
+                    return pt
+                return _registry.get_or_add(pt[0], pt[1])
+            sub_c0 = _register(_interp_pt(c0, c1, t_a))
+            sub_c1 = _register(_interp_pt(c0, c1, t_b))
+            sub_c2 = _register(_interp_pt(c3, c2, t_b))
+            sub_c3 = _register(_interp_pt(c3, c2, t_a))
             from shapely.geometry import Polygon
             try:
                 poly = Polygon([sub_c0, sub_c1, sub_c2, sub_c3,
@@ -1403,12 +1425,21 @@ def _split_sloped_rects_at_violations(
         # For each cluster, also move the originating junction
         # vertices onto the new sub-rect corner — whichever of the
         # two long-edge corners at parameter t is closer to each
-        # source vertex.  Without this, the junction vertex remains
-        # ~ ``on_edge_tol_m`` perpendicular off the new sub-rect's
-        # long edge (Test 2's Rule 2 violation pattern).
+        # source vertex.  Both corners go through the canonical
+        # registry first so junction-vertex moves land on the
+        # SAME canonical (x, y) that ``new_s.polygon`` already
+        # uses for its corners — shared-vertex by construction.
         for cluster_t, v_data_list in clusters:
-            corner_a = _interp_pt(c0, c1, cluster_t)
-            corner_b = _interp_pt(c3, c2, cluster_t)
+            corner_a_raw = _interp_pt(c0, c1, cluster_t)
+            corner_b_raw = _interp_pt(c3, c2, cluster_t)
+            if _registry is not None:
+                corner_a = _registry.get_or_add(
+                    corner_a_raw[0], corner_a_raw[1])
+                corner_b = _registry.get_or_add(
+                    corner_b_raw[0], corner_b_raw[1])
+            else:
+                corner_a = corner_a_raw
+                corner_b = corner_b_raw
             for (j_idx, v_idx, jx, jy) in v_data_list:
                 da = (jx - corner_a[0]) ** 2 + (jy - corner_a[1]) ** 2
                 db = (jx - corner_b[0]) ** 2 + (jy - corner_b[1]) ** 2
@@ -1452,6 +1483,17 @@ def _split_sloped_rects_at_violations(
                 continue
             if new_poly.geom_type == "MultiPolygon":
                 new_poly = max(new_poly.geoms, key=lambda g: g.area)
+            # Route the (possibly ``buffer(0)``-repaired) modified
+            # junction perimeter through the canonical registry so
+            # any drift from the Shapely repair resolves back to
+            # canonical coordinates shared with neighbours.
+            _reg2 = getattr(layout, "canonical_points", None)
+            if _reg2 is not None:
+                new_poly = snap_polygon_through_registry(
+                    new_poly, _reg2)
+                if (new_poly is None or new_poly.is_empty
+                        or new_poly.geom_type != "Polygon"):
+                    continue
             if new_poly.geom_type != "Polygon":
                 continue
         except _GEOM_EXC:
@@ -2040,6 +2082,20 @@ def _absorb_rects_at_junction_perimeters(
                     and new_j_poly.is_valid
                     and not new_j_poly.is_empty):
                 continue
+            # Route the unary_union output through the canonical
+            # registry: ``unary_union`` reorders / re-rounds
+            # vertices during merging and the result's perimeter
+            # vertices can drift mm-m off the input rect / junction
+            # corners that were originally registered.  Routing
+            # restores exact canonical coordinates so the extended
+            # junction still shares vertices with its neighbours.
+            _registry = getattr(layout, "canonical_points", None)
+            if _registry is not None:
+                new_j_poly = snap_polygon_through_registry(
+                    new_j_poly, _registry)
+                if (new_j_poly is None or new_j_poly.is_empty
+                        or new_j_poly.geom_type != "Polygon"):
+                    continue
             # Also register strip corners in alt_lookup.  Use the
             # NEAREST OLD junction vertex's altitude (a reasonable
             # approximation since the strip is adjacent to the

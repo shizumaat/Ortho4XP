@@ -195,6 +195,26 @@ class PavementLayout:
     # legitimate vertex sources rather than densification orphans.
     apt_pavement_vertices: List[Tuple[float, float]] = field(
         default_factory=list)
+    # Union of apt.dat row-110 pavement polygons' boundaries in
+    # meter space.  Junction perimeters that follow the row-110
+    # pavement edge can land at any point ALONG these segments
+    # (not only at the segment endpoints in
+    # ``apt_pavement_vertices``).  Captured here so the
+    # source-attribution test can recognise mid-edge points as
+    # legitimate inheritances from row-110 rather than orphan
+    # densification.
+    apt_pavement_boundary: Optional[
+        "shapely.geometry.base.BaseGeometry"] = None
+    # Canonical-point registry shared across every pass that creates
+    # or modifies a polygon vertex.  Per user 2026-05-18: each
+    # shared corner across multiple shapes must resolve to ONE
+    # canonical (x, y) — exact-equality coordinates — so
+    # ``pav_union.difference(rects)`` and the OSM emitter's vertex
+    # bucketing produce a single node ID per real-world meeting
+    # point.  See ``canonical_points.CanonicalPointRegistry`` and
+    # the rect-builder seeding in ``pipeline.py``.
+    canonical_points: Optional[
+        "CanonicalPointRegistry"] = None
 
     # ---- coordinate helpers ------------------------------------------
     def m_to_ll(self, x: float, y: float) -> Tuple[float, float]:

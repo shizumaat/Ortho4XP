@@ -252,18 +252,27 @@ def build_airport_pavement(icao: str, xplane_root: str,
     # vertices inherited from row-110 (junctions are built as
     # ``pav_union.difference(rects)`` — see junction_emit.py).
     _seen = set()
+    _boundary_lines = []
     for _p in pav_polys:
         try:
             rings = [_p.exterior, *_p.interiors]
         except _GEOM_EXC:
             continue
         for _r in rings:
+            _boundary_lines.append(_r)
             for _x, _y in _r.coords:
                 _key = (round(_x, 2), round(_y, 2))
                 if _key in _seen:
                     continue
                 _seen.add(_key)
                 layout.apt_pavement_vertices.append((float(_x), float(_y)))
+    # Also store the boundary line union so mid-edge points count
+    # as legitimate row-110 inheritances.
+    if _boundary_lines:
+        try:
+            layout.apt_pavement_boundary = unary_union(_boundary_lines)
+        except _GEOM_EXC:
+            layout.apt_pavement_boundary = None
 
     # ── Runway shoulder absorption ─────────────────────────────────
     # Long thin row-110 polygons parallel to a runway and touching
@@ -1740,11 +1749,39 @@ def build_airport_pavement(icao: str, xplane_root: str,
         pav_union=pav_union, rwy_union=layout.runway_union,
         rwy_centerlines=rwy_centerlines)
 
+    # ── Canonical-point registry (user 2026-05-18) ────────────────
+    # Build the shared registry now, before any rect / junction
+    # construction, and store on the layout so every downstream
+    # pass that creates or modifies a polygon vertex resolves
+    # through it.  Seeded with apt.dat row-110 pavement vertices
+    # and runway corners — the immutable input geometry — so the
+    # registry's "first wins" rule starts from real apt.dat data
+    # rather than from whichever rect happens to register first.
+    from .canonical_points import CanonicalPointRegistry
+    from .layout import SHARED_VERTEX_TOL_M
+    layout.canonical_points = CanonicalPointRegistry(
+        tol_m=SHARED_VERTEX_TOL_M)
+    layout.canonical_points.seed(layout.apt_pavement_vertices)
+    if layout.runway_union is not None and not layout.runway_union.is_empty:
+        try:
+            _ru = layout.runway_union
+            for _rp in (_ru.geoms
+                        if _ru.geom_type == "MultiPolygon" else [_ru]):
+                if _rp.geom_type != "Polygon":
+                    continue
+                _ext = list(_rp.exterior.coords)
+                if _ext and _ext[0] == _ext[-1]:
+                    _ext = _ext[:-1]
+                layout.canonical_points.seed(_ext)
+        except _GEOM_EXC:
+            pass
+
     # ── Build taxi rects from centerlines ────────────────────────
     taxi_rects = _build_taxi_rects(
         osm_centerlines, pav_union, layout.runway_union,
         rwy_centerlines, apt_vertices=apt_pav_vertices,
-        ref_overall_bearings=ref_overall_bearings)
+        ref_overall_bearings=ref_overall_bearings,
+        registry=layout.canonical_points)
 
     # Filter stubs by user's runway-connection rule: a stub rect is
     # kept only if its OSM centerline reaches a runway.  Stubs whose
