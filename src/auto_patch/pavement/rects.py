@@ -33,12 +33,14 @@ from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import nearest_points, unary_union
 
+from ..canonical_points import CanonicalPointRegistry
 from ..config import MIN_SEGMENT_LEN_M
 from ..layout import (
     ROLE_CROSS_CONNECTOR,
     ROLE_PRIMARY_PARALLEL,
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
+    SHARED_VERTEX_TOL_M,
 )
 
 # Narrow exception tuple for shapely / numeric-geometry failure
@@ -74,6 +76,7 @@ def _build_taxi_rects(
     rwy_centerlines: List[LineString],
     apt_vertices: Optional[List[Tuple[float, float]]] = None,
     ref_overall_bearings: Optional[Dict[str, float]] = None,
+    registry: Optional[CanonicalPointRegistry] = None,
 ) -> List[Tuple[Polygon, LineString, str, str]]:
     """Convert each usable centerline into a 4-vertex rect.
 
@@ -107,6 +110,37 @@ def _build_taxi_rects(
     # uses.  The ``rwy_union`` parameter is retained for the role
     # / dedup classifier but no longer gates rect geometry.
     pav_non_rwy = pav_union
+
+    # Canonical-point registry (user 2026-05-18): every rect corner
+    # is resolved through a shared registry so adjacent rects
+    # converge on EXACT identical coordinates at intersection
+    # points.  Seeded with the apt.dat row-110 vertices + runway
+    # corners so the registry's "first wins" rule starts from the
+    # real input geometry, not from whichever rect happens to build
+    # first.  Without this registry, each rect snaps its corners
+    # to pav.boundary independently and lands at slightly different
+    # boundary points than its neighbour's corresponding corner —
+    # the cumulative drift drives ``buffer(0)`` validity repairs,
+    # sliver-corner removal, T-junction splits, and the
+    # vertex-source orphans observed downstream.
+    if registry is None:
+        registry = CanonicalPointRegistry(tol_m=SHARED_VERTEX_TOL_M)
+        # Seed with pav_union vertices.
+        registry.seed(_pav_boundary_nodes(pav_union))
+        # Seed with runway corners.
+        if rwy_union is not None and not rwy_union.is_empty:
+            try:
+                for poly in (rwy_union.geoms
+                             if rwy_union.geom_type == "MultiPolygon"
+                             else [rwy_union]):
+                    if poly.geom_type != "Polygon":
+                        continue
+                    ext = list(poly.exterior.coords)
+                    if ext and ext[0] == ext[-1]:
+                        ext = ext[:-1]
+                    registry.seed(ext)
+            except _GEOM_EXC:
+                pass
 
     centerlines = sorted(centerlines, key=lambda x: -x[0].length)
 
@@ -162,7 +196,8 @@ def _build_taxi_rects(
 
         width = 2.0 * trim_narrow_hw
         rect = _rect_from_axis_extended(trimmed, width, pav_non_rwy,
-                                        apt_vertices=apt_vertices)
+                                        apt_vertices=apt_vertices,
+                                        registry=registry)
         # Diagonal-stub fallback (user 2026-05-12): when the strict
         # symmetric-rect builder rejects a digit-ref centerline whose
         # bearing is diagonal to the runway, retry with
@@ -183,7 +218,8 @@ def _build_taxi_rects(
                 rect = _rect_from_axis_extended(
                     trimmed, width, pav_non_rwy,
                     apt_vertices=apt_vertices,
-                    accept_asymmetric=True)
+                    accept_asymmetric=True,
+                    registry=registry)
         if rect is None or rect.is_empty:
             continue
         # Skip invalid rects (self-intersecting after snap).
@@ -1012,6 +1048,8 @@ def _rect_from_axis_extended(axis: LineString, width: float,
                             apt_vertices: Optional[
                                 List[Tuple[float, float]]] = None,
                             accept_asymmetric: bool = False,
+                            registry: Optional[
+                                CanonicalPointRegistry] = None,
                             ) -> Optional[Polygon]:
     """Build a rect around the axis at its first-to-last direction.
 
@@ -1085,7 +1123,7 @@ def _rect_from_axis_extended(axis: LineString, width: float,
             (p1[0] - px * half, p1[1] - py * half),   # 3: end1 side2
         ]
         snapped = _snap_corners_to_pavement(
-            corners, pav, apt_vertices)
+            corners, pav, apt_vertices, registry=registry)
         if snapped is None:
             # Degenerate rect (≥2 corners collapsed within 1 m of
             # each other after snap).  Stop iterating — further
@@ -1205,36 +1243,37 @@ def _snap_corners_to_pavement(
     corners: List[Tuple[float, float]],
     pav: Polygon,
     apt_vertices: Optional[List[Tuple[float, float]]] = None,
+    registry: Optional[CanonicalPointRegistry] = None,
 ) -> Optional[List[Tuple[float, float]]]:
-    """Snap each rect corner to ``pav.boundary``.  Per user
-    2026-05-05:
+    """Snap each rect corner to ``pav.boundary`` and resolve
+    through the canonical-point registry.
 
-      * Snap to nearest boundary point first (no radius cap on the
-        boundary projection — corners far from any boundary still
-        snap in).
-      * Then prefer a pav.boundary VERTEX within
-        ``PAV_NODE_PREFER_RADIUS_M`` of the boundary-snapped point;
-        if a vertex is close, use it instead so the corner shares
-        an exact node with pav.
+    Per user 2026-05-18:
+
+    1. Project the input corner to the nearest ``pav.boundary``
+       point.
+    2. Resolve the boundary point through the canonical-point
+       registry: ``get_or_add`` returns the existing canonical
+       point within ``SHARED_VERTEX_TOL_M`` if one exists, else
+       inserts the boundary point as a new canonical entry.
+
+    Result: every rect built in the same pipeline pass converges
+    on EXACT identical coordinates at the same intersection.  Two
+    rects approaching the same physical corner from different
+    centerlines get the EXACT same (x, y), so adjacent rects
+    share vertices and ``pav_union.difference(rects)`` inherits
+    those shared positions on the junction perimeter.  No
+    ``buffer(0)`` repairs needed downstream.
 
     Per user 2026-05-11: this function does NOT decide whether a
     rect "should be emitted at all" — that's the absorption pass's
-    job (``_drop_primary_parallels_embedded_in_pavement``), which
-    applies the authoritative long-edge-adjacent ruleset (probe
-    each long edge at 5 m steps, absorb runs ≥ 10 % of axial
-    length, keep ≥ 30 m surviving fragments).  An earlier
-    apron-interior reject here short-circuited the absorption
-    ruleset before it ran — every centerline whose natural corners
-    sat deep inside pavement got dropped, even legitimate taxi
-    corridors running through wide apron pavement (e.g. CYXY's G
-    parallel).  Always snap.  Apron-interior fragments are
-    discarded downstream by the kept-fragment guard inside
-    absorption (``n_off == 4 and max_off > 5.0``) once the
-    splitting rule has decided what survives.
+    job (``_drop_primary_parallels_embedded_in_pavement``).
+    Always snap.  Apron-interior fragments are discarded
+    downstream by the absorption kept-fragment guard.
 
     Returns ``None`` only for genuine geometric degeneracy: when
     the snap collapses two corners onto near-identical points
-    (within 1 m), producing a degenerate quadrilateral.
+    (within 1 m).
     """
     boundary = pav.boundary
     pav_nodes = _pav_boundary_nodes(pav)
@@ -1243,7 +1282,19 @@ def _snap_corners_to_pavement(
         p = Point(cx, cy)
         near, _ = nearest_points(boundary, p)
         boundary_pt = (float(near.x), float(near.y))
+        # Layer 1: prefer a pav.boundary vertex within
+        # ``PAV_NODE_PREFER_RADIUS_M`` (5 m) of the projection.
+        # Keeps the long-standing snap-to-row-110-vertex behavior.
         prefered = _prefer_pav_node(boundary_pt, pav_nodes)
+        # Layer 2: route through the canonical-point registry at
+        # ``SHARED_VERTEX_TOL_M`` (0.5 m) so two rects whose corners
+        # snap to within sub-metre distance of each other converge
+        # on the EXACT same coordinates.  Combined with Layer 1's
+        # vertex preference, rect corners at multi-rect intersections
+        # share canonical coordinates whether the intersection has
+        # a row-110 vertex or not.
+        if registry is not None:
+            prefered = registry.get_or_add(prefered[0], prefered[1])
         snapped.append(prefered)
     # Reject degenerate rects where two corners collapsed onto the
     # same point (within 1 m).
