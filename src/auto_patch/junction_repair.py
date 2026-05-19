@@ -2247,36 +2247,17 @@ def _reclassify_apron_junctions(
                 if max_d > cap_m:
                     break
         if max_d > cap_m:
+            # Role-only change.  Per user 2026-05-18: aprons keep
+            # per-corner ``node_altitudes`` (NOT a flat single
+            # altitude); the solver already constrained the field
+            # to 1.5 %.  Earlier flatten-on-reclass version averaged
+            # each apron independently — adjacent aprons sharing a
+            # corner (same canonical solver node, identical
+            # altitude) ended up at different averages (each
+            # apron's own mean), creating 4-8 m cliffs at shared
+            # corners.  Preserving the solver's per-corner output
+            # keeps shared corners consistent.
             s.role = ROLE_APRON
-            # Per user 2026-05-18: aprons must satisfy 1.5 %
-            # within-shape across the entire interior surface,
-            # AND the solver's apron writeback flattens to a
-            # single altitude (mean of corner elevations).
-            # Junctions write per-corner ``node_altitudes`` so
-            # a shape reclassified after the solver would otherwise
-            # keep its per-corner field — which inherits the row-110
-            # / runway-anchor elevation variation that motivated
-            # the apron tag in the first place.  Flatten now to
-            # the corner-mean so the new apron actually satisfies
-            # its all-pair 1.5 % rule (zero variation → 0 % grade
-            # trivially under cap).  Adjacent rect / junction
-            # neighbours that shared corners with this junction
-            # have to absorb the corner-elevation change at
-            # their own end (per user: apron 1.5 % cap wins).
-            if s.node_altitudes:
-                _alts = [float(a) for a in s.node_altitudes[:-1]]
-                if _alts:
-                    s.altitude = round(
-                        sum(_alts) / len(_alts), 1)
-                    s.altitude_high = None
-                    s.altitude_low = None
-                    s.node_altitudes = None
-            elif (s.altitude_high is not None
-                  and s.altitude_low is not None):
-                s.altitude = round(
-                    0.5 * (s.altitude_high + s.altitude_low), 1)
-                s.altitude_high = None
-                s.altitude_low = None
             n_reclassified += 1
     if n_reclassified:
         try:
