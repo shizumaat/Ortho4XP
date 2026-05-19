@@ -114,8 +114,6 @@ def solve(layout, icao: str,
     layout values (or backfill from nearest HARD), which collapses
     DEM-elevated terrain to runway level.
     """
-    from auto_patch.elevation import _corner_elevation_bucket
-
     t_start = _time.time()
     nodes, bucket_to_idx = _build_node_list(layout)
     if not nodes:
@@ -154,32 +152,6 @@ def solve(layout, icao: str,
 # ── Stage 1: build node list ──────────────────────────────────────
 
 
-def _solver_key(layout, x, y):
-    """Return the canonical-point key for (x, y) under the layout's
-    shared registry.
-
-    The original discrete-bucket key
-    ``_corner_elevation_bucket`` = ``(int(round(x/0.5)), int(round(y/0.5)))``
-    suffered from edge-of-bucket aliasing: two corners 0.002 m
-    apart could land in adjacent buckets (different solver nodes
-    → independent altitudes) even though the OSM emit round-trip
-    treats them as coincident.
-
-    With a layout-attached ``canonical_points`` registry, route
-    every solver key through ``registry.get_or_add`` so vertices
-    within ``SHARED_VERTEX_TOL_M`` proximity collapse to the same
-    canonical (x, y) regardless of which discrete bucket they
-    would have landed in.  Falls back to the legacy bucket when
-    no registry is attached (defensive, mainly for tests that
-    drive the solver outside the pipeline).
-    """
-    reg = getattr(layout, "canonical_points", None)
-    if reg is not None:
-        return reg.get_or_add(float(x), float(y))
-    from auto_patch.elevation import _corner_elevation_bucket
-    return _corner_elevation_bucket(x, y)
-
-
 def _build_node_list(layout):
     """Assign one node index per unique canonical point across all
     pavement-role shapes.  Returns ``(nodes, bucket_to_idx)`` —
@@ -199,7 +171,7 @@ def _build_node_list(layout):
         except _GEOM_EXC:
             continue
         for x, y in coords:
-            k = _solver_key(layout, x, y)
+            k = layout.canonical_points.get_or_add(float(x), float(y))
             if k not in bucket_to_idx:
                 bucket_to_idx[k] = len(nodes)
                 nodes.append((float(x), float(y)))
@@ -229,7 +201,6 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
     anchors only where the per-edge grade cap is exceeded.
     """
     from auto_patch.elevation import _sample_dem
-    from auto_patch.elevation import _corner_elevation_bucket
     n = len(nodes)
     elev: List[float] = [0.0] * n
     is_hard: List[bool] = [False] * n
@@ -285,7 +256,7 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
             else:
                 continue
             for (x, y), a in zip(coords, per):
-                k = _solver_key(layout, x, y)
+                k = layout.canonical_points.get_or_add(float(x), float(y))
                 idx = bucket_to_idx.get(k)
                 if idx is None:
                     continue
@@ -323,7 +294,7 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
                 seam_bk = (int(round(x * bk_s)), int(round(y * bk_s)))
                 if seam_bk not in seam_keys:
                     continue
-                k = _solver_key(layout, x, y)
+                k = layout.canonical_points.get_or_add(float(x), float(y))
                 idx = bucket_to_idx.get(k)
                 if idx is None:
                     continue
@@ -352,7 +323,7 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
         else:
             continue
         for (x, y), a in zip(coords, per):
-            k = _solver_key(layout, x, y)
+            k = layout.canonical_points.get_or_add(float(x), float(y))
             idx = bucket_to_idx.get(k)
             if idx is None or is_hard[idx] or have_initial[idx]:
                 continue
@@ -476,7 +447,6 @@ def _build_edges(layout, bucket_to_idx
     wins.
     """
     from shapely.geometry import Point
-    from auto_patch.elevation import _corner_elevation_bucket
     edge_grade: Dict[Tuple[int, int], float] = {}
     edge_length: Dict[Tuple[int, int], float] = {}
 
@@ -502,7 +472,7 @@ def _build_edges(layout, bucket_to_idx
             continue
         gr = _role_grade(s.role)
         m = len(coords)
-        node_idx = [bucket_to_idx.get(_solver_key(layout, x, y))
+        node_idx = [bucket_to_idx.get(layout.canonical_points.get_or_add(float(x), float(y)))
                     for x, y in coords]
         # Ring edges (every shape).
         for i in range(m):
@@ -585,7 +555,7 @@ def _build_rect_cross_section_groups(layout, bucket_to_idx):
             idxs = []
             for i in pair:
                 if 0 <= i < len(coords):
-                    k = _solver_key(layout, *coords[i])
+                    k = layout.canonical_points.get_or_add(float(coords[i][0]), float(coords[i][1]))
                     if k in bucket_to_idx:
                         idxs.append(bucket_to_idx[k])
             if len(idxs) >= 2 and idxs[0] != idxs[1]:
@@ -597,7 +567,6 @@ def _build_terminal_groups(layout, bucket_to_idx):
     """Each terminal contributes one group of node indices that
     must share a single elevation (the flatness constraint).
     """
-    from auto_patch.elevation import _corner_elevation_bucket
     groups: List[List[int]] = []
     for s in layout.shapes:
         if s.role != ROLE_TERMINAL:
@@ -607,7 +576,7 @@ def _build_terminal_groups(layout, bucket_to_idx):
         coords = _open_ring(list(s.polygon.exterior.coords))
         idxs = []
         for x, y in coords:
-            k = _solver_key(layout, x, y)
+            k = layout.canonical_points.get_or_add(float(x), float(y))
             if k in bucket_to_idx:
                 idxs.append(bucket_to_idx[k])
         if len(idxs) >= 2:
@@ -852,7 +821,7 @@ def _writeback(layout, elev, bucket_to_idx):
 def _read_corner_elevs(coords_open, elev, bucket_to_idx, layout=None):
     out = []
     for x, y in coords_open:
-        idx = bucket_to_idx.get(_solver_key(layout, x, y))
+        idx = bucket_to_idx.get(layout.canonical_points.get_or_add(float(x), float(y)))
         if idx is None:
             return None
         out.append(elev[idx])
