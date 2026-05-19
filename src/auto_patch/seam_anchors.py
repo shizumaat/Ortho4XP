@@ -386,12 +386,20 @@ def _insert_seam_vertices(
         cut_lines: List[LineString],
         anchor_keys: Set[Tuple[int, int]]) -> Optional[BuiltShape]:
     """Insert intersection points of cut_lines with the shape's
-    exterior ring, return a new BuiltShape with ``node_altitudes`` set.
+    exterior ring, return a new BuiltShape with seam vertices added.
 
-    The new vertices' altitudes are placeholders (0.0); Phase-2 sets
-    them to ``dem.alt_strict``.  Existing-vertex altitudes are
-    preserved (sloped rect → unpacked via [H, L, L, H] convention;
-    flat → broadcast; per-vertex → carried through).
+    Inserted-vertex altitudes are interpolated from the bracketing
+    original-vertex altitudes; Phase-2 then overwrites them with
+    ``dem.alt_strict`` at the recorded anchor keys.  Existing-vertex
+    altitudes are preserved (sloped rect → unpacked via [H, L, L, H]
+    convention; flat → broadcast; per-vertex → carried through).
+
+    When the shape arrives with no altitude representation at all —
+    the corner-clip fallback path from
+    ``_split_taxi_rect_at_seams`` for a taxi rect awaiting solver
+    assignment — geometric vertices and anchor keys are still
+    inserted/recorded, but ``node_altitudes`` is left ``None`` on
+    the returned shape.  The solver assigns altitudes downstream.
     """
     poly = shape.polygon
     ring = list(poly.exterior.coords)
@@ -401,7 +409,17 @@ def _insert_seam_vertices(
     if n_orig < 3:
         return None
 
-    # Determine the original per-vertex altitudes.
+    # Determine the original per-vertex altitudes.  ``old_alts`` is
+    # ``None`` when the shape has no altitude representation yet —
+    # taxi rects awaiting solver assignment (see
+    # ``_split_taxi_rect_at_seams`` docstring) that fell through to
+    # this function via the corner-clip fallback path.  In that case
+    # we still insert geometric seam vertices and record anchor keys
+    # for the solver's HARD-anchor pass; we just don't fabricate
+    # altitudes (the previous ``[0.0] * n_orig`` placeholder produced
+    # silent sea-level cliffs whenever Phase 2 didn't cover the
+    # affected vertices — e.g. the MMOX boundary-bridge 1000 m drop).
+    old_alts: Optional[List[float]]
     if shape.node_altitudes:
         old_alts = list(shape.node_altitudes[:n_orig])
         if len(old_alts) < n_orig:
@@ -418,14 +436,13 @@ def _insert_seam_vertices(
     elif shape.altitude is not None:
         old_alts = [float(shape.altitude)] * n_orig
     else:
-        # No elevation data yet — Phase 2 will fill all altitudes.
-        old_alts = [0.0] * n_orig
+        old_alts = None
 
     # Walk each edge, find intersections with each cut line, insert in
     # parametric order.  Track which inserted vertices are seam-anchored
     # AND which existing vertices sit on a seam.
     new_ring: List[Tuple[float, float]] = []
-    new_alts: List[float] = []
+    new_alts: Optional[List[float]] = [] if old_alts is not None else None
     inserted_idxs: List[int] = []
     existing_on_seam: List[int] = []  # indices in new_ring of original
                                        # ring vertices that lie on a seam
@@ -434,7 +451,8 @@ def _insert_seam_vertices(
         p1 = ring[i]
         p2 = ring[(i + 1) % n_orig]
         new_ring.append(p1)
-        new_alts.append(old_alts[i])
+        if new_alts is not None and old_alts is not None:
+            new_alts.append(old_alts[i])
         edge = LineString([p1, p2])
         edge_len = edge.length
         if edge_len < 1e-6:
@@ -466,13 +484,13 @@ def _insert_seam_vertices(
                 continue
             ips.append((t, pt))
         ips.sort(key=lambda x: x[0])
-        a1 = old_alts[i]
-        a2 = old_alts[(i + 1) % n_orig]
         for t, pt in ips:
-            interp_alt = a1 + t * (a2 - a1)
             inserted_idxs.append(len(new_ring))
             new_ring.append(pt)
-            new_alts.append(interp_alt)
+            if new_alts is not None and old_alts is not None:
+                a1 = old_alts[i]
+                a2 = old_alts[(i + 1) % n_orig]
+                new_alts.append(a1 + t * (a2 - a1))
             anchor_keys.add(_bucket_key(pt[0], pt[1]))
 
     if not inserted_idxs and not existing_on_seam:
@@ -491,7 +509,15 @@ def _insert_seam_vertices(
     except _GEOM_EXC:
         return None
     # node_altitudes carries the CLOSING repeat per layout convention.
-    closed_alts = new_alts + [new_alts[0]]
+    # When the input had no altitude rep (taxi-rect awaiting solver),
+    # leave node_altitudes=None so the solver assigns; the geometric
+    # vertices and anchor keys recorded above are still enough for
+    # cross-tile parity and HARD-anchoring.
+    closed_alts: Optional[List[float]]
+    if new_alts is not None:
+        closed_alts = new_alts + [new_alts[0]]
+    else:
+        closed_alts = None
     # If the source was a sloped 4-corner rect without an explicit
     # source_axis (typical of runway shapes built from CIFP), derive
     # one from the H→L pair so downstream Stage A regrade can project

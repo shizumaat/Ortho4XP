@@ -339,10 +339,9 @@ def regrade_runways_in_layout(
             try:
                 dem_alt = float(dem.alt_strict(
                     (lon - tile_lon, lat - tile_lat)))
-            except Exception:
+            except (IndexError, ValueError, TypeError):
                 dem_alt = float("nan")
-            if (dem_alt != dem_alt   # NaN
-                    or dem_alt == getattr(dem, "nodata", -32768)):
+            if dem_alt != dem_alt or dem_alt == dem.nodata:   # NaN or NODATA
                 continue
             seam_inputs.append((t, dem_alt))
             seam_dem_alts.append((i, dem_alt))

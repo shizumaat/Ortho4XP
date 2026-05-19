@@ -22,6 +22,7 @@ import math
 import os
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+import O4_UI_Utils as UI
 from shapely.errors import GEOSException, TopologicalError
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, nearest_points, unary_union
@@ -498,10 +499,19 @@ def _emit_airport_boundary_shape(
             perp1 = vertex_perp[(i + 1) % N_open]
             a0 = _runway_clamped_alt(p0[0], p0[1])
             a1 = _runway_clamped_alt(p1[0], p1[1])
-            if a0 is None:
-                a0 = 0.0
-            if a1 is None:
-                a1 = 0.0
+            if a0 is None or a1 is None:
+                # Both DEM and runway-clamp returned None for at
+                # least one endpoint — we genuinely don't know the
+                # altitude here.  Per
+                # ``feedback_boundary_clamp_asymmetric``, the clamp
+                # lifts UP toward the runway only, so missing data
+                # cannot be silently replaced with sea level; that
+                # produces a multi-hundred-metre cliff at any non-
+                # coastal airport.  Skip the rect.
+                UI.vprint(1,
+                    "  [pav-builder] boundary rect skipped: altitude "
+                    f"unresolvable at p0={p0} (a0={a0}) p1={p1} (a1={a1})")
+                continue
             built = _rect_for_segment(p0, p1, float(a0), float(a1),
                                        perp0, perp1)
             if built is None:
@@ -752,6 +762,18 @@ def _emit_boundary_dem_bridge(
                 if len(coords) < 4:
                     continue
                 per = [float(s.altitude)] * len(coords)
+            elif s.node_altitudes:
+                # Seam-vertex-inserted runway: rect tags were
+                # converted to per-vertex altitudes by
+                # ``_insert_seam_vertices``.  Without this branch,
+                # cross-tile builds drop the runway from
+                # ``pav_edge_pts`` entirely, breaking the bridge's
+                # nearest-pavement altitude lookup (root cause of
+                # MMOX north-tile bridge dipping to valley DEM).
+                per = [float(a) for a in
+                       s.node_altitudes[:len(coords)]]
+                if len(per) < len(coords):
+                    continue
             else:
                 continue
             for (x, y), a in zip(coords, per):
@@ -781,6 +803,36 @@ def _emit_boundary_dem_bridge(
         if best_alt is None:
             return None
         return (best_alt, math.sqrt(best_d2))
+
+    def _bridge_alt(x: float, y: float) -> Optional[float]:
+        """Altitude for a bridge vertex.  Per
+        ``feedback_boundary_clamp_asymmetric``: never let the bridge
+        dip below the surrounding pavement.
+
+        ``_clamped_alt``'s asymmetric runway clamp only acts within
+        ``runway_clamp_radius_m`` (400 m).  For airports whose
+        boundary extends well beyond that radius (e.g. MMOX, where
+        the +17 tile's bridge geometry reaches ~1.4 km north of the
+        runway tip), positions outside the radius fall back to raw
+        DEM — which at a plateau airport like MMOX (1520 m) samples
+        the surrounding valley (~360 m) and silently produced a
+        ~1000 m bridge drop.
+
+        Resolution order:
+          1. Nearest pavement edge (linear scan, up to 5 km).  This
+             keeps the bridge tied to airport elevation no matter
+             how far the boundary extends from the runway.
+          2. Asymmetric clamp (DEM lifted UP toward runway band).
+          3. Raw DEM.
+        Returns None only when none of the three are available.
+        """
+        near = _nearest_pav_alt(x, y, max_d_m=5000.0)
+        if near is not None:
+            return float(near[0])
+        clamped = _clamped_alt(x, y)
+        if clamped is not None:
+            return float(clamped)
+        return _dem_alt(x, y)
 
     n_emitted = 0
     for boundary_poly in rings:
@@ -937,9 +989,26 @@ def _emit_boundary_dem_bridge(
             k = (int(round(px * 10)), int(round(py * 10)))
             if k in pav_alt_lookup:
                 return pav_alt_lookup[k]
-            # Synthesised by unary_union — fall back to DEM
-            sd = _dem_alt(px, py)
-            return float(sd) if sd is not None else 0.0
+            # Bucket missed (typically because the point came from a
+            # unary_union intersection that isn't on a canonical
+            # pavement vertex).  Use the nearest pavement-edge
+            # altitude rather than raw DEM — raw DEM sampled at
+            # inner-bridge positions in valley terrain north of an
+            # elevated airport (e.g. MMOX 1520 m plateau, valley at
+            # ~360 m) silently dropped the bridge by ~1000 m.  Per
+            # ``feedback_boundary_clamp_asymmetric`` the bridge
+            # altitude must never dip below the surrounding pavement.
+            near = _nearest_pav_alt(px, py, max_d_m=2000.0)
+            if near is not None:
+                return near[0]
+            clamped = _clamped_alt(px, py)
+            if clamped is not None:
+                return float(clamped)
+            raise RuntimeError(
+                f"_pav_alt: no altitude source for ({px:.2f}, {py:.2f}) "
+                f"— bucket miss, no nearest pavement within 2 km, "
+                f"no clamped DEM.  Investigate why this point has no "
+                f"resolvable altitude.")
 
         for run in runs:
             if len(run) < 2:
@@ -955,10 +1024,18 @@ def _emit_boundary_dem_bridge(
             raw_outer_pts: List[Tuple[float, float]] = []
             raw_outer_alts: List[float] = []
             for ii_in_run, i_dense in enumerate(run):
-                raw_outer_pts.append(
-                    (per_vert[i_dense][0], per_vert[i_dense][1]))
-                raw_outer_alts.append(
-                    round(float(per_vert[i_dense][2]), 1))
+                vx, vy = per_vert[i_dense][0], per_vert[i_dense][1]
+                raw_outer_pts.append((vx, vy))
+                # Use _bridge_alt (nearest-pavement floor) rather than
+                # per_vert's _clamped_alt directly — the latter falls
+                # back to raw DEM beyond runway_clamp_radius_m, which
+                # is the source of the MMOX 1000 m drop.
+                ba = _bridge_alt(vx, vy)
+                if ba is None:
+                    raise RuntimeError(
+                        f'boundary_dem_bridge outer: no altitude '
+                        f'source for ({vx:.2f}, {vy:.2f})')
+                raw_outer_alts.append(round(ba, 1))
             # Compute inward-perpendicular offset per vertex from
             # the local boundary tangent (average of the two
             # adjacent segments).  The two perpendiculars are
@@ -1007,23 +1084,39 @@ def _emit_boundary_dem_bridge(
                 ctr = boundary_poly.centroid
                 inner_pts: List[Tuple[float, float]] = []
                 inner_alts: List[float] = []
-                for (bx, by) in outer_pts:
+                for k_pt, (bx, by) in enumerate(outer_pts):
                     perp_x = ctr.x - bx
                     perp_y = ctr.y - by
                     pmag = math.hypot(perp_x, perp_y)
                     if pmag < 1e-6:
+                        # Degenerate (point coincides with centroid).
+                        # Inherit the outer-edge altitude rather than
+                        # fabricating 0 m (sea level cliff at any
+                        # non-coastal airport).
                         inner_pts.append((bx, by))
-                        inner_alts.append(0.0)
+                        inner_alts.append(outer_alts[k_pt])
                         continue
                     perp_x /= pmag
                     perp_y /= pmag
                     sx = bx + perp_x * bridge_depth_m
                     sy = by + perp_y * bridge_depth_m
-                    sd = _dem_alt(sx, sy)
+                    # Use nearest-pavement altitude (per
+                    # ``feedback_boundary_clamp_asymmetric``) instead
+                    # of raw DEM — raw DEM samples valley terrain at
+                    # plateau airports (e.g. MMOX 1520 m) and dropped
+                    # the bridge inner edge by ~1000 m.
+                    near = _nearest_pav_alt(sx, sy, max_d_m=2000.0)
+                    if near is not None:
+                        ia = round(near[0], 1)
+                    else:
+                        clamped = _clamped_alt(sx, sy)
+                        if clamped is None:
+                            # Last resort: inherit outer-edge alt.
+                            ia = outer_alts[k_pt]
+                        else:
+                            ia = round(float(clamped), 1)
                     inner_pts.append((sx, sy))
-                    inner_alts.append(
-                        round(float(sd), 1)
-                        if sd is not None else 0.0)
+                    inner_alts.append(ia)
                 ring_pts = list(outer_pts) + list(reversed(inner_pts))
                 ring_alts = list(outer_alts) + list(reversed(inner_alts))
             else:
@@ -1031,8 +1124,9 @@ def _emit_boundary_dem_bridge(
                 start_b = outer_pts[0]
                 end_b = outer_pts[-1]
                 # Snap to nearest pav_union outer-ring VERTEX
-                # (not just nearest point — the snap target must be
-                # canonical).
+                # (canonical alignment so bridge inner-edge vertices
+                # coincide with junction corners, preserving the
+                # shared-vertex invariant).
                 def _nearest_pav_vertex(x: float, y: float
                                           ) -> Tuple[int, float]:
                     best_i = -1
@@ -1045,31 +1139,38 @@ def _emit_boundary_dem_bridge(
                     return best_i, best_d
                 start_i, start_d = _nearest_pav_vertex(*start_b)
                 end_i, end_d = _nearest_pav_vertex(*end_b)
-                # Reject runs with no nearby pavement on either end.
+                # Reject runs with no nearby pavement vertex on
+                # either end — pav_ring_coords can be sparse
+                # (corners only) in cross-tile builds.  Fall back
+                # to a centroid-perpendicular synthesised inner
+                # edge with ``_bridge_alt`` altitudes (NOT raw
+                # DEM — per ``feedback_boundary_clamp_asymmetric``
+                # the bridge must never dip below surrounding
+                # pavement).
                 if (start_i < 0 or end_i < 0
                         or start_d > bridge_depth_m * 2
                         or end_d > bridge_depth_m * 2):
-                    # Fall back to synthesised inner edge.
                     ctr = boundary_poly.centroid
                     inner_pts = []
                     inner_alts = []
-                    for (bx, by) in outer_pts:
+                    for k_pt, (bx, by) in enumerate(outer_pts):
                         perp_x = ctr.x - bx
                         perp_y = ctr.y - by
                         pmag = math.hypot(perp_x, perp_y)
                         if pmag < 1e-6:
                             inner_pts.append((bx, by))
-                            inner_alts.append(0.0)
+                            inner_alts.append(outer_alts[k_pt])
                             continue
                         perp_x /= pmag
                         perp_y /= pmag
                         sx = bx + perp_x * bridge_depth_m
                         sy = by + perp_y * bridge_depth_m
-                        sd = _dem_alt(sx, sy)
+                        ba = _bridge_alt(sx, sy)
                         inner_pts.append((sx, sy))
-                        inner_alts.append(
-                            round(float(sd), 1)
-                            if sd is not None else 0.0)
+                        if ba is None:
+                            inner_alts.append(outer_alts[k_pt])
+                        else:
+                            inner_alts.append(round(ba, 1))
                     ring_pts = list(outer_pts) + list(reversed(inner_pts))
                     ring_alts = list(outer_alts) + list(reversed(inner_alts))
                 else:
@@ -1087,12 +1188,9 @@ def _emit_boundary_dem_bridge(
                                         bwd_first[1] - start_b[1])
                     step = +1 if d_fwd < d_bwd else -1
                     # Walk pav_union from end_i back toward start;
-                    # STOP when current vertex is > 400 m from
-                    # start_b (the user's closure rule).  This
-                    # bounds the inner walk so a bridge run on one
-                    # side of the airport doesn't trace around to
-                    # the opposite side.
-                    CLOSURE_DIST_M = runway_clamp_radius_m  # 400m
+                    # STOP when current vertex is >
+                    # runway_clamp_radius_m (400 m) from start_b.
+                    CLOSURE_DIST_M = runway_clamp_radius_m
                     inner_pts = []
                     inner_alts = []
                     idx = end_i
@@ -1111,8 +1209,6 @@ def _emit_boundary_dem_bridge(
                         visited += 1
                     if len(inner_pts) < 2:
                         continue
-                    # Close: last inner vertex → start_b via the
-                    # implicit short edge of the polygon ring.
                     ring_pts = list(outer_pts) + list(inner_pts)
                     ring_alts = list(outer_alts) + list(inner_alts)
 
@@ -1227,9 +1323,29 @@ def _emit_boundary_dem_bridge(
                       int(round(cy * 10)))
                 ca = canon_alt.get(ck)
                 if ca is None:
-                    sd = _dem_alt(cx, cy)
-                    ca = (round(float(sd), 1)
-                          if sd is not None else 0.0)
+                    # The 0.1 m bucket can miss because the cleanup
+                    # subtractions above run buffer(0)/difference and
+                    # nudge ring vertices off their original keys.
+                    # Falling back to raw ``_dem_alt`` here silently
+                    # produced the MMOX north-tile 1000 m drop
+                    # (bridge inner edge sampling valley DEM ~360 m
+                    # while the airport plateau is at ~1520 m).  Use
+                    # nearest-pavement altitude instead so the bridge
+                    # inherits surrounding pavement elevation, per
+                    # ``feedback_boundary_clamp_asymmetric``.
+                    near = _nearest_pav_alt(cx, cy, max_d_m=2000.0)
+                    if near is not None:
+                        ca = round(near[0], 1)
+                    else:
+                        clamped = _clamped_alt(cx, cy)
+                        if clamped is None:
+                            raise RuntimeError(
+                                f"boundary_dem_bridge: no altitude "
+                                f"source for vertex "
+                                f"({cx:.2f}, {cy:.2f}) — bucket miss, "
+                                f"no pavement within 2 km, no clamped "
+                                f"DEM.  Investigate upstream cause.")
+                        ca = round(float(clamped), 1)
                 ring_alts.append(ca)
 
             node_alts = list(ring_alts) + [ring_alts[0]]

@@ -2413,8 +2413,18 @@ def build_airport_pavement(icao: str, xplane_root: str,
                                  and s.ref == "boundary_dem_bridge")]
         try:
             from .boundary import _emit_boundary_dem_bridge as _emit_br
-            from .elevation import _load_airport_dem as _ld_dem
-            _dem_pp = _ld_dem(layout.anchor[0], layout.anchor[1])
+            # Use the CURRENT-TILE DEM (same as ``finalize.run_phase2``
+            # passes at the first emit), not the anchor-tile DEM.  For
+            # cross-tile airports (e.g. MMOX straddling lat 17), the
+            # anchor sits in one tile while the current build is the
+            # OTHER tile; passing the anchor-tile DEM with
+            # ``current_tile_lat/lon`` causes ``_sample_dem`` to compute
+            # offsets relative to the current tile but apply them to
+            # the anchor tile's coordinate frame — silently reading
+            # elevations from ~1° away (100 km).  Manifested as
+            # MMOX +17 tile bridge inner-edge altitudes sampling
+            # canyon DEM in the +16 tile.
+            _dem_pp = dem
             _tl = (current_tile_lat
                    if current_tile_lat is not None
                    else math.floor(layout.anchor[0]))

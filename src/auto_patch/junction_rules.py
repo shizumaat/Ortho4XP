@@ -644,7 +644,7 @@ def _snap_to_sloping_edge_corners(layout: PavementLayout) -> None:
             continue
         shape.polygon = new_poly
         if node_alts is not None:
-            new_alts = [e[1] if e[1] is not None else 0.0 for e in deduped]
+            new_alts = [e[1] for e in deduped]
             shape.node_altitudes = new_alts + [new_alts[0]]
 
 
@@ -908,6 +908,12 @@ def _do_widen(
 
         def _attempt_insert(insert_at, neighbor, alt):
             nonlocal current_coords, current_alts, existing_keys
+            # Refuse to widen when the runway-corner altitude is
+            # unknown but the polygon tracks per-vertex altitudes —
+            # fabricating 0.0 would silently introduce a sea-level
+            # vertex into a junction the solver then HARD-anchors.
+            if current_alts is not None and alt is None:
+                return False
             trial = list(current_coords)
             trial.insert(insert_at, neighbor)
             if len(trial) < 3:
@@ -976,8 +982,7 @@ def _do_widen(
             # Commit
             current_coords = trial
             if current_alts is not None:
-                current_alts.insert(
-                    insert_at, alt if alt is not None else 0.0)
+                current_alts.insert(insert_at, alt)
             existing_keys.add(_key(neighbor))
             return True
 
@@ -1649,7 +1654,7 @@ def _rewrite_runway_runs(
                 for k, t in enumerate(rep):
                     out_pts.append(t)
                     if out_alts is not None:
-                        out_alts.append(alts[k] if alts else 0.0)
+                        out_alts.append(alts[k])
             # Skip this vertex (in-run, dropped).
             continue
         out_pts.append(coords[i])

@@ -241,7 +241,13 @@ def _emit_groundside_pavement_dem(
                 if alts[right] is not None:
                     found = alts[right]
                     break
-            alts[k] = found if found is not None else 0.0
+            # The precondition above (``all(a is None ...): continue``)
+            # guarantees at least one non-None alt; the wraparound
+            # walk visits every index so ``found`` must be set.
+            assert found is not None, (
+                "groundside: walk-outward DEM neighbour search failed "
+                "despite precondition ensuring at least one valid sample")
+            alts[k] = found
         # Rebuild the polygon from densified coords (so it matches
         # the node_altitudes list 1-for-1) and append the closing
         # repeat.
