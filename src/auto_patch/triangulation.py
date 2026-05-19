@@ -317,9 +317,13 @@ def _triangulate_junctions(
         close in 2D.  Cross-junction agreement on shared SOFT
         buckets is restored by the cross-junction averaging pass in
         the outer iteration below."""
-        bucket = _corner_elevation_bucket(x, y)
-        # 1. Bucket lookup — exact shared-vertex match against
-        # rect / runway / terminal corners.  HARD.
+        # Canonical-point lookup (user 2026-05-18): the registry's
+        # proximity-based matching aligns with the solver and OSM
+        # emit so junction vertices that share a canonical point
+        # with a rect/runway/terminal corner hit the same key.
+        bucket = layout.canonical_points.get_or_add(float(x), float(y))
+        # 1. Lookup — exact shared-vertex match against rect /
+        # runway / terminal corners.  HARD.
         e = corner_elev.get(bucket)
         if e is not None:
             return e, True

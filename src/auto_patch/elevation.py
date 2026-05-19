@@ -2072,7 +2072,14 @@ def _snap_junction_altitudes_to_rect_corners(
 
     Returns the number of altitude entries adjusted.
     """
-    rwy_corner_alt: Dict[Tuple[int, int], float] = {}
+    # Key the corner-altitude map by canonical-point coordinates
+    # (user 2026-05-18): the discrete ``_corner_elevation_bucket``
+    # has a known bucket-boundary aliasing bug where two points
+    # 0.002 m apart land in adjacent buckets and miss each other.
+    # The shared registry's proximity lookup matches by physical
+    # distance, identical to the solver's vertex matching.
+    rwy_corner_alt: Dict[Tuple[float, float], float] = {}
+    _reg = layout.canonical_points
     sloping_rect_roles_for_snap = {
         ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
         ROLE_SECONDARY_PARALLEL, ROLE_STUB,
@@ -2104,21 +2111,21 @@ def _snap_junction_altitudes_to_rect_corners(
                 and s.altitude_low is not None
                 and len(coords) == 4):
             for i, (cx, cy) in enumerate(coords):
-                b = _corner_elevation_bucket(cx, cy)
+                k = _reg.get_or_add(float(cx), float(cy))
                 e = (s.altitude_high
                      if i in (0, 3)
                      else s.altitude_low)
                 # First-writer wins — avoids different runway
                 # segments at a shared corner disagreeing about
                 # the canonical altitude.
-                rwy_corner_alt.setdefault(b, float(e))
+                rwy_corner_alt.setdefault(k, float(e))
             rect_shapes_for_interior.append(s)
         elif s.altitude is not None:
             # Flat shapes (terminal pads, pre-elevation rects).
             # Any number of vertices; all share a single altitude.
             for (cx, cy) in coords:
-                b = _corner_elevation_bucket(cx, cy)
-                rwy_corner_alt.setdefault(b, float(s.altitude))
+                k = _reg.get_or_add(float(cx), float(cy))
+                rwy_corner_alt.setdefault(k, float(s.altitude))
             rect_shapes_for_interior.append(s)
     if not rwy_corner_alt and not rect_shapes_for_interior:
         return 0
@@ -2152,10 +2159,10 @@ def _snap_junction_altitudes_to_rect_corners(
         for i, (cx, cy) in enumerate(coords_open):
             if i >= len(s.node_altitudes):
                 break
-            # Pass 1: corner-bucket snap (prevents shared-corner
+            # Pass 1: canonical-corner snap (prevents shared-corner
             # disagreement between junction and rect tags).
-            b = _corner_elevation_bucket(cx, cy)
-            target_e = rwy_corner_alt.get(b)
+            k = _reg.get_or_add(float(cx), float(cy))
+            target_e = rwy_corner_alt.get(k)
             if target_e is not None:
                 if abs(s.node_altitudes[i] - target_e) >= 0.05:
                     s.node_altitudes[i] = round(target_e, 1)
@@ -2585,11 +2592,13 @@ def _corner_elevation_bucket(x: float, y: float,
 
 
 def _corner_elev_map(layout: "PavementLayout"
-                     ) -> Dict[Tuple[int, int], float]:
-    """Return a bucket-keyed elevation lookup for every corner of
-    every elevation-bearing non-junction shape.  Uses the same
-    bucket size as ``to_osm`` so junction vertices that share a
-    node id with a corner will hit the same bucket.
+                     ) -> Dict[Tuple[float, float], float]:
+    """Return a canonical-point-keyed elevation lookup for every
+    corner of every elevation-bearing non-junction shape.  Per
+    user 2026-05-18: route through ``layout.canonical_points`` so
+    junction vertex lookups use the same proximity-based matching
+    as the solver, eliminating the bucket-boundary aliasing where
+    two points 0.002 m apart land in adjacent buckets and miss.
 
     For sloped rect/runway shapes (altitude_high+altitude_low),
     ring indices 0,3 are the HIGH short edge and 1,2 are the LOW
@@ -2599,7 +2608,8 @@ def _corner_elev_map(layout: "PavementLayout"
     rect_like_roles = {ROLE_RUNWAY, ROLE_PRIMARY_PARALLEL,
                        ROLE_SECONDARY_PARALLEL,
                        ROLE_STUB, ROLE_CROSS_CONNECTOR}
-    out: Dict[Tuple[int, int], float] = {}
+    out: Dict[Tuple[float, float], float] = {}
+    reg = layout.canonical_points
     for s in layout.shapes:
         if s.role == ROLE_JUNCTION:
             continue
@@ -2620,13 +2630,14 @@ def _corner_elev_map(layout: "PavementLayout"
                      s.altitude_low, s.altitude_high]
             for (cx, cy), e in zip(coords, elevs):
                 out.setdefault(
-                    _corner_elevation_bucket(cx, cy), float(e))
+                    reg.get_or_add(float(cx), float(cy)),
+                    float(e))
             continue
         # Flat polygon (terminal, flat rect, or flat runway).
         if s.altitude is not None:
             for (cx, cy) in coords:
                 out.setdefault(
-                    _corner_elevation_bucket(cx, cy),
+                    reg.get_or_add(float(cx), float(cy)),
                     float(s.altitude))
     return out
 

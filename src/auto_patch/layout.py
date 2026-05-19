@@ -268,12 +268,25 @@ class PavementLayout:
           ``node_altitudes`` so the per-corner consensus is
           preserved.
         """
-        bucket_size = SHARED_VERTEX_TOL_M
-        # xy_bucket → list of (node_id, claimed_altitude_or_None).
-        # Altitude-aware bucketing: vertices land in the existing
-        # node only if their altitude is within
-        # VERTEX_ALT_MERGE_TOL_M of the bucket's claim.
-        xy_to_nodes: Dict[Tuple[int, int],
+        # Canonical-point key → list of (node_id, claimed_altitude).
+        # Per user 2026-05-18: the OSM emitter uses the same shared
+        # CanonicalPointRegistry as the solver, so vertex matching
+        # is proximity-based (single source of truth) rather than
+        # discrete-bucket-based.  Two corners 0.002 m apart that
+        # would have landed in adjacent discrete buckets now
+        # resolve to the same canonical point.  Altitude-aware
+        # sub-grouping inside each canonical point preserves the
+        # ``VERTEX_ALT_MERGE_TOL_M`` rule (wall / cliff separation
+        # when Δalt > tol).
+        registry = self.canonical_points
+        if registry is None:
+            # Defensive: a layout constructed outside the pipeline
+            # (tests) may lack a registry.  Build one on the fly
+            # so this method is callable independently.
+            from .canonical_points import CanonicalPointRegistry
+            registry = CanonicalPointRegistry(
+                tol_m=SHARED_VERTEX_TOL_M)
+        xy_to_nodes: Dict[Tuple[float, float],
                           List[Tuple[int, Optional[float]]]] = {}
         node_id_to_ll: Dict[int, Tuple[float, float]] = {}
         # Accumulate every altitude contributed to each node so the
@@ -283,9 +296,7 @@ class PavementLayout:
 
         def _intern(x: float, y: float,
                     alt: Optional[float] = None) -> int:
-            kx = int(round(x / bucket_size))
-            ky = int(round(y / bucket_size))
-            key = (kx, ky)
+            key = registry.get_or_add(float(x), float(y))
             existing = xy_to_nodes.get(key)
             if existing:
                 # Find the first existing node within altitude
@@ -301,13 +312,16 @@ class PavementLayout:
                             nid, []).append(alt)
                         return nid
                 # No altitude match: real wall / cliff.  Allocate
-                # a fresh node at the SAME lat/lon so X-Plane
-                # renders the vertical step between adjacent
-                # polygons.
+                # a fresh node at the SAME canonical lat/lon so
+                # X-Plane renders the vertical step between
+                # adjacent polygons.
             nid = next_nid[0]
             next_nid[0] -= 1
             xy_to_nodes.setdefault(key, []).append((nid, alt))
-            node_id_to_ll[nid] = self.m_to_ll(x, y)
+            # Use the CANONICAL coordinates (not the input) so all
+            # nodes referencing this canonical point produce the
+            # exact same lat/lon in the OSM file.
+            node_id_to_ll[nid] = self.m_to_ll(key[0], key[1])
             if alt is not None:
                 node_id_to_alts[nid] = [alt]
             return nid
