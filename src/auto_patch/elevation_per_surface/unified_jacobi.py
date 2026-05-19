@@ -739,12 +739,32 @@ def _writeback(layout, elev, bucket_to_idx):
             coords_open, elev, bucket_to_idx)
         if corner_elevs is None:
             continue
-        if s.role == ROLE_TERMINAL or s.role == ROLE_APRON:
+        if s.role == ROLE_TERMINAL:
+            # Terminal is FLAT (per user 2026-05-18: a terminal sits
+            # on one floor altitude).  The terminal-flatness equality
+            # group already enforced this in the solver; average is
+            # just a defensive round.
             avg = sum(corner_elevs) / len(corner_elevs)
             s.altitude = round(float(avg), 1)
             s.altitude_high = None
             s.altitude_low = None
             s.node_altitudes = None
+            n_terms += 1
+        elif s.role == ROLE_APRON:
+            # Per user 2026-05-18: aprons are NOT 100 % flat — they
+            # satisfy 1.5 % across their surface, NOT zero gradient.
+            # Keep the solver's per-corner altitudes (which it
+            # already constrained via all-pair Euclidean edges) so
+            # adjacent aprons that share corners don't end up at
+            # 4-8 m cliff steps (each apron previously averaged to
+            # its own single altitude → adjacent aprons diverged).
+            alts = [round(float(e), 1) for e in corner_elevs]
+            if ring_closed:
+                alts.append(alts[0])
+            s.node_altitudes = alts
+            s.altitude = None
+            s.altitude_high = None
+            s.altitude_low = None
             n_terms += 1
         elif s.role in SLOPING_RECT_ROLES:
             # Per user 2026-05-13: keep node_altitudes when the shape
