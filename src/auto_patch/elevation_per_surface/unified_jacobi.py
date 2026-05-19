@@ -154,12 +154,40 @@ def solve(layout, icao: str,
 # ── Stage 1: build node list ──────────────────────────────────────
 
 
-def _build_node_list(layout):
-    """Assign one node index per unique vertex bucket across all
-    pavement-role shapes.  Returns ``(nodes, bucket_to_idx)``.
+def _solver_key(layout, x, y):
+    """Return the canonical-point key for (x, y) under the layout's
+    shared registry.
+
+    The original discrete-bucket key
+    ``_corner_elevation_bucket`` = ``(int(round(x/0.5)), int(round(y/0.5)))``
+    suffered from edge-of-bucket aliasing: two corners 0.002 m
+    apart could land in adjacent buckets (different solver nodes
+    → independent altitudes) even though the OSM emit round-trip
+    treats them as coincident.
+
+    With a layout-attached ``canonical_points`` registry, route
+    every solver key through ``registry.get_or_add`` so vertices
+    within ``SHARED_VERTEX_TOL_M`` proximity collapse to the same
+    canonical (x, y) regardless of which discrete bucket they
+    would have landed in.  Falls back to the legacy bucket when
+    no registry is attached (defensive, mainly for tests that
+    drive the solver outside the pipeline).
     """
+    reg = getattr(layout, "canonical_points", None)
+    if reg is not None:
+        return reg.get_or_add(float(x), float(y))
     from auto_patch.elevation import _corner_elevation_bucket
-    bucket_to_idx: Dict[Tuple[int, int], int] = {}
+    return _corner_elevation_bucket(x, y)
+
+
+def _build_node_list(layout):
+    """Assign one node index per unique canonical point across all
+    pavement-role shapes.  Returns ``(nodes, bucket_to_idx)`` —
+    the dict still names ``bucket_to_idx`` for legacy continuity
+    but keys are canonical (x, y) tuples when the layout has a
+    registry, else legacy discrete buckets.
+    """
+    bucket_to_idx: Dict = {}
     nodes: List[Tuple[float, float]] = []
     for s in layout.shapes:
         if s.role not in PAVEMENT_ROLES:
@@ -171,9 +199,9 @@ def _build_node_list(layout):
         except _GEOM_EXC:
             continue
         for x, y in coords:
-            b = _corner_elevation_bucket(x, y)
-            if b not in bucket_to_idx:
-                bucket_to_idx[b] = len(nodes)
+            k = _solver_key(layout, x, y)
+            if k not in bucket_to_idx:
+                bucket_to_idx[k] = len(nodes)
                 nodes.append((float(x), float(y)))
     return nodes, bucket_to_idx
 
@@ -257,8 +285,8 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
             else:
                 continue
             for (x, y), a in zip(coords, per):
-                b = _corner_elevation_bucket(x, y)
-                idx = bucket_to_idx.get(b)
+                k = _solver_key(layout, x, y)
+                idx = bucket_to_idx.get(k)
                 if idx is None:
                     continue
                 # Pass 1 (CIFP): only set if not already HARD.
@@ -295,8 +323,8 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
                 seam_bk = (int(round(x * bk_s)), int(round(y * bk_s)))
                 if seam_bk not in seam_keys:
                     continue
-                b = _corner_elevation_bucket(x, y)
-                idx = bucket_to_idx.get(b)
+                k = _solver_key(layout, x, y)
+                idx = bucket_to_idx.get(k)
                 if idx is None:
                     continue
                 # Seam wins: override any existing HARD value too.
@@ -324,8 +352,8 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
         else:
             continue
         for (x, y), a in zip(coords, per):
-            b = _corner_elevation_bucket(x, y)
-            idx = bucket_to_idx.get(b)
+            k = _solver_key(layout, x, y)
+            idx = bucket_to_idx.get(k)
             if idx is None or is_hard[idx] or have_initial[idx]:
                 continue
             elev[idx] = float(a)
@@ -474,7 +502,7 @@ def _build_edges(layout, bucket_to_idx
             continue
         gr = _role_grade(s.role)
         m = len(coords)
-        node_idx = [bucket_to_idx.get(_corner_elevation_bucket(x, y))
+        node_idx = [bucket_to_idx.get(_solver_key(layout, x, y))
                     for x, y in coords]
         # Ring edges (every shape).
         for i in range(m):
@@ -557,9 +585,9 @@ def _build_rect_cross_section_groups(layout, bucket_to_idx):
             idxs = []
             for i in pair:
                 if 0 <= i < len(coords):
-                    b = _corner_elevation_bucket(*coords[i])
-                    if b in bucket_to_idx:
-                        idxs.append(bucket_to_idx[b])
+                    k = _solver_key(layout, *coords[i])
+                    if k in bucket_to_idx:
+                        idxs.append(bucket_to_idx[k])
             if len(idxs) >= 2 and idxs[0] != idxs[1]:
                 groups.append(idxs)
     return groups
@@ -579,9 +607,9 @@ def _build_terminal_groups(layout, bucket_to_idx):
         coords = _open_ring(list(s.polygon.exterior.coords))
         idxs = []
         for x, y in coords:
-            b = _corner_elevation_bucket(x, y)
-            if b in bucket_to_idx:
-                idxs.append(bucket_to_idx[b])
+            k = _solver_key(layout, x, y)
+            if k in bucket_to_idx:
+                idxs.append(bucket_to_idx[k])
         if len(idxs) >= 2:
             groups.append(idxs)
     return groups
@@ -736,7 +764,7 @@ def _writeback(layout, elev, bucket_to_idx):
         ring_closed = coords and coords[0] == coords[-1]
         coords_open = coords[:-1] if ring_closed else coords
         corner_elevs = _read_corner_elevs(
-            coords_open, elev, bucket_to_idx)
+            coords_open, elev, bucket_to_idx, layout)
         if corner_elevs is None:
             continue
         if s.role == ROLE_TERMINAL:
@@ -821,11 +849,10 @@ def _writeback(layout, elev, bucket_to_idx):
     return n_terms, n_rects, n_juncs
 
 
-def _read_corner_elevs(coords_open, elev, bucket_to_idx):
-    from auto_patch.elevation import _corner_elevation_bucket
+def _read_corner_elevs(coords_open, elev, bucket_to_idx, layout=None):
     out = []
     for x, y in coords_open:
-        idx = bucket_to_idx.get(_corner_elevation_bucket(x, y))
+        idx = bucket_to_idx.get(_solver_key(layout, x, y))
         if idx is None:
             return None
         out.append(elev[idx])
