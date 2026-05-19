@@ -314,7 +314,14 @@ def test_junction_vertices_have_source(icao):
     # ON a row-110 edge (between two row-110 vertices) is also a
     # legitimate inheritance from the pavement union, not an
     # orphan from densification / buffer drift.  Accept any
-    # junction vertex within ``tol`` of the boundary line.
+    # junction vertex within ``BOUNDARY_TOL`` of the boundary line.
+    # Per user 2026-05-19: row-110 boundary tolerance is wider than
+    # the shared-vertex tolerance because shapely's ``difference()``
+    # / ``buffer(0)`` rounding can place a difference-derived vertex
+    # ~0.7 m off the source LineString even when its underlying
+    # canonical point IS on the boundary in JOSM rendering.  1 m
+    # covers that drift; orphans from real densification still flag.
+    BOUNDARY_TOL = 1.0
     pav_boundary = getattr(layout, "apt_pavement_boundary", None)
 
     orphans: List[str] = []
@@ -339,7 +346,7 @@ def test_junction_vertices_have_source(icao):
                     d_b = pav_boundary.distance(Point(vx, vy))
                 except Exception:
                     d_b = float("inf")
-                if d_b <= tol:
+                if d_b <= BOUNDARY_TOL:
                     continue
                 d = min(d, d_b)
             orphans.append(
@@ -349,8 +356,8 @@ def test_junction_vertices_have_source(icao):
 
     assert not orphans, (
         f"{icao}: {len(orphans)} junction vertex(es) have no "
-        f"source-shape corner or pavement edge within "
-        f"{tol:.2f} m.  First 5:\n  "
+        f"source-shape corner within {tol:.2f} m or pavement "
+        f"edge within {BOUNDARY_TOL:.2f} m.  First 5:\n  "
         + "\n  ".join(orphans[:5]))
 
 
