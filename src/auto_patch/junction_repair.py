@@ -461,65 +461,18 @@ def _subdivide_violating_junctions(layout: "PavementLayout") -> int:
             new_shapes.append(s)
             continue
 
-        # Per user 2026-05-18: junctions slope ALONG converging
-        # centerlines only, not all-pair across the polygon.  Compute
-        # the worst grade as the max ALONG-AXIS grade across every
-        # centerline / runway long-axis passing through the polygon;
-        # cross-axial vertex pairs do NOT contribute.  Without this,
-        # the legacy all-pair check fires on legitimate bilinear
-        # junction slopes and drives the subdivide loop to chop
-        # valid junctions apart.
-        from shapely.geometry import Point as _PtSub
-        # Local import to dodge circular dep on the elevation module.
-        from .elevation_per_surface.unified_jacobi import (
-            _collect_junction_axes, JUNCTION_AXIS_PERP_TOL_M)
-        _axes_for_subdivide = _collect_junction_axes(layout, s.polygon)
-
         def _worst_grade(pts: List[Tuple[float, float]],
                          es: List[float]) -> Tuple[float,
                                                     Optional[Tuple[int, int]]]:
-            """Worst per-axis grade across centerlines through the
-            junction.  Returns (grade, (i, j)) of the offending
-            vertex pair.  If no axes are found (centerline-less
-            junction — typically a future-apron pre-reclass), fall
-            back to all-pair Euclidean."""
+            """Worst all-pair Euclidean grade within the polygon.
+            Per user 2026-05-18: junction grade applies across the
+            entire interior surface, not just along centerlines —
+            same rule as aprons."""
             radius2 = SUBDIVIDE_MAX_PAIR_DIST_M ** 2
             min_d2 = 0.5 ** 2
             wg = 0.0
             wp = None
             m = len(pts)
-            if _axes_for_subdivide:
-                # Per-axis: for each axis, find near-axis vertices
-                # and check along-axis grade between them.
-                for axis in _axes_for_subdivide:
-                    near = []
-                    for a in range(m):
-                        p_a = _PtSub(pts[a][0], pts[a][1])
-                        try:
-                            along_a = axis.project(p_a)
-                            perp_a = axis.distance(p_a)
-                        except _GEOM_EXC:
-                            continue
-                        if perp_a <= JUNCTION_AXIS_PERP_TOL_M:
-                            near.append((a, along_a))
-                    for ia in range(len(near)):
-                        a, along_a = near[ia]
-                        ea = es[a]
-                        for ib in range(ia + 1, len(near)):
-                            b, along_b = near[ib]
-                            d_ = abs(along_a - along_b)
-                            if d_ < 0.5 or d_ * d_ > radius2:
-                                continue
-                            de_ = abs(ea - es[b])
-                            if de_ <= TAXI_MAX_GRADE * d_ + 0.10:
-                                continue
-                            g_ = de_ / d_
-                            if g_ > wg:
-                                wg = g_
-                                wp = (a, b)
-                return wg, wp
-            # Fallback: all-pair Euclidean for centerline-less
-            # junctions (will be reclassified to apron shortly).
             for a in range(m):
                 xa, ya = pts[a]
                 ea = es[a]

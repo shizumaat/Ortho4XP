@@ -2696,12 +2696,10 @@ def _report_within_shape_violations(
     # diagonal IS more than 1.5 % grade because the axial cap fits
     # exactly along the long edge).
     AUDITED_ROLES = {ROLE_JUNCTION, ROLE_APRON}
-    # Per user 2026-05-18: junctions are audited per-centerline (along
-    # converging centerlines only, not all-pair).  Aprons stay all-pair.
-    from shapely.geometry import Point as _AuditPt
-    from .elevation_per_surface.unified_jacobi import (
-        _collect_junction_axes as _audit_collect_axes,
-        JUNCTION_AXIS_PERP_TOL_M as _AUDIT_PERP_TOL)
+    # Per user 2026-05-18 clarification: junction grade applies
+    # across the ENTIRE interior surface, not just along centerlines.
+    # All-pair Euclidean is the rule for both ROLE_JUNCTION and
+    # ROLE_APRON.
     for s in layout.shapes:
         if s.polygon is None or s.polygon.is_empty:
             continue
@@ -2740,42 +2738,6 @@ def _report_within_shape_violations(
                 x = math.radians(lon - layout.anchor[1]) * R_EARTH * cos0
                 y = math.radians(lat - layout.anchor[0]) * R_EARTH
                 coords_m.append((x, y))
-        if s.role == ROLE_JUNCTION:
-            # Per-axis grade audit: for each centerline through the
-            # polygon, project vertices onto it and check pairs.
-            axes = _audit_collect_axes(layout, s.polygon)
-            if axes:
-                for axis in axes:
-                    near = []
-                    for i in range(n):
-                        p = _AuditPt(coords_m[i][0], coords_m[i][1])
-                        try:
-                            along = axis.project(p)
-                            perp = axis.distance(p)
-                        except _GEOM_EXC:
-                            continue
-                        if perp <= _AUDIT_PERP_TOL:
-                            near.append((i, along))
-                    for a in range(len(near)):
-                        i_a, al_a = near[a]
-                        ea = elevs[i_a]
-                        for b in range(a + 1, len(near)):
-                            i_b, al_b = near[b]
-                            d = abs(al_a - al_b)
-                            if d < 0.5:
-                                continue
-                            de = abs(ea - elevs[i_b])
-                            if de <= cap_pct * d + rounding_allowance_m:
-                                continue
-                            pct = (de / d) * 100.0
-                            if pct > worst_pct:
-                                worst_pct = pct
-                                worst_info = (
-                                    s.role or "?", s.ref or "",
-                                    ea, elevs[i_b], d, de)
-                            n_viol += 1
-                continue
-            # No axes — falls through to all-pair (apron-like).
         for i in range(n):
             xi, yi = coords_m[i]
             ei = elevs[i]

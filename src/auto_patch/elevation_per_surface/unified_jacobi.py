@@ -490,49 +490,12 @@ def _build_edges(layout, bucket_to_idx
         if (s.role in SLOPING_RECT_ROLES
                 or s.role in (ROLE_RUNWAY, ROLE_RUNWAY_CROSSING)):
             continue
-        if s.role == ROLE_JUNCTION:
-            # Per-axis edges: for each centerline through the
-            # polygon, find vertices within perpendicular tolerance,
-            # then add edges using along-axis projected distance.
-            # Vertices NOT near any axis (e.g. fillet apex points)
-            # are only constrained by ring continuity.
-            axes = _collect_junction_axes(layout, s.polygon)
-            if axes:
-                for axis in axes:
-                    # Project each vertex onto the axis; record
-                    # (along, perp) for vertices within the
-                    # perpendicular tolerance.
-                    near_axis: List[Tuple[int, float]] = []
-                    for i in range(m):
-                        p = Point(coords[i][0], coords[i][1])
-                        try:
-                            along = axis.project(p)
-                            perp = axis.distance(p)
-                        except _GEOM_EXC:
-                            continue
-                        if perp <= JUNCTION_AXIS_PERP_TOL_M:
-                            near_axis.append((i, along))
-                    # Add along-axis edges between every near-axis
-                    # pair.  Pairs that project to the same axis
-                    # position add no constraint from this axis;
-                    # another axis may constrain them.
-                    for a in range(len(near_axis)):
-                        i_a, along_a = near_axis[a]
-                        for b in range(a + 1, len(near_axis)):
-                            i_b, along_b = near_axis[b]
-                            d = abs(along_a - along_b)
-                            if d < 0.5:
-                                continue
-                            _add_edge(node_idx[i_a], node_idx[i_b],
-                                       d, gr)
-                continue
-            # Fall through: no centerline passes through this
-            # junction.  These are typically future aprons — the
-            # post-solver reclassification will catch them — but
-            # for the current solver pass we need SOME within-shape
-            # grade constraint, so treat as apron (all-pair
-            # Euclidean below).
-        # Apron / terminal: all-pair Euclidean.
+        # Junction / apron / terminal: all-pair Euclidean within
+        # the polygon.  Per user 2026-05-18: "a junction should not
+        # exceed 1.5 % across ANY portion, not just along its
+        # edge."  Same all-pair rule as aprons — junction grade
+        # holds across the entire interior surface, not only along
+        # converging centerlines.
         for i in range(m):
             xi, yi = coords[i]
             for j in range(i + 2, m):
