@@ -55,6 +55,7 @@ __all__ = [
     "ROLE_APRON",
     "ROLE_TERMINAL",
     "ROLE_JUNCTION",
+    "ROLE_RUNWAY_CROSSING",
     "ROLE_BOUNDARY",
     "ROLE_TUNNEL_RAMP",
     "ROLE_RETAINING_WALL",
@@ -92,6 +93,16 @@ ROLE_CROSS_CONNECTOR = PS.ROLE_CROSS_CONNECTOR
 ROLE_APRON = PS.ROLE_APRON
 ROLE_TERMINAL = "terminal"
 ROLE_JUNCTION = "junction"
+# A junction at the intersection of two runways (user 2026-05-18).
+# Created by ``_resolve_runway_crossings`` when overlapping runway
+# segments are merged into a multi-directional sloping polygon.
+# Distinct from ``ROLE_JUNCTION`` because:
+#   * Its corners come from runway geometry (a SOURCE for adjacent
+#     shapes), not from row-110 + rect-difference.
+#   * It must NOT be reclassified to apron — the crossing IS the
+#     centerline of two runways.
+#   * Grade enforced per-runway-axis (per the junction rule).
+ROLE_RUNWAY_CROSSING = "runway_crossing"
 ROLE_BOUNDARY = "boundary"
 # Tunnel portals: ``tunnel_ramp`` is a sloped 4-corner rect from
 # outside-DEM down to apt-elev-6m at the portal; ``retaining_wall``
@@ -112,6 +123,7 @@ AEROWAY_FOR_ROLE = {
     ROLE_STUB: "taxiway",
     ROLE_CROSS_CONNECTOR: "taxiway",
     ROLE_JUNCTION: "taxiway",
+    ROLE_RUNWAY_CROSSING: "runway",
     ROLE_APRON: "apron",
     ROLE_TERMINAL: "building",
     ROLE_BOUNDARY: "aerodrome",

@@ -272,12 +272,16 @@ def test_junction_vertices_have_source(icao):
     # Source shapes: anything that contributes a real geometric
     # corner that a junction can legitimately anchor on.  Other
     # junctions are excluded — two junctions sharing a vertex
-    # doesn't ground it in source geometry.
+    # doesn't ground it in source geometry.  ROLE_RUNWAY_CROSSING
+    # IS included because its corners come from runway-segment
+    # union geometry (runway-derived, authoritative source — same
+    # category as ROLE_RUNWAY corners).
     SOURCE_ROLES = {
         "runway", "primary_parallel", "secondary_parallel",
         "stub", "cross_connector",
         "apron", "terminal", "groundside_pavement", "boundary",
         "tunnel_ramp", "retaining_wall",
+        "runway_crossing",
     }
     source_corners: List[Tuple[float, float]] = []
     for s in layout.shapes:

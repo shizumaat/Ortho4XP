@@ -52,8 +52,8 @@ from shapely.errors import GEOSException, TopologicalError
 from auto_patch.elevation import APRON_MAX_GRADE, TAXI_MAX_GRADE
 from auto_patch.layout import (
     ROLE_APRON, ROLE_BOUNDARY, ROLE_CROSS_CONNECTOR, ROLE_JUNCTION,
-    ROLE_PRIMARY_PARALLEL, ROLE_RUNWAY, ROLE_SECONDARY_PARALLEL,
-    ROLE_STUB, ROLE_TERMINAL,
+    ROLE_PRIMARY_PARALLEL, ROLE_RUNWAY, ROLE_RUNWAY_CROSSING,
+    ROLE_SECONDARY_PARALLEL, ROLE_STUB, ROLE_TERMINAL,
 )
 
 # Narrow exception tuple for shapely / numeric-geometry failure
@@ -70,6 +70,13 @@ SLOPING_RECT_ROLES = (
 PAVEMENT_ROLES = {
     ROLE_RUNWAY, *SLOPING_RECT_ROLES,
     ROLE_APRON, ROLE_TERMINAL, ROLE_JUNCTION,
+    # Per user 2026-05-18: runway-crossing junctions carry runway-
+    # interpolated ``node_altitudes`` from
+    # ``_resolve_runway_crossings``.  Treat them as HARD-anchored
+    # ring-only edges (same path as ``ROLE_RUNWAY``) so the solver
+    # doesn't reshape elevations that the runway-interpolation
+    # already established.
+    ROLE_RUNWAY_CROSSING,
 }
 
 CAP_SWEEPS_PER_ITER = 5
@@ -222,7 +229,11 @@ def _seed_elevations(layout, nodes, bucket_to_idx,
     # threshold corners with adjacent sub-rects.
     for pass_node_alts in (False, True):
         for s in layout.shapes:
-            if s.role != ROLE_RUNWAY:
+            # ROLE_RUNWAY_CROSSING shares the runway HARD-anchor
+            # path: its ``node_altitudes`` come from runway-segment
+            # interpolation in ``_resolve_runway_crossings`` and
+            # are authoritative; the solver must not reshape them.
+            if s.role not in (ROLE_RUNWAY, ROLE_RUNWAY_CROSSING):
                 continue
             if s.polygon is None or s.polygon.is_empty:
                 continue
@@ -472,8 +483,12 @@ def _build_edges(layout, bucket_to_idx
             x2, y2 = coords[j]
             length = math.hypot(x2 - x1, y2 - y1)
             _add_edge(node_idx[i], node_idx[j], length, gr)
-        # Rects / runways: ring-only, no spatial pairs.
-        if s.role in SLOPING_RECT_ROLES or s.role == ROLE_RUNWAY:
+        # Rects / runways / runway-crossings: ring-only, no spatial
+        # pairs.  Runway-crossings are HARD-anchored via the
+        # runway-interpolated ``node_altitudes`` seed; spatial
+        # edges would constrain them needlessly.
+        if (s.role in SLOPING_RECT_ROLES
+                or s.role in (ROLE_RUNWAY, ROLE_RUNWAY_CROSSING)):
             continue
         if s.role == ROLE_JUNCTION:
             # Per-axis edges: for each centerline through the

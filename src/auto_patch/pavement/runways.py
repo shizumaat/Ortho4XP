@@ -39,6 +39,7 @@ from ..layout import (
     ROLE_JUNCTION,
     ROLE_PRIMARY_PARALLEL,
     ROLE_RUNWAY,
+    ROLE_RUNWAY_CROSSING,
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
 )
@@ -358,7 +359,7 @@ def _resolve_runway_crossings(
             s.ref for s in seg_shapes if s.ref)
         new_shape = BuiltShape(
             polygon=union_poly,
-            role=ROLE_JUNCTION,
+            role=ROLE_RUNWAY_CROSSING,
             ref=ref_combined,
             node_altitudes=closed_alts)
         new_shapes.append(new_shape)

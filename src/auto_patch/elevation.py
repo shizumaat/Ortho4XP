@@ -97,6 +97,7 @@ from .layout import (
     ROLE_JUNCTION,
     ROLE_PRIMARY_PARALLEL,
     ROLE_RUNWAY,
+    ROLE_RUNWAY_CROSSING,
     ROLE_SECONDARY_PARALLEL,
     ROLE_STUB,
     ROLE_TERMINAL,
@@ -2987,7 +2988,11 @@ def _drop_overlap_against_fixed_shapes(
     # of the JUNCTION class additionally yield to LARGER junctions
     # so two junctions can't both claim the same residue area.
     priority: List[set] = [
-        {ROLE_RUNWAY},
+        # ROLE_RUNWAY_CROSSING is runway-derived geometry that
+        # replaced its source runway segments — same tier as
+        # ROLE_RUNWAY so adjacent rects/junctions/aprons clip
+        # AGAINST it instead of overlapping into its footprint.
+        {ROLE_RUNWAY, ROLE_RUNWAY_CROSSING},
         {ROLE_TERMINAL},
         {ROLE_PRIMARY_PARALLEL, ROLE_SECONDARY_PARALLEL,
          ROLE_STUB, ROLE_CROSS_CONNECTOR},
