@@ -1752,6 +1752,14 @@ def _absorb_rects_at_junction_perimeters(
             continue
         if r.polygon.geom_type != "Polygon":
             continue
+        # Per user 2026-05-19: shapes with per-vertex node_altitudes
+        # are no longer canonical sloping rects (seam-cut or tile-
+        # cut converted them away from altitude_high/low because
+        # the polygon could no longer be expressed as a planar
+        # 4-corner rect).  Absorption only applies to shapes that
+        # still render with the planar altitude_high/low convention.
+        if r.node_altitudes is not None:
+            continue
         rc = list(r.polygon.exterior.coords)
         if rc and rc[0] == rc[-1]:
             rc = rc[:-1]

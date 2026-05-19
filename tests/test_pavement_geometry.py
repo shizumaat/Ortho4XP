@@ -300,13 +300,21 @@ def test_no_vertex_on_sloping_rect_edge(icao):
     # kinks.  Only sloped rects (altitude_high+low set) and
     # untagged residue (no altitude info at all) are subject to
     # the 4-corner invariant.
+    #
+    # Per user 2026-05-19: shapes with per-vertex ``node_altitudes``
+    # are likewise NOT canonical sloping rects — the seam-anchor
+    # and tile-cut passes convert away from altitude_high/low when
+    # the polygon can't be expressed as a planar 4-corner rect, and
+    # those node_altitudes shapes can carry arbitrary ring vertices
+    # by design.
     sloping = [s for s in layout.shapes
                if s.role in sloping_roles
                and s.polygon is not None
                and not s.polygon.is_empty
                and not (s.altitude is not None
                         and s.altitude_high is None
-                        and s.altitude_low is None)]
+                        and s.altitude_low is None)
+               and s.node_altitudes is None]
     others = [s for s in layout.shapes
               if s.role not in sloping_roles
               and s.polygon is not None

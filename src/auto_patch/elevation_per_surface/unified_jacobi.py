@@ -717,13 +717,26 @@ def _writeback(layout, elev, bucket_to_idx):
             continue
         # Runway shapes are normally skipped (their altitudes come
         # from CIFP — HARD-anchored, immutable through the solver).
-        # Exception (user 2026-05-13): seam-converted runway sub-rects
-        # have node_altitudes; we need to write back per-vertex
-        # solver-output altitudes so shared corners with adjacent
-        # sub-rects agree on the regraded value.  CIFP-only 4-corner
-        # runway sub-rects with altitude_high/low are left alone.
+        # Exceptions where the writeback DOES run:
+        #   * Seam-converted runway sub-rects (user 2026-05-13): they
+        #     have ``node_altitudes`` set; we write per-vertex
+        #     solver-output altitudes so shared corners with adjacent
+        #     sub-rects agree on the regraded value.
+        #   * Non-4-corner runway shapes (user 2026-05-19): a runway
+        #     segment that lost its canonical 4-corner form through
+        #     downstream geometry passes (crossing union, snap-to-
+        #     corner, etc.) is no longer a sloped rect — its
+        #     altitude_high/low tags are stale because X-Plane's
+        #     planar 4-corner convention requires exactly 4 corners.
+        #     Convert to ``node_altitudes`` so the OSM emit + the
+        #     no-vertex-on-sloping-edge invariant treat it as the
+        #     non-rect it actually is.
         if s.role == ROLE_RUNWAY and not s.node_altitudes:
-            continue
+            _rc_check = list(s.polygon.exterior.coords) if s.polygon else []
+            if _rc_check and _rc_check[0] == _rc_check[-1]:
+                _rc_check = _rc_check[:-1]
+            if len(_rc_check) == 4:
+                continue
         if s.polygon is None or s.polygon.is_empty:
             continue
         try:

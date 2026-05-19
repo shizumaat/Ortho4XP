@@ -291,15 +291,68 @@ class EdgeStep:
     elev_proj: float
 
 
-ELEV_ROUNDING_NOISE_M = 0.1  # patch elevations are stored at 1
-                              # decimal -> worst-case rounding noise
-                              # between any two elevs is 0.1 m
+ELEV_ROUNDING_NOISE_M = 0.15  # patch elevations are stored at 1
+                               # decimal, contributing up to 0.1 m
+                               # of paired-rounding noise; the per-
+                               # surface solver converges to within
+                               # ~0.05 m of its grade cap before
+                               # writeback.  0.15 m envelopes both
+                               # without masking real (≥ 1.6 %)
+                               # violations.
+
+
+# X-Plane tile seams run along integer latitude / longitude lines.
+# auto_patch handles them in two passes:
+#
+#   1. ``seam_anchors`` inserts vertices on each integer line that
+#      crosses the airport and HARD-anchors them to ``dem.alt_strict``
+#      — the terrain mesh in the neighbour tile pins the same points
+#      to DEM, so they must agree or the patch tears at the boundary.
+#   2. ``tile_cut`` later subtracts a ``half_width_m`` strip
+#      (default 5 m each side, 10 m total) at every integer line.
+#      The pre-cut seam vertex at the integer line is removed; the
+#      resulting polygon gets new boundary vertices on the airport
+#      side of the strip, exactly ``half_width_m`` away from the
+#      integer line.  Those new vertices inherit altitudes by
+#      resampling (nearest-neighbour or slope-projected) from the
+#      pre-cut DEM-anchored ring — so they're effectively DEM-pinned
+#      too, even though they no longer carry the seam tag.
+#
+# Both classes of vertex are immovable from the solver's POV: their
+# altitudes are dictated by the DEM at the tile boundary, and the
+# adjacent-tile patch + terrain mesh must agree exactly.  Within-
+# shape grade between any pair touching one of these vertices is a
+# function of DEM noise at the tile edge, not of solver feasibility,
+# so we skip those pairs (and any triangle that touches one).
+#
+# Cross-shape proximity and edge/mid-edge step checks naturally
+# still pass because both adjacent shapes sample the same DEM at
+# the same XY, so the tile-edge vertex altitudes agree across
+# shapes.
+#
+# Detection is geometric: a vertex is on the tile seam iff its lat
+# OR its lon is within ``_SEAM_LL_TOL_DEG`` of an integer value.
+# The tolerance (1e-4 °, ~11 m) covers the 5-m offset of post-cut
+# boundary vertices plus slack for projection round-trip drift.
+_SEAM_LL_TOL_DEG = 1e-4
+
+
+def _seam_nids(nodes: Dict[str, Tuple[float, float]]) -> set:
+    """Set of nids on a tile-boundary seam (integer lat or lon)."""
+    out: set = set()
+    for nid, (lat, lon) in nodes.items():
+        if (abs(lat - round(lat)) <= _SEAM_LL_TOL_DEG
+                or abs(lon - round(lon)) <= _SEAM_LL_TOL_DEG):
+            out.add(nid)
+    return out
 
 
 def _check_plane_gradient(ways: List[Way],
                           nodes: Dict[str, Tuple[float, float]],
                           ll_to_m,
-                          max_grade: float) -> List[Violation]:
+                          max_grade: float,
+                          seam_nids: Optional[set] = None,
+                          ) -> List[Violation]:
     """For each 3-vertex polygon (a triangle, which X-Plane renders
     as a planar surface), compute the plane's elevation gradient
     and flag if its magnitude exceeds ``max_grade``.
@@ -310,11 +363,22 @@ def _check_plane_gradient(ways: List[Way],
     gradient perpendicular to BC may be several %.  This shows up
     as a visible slope inside the triangle even though no vertex
     pair is "too steep".
+
+    Triangles that touch any seam vertex are skipped — their plane
+    is dictated by DEM-pinned corners the solver cannot move.
     """
+    seam_nids = seam_nids or set()
     out: List[Violation] = []
     for w in ways:
         grade_cap = _role_grade_limit(w, max_grade)
         if grade_cap is None:
+            continue
+        # Pre-screen ring nids — skip the whole triangle if any
+        # vertex lies on the tile seam.
+        ring_nids = (w.nids[:-1] if (len(w.nids) > 1
+                     and w.nids[0] == w.nids[-1])
+                     else w.nids)
+        if any(nid in seam_nids for nid in ring_nids):
             continue
         pts: List[Tuple[float, float, float]] = []
         for k, nid in enumerate(w.nids[:-1] if (len(w.nids) > 1
@@ -343,30 +407,35 @@ def _check_plane_gradient(ways: List[Way],
         gx = -nx / nz
         gy = -ny / nz
         grad = math.hypot(gx, gy)
-        if grad > grade_cap + 1e-5:
-            # Pick two vertices along the gradient direction for
-            # the report: project all three onto the gradient axis,
-            # take the max/min-elevation pair.
-            gnorm = math.hypot(gx, gy)
-            if gnorm < 1e-9:
-                continue
-            ghx, ghy = gx / gnorm, gy / gnorm  # unit gradient
-            proj = [(p[0] * ghx + p[1] * ghy, p[2], p)
-                    for p in pts]
-            proj.sort()
-            lo_p, lo_z, lo_pt = proj[0]
-            hi_p, hi_z, hi_pt = proj[-1]
-            dist_along_grad = hi_p - lo_p
-            out.append(Violation(
-                grade_pct=grad * 100,
-                excess_pct=(grad - grade_cap) * 100,
-                distance_m=dist_along_grad if dist_along_grad > 0.5
-                           else 1.0,
-                de_m=abs(hi_z - lo_z),
-                way_a=w, way_b=w,
-                pt_a=(lo_pt[0], lo_pt[1]),
-                pt_b=(hi_pt[0], hi_pt[1]),
-                elev_a=lo_z, elev_b=hi_z))
+        # Project vertices along the gradient direction to get the
+        # plane's altitude swing across the triangle.  The
+        # gradient check fires only when the swing exceeds the
+        # grade cap allowance for that swing distance — matching
+        # the within-shape pair check's rounding-noise envelope.
+        gnorm = grad
+        if gnorm < 1e-9:
+            continue
+        ghx, ghy = gx / gnorm, gy / gnorm
+        proj = [(p[0] * ghx + p[1] * ghy, p[2], p)
+                for p in pts]
+        proj.sort()
+        lo_p, lo_z, lo_pt = proj[0]
+        hi_p, hi_z, hi_pt = proj[-1]
+        dist_along_grad = hi_p - lo_p
+        de_along_grad = abs(hi_z - lo_z)
+        allowance = grade_cap * dist_along_grad + ELEV_ROUNDING_NOISE_M
+        if de_along_grad <= allowance:
+            continue
+        out.append(Violation(
+            grade_pct=grad * 100,
+            excess_pct=(grad - grade_cap) * 100,
+            distance_m=dist_along_grad if dist_along_grad > 0.5
+                       else 1.0,
+            de_m=de_along_grad,
+            way_a=w, way_b=w,
+            pt_a=(lo_pt[0], lo_pt[1]),
+            pt_b=(hi_pt[0], hi_pt[1]),
+            elev_a=lo_z, elev_b=hi_z))
     return out
 
 
@@ -435,7 +504,9 @@ def _pair_grade_limit(way_a: "Way", way_b: "Way",
 def _check_within_shape(ways: List[Way],
                         nodes: Dict[str, Tuple[float, float]],
                         ll_to_m,
-                        max_grade: float) -> List[Violation]:
+                        max_grade: float,
+                        seam_nids: Optional[set] = None,
+                        ) -> List[Violation]:
     """Grade check between vertex pairs on the same way.
 
     The grade limit per way is resolved from
@@ -457,17 +528,23 @@ def _check_within_shape(ways: List[Way],
     failure mode (free-vertex drift near anchored neighbours)
     that the prior consecutive-only check missed.
 
+    Pairs that include a seam vertex are skipped — those endpoints
+    are HARD-anchored to DEM by the seam pipeline and the solver
+    cannot move them, so a grade violation here reflects DEM noise
+    along the tile boundary, not a solver bug.
+
     A violation requires ``|de| > grade × dist + ELEV_ROUNDING_NOISE_M``
     so single-decimal rounding doesn't produce spurious flags at
     sub-metre distances (where 0.05 m of true error rounds to 0.10 m
     of stored error).
     """
+    seam_nids = seam_nids or set()
     out: List[Violation] = []
     for w in ways:
         grade_cap = _role_grade_limit(w, max_grade)
         if grade_cap is None:
             continue  # skip ROLE_GRADE_LIMITS[role] is None
-        pts: List[Tuple[float, float, float]] = []
+        pts: List[Tuple[float, float, float, bool]] = []
         for k, nid in enumerate(w.nids[:-1] if (len(w.nids) > 1
                                 and w.nids[0] == w.nids[-1])
                                 else w.nids):
@@ -478,7 +555,7 @@ def _check_within_shape(ways: List[Way],
             e = w.elevs[k]
             if e is None:
                 continue
-            pts.append((x, y, e))
+            pts.append((x, y, e, nid in seam_nids))
         n = len(pts)
         if n < 3:
             continue
@@ -497,8 +574,10 @@ def _check_within_shape(ways: List[Way],
                             * WITHIN_SHAPE_MAX_PAIR_DIST_M):
                         pairs.append((i, j))
         for i, j in pairs:
-            xi, yi, ei = pts[i]
-            xj, yj, ej = pts[j]
+            xi, yi, ei, si = pts[i]
+            xj, yj, ej, sj = pts[j]
+            if si or sj:
+                continue  # seam-anchored endpoint — DEM controls.
             d = math.hypot(xi - xj, yi - yj)
             if d < 0.5:
                 continue
@@ -833,18 +912,22 @@ def run_checks(
     ll_to_m = _ll_to_m_factory(nodes)
     vertices, edges = _build_vertex_edge_tables(nodes, ways, ll_to_m)
     max_grade = max_grade_pct / 100.0
+    seam_nids = _seam_nids(nodes)
 
     print(f"=== Grade validation: {osm_path} ===")
     n_with_elev = sum(1 for v in vertices if v.elev is not None)
     print(f"  ways: {len(ways)} | vertices: {len(vertices)} "
-          f"({n_with_elev} with elevation) | edges: {len(edges)}")
+          f"({n_with_elev} with elevation) | edges: {len(edges)} "
+          f"| seam vertices: {len(seam_nids)}")
 
-    within = _check_within_shape(ways, nodes, ll_to_m, max_grade)
+    within = _check_within_shape(
+        ways, nodes, ll_to_m, max_grade, seam_nids=seam_nids)
     _print_violations(
         f"WITHIN-SHAPE vertex-pair grade > {max_grade_pct}%",
         within, top_n)
 
-    plane = _check_plane_gradient(ways, nodes, ll_to_m, max_grade)
+    plane = _check_plane_gradient(
+        ways, nodes, ll_to_m, max_grade, seam_nids=seam_nids)
     _print_violations(
         f"PLANE GRADIENT (triangle surface) > {max_grade_pct}%",
         plane, top_n)

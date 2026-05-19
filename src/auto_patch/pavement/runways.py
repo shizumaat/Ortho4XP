@@ -29,7 +29,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from shapely.errors import GEOSException, TopologicalError
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 from ..layout import (
@@ -161,6 +161,75 @@ def _sample_runway_segment_elev(
                - float(shape.altitude_high)))
 
 
+def _runway_segment_centerline(poly):
+    """Return a LineString through a runway segment's long axis,
+    or ``None`` if the geometry isn't usable.
+
+    A runway segment is a sloped rect built by ``_rect_from_axis_
+    extended`` with the canonical convention: corners 0 and 3 at one
+    axis-end (HIGH), corners 1 and 2 at the other (LOW).  The
+    centerline runs from midpoint(0,3) to midpoint(1,2) regardless
+    of which polygon side happens to be longer — for very-short
+    runway sub-rects (e.g. CYXY 14R/32L at 30 m long × 45 m wide,
+    typical after seam-driven subdivision) the runway's WIDTH
+    exceeds its segment length and an OBB-based axis-finder would
+    pick the wrong direction.
+    """
+    if poly is None or poly.is_empty:
+        return None
+    try:
+        coords = list(poly.exterior.coords)
+    except _GEOM_EXC:
+        return None
+    if coords and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    n = len(coords)
+    if n < 3:
+        return None
+    if n == 4:
+        mid_a = (0.5 * (coords[0][0] + coords[3][0]),
+                 0.5 * (coords[0][1] + coords[3][1]))
+        mid_b = (0.5 * (coords[1][0] + coords[2][0]),
+                 0.5 * (coords[1][1] + coords[2][1]))
+        if math.hypot(mid_a[0] - mid_b[0], mid_a[1] - mid_b[1]) < 1.0:
+            return None
+        return LineString([mid_a, mid_b])
+    # Non-4-corner (seam-inserted): the original two short edges
+    # remain the shortest two sides.  Find the perpendicular pair
+    # via the oriented bounding box and project polygon vertices to
+    # find each axis-end's midpoint.
+    try:
+        obb = poly.minimum_rotated_rectangle
+        obb_coords = list(obb.exterior.coords)
+        if obb_coords and obb_coords[0] == obb_coords[-1]:
+            obb_coords = obb_coords[:-1]
+    except _GEOM_EXC:
+        return None
+    if len(obb_coords) != 4:
+        return None
+    side_lens = [
+        math.hypot(obb_coords[(i + 1) % 4][0] - obb_coords[i][0],
+                   obb_coords[(i + 1) % 4][1] - obb_coords[i][1])
+        for i in range(4)]
+    # The long-axis side runs between two short-edge midpoints.
+    # The runway's long axis is parallel to the SHORTER OBB side
+    # only when the polygon is wider than long (post-seam subdivision);
+    # parallel to the LONGER OBB side otherwise.  Without segment-
+    # length context, fall back to the longer-side assumption,
+    # matching pre-seam behaviour for fragments larger than the
+    # runway width.
+    long_idx = 0 if side_lens[0] >= side_lens[1] else 1
+    short1 = ((long_idx + 1) % 4, (long_idx + 2) % 4)
+    short2 = ((long_idx + 3) % 4, (long_idx + 0) % 4)
+    mid_a = (0.5 * (obb_coords[short1[0]][0] + obb_coords[short1[1]][0]),
+             0.5 * (obb_coords[short1[0]][1] + obb_coords[short1[1]][1]))
+    mid_b = (0.5 * (obb_coords[short2[0]][0] + obb_coords[short2[1]][0]),
+             0.5 * (obb_coords[short2[0]][1] + obb_coords[short2[1]][1]))
+    if math.hypot(mid_a[0] - mid_b[0], mid_a[1] - mid_b[1]) < 1.0:
+        return None
+    return LineString([mid_a, mid_b])
+
+
 def _resolve_runway_crossings(
         layout: "PavementLayout",
         min_overlap_m2: float = 20.0,
@@ -193,7 +262,10 @@ def _resolve_runway_crossings(
                     and not s.polygon.is_empty]
     if len(rwy_indices) < 2:
         return 0
-    rwy_polys = [layout.shapes[i].polygon for i in rwy_indices]
+    rwy_shapes = [layout.shapes[i] for i in rwy_indices]
+    rwy_polys = [s.polygon for s in rwy_shapes]
+    rwy_refs = [s.ref for s in rwy_shapes]
+    rwy_centerlines = [_runway_segment_centerline(p) for p in rwy_polys]
     from shapely.strtree import STRtree
     try:
         tree = STRtree(rwy_polys)
@@ -215,8 +287,24 @@ def _resolve_runway_crossings(
         if ra != rb:
             parent[ra] = rb
 
+    # A "real" runway crossing has two CENTERLINES that intersect —
+    # this is the only case where two runways physically share a
+    # surface and their elevations must reconcile.  Rect-polygon
+    # overlap alone (the previous criterion, area > 20 m²) caught
+    # close-pass non-crossing runways: at CYXY runway 02/20's rect
+    # corner intrudes into runway 14R/32L's rect width by ~3-15 m,
+    # producing a triangular overlap region that the old code
+    # treated as a crossing.  But the two centerlines don't meet,
+    # so each runway follows its own CIFP profile and the two
+    # disagree by ~4 m at the close-pass — the resulting "crossing"
+    # junction had HARD-anchored corners from both runways that
+    # couldn't simultaneously satisfy the 1.5 % grade rule.  Real
+    # geometric overlap of two non-crossing runways is the overlap-
+    # clip pass's job; ``_resolve_runway_crossings`` only fires
+    # when there's an actual centerline meeting point.
     for ai in range(n):
         pa = rwy_polys[ai]
+        ca = rwy_centerlines[ai]
         try:
             cands = tree.query(pa)
         except _GEOM_EXC:
@@ -225,9 +313,22 @@ def _resolve_runway_crossings(
             bi = int(ci)
             if bi <= ai:
                 continue
-            pb = rwy_polys[bi]
+            # Same-runway segments are sequential parts of one
+            # runway profile, not a crossing — skip the pairwise
+            # check.  (Transitive union via a third runway can still
+            # group them if both cross a common third runway.)
+            if rwy_refs[ai] and rwy_refs[ai] == rwy_refs[bi]:
+                continue
+            cb = rwy_centerlines[bi]
+            if ca is None or cb is None:
+                continue
             try:
-                inter = pa.intersection(pb)
+                if not ca.intersects(cb):
+                    continue
+                # Belt-and-braces: still require a non-trivial
+                # rect-overlap so a stray micro-touch at the very
+                # tip of two centerlines doesn't trigger a crossing.
+                inter = rwy_polys[ai].intersection(rwy_polys[bi])
                 if inter.is_empty or inter.area < min_overlap_m2:
                     continue
                 union_uf(ai, bi)
@@ -371,7 +472,150 @@ def _resolve_runway_crossings(
         layout.shapes = [s for i, s in enumerate(layout.shapes)
                           if i not in drop_set]
         layout.shapes.extend(new_shapes)
+    if n_resolved:
+        _absorb_crossing_vertices_into_adjacent_rects(layout)
     return n_resolved
+
+
+def _absorb_crossing_vertices_into_adjacent_rects(
+        layout: "PavementLayout",
+        perp_tol_m: float = 0.5,
+        corner_tol_m: float = 0.5,
+) -> int:
+    """Convert any canonical 4-corner runway sub-rect whose sloping
+    edge has a runway_crossing vertex on its INTERIOR to per-vertex
+    ``node_altitudes`` form, with the foreign vertex inserted into
+    the rect's ring.
+
+    Per user 2026-05-19: when a runway-crossing polygon's boundary
+    walks past an adjacent runway sub-rect's corner without quite
+    reaching it (the union/snap pipeline produces vertices a few
+    metres from the rect's nearest corner because the runways meet
+    at an oblique angle), the crossing's vertex lands on the rect's
+    sloping edge interior.  ``test_no_vertex_on_sloping_rect_edge``
+    enforces "junctions share only CORNERS, never edge interiors"
+    on canonical rects; the architectural escape hatch is to admit
+    the rect can no longer maintain its planar 4-corner contract
+    along that shared boundary, and convert it to ``node_altitudes``
+    (which the invariant test legitimately exempts).  Altitudes
+    along the new ring are interpolated from the original
+    altitude_high/low profile (linear along each edge), preserving
+    the same planar surface — just expressed per-vertex now.
+
+    Returns the number of rects converted.
+    """
+    rwy_shapes: List[Tuple[int, "BuiltShape"]] = []
+    for i, s in enumerate(layout.shapes):
+        if s.role != ROLE_RUNWAY:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        if s.node_altitudes is not None:
+            continue
+        if s.altitude_high is None or s.altitude_low is None:
+            continue
+        try:
+            coords = list(s.polygon.exterior.coords)
+        except _GEOM_EXC:
+            continue
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        rwy_shapes.append((i, s))
+    rc_vertices: List[Tuple[float, float]] = []
+    for s in layout.shapes:
+        if s.role != ROLE_RUNWAY_CROSSING:
+            continue
+        if s.polygon is None or s.polygon.is_empty:
+            continue
+        try:
+            rc_coords = list(s.polygon.exterior.coords)
+        except _GEOM_EXC:
+            continue
+        if rc_coords and rc_coords[0] == rc_coords[-1]:
+            rc_coords = rc_coords[:-1]
+        rc_vertices.extend((float(x), float(y)) for x, y in rc_coords)
+    if not rwy_shapes or not rc_vertices:
+        return 0
+
+    n_converted = 0
+    for _idx, r in rwy_shapes:
+        coords = list(r.polygon.exterior.coords)
+        if coords and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) != 4:
+            continue
+        # Canonical [HI-LEFT, LO-LEFT, LO-RIGHT, HI-RIGHT] convention:
+        # corners 0, 3 at HI altitude; corners 1, 2 at LO altitude.
+        # This matches how ``runway_segments.add_rect_patch`` builds
+        # runway sub-rects (using ``runway_corners(lat_A, lon_A,
+        # lat_B, lon_B, width)`` with the HIGH end first).
+        eh = float(r.altitude_high)
+        el = float(r.altitude_low)
+        corner_alts = [eh, el, el, eh]
+        new_ring: List[Tuple[float, float]] = []
+        new_alts: List[float] = []
+        any_insert = False
+        for k in range(4):
+            new_ring.append((float(coords[k][0]), float(coords[k][1])))
+            new_alts.append(corner_alts[k])
+            ax, ay = coords[k]
+            bx, by = coords[(k + 1) % 4]
+            dx = bx - ax
+            dy = by - ay
+            edge_L2 = dx * dx + dy * dy
+            if edge_L2 < 1.0:
+                continue
+            edge_L = math.sqrt(edge_L2)
+            # Skip edges shorter than corner_tol_m × 2 — there's no
+            # interior to land on.
+            if edge_L < 2.0 * corner_tol_m:
+                continue
+            edge_inserts: List[Tuple[float, float, float]] = []
+            for fx, fy in rc_vertices:
+                t = ((fx - ax) * dx + (fy - ay) * dy) / edge_L2
+                if t * edge_L <= corner_tol_m:
+                    continue
+                if (1.0 - t) * edge_L <= corner_tol_m:
+                    continue
+                px = ax + t * dx
+                py = ay + t * dy
+                perp_d = math.hypot(fx - px, fy - py)
+                if perp_d > perp_tol_m:
+                    continue
+                # Deduplicate near-coincident foreign vertices on the
+                # same edge (e.g. multiple runway_crossing polygons
+                # contributing the same boundary point).
+                if any(abs(t - et) * edge_L < corner_tol_m
+                       for et, _, _ in edge_inserts):
+                    continue
+                edge_inserts.append((t, float(fx), float(fy)))
+            edge_inserts.sort(key=lambda r: r[0])
+            for t, fx, fy in edge_inserts:
+                # Altitude interpolation along this edge between
+                # corner k and corner k+1.
+                a_alt = corner_alts[k]
+                b_alt = corner_alts[(k + 1) % 4]
+                new_ring.append((fx, fy))
+                new_alts.append(a_alt + t * (b_alt - a_alt))
+                any_insert = True
+        if not any_insert:
+            continue
+        if len(new_ring) < 4:
+            continue
+        try:
+            new_poly = Polygon(new_ring + [new_ring[0]])
+            if not new_poly.is_valid or new_poly.is_empty:
+                continue
+        except _GEOM_EXC:
+            continue
+        r.polygon = new_poly
+        r.node_altitudes = new_alts + [new_alts[0]]
+        r.altitude_high = None
+        r.altitude_low = None
+        n_converted += 1
+    return n_converted
 
 
 def _insert_runway_chain_bridges(

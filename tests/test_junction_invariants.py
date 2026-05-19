@@ -478,6 +478,15 @@ def test_taxi_rects_not_alongside_apron(icao):
             continue
         if s.polygon is None or s.polygon.is_empty:
             continue
+        # Skip shapes whose altitude representation is per-vertex
+        # node_altitudes — per user 2026-05-19 these are no longer
+        # canonical sloping rects (the seam-anchor / tile-cut passes
+        # convert away from altitude_high/low when the polygon can
+        # no longer be expressed as a planar 4-corner rect).  The
+        # sloping-edge invariant only applies to shapes that still
+        # render with the planar altitude_high/low convention.
+        if s.node_altitudes is not None:
+            continue
         coords = list(s.polygon.exterior.coords)
         if coords and coords[0] == coords[-1]:
             coords = coords[:-1]

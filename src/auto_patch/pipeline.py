@@ -2241,6 +2241,14 @@ def build_airport_pavement(icao: str, xplane_root: str,
                     f"{n_seam} DEM-anchored, "
                     f"{n_regraded} runway(s) regraded.")
 
+            # First solver pass — gives every shape coherent
+            # altitudes so the downstream geometric passes (snap,
+            # subdivide, stitch) can make altitude-dependent
+            # decisions and so that the writeback's canonical-point
+            # routing ensures adjacent shapes share altitudes at
+            # would-be-shared corners.  Removing this pass produces
+            # cross-shape steps at adjacent-apron corners that the
+            # final solver pass alone can't fully reconcile.
             per_surface_solve(layout, icao,
                                dem=dem,
                                tile_lat=tile_lat, tile_lon=tile_lon)
@@ -2248,8 +2256,10 @@ def build_airport_pavement(icao: str, xplane_root: str,
             # Grade-based subdivide (``_subdivide_violating_junctions``,
             # threshold 2 %) — catches residual within-shape grade
             # violations the solver alone can't relax.  Iterates up
-            # to 4 rounds, then re-runs the solver to integrate the
-            # new geometry.
+            # to 4 rounds to settle.  Re-solving here is redundant —
+            # the final solver pass at the end of the pipeline (after
+            # tile_cut) integrates every post-subdivision geometry
+            # change.
             from .junction_repair import _subdivide_violating_junctions
             n_grade = 0
             for _ in range(4):
@@ -2257,10 +2267,11 @@ def build_airport_pavement(icao: str, xplane_root: str,
                 if n == 0:
                     break
                 n_grade += n
-            if n_grade > 0:
-                per_surface_solve(layout, icao,
-                                   dem=dem,
-                                   tile_lat=tile_lat, tile_lon=tile_lon)
+            # The final solver pass at the end of the pipeline
+            # (after tile_cut) integrates every post-subdivision
+            # geometry change, so the historic post-subdivide rerun
+            # here is redundant — its only customers downstream are
+            # the snap passes, which the final solver also covers.
 
         # Stitch pavement to terminal pads (user 2026-05-04): make
         # the two share an identical vertex sequence on every shared
@@ -2419,6 +2430,32 @@ def build_airport_pavement(icao: str, xplane_root: str,
             current_tile_lat=current_tile_lat,
             current_tile_lon=current_tile_lon,
         )
+
+        # Final per-surface solver pass against the FULLY-SETTLED
+        # geometry — runs AFTER tile_cut.  Every mutation since the
+        # first/second solver passes above (corner-snap, stitch,
+        # sloped-rect split, junction absorption, apron
+        # reclassification, tile-boundary cut) can introduce
+        # within-shape grade violations the prior solver runs had
+        # resolved.  Tile_cut in particular resamples each post-cut
+        # boundary vertex's altitude via NN against the pre-cut
+        # ring — a 7-m DEM range across a 30-m apron can produce
+        # >1.5 % between two adjacent resampled vertices.
+        #
+        # Post-cut tile-edge vertices sit at ``half_width_m`` offset
+        # from the integer seam line (5 m by default).  The seam
+        # vertex itself was removed by the cut; the new vertex is
+        # NOT a seam anchor — both this tile's auto_patch and the
+        # adjacent tile's auto_patch independently pick altitudes
+        # for their own (offset) boundary vertices, and Ortho4XP's
+        # terrain mesh interpolates across the 10-m gap at render
+        # time.  So the final solver pass is free to cap-project
+        # post-cut boundary vertices toward grade compliance.
+        if USE_PER_SURFACE_SOLVER and layout.anchor is not None:
+            per_surface_solve(layout, icao,
+                               dem=dem,
+                               tile_lat=tile_lat, tile_lon=tile_lon)
+
         if n_tile_delta != 0:
             UI.vprint(1,
                 f"  [pav-builder] {icao}: tile-boundary cut "

@@ -267,12 +267,50 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
     paired_list = [(da, dat_a, db, dat_b)
                    for da, dat_a, db, dat_b in runway_pairs
                    if db is not None and dat_b is not None]
+    # Pre-compute which runway pairs have a real centerline crossing.
+    # For those pairs, skip the threshold-projection anchor logic
+    # below: the crossing-reconciliation anchor (added afterward)
+    # is the authoritative altitude constraint at the meeting point,
+    # and adding a competing taxi-grade anchor for one runway's
+    # threshold projected onto the other ~50-100 m from the crossing
+    # produces clustered anchors with mutually-infeasible altitudes
+    # (e.g. CYXY: 14R/32L receives a 694.3 anchor from RW02's
+    # projection and a 696.1 reconciliation anchor at the actual
+    # centerline crossing 50 m away — 2.99 % local grade).  The
+    # threshold-projection logic was designed for *non-crossing*
+    # close-pass runways where a taxi may bridge them; that case is
+    # unchanged.
+    from shapely.geometry import LineString as _LSx
+    crossing_pairs: set = set()
+    for ti in range(len(paired_list)):
+        da_t, dat_a_t, db_t, dat_b_t = paired_list[ti]
+        cl_t = _LSx([(dat_a_t["lon"], dat_a_t["lat"]),
+                     (dat_b_t["lon"], dat_b_t["lat"])])
+        for ri in range(len(paired_list)):
+            if ri == ti:
+                continue
+            da_r, dat_a_r, db_r, dat_b_r = paired_list[ri]
+            cl_r = _LSx([(dat_a_r["lon"], dat_a_r["lat"]),
+                         (dat_b_r["lon"], dat_b_r["lat"])])
+            try:
+                if cl_t.intersects(cl_r):
+                    pt = cl_t.intersection(cl_r)
+                    if pt.geom_type == "Point":
+                        crossing_pairs.add((ti, ri))
+            except Exception:
+                continue
+
     for ti, (da_t, dat_a_t, db_t, dat_b_t) in enumerate(paired_list):
         for src_desig, src_data in (
                 (da_t, dat_a_t), (db_t, dat_b_t)):
             for ri, (da_r, dat_a_r, db_r, dat_b_r) in enumerate(
                     paired_list):
                 if ri == ti:
+                    continue
+                # Skip threshold-projection anchor when these two
+                # runways already have a centerline crossing — the
+                # reconciliation anchor handles altitude agreement.
+                if (ti, ri) in crossing_pairs:
                     continue
                 mid_lat = 0.5 * (dat_a_r["lat"] + dat_b_r["lat"])
                 cl_v = cos(mid_lat * pi / 180.0)
@@ -318,6 +356,68 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 key = (da_r, db_r)
                 auto_extra_anchors.setdefault(key, []).append(
                     (p_lat, p_lon, anchor_e))
+    # ── Runway-runway centerline-crossing reconciliation ──
+    # Per user 2026-05-19: CIFP fixes only the runway threshold
+    # elevations; the altitude along the rest of the runway is
+    # OUR responsibility.  At any point where two runway
+    # centerlines geometrically cross, the runways must share the
+    # same altitude — they physically occupy the same surface
+    # there, so a 4 m disagreement (CYXY 02/20 × 14R/32L from
+    # threshold-to-threshold linear interpolation) is an
+    # auto-patch bug, not a CIFP problem.
+    #
+    # Reconciliation: at every centerline crossing between two
+    # paired runways, take the average of each runway's
+    # threshold-to-threshold linear-interpolated altitude at the
+    # crossing.  Inject that average as an ANCHORED extra-anchor
+    # on BOTH runways at the crossing point.  The existing
+    # segmenter then re-shapes each runway's profile to honor the
+    # new interior anchor alongside the threshold anchors, and
+    # both runways meet smoothly at the crossing.
+    #
+    # Affects only airports with crossing runways (CYXY).  At
+    # SPJC / SPLP each airport has a single runway pair so no
+    # crossings exist and this pre-pass is a no-op.
+    from shapely.geometry import LineString as _LS
+    for ti in range(len(paired_list)):
+        da_t, dat_a_t, db_t, dat_b_t = paired_list[ti]
+        for ri in range(ti + 1, len(paired_list)):
+            da_r, dat_a_r, db_r, dat_b_r = paired_list[ri]
+            try:
+                cl_t = _LS([
+                    (dat_a_t["lon"], dat_a_t["lat"]),
+                    (dat_b_t["lon"], dat_b_t["lat"])])
+                cl_r = _LS([
+                    (dat_a_r["lon"], dat_a_r["lat"]),
+                    (dat_b_r["lon"], dat_b_r["lat"])])
+                if not cl_t.intersects(cl_r):
+                    continue
+                pt = cl_t.intersection(cl_r)
+            except Exception:
+                continue
+            if pt.is_empty or pt.geom_type != "Point":
+                continue
+            try:
+                t_t = cl_t.project(pt) / cl_t.length
+                t_r = cl_r.project(pt) / cl_r.length
+            except (ZeroDivisionError, Exception):
+                continue
+            # Skip endpoints — they're already anchored at CIFP
+            # threshold elevations.  Only interior crossings need
+            # this reconciliation.
+            if not (0.001 < t_t < 0.999 and 0.001 < t_r < 0.999):
+                continue
+            z_t = dat_a_t["elevation_m"] + t_t * (
+                dat_b_t["elevation_m"] - dat_a_t["elevation_m"])
+            z_r = dat_a_r["elevation_m"] + t_r * (
+                dat_b_r["elevation_m"] - dat_a_r["elevation_m"])
+            agreed = 0.5 * (z_t + z_r)
+            c_lat, c_lon = pt.y, pt.x
+            auto_extra_anchors.setdefault(
+                (da_t, db_t), []).append((c_lat, c_lon, agreed))
+            auto_extra_anchors.setdefault(
+                (da_r, db_r), []).append((c_lat, c_lon, agreed))
+
     # Merge user-supplied extra_anchors on top of auto-detected
     # ones — user values take precedence (replace auto if same
     # exact lat/lon, else append).
