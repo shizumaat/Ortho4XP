@@ -357,6 +357,7 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
     # ── Segmented runway rectangles (legacy CIFP + DEM) ─────────
     cifp_path = _find_cifp_path(xplane_root, icao)
     runway_segment_chain = []
+    runway_profile_state: dict = {}
     if cifp_path is not None and dem is not None:
         try:
             from . import driver as _AP
@@ -400,12 +401,19 @@ def _compute_elevations(layout: "PavementLayout", icao: str,
                 # to bridge the gap with boundary-trace waypoints.
                 pav_intersections = getattr(
                     layout, "_pav_runway_intersections", None)
-                _xml, runway_segment_chain = _AP.generate_patch_osm(
-                    icao, pairs, runway_widths=runway_widths,
-                    tile=tile, apt_runways=apt_runway_geom,
-                    pav_intersections=pav_intersections)
+                _xml, runway_segment_chain, runway_profile_state = (
+                    _AP.generate_patch_osm(
+                        icao, pairs, runway_widths=runway_widths,
+                        tile=tile, apt_runways=apt_runway_geom,
+                        pav_intersections=pav_intersections))
         except _GEOM_EXC:
             runway_segment_chain = []
+            runway_profile_state = {}
+
+    # Stash the per-pair FAA-profile state on the layout so a
+    # downstream redistribute step can fold seam DEM altitudes
+    # into the same profile (see ``runway_redistribute``).
+    layout._runway_profile_state = runway_profile_state
 
     new_runway_polys: List[Polygon] = []
     if runway_segment_chain:

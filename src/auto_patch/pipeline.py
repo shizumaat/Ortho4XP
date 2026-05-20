@@ -2220,26 +2220,36 @@ def build_airport_pavement(icao: str, xplane_root: str,
             #    and convert sloped rects to node_altitudes.
             # 2) Sample DEM at each seam vertex via dem.alt_strict
             #    (deterministic across tiles via SRTM overlap).
-            # 3) Stage A: regrade each runway's threshold altitudes
-            #    against seam HARD anchors with FAA grade + K-factor
-            #    rules; CIFP threshold altitudes act as soft preference.
-            # 4) Solver runs as before — _seed_elevations now honors
-            #    seam HARD anchors with OVERRIDE priority over CIFP.
+            # 3) Redistribute the runway profile (user 2026-05-19):
+            #    fold seam DEM altitudes into the FAA-compliant
+            #    profile that ``runway_segments.generate_patch_osm``
+            #    emitted, run the same gates (envelope clamp + hard
+            #    cap + rate-of-grade-change), and rewrite every
+            #    runway sub-rect's altitudes per-vertex via axis
+            #    projection.  Replaces the older threshold-only
+            #    ``regrade_runways_in_layout`` step — that approach
+            #    only adjusted the two threshold corners and left
+            #    interior segment-boundary corners at their emit-time
+            #    CIFP values, so the runway's combined profile after
+            #    seam DEM anchors entered was no longer FAA-compliant.
+            # 4) Solver runs as before — every runway vertex is
+            #    HARD-anchored (whole-runway authoritative) and
+            #    adjacent shapes grade themselves against it.
             from .seam_anchors import (
                 split_pavement_at_seams, apply_seam_dem_anchors)
-            from .runway_regrade import regrade_runways_in_layout
+            from .runway_redistribute import redistribute_runway_profile
             n_split = split_pavement_at_seams(layout)
             n_seam = apply_seam_dem_anchors(
                 layout, dem, tile_lat, tile_lon)
-            n_regraded = regrade_runways_in_layout(
+            n_redistributed = redistribute_runway_profile(
                 layout, dem, tile_lat, tile_lon)
             seam_keys = getattr(layout, "_seam_anchor_keys", set())
-            if seam_keys or n_seam or n_regraded:
+            if seam_keys or n_seam or n_redistributed:
                 UI.vprint(1,
                     f"  [pav-builder] {icao}: seam pipeline — "
                     f"{len(seam_keys)} seam vert(s), "
                     f"{n_seam} DEM-anchored, "
-                    f"{n_regraded} runway(s) regraded.")
+                    f"{n_redistributed} runway shape(s) redistributed.")
 
             # First solver pass — gives every shape coherent
             # altitudes so the downstream geometric passes (snap,

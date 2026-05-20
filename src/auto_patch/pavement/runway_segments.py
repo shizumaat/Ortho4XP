@@ -63,8 +63,252 @@ __all__ = [
     "OVERRUN_EXTENSION",
     "RUNWAY_MARGIN",
     "RUNWAY_SEGMENT_LENGTH",
+    "faa_envelope_clamp",
+    "faa_hard_cap_pass",
+    "faa_rate_of_change_pass",
+    "faa_joint_solve",
     "generate_patch_osm",
 ]
+
+
+# ──────────────────────────────────────────────────────────────────
+# FAA profile passes — standalone helpers used by ``generate_patch_osm``
+# at emit time and ``runway_redistribute.redistribute_runway_profile``
+# when seam DEM altitudes need to fold back into the profile.
+#
+# Each pass mutates ``elevs`` in place; ``fractions`` and ``anchored``
+# are read-only.  The profile is a list of samples (fractions[i],
+# elevs[i]) along the runway axis (fractions in [0, 1]); anchored
+# samples are immutable (thresholds, cross-runway projections,
+# centerline crossings, seam DEMs).  ``phys_dist`` is the runway
+# physical length in metres.
+# ──────────────────────────────────────────────────────────────────
+
+
+def faa_envelope_clamp(fractions, elevs, anchored, phys_dist,
+                       grade_cap=MAX_RUNWAY_GRADE,
+                       max_dg_per_m=MAX_RUNWAY_GRADE_CHANGE_PER_M):
+    """Parabolic vertical-curve envelope pre-clamp.
+
+    At distance d from any anchored sample, the maximum elevation
+    deviation reachable while respecting the grade-change-rate is
+        max_dev = 0.5 × MAX_GC × d²       (for d ≤ L_VC)
+        max_dev = 0.5 × MAX_GC × L_VC²
+                   + MAX_GRADE × (d − L_VC)  (for d > L_VC)
+    where L_VC = MAX_GRADE / MAX_GC.
+
+    For every NON-anchored sample, intersect the envelope cones
+    around every anchored sample and clamp the sample into the
+    feasible band.  Per user 2026-05-19: this is applied around
+    ALL anchors (PVI assumption everywhere), not just blast-pad
+    boundaries.
+    """
+    n = len(fractions)
+    if n == 0:
+        return
+    L_VC = grade_cap / max_dg_per_m
+
+    def _max_dev(d):
+        if d <= L_VC:
+            return 0.5 * max_dg_per_m * d * d
+        return (0.5 * max_dg_per_m * L_VC * L_VC
+                + grade_cap * (d - L_VC))
+
+    cum_dist = [0.0]
+    for i in range(1, n):
+        cum_dist.append(cum_dist[-1]
+                         + abs(fractions[i] - fractions[i - 1]) * phys_dist)
+
+    anchor_idxs = [j for j in range(n) if anchored[j]]
+    for i in range(n):
+        if anchored[i]:
+            continue
+        lo = float('-inf')
+        hi = float('inf')
+        for j in anchor_idxs:
+            d_ij = abs(cum_dist[i] - cum_dist[j])
+            cap = _max_dev(d_ij)
+            lo = max(lo, elevs[j] - cap)
+            hi = min(hi, elevs[j] + cap)
+        if lo <= hi:
+            if elevs[i] > hi:
+                elevs[i] = hi
+            elif elevs[i] < lo:
+                elevs[i] = lo
+        else:
+            # Infeasible — fall back to linear interp through anchors.
+            if anchor_idxs:
+                # Find bracketing anchors and lerp.
+                left_j = None
+                right_j = None
+                for j in anchor_idxs:
+                    if fractions[j] <= fractions[i]:
+                        left_j = j
+                    if fractions[j] >= fractions[i] and right_j is None:
+                        right_j = j
+                if left_j is None:
+                    elevs[i] = elevs[right_j]
+                elif right_j is None or right_j == left_j:
+                    elevs[i] = elevs[left_j]
+                else:
+                    span = fractions[right_j] - fractions[left_j]
+                    if span < 1e-9:
+                        elevs[i] = elevs[left_j]
+                    else:
+                        u = (fractions[i] - fractions[left_j]) / span
+                        elevs[i] = (elevs[left_j]
+                                    + u * (elevs[right_j] - elevs[left_j]))
+
+
+def faa_hard_cap_pass(fractions, elevs, anchored, phys_dist,
+                       grade_cap=MAX_RUNWAY_GRADE,
+                       max_iters=GRADE_RELAX_ITERATIONS):
+    """Iterative per-edge grade-cap projection.
+
+    For each non-anchored sample, restrict its elevation to the band
+    reachable from its two neighbours within ±(grade_cap × segment
+    length).  Iterates until no further change.
+    """
+    n = len(elevs)
+    for _it in range(max_iters):
+        changed = False
+        for idx in range(n):
+            if anchored[idx]:
+                continue
+            lo = float("-inf")
+            hi = float("inf")
+            for nidx in (idx - 1, idx + 1):
+                if nidx < 0 or nidx >= n:
+                    continue
+                seg = abs(fractions[nidx] - fractions[idx]) * phys_dist
+                if seg < 0.1:
+                    continue
+                max_rise = seg * grade_cap
+                lo = max(lo, elevs[nidx] - max_rise)
+                hi = min(hi, elevs[nidx] + max_rise)
+            if lo == float("-inf") and hi == float("inf"):
+                continue
+            new_e = ((lo + hi) / 2.0 if lo > hi
+                     else min(max(elevs[idx], lo), hi))
+            if abs(new_e - elevs[idx]) > 0.001:
+                elevs[idx] = new_e
+                changed = True
+        if not changed:
+            return
+
+
+def faa_rate_of_change_pass(fractions, elevs, anchored, phys_dist,
+                             blast_a=0.0, blast_b=0.0,
+                             max_dg_per_m=MAX_RUNWAY_GRADE_CHANGE_PER_M,
+                             max_iters=GRADE_RELAX_ITERATIONS):
+    """FAA vertical-curve rate-of-grade-change projection.
+
+    For each interior sample, enforces
+        |g_right − g_left| ≤ max_dg_per_m × (L_left + L_right) / 2
+    by moving the sample (if SOFT) or its non-anchored neighbours
+    (if HARD).  Per the blast-pad model (user 2026-04-28), virtual
+    anchored samples at the threshold elevation are prepended /
+    appended when ``blast_a`` / ``blast_b`` > 0 so the constraint
+    propagates inward from a g=0 flat blast pad.
+    """
+    n = len(elevs)
+    if n < 3:
+        return
+
+    def _seg_len(i):
+        return abs(fractions[i + 1] - fractions[i]) * phys_dist
+
+    elevs_ext = list(elevs)
+    anchored_ext = list(anchored)
+    seg_lens = [_seg_len(k) for k in range(n - 1)]
+    start_offset = 0
+    if blast_a > 0.1 and anchored[0]:
+        elevs_ext.insert(0, elevs[0])
+        anchored_ext.insert(0, True)
+        seg_lens.insert(0, blast_a)
+        start_offset = 1
+    if blast_b > 0.1 and anchored[-1]:
+        elevs_ext.append(elevs[-1])
+        anchored_ext.append(True)
+        seg_lens.append(blast_b)
+
+    def _eseg(i):
+        return seg_lens[i] if 0 <= i < len(seg_lens) else 0.0
+
+    for _it in range(max_iters):
+        changed = False
+        for i in range(1, len(elevs_ext) - 1):
+            ll = _eseg(i - 1)
+            lr = _eseg(i)
+            if ll < 0.1 or lr < 0.1:
+                continue
+            g_left = (elevs_ext[i] - elevs_ext[i - 1]) / ll
+            g_right = (elevs_ext[i + 1] - elevs_ext[i]) / lr
+            max_dg = max_dg_per_m * ((ll + lr) / 2.0)
+            dg = g_right - g_left
+            if abs(dg) <= max_dg:
+                continue
+            target_dg = max_dg if dg > 0 else -max_dg
+            excess = dg - target_dg
+            if not anchored_ext[i]:
+                denom = 1.0 / lr + 1.0 / ll
+                new_e = (elevs_ext[i + 1] / lr
+                         + elevs_ext[i - 1] / ll
+                         - target_dg) / denom
+                if abs(new_e - elevs_ext[i]) > 0.001:
+                    elevs_ext[i] = new_e
+                    changed = True
+            else:
+                free_l = not anchored_ext[i - 1]
+                free_r = not anchored_ext[i + 1]
+                if not (free_l or free_r):
+                    continue
+                if free_l and free_r:
+                    delta_l = excess / 2.0
+                    delta_r = excess / 2.0
+                elif free_l:
+                    delta_l = excess
+                    delta_r = 0.0
+                else:
+                    delta_l = 0.0
+                    delta_r = excess
+                if free_l and abs(delta_l) > 1e-9:
+                    new_lo = elevs_ext[i - 1] - delta_l * ll
+                    if abs(new_lo - elevs_ext[i - 1]) > 0.001:
+                        elevs_ext[i - 1] = new_lo
+                        changed = True
+                if free_r and abs(delta_r) > 1e-9:
+                    new_hi = elevs_ext[i + 1] - delta_r * lr
+                    if abs(new_hi - elevs_ext[i + 1]) > 0.001:
+                        elevs_ext[i + 1] = new_hi
+                        changed = True
+        if not changed:
+            break
+
+    for j in range(n):
+        elevs[j] = elevs_ext[j + start_offset]
+
+
+def faa_joint_solve(fractions, elevs, anchored, phys_dist,
+                     blast_a=0.0, blast_b=0.0,
+                     grade_cap=MAX_RUNWAY_GRADE,
+                     max_dg_per_m=MAX_RUNWAY_GRADE_CHANGE_PER_M,
+                     n_outer=8, tol_m=0.005):
+    """Run envelope clamp + alternating hard-cap and rate-of-change
+    passes until joint convergence.  Mutates ``elevs`` in place.
+    """
+    faa_envelope_clamp(fractions, elevs, anchored, phys_dist,
+                        grade_cap=grade_cap,
+                        max_dg_per_m=max_dg_per_m)
+    for _outer in range(n_outer):
+        prev = list(elevs)
+        faa_hard_cap_pass(fractions, elevs, anchored, phys_dist,
+                           grade_cap=grade_cap)
+        faa_rate_of_change_pass(fractions, elevs, anchored, phys_dist,
+                                  blast_a=blast_a, blast_b=blast_b,
+                                  max_dg_per_m=max_dg_per_m)
+        if max(abs(a - b) for a, b in zip(elevs, prev)) < tol_m:
+            break
 
 
 def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
@@ -134,6 +378,18 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
     way_id = -1
     nodes = []  # list of (id, lat, lon)
     ways = []  # list of (id, [node_ids], {tags})
+    # Per-pair FAA-profile state, returned alongside the OSM/chain so a
+    # downstream redistribute step (``runway_redistribute``) can fold
+    # seam DEM altitudes into the same profile and rewrite every runway
+    # sub-rect's altitudes per-vertex via axis projection.  Each entry:
+    #   (desig_a, desig_b) → {
+    #     phys_end_a_ll, phys_end_b_ll, phys_dist_m,
+    #     blast_a_m, blast_b_m,
+    #     fractions: List[float],  # t in [0, 1] along phys-end-to-phys-end
+    #     elevs:     List[float],  # FAA-compliant altitudes
+    #     anchored:  List[bool],   # True for thresholds + extras
+    #   }
+    profile_state: dict = {}
     # Chain of emitted runway segments, captured for downstream
     # consumers that need the authoritative runway elevation at an
     # arbitrary (lat, lon).  Each entry:
@@ -357,23 +613,44 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 auto_extra_anchors.setdefault(key, []).append(
                     (p_lat, p_lon, anchor_e))
     # ── Runway-runway centerline-crossing reconciliation ──
-    # Per user 2026-05-19: CIFP fixes only the runway threshold
-    # elevations; the altitude along the rest of the runway is
-    # OUR responsibility.  At any point where two runway
-    # centerlines geometrically cross, the runways must share the
-    # same altitude — they physically occupy the same surface
-    # there, so a 4 m disagreement (CYXY 02/20 × 14R/32L from
-    # threshold-to-threshold linear interpolation) is an
-    # auto-patch bug, not a CIFP problem.
+    # Per user 2026-05-19: at any point where two runway
+    # centerlines geometrically cross, both runways must share
+    # the SAME altitude — they physically occupy the same
+    # surface there.
     #
-    # Reconciliation: at every centerline crossing between two
-    # paired runways, take the average of each runway's
-    # threshold-to-threshold linear-interpolated altitude at the
-    # crossing.  Inject that average as an ANCHORED extra-anchor
-    # on BOTH runways at the crossing point.  The existing
-    # segmenter then re-shapes each runway's profile to honor the
-    # new interior anchor alongside the threshold anchors, and
-    # both runways meet smoothly at the crossing.
+    # Choosing the agreed altitude (closer-threshold wins):
+    # whichever runway has the threshold geometrically closer
+    # to the crossing point gets its CIFP-linear-interp value
+    # used as the agreed altitude.  That runway's profile then
+    # passes through the crossing on its natural CIFP profile,
+    # and the OTHER runway accommodates by deviating from its
+    # own linear interpolation as much as the FAA gates allow.
+    #
+    # Why this rule: a runway with thresholds close to the
+    # crossing has less profile flexibility — short distance
+    # means small allowed altitude deviation.  A runway whose
+    # thresholds are far away has more total altitude budget to
+    # absorb a deviation at the crossing.  Picking the closer-
+    # threshold runway as authoritative means we honor CIFP for
+    # the runway that needs it most and let the other one bend.
+    #
+    # Example (CYXY): RW02/RW20 is essentially flat (694 → 694)
+    # and 548 m long; RW14R/RW32L climbs 694 → 706 over 2946 m.
+    # At their crossing, RW02 is 237 m away from the crossing
+    # while RW14R is 1036 m away.  RW02/20 dominates — agreed
+    # altitude = its CIFP-linear value (694.07).  RW14R/RW32L
+    # then has a small "dip" at the crossing on its overall
+    # climb, which is what a real runway through the lower
+    # terrain at the crossing would do.
+    #
+    # Previously averaged the two CIFP-linear values
+    # (≈ 696 in the CYXY case), which forced a 2 m bump on the
+    # flat runway and an equal dip on the sloped one — neither
+    # consistent with the actual airport surface.
+    #
+    # CIFP-derived (not DEM-derived): CIFP threshold elevations
+    # are authoritative for the airport surface; DEM at this
+    # level of detail is unreliable.
     #
     # Affects only airports with crossing runways (CYXY).  At
     # SPJC / SPLP each airport has a single runway pair so no
@@ -407,12 +684,24 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             # this reconciliation.
             if not (0.001 < t_t < 0.999 and 0.001 < t_r < 0.999):
                 continue
-            z_t = dat_a_t["elevation_m"] + t_t * (
-                dat_b_t["elevation_m"] - dat_a_t["elevation_m"])
-            z_r = dat_a_r["elevation_m"] + t_r * (
-                dat_b_r["elevation_m"] - dat_a_r["elevation_m"])
-            agreed = 0.5 * (z_t + z_r)
             c_lat, c_lon = pt.y, pt.x
+            # Closer-threshold runway dominates.  Distance to
+            # nearest threshold is min(t, 1-t) × runway-length;
+            # ``cl_t.length`` and ``cl_r.length`` are in lat/lon
+            # units but proportional to physical distance at the
+            # same airport (both have the same cos(lat) scale),
+            # so the relative comparison is valid without
+            # converting to metres.
+            d_t_to_thresh = min(t_t, 1.0 - t_t) * cl_t.length
+            d_r_to_thresh = min(t_r, 1.0 - t_r) * cl_r.length
+            if d_t_to_thresh <= d_r_to_thresh:
+                # Runway T's threshold is closer — T's CIFP wins.
+                agreed = dat_a_t["elevation_m"] + t_t * (
+                    dat_b_t["elevation_m"] - dat_a_t["elevation_m"])
+            else:
+                # Runway R's threshold is closer — R's CIFP wins.
+                agreed = dat_a_r["elevation_m"] + t_r * (
+                    dat_b_r["elevation_m"] - dat_a_r["elevation_m"])
             auto_extra_anchors.setdefault(
                 (da_t, db_t), []).append((c_lat, c_lon, agreed))
             auto_extra_anchors.setdefault(
@@ -899,271 +1188,37 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
                 else:
                     elevs[i] = dem_e
 
-            # ── FAA-absorption envelope pre-clamp ────────────────
-            # Per user 2026-04-28: enforce the parabolic vertical-
-            # curve envelope explicitly.  At distance d from any
-            # anchor, the maximum elevation deviation that's
-            # achievable while respecting MAX_GC × distance grade-
-            # change-rate is:
-            #   max_dev = 0.5 × MAX_GC × d²       (for d ≤ L_VC)
-            #   max_dev = 0.5 × MAX_GC × L_VC²
-            #             + MAX_GRADE × (d − L_VC)  (for d > L_VC)
-            # where L_VC = MAX_GRADE / MAX_GC (the curve length to
-            # reach max grade).
-            #
-            # Threshold anchors with blast pads ALSO need to
-            # satisfy this envelope assuming g_in=0 from the flat
-            # blast pad.  Interior (cross-runway) anchors don't
-            # have a defined g_in, so the envelope around them
-            # uses just the linear MAX_GRADE × d bound.
-            #
-            # This pre-clamp guarantees the profile is FAA-
-            # compliant by construction.  The downstream
-            # _pass_hard_cap and _pass_rate_of_change converge in
-            # 1-2 iterations (mostly to round 0.001 m residuals).
-            L_VC = MAX_RUNWAY_GRADE / MAX_RUNWAY_GRADE_CHANGE_PER_M
+            # ── FAA-compliant profile gates ──────────────────────
+            # Envelope pre-clamp + alternating hard-cap and rate-of-
+            # change passes until joint convergence.  The detail of
+            # each pass lives in module-level helpers
+            # ``faa_envelope_clamp``, ``faa_hard_cap_pass``,
+            # ``faa_rate_of_change_pass`` so the same logic is
+            # reusable by ``runway_redistribute.redistribute_runway_profile``
+            # when seam DEM altitudes fold back into the profile.
+            faa_joint_solve(
+                fractions, elevs, anchored, phys_dist,
+                blast_a=blast_a, blast_b=blast_b,
+                grade_cap=MAX_RUNWAY_GRADE,
+                max_dg_per_m=MAX_RUNWAY_GRADE_CHANGE_PER_M)
 
-            def _faa_max_dev(d: float) -> float:
-                if d <= L_VC:
-                    return 0.5 * MAX_RUNWAY_GRADE_CHANGE_PER_M * d * d
-                return (0.5 * MAX_RUNWAY_GRADE_CHANGE_PER_M
-                        * L_VC * L_VC
-                        + MAX_RUNWAY_GRADE * (d - L_VC))
-
-            for i in range(n_samples):
-                if anchored[i]:
-                    continue
-                lo = float('-inf')
-                hi = float('inf')
-                for j in range(n_samples):
-                    if not anchored[j]:
-                        continue
-                    d_ij = abs(cum_dist[i] - cum_dist[j])
-                    # Boundary anchors with blast pads use the
-                    # FAA absorption envelope (the blast pad's
-                    # g_in=0 is part of the constraint).  Interior
-                    # anchors use only the linear grade envelope.
-                    is_boundary_with_blast = (
-                        (j == 0 and blast_a > 0.1)
-                        or (j == n_samples - 1 and blast_b > 0.1))
-                    if is_boundary_with_blast:
-                        cap = _faa_max_dev(d_ij)
-                    else:
-                        cap = MAX_RUNWAY_GRADE * d_ij
-                    lo = max(lo, elevs[j] - cap)
-                    hi = min(hi, elevs[j] + cap)
-                if lo <= hi:
-                    if elevs[i] > hi:
-                        elevs[i] = hi
-                    elif elevs[i] < lo:
-                        elevs[i] = lo
-                else:
-                    # Infeasible: anchors are inconsistent with
-                    # the FAA envelope.  Use baseline as fallback.
-                    base_e = _anchor_profile(fractions[i])
-                    if base_e is not None:
-                        elevs[i] = base_e
-
-            def _pass_hard_cap():
-                for _it in range(GRADE_RELAX_ITERATIONS):
-                    changed = False
-                    for idx in range(len(elevs)):
-                        if anchored[idx]:
-                            continue
-                        lo = float("-inf")
-                        hi = float("inf")
-                        for nidx in (idx - 1, idx + 1):
-                            if nidx < 0 or nidx >= len(elevs):
-                                continue
-                            seg_dist = (
-                                abs(fractions[nidx] - fractions[idx])
-                                * phys_dist)
-                            if seg_dist < 0.1:
-                                continue
-                            max_rise = seg_dist * MAX_RUNWAY_GRADE
-                            lo = max(lo, elevs[nidx] - max_rise)
-                            hi = min(hi, elevs[nidx] + max_rise)
-                        if lo == float("-inf") and hi == float("inf"):
-                            continue
-                        if lo > hi:
-                            # Infeasible — neighbours diverge more
-                            # than the grade cap allows.  Snap to
-                            # the midpoint so the constraint
-                            # propagates.
-                            new_e = (lo + hi) / 2.0
-                        else:
-                            new_e = min(max(elevs[idx], lo), hi)
-                        if abs(new_e - elevs[idx]) > 0.001:
-                            elevs[idx] = new_e
-                            changed = True
-                    if not changed:
-                        return
-
-            # Joint solver: alternate hard-cap and rate-of-change
-            # passes until neither one changes anything.  Running
-            # each pass only once can leave small mutual residuals
-            # (the cap pass can push samples outside the rate-of-
-            # change envelope, and vice versa); with the envelope
-            # pre-clamp above this usually converges in 2–3 outer
-            # iterations.
-            _pass_hard_cap()
-
-            # FAA vertical-curve rate-of-change pass for RUNWAYS.
-            # The runway rule is L ≥ 305 m × |ΔG| (vs 30.5 m for
-            # taxiways), which means grade can only change by
-            # ≈ 0.0033 % per metre of pavement.  Over a 100 m
-            # segment adjacent grades can therefore differ by at
-            # most 0.33 %, so going from 0 % to the 1.5 % cap takes
-            # at least ~450 m of runway.  This is what produces the
-            # "long gentle slopes" characteristic of real runways.
-            #
-            # For each interior sample i (1..n-2):
-            #   g_left  = (e[i]   - e[i-1]) / L_left
-            #   g_right = (e[i+1] - e[i])   / L_right
-            #   |g_right - g_left| must be
-            #     ≤ MAX_RUNWAY_GRADE_CHANGE_PER_M × ((L_left+L_right)/2)
-            def _seg_len(i):
-                return abs(fractions[i + 1] - fractions[i]) * phys_dist
-
-            def _pass_rate_of_change():
-                """FAA rate-of-grade-change pass.
-
-                Per user 2026-04-28 (refined): treats blast pads as
-                virtual anchored samples (grade=0 contributing
-                segments) at the start and end of the sample list.
-                With this, the constraint at the threshold/blast-pad
-                interface propagates inward over MULTIPLE samples
-                instead of being one-sample-deep — so the runway
-                forms a proper FAA vertical curve coming out of the
-                threshold, not a sharp grade kink.
-
-                Also enforces ΔG at INTERIOR anchored samples (e.g.
-                cross-runway projection anchors) by adjusting
-                the anchor's neighbours when the anchor's incoming
-                vs outgoing grade differ by more than the FAA limit.
-                """
-                # Build extended arrays with virtual blast pad
-                # samples at frac < 0 and frac > 1.  The virtual
-                # samples are anchored at the same elevation as
-                # the threshold, so the segment between them and
-                # the threshold has grade 0 — exactly modelling a
-                # flat blast pad.
-                elevs_ext = list(elevs)
-                anchored_ext = list(anchored)
-                # Segment lengths: one entry per gap between
-                # consecutive samples in elevs_ext.
-                seg_lens: list = [_seg_len(k)
-                                   for k in range(len(elevs) - 1)]
-                start_offset = 0
-                if blast_a > 0.1 and anchored[0]:
-                    elevs_ext.insert(0, elevs[0])
-                    anchored_ext.insert(0, True)
-                    seg_lens.insert(0, blast_a)
-                    start_offset = 1
-                end_offset = 0
-                if blast_b > 0.1 and anchored[-1]:
-                    elevs_ext.append(elevs[-1])
-                    anchored_ext.append(True)
-                    seg_lens.append(blast_b)
-                    end_offset = 1
-
-                def _eseg(i):
-                    return seg_lens[i] if 0 <= i < len(seg_lens) else 0.0
-
-                any_change = False
-                for _it in range(GRADE_RELAX_ITERATIONS):
-                    changed = False
-                    # Walk every sample (including anchored interior
-                    # ones — they don't move themselves but their
-                    # ΔG is enforced by adjusting neighbours).
-                    for i in range(1, len(elevs_ext) - 1):
-                        ll = _eseg(i - 1)
-                        lr = _eseg(i)
-                        if ll < 0.1 or lr < 0.1:
-                            continue
-                        g_left = (
-                            (elevs_ext[i] - elevs_ext[i - 1]) / ll)
-                        g_right = (
-                            (elevs_ext[i + 1] - elevs_ext[i]) / lr)
-                        max_dg = (MAX_RUNWAY_GRADE_CHANGE_PER_M
-                                   * ((ll + lr) / 2.0))
-                        dg = g_right - g_left
-                        if abs(dg) <= max_dg:
-                            continue
-                        target_dg = (max_dg if dg > 0 else -max_dg)
-                        excess = dg - target_dg
-                        if not anchored_ext[i]:
-                            # Standard case: move sample i to make
-                            # ΔG = target_dg.
-                            denom = 1.0 / lr + 1.0 / ll
-                            new_e = (elevs_ext[i + 1] / lr
-                                      + elevs_ext[i - 1] / ll
-                                      - target_dg) / denom
-                            if abs(new_e - elevs_ext[i]) > 0.001:
-                                elevs_ext[i] = new_e
-                                changed = True
-                                any_change = True
-                        else:
-                            # Anchored sample: we cannot move it.
-                            # Move its non-anchored neighbours to
-                            # make ΔG = target_dg.
-                            #
-                            # We want g_left' = g_left + δ_l,
-                            # g_right' = g_right - δ_r, such that
-                            # new dg = dg − δ_l − δ_r = target_dg.
-                            # → δ_l + δ_r = excess.
-                            free_l = not anchored_ext[i - 1]
-                            free_r = not anchored_ext[i + 1]
-                            if not free_l and not free_r:
-                                continue  # both neighbours anchored
-                            if free_l and free_r:
-                                delta_l = excess / 2.0
-                                delta_r = excess / 2.0
-                            elif free_l:
-                                delta_l = excess
-                                delta_r = 0.0
-                            else:
-                                delta_l = 0.0
-                                delta_r = excess
-                            if free_l and abs(delta_l) > 1e-9:
-                                # increase g_left by delta_l
-                                # → decrease elev[i-1] by delta_l*ll
-                                new_lo = (
-                                    elevs_ext[i - 1] - delta_l * ll)
-                                if abs(new_lo
-                                        - elevs_ext[i - 1]) > 0.001:
-                                    elevs_ext[i - 1] = new_lo
-                                    changed = True
-                                    any_change = True
-                            if free_r and abs(delta_r) > 1e-9:
-                                # decrease g_right by delta_r
-                                # → decrease elev[i+1] by delta_r*lr
-                                new_hi = (
-                                    elevs_ext[i + 1] - delta_r * lr)
-                                if abs(new_hi
-                                        - elevs_ext[i + 1]) > 0.001:
-                                    elevs_ext[i + 1] = new_hi
-                                    changed = True
-                                    any_change = True
-                    if not changed:
-                        break
-
-                # Copy interior values back to the real arrays
-                # (skip the virtual blast pad samples).
-                for j in range(len(elevs)):
-                    elevs[j] = elevs_ext[j + start_offset]
-                return any_change
-
-            _pass_rate_of_change()
-
-            # Outer joint convergence loop: keep alternating the two
-            # passes until neither one moves anything.
-            for _outer in range(8):
-                prev_elevs = list(elevs)
-                _pass_hard_cap()
-                _pass_rate_of_change()
-                if max(abs(a - b) for a, b in zip(elevs, prev_elevs)) < 0.005:
-                    break
+            # Capture the per-pair FAA-compliant profile state so a
+            # downstream redistribute step can fold seam DEM altitudes
+            # into the same profile.  Stored before consolidation /
+            # emit so the sample list reflects the full uniform
+            # 100 m + threshold + pav_intersection + cross-runway +
+            # crossing-reconciliation grid.
+            profile_state[(desig_a, desig_b)] = {
+                'phys_end_a_ll': phys_end_a,
+                'phys_end_b_ll': phys_end_b,
+                'phys_dist_m': phys_dist,
+                'blast_a_m': blast_a,
+                'blast_b_m': blast_b,
+                'patch_width_m': patch_width,
+                'fractions': list(fractions),
+                'elevs': list(elevs),
+                'anchored': list(anchored),
+            }
 
             # Identify which sample indices correspond to pav_inter-
             # section breakpoints (junction-snap points).  These are
@@ -1322,4 +1377,4 @@ def generate_patch_osm(icao, runway_pairs, runway_widths=None, tile=None,
             lines.append("    <tag k='{}' v='{}' />".format(k, v))
         lines.append("  </way>")
     lines.append("</osm>")
-    return "\n".join(lines) + "\n", runway_chain
+    return "\n".join(lines) + "\n", runway_chain, profile_state
